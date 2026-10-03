@@ -1,0 +1,270 @@
+// Shared CGRA orchestration utilities.
+
+#ifndef TASKFLOW_ORCHESTRATION_UTILS_H
+#define TASKFLOW_ORCHESTRATION_UTILS_H
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace mlir {
+namespace taskflow {
+
+// Grid constants.
+
+constexpr int kCgraGridRows = 4;
+constexpr int kCgraGridCols = 4;
+
+// CgraShape.
+
+// Represents a CGRA orchestration shape on the grid.
+//
+// For rectangular shapes: rows × cols == cgra_count, and `cgra_positions`
+// is empty (all cells in the bounding box are used).
+//
+// For non-rectangular shapes (L, T): `cgra_positions` stores the explicit
+// (col, row) coordinates of the occupied CGRAs.  `rows`/`cols` give the
+// bounding box so that tile-level x_tiles/y_tiles can be computed.
+struct CgraShape {
+  int rows;            // Bounding-box CGRA rows.
+  int cols;            // Bounding-box CGRA columns.
+  bool is_rectangular; // True if all cells in the bbox are used.
+  // Explicit CGRA positions for non-rectangular shapes.
+  // Each pair is (col, row) in CGRA coordinates.  Empty for rectangles.
+  llvm::SmallVector<std::pair<int, int>> cgra_positions;
+
+  // Returns the bounding-box area (rows * cols).  For rectangular shapes this
+  // equals cgra_count; for non-rectangular shapes it is larger than cgra_count
+  // (some cells in the bbox are unoccupied).  Used only for shape sorting
+  // (prefer smaller bounding boxes), not for counting occupied CGRAs.
+  int area() const { return rows * cols; }
+};
+
+// Shape enumeration utilities.
+
+// Generates all placement-candidate shapes for `cgra_count` CGRAs, including
+// rotations. Rectangular shapes include both orientations (rows×cols and
+// cols×rows, deduplicated for squares). Non-rectangular shapes include all
+// four 90° rotations.
+//
+// Ordering (tried first to last):
+//   1. Rectangular shapes, sorted by squareness (e.g. 2×2 before 1×4),
+//      with smaller bounding-box area as tiebreaker.
+//   2. Non-rectangular shapes (L, T, etc.) in all unique rotations.
+llvm::SmallVector<CgraShape> getAllPlacementShapes(int cgra_count);
+
+// Task scheduling utilities.
+
+// Controls whether a time-slot dimension is added to every CGRA assignment.
+enum class SchedulingMode {
+  // Each CGRA is assigned to at most one task. Asserts if tasks exceed the
+  // grid size.
+  Spatial,
+  // Adds a time-slot dimension. Tasks that would over-subscribe the grid are
+  // scheduled at a later time slot, enabling temporal reuse of CGRAs.
+  SpatialTemporal,
+};
+
+// Controls how the scheduler interprets a task's cgra_shape attribute.
+enum class ShapeSelectionPolicy {
+  // Tries every legal rotation of a supplied shape. When no shape is supplied,
+  // enumerates legal shapes with the requested CGRA count.
+  RotateOrEnumerateShapes,
+  // Uses the supplied rows-by-columns orientation exactly as written. The
+  // scheduler neither transposes it nor enumerates a fallback shape.
+  FixedOrientation,
+};
+
+// One scheduled CGRA cell assignment for a task.
+struct CgraPosition;
+
+// Complete CGRA placement chosen for one task.
+struct TaskPlacement;
+
+// Internal task node used by the scheduler's dependency graph.
+struct TaskNode;
+
+// Internal task/memory dependency graph built from one func.func.
+class TaskMemoryGraph;
+
+class TaskCommunicationModel;
+
+// Opaque reservation state supplied by an optional communication model.
+// The owner and type tag are part of the contract: callers must never pass a
+// handle captured from another model instance or another concrete provider.
+// The payload is intentionally type-erased so this interface remains usable
+// by builds compiled with RTTI disabled.
+struct TaskCommunicationReservationCheckpoint {
+  const TaskCommunicationModel *owner = nullptr;
+  uint64_t typeTag = 0;
+  std::shared_ptr<const void> state;
+};
+
+// Optional strict model for task-level dependencies and routed transfers.
+// Trial reservations let placement compare alternatives without consuming
+// link capacity; the chosen placement is replayed with commit=true.
+class TaskCommunicationModel {
+public:
+  virtual ~TaskCommunicationModel() = default;
+
+  virtual bool
+  getTaskPredecessors(Operation *consumer,
+                      llvm::SmallVectorImpl<Operation *> &predecessors,
+                      std::string &error) const = 0;
+  virtual bool getTransferLowerBound(Operation *, Operation *, int64_t &cycles, std::string &) const {
+    cycles = 0; return true;
+  }
+  virtual bool getTransferLowerBoundForEndpoints(
+      Operation *producer, Operation *consumer, int source_row, int source_col,
+      int destination_row, int destination_col, int64_t &cycles,
+      std::string &error) const {
+    (void)source_row;
+    (void)source_col;
+    (void)destination_row;
+    (void)destination_col;
+    return getTransferLowerBound(producer, consumer, cycles, error);
+  }
+  virtual bool supportsStaticEndpointLowerBoundCache() const { return false; }
+  virtual bool supportsCanonicalReservationState() const { return false; }
+  virtual bool getCanonicalReservationState(std::string &state,
+                                            std::string &error) const {
+    state.clear();
+    error = "communication model does not expose canonical reservation state";
+    return false;
+  }
+  virtual bool supportsReservationCheckpoint() const { return false; }
+  virtual bool captureReservationCheckpoint(
+      TaskCommunicationReservationCheckpoint &checkpoint,
+      std::string &error) const {
+    checkpoint = {};
+    error = "communication model does not expose reservation checkpoints";
+    return false;
+  }
+  virtual bool restoreReservationCheckpoint(
+      const TaskCommunicationReservationCheckpoint &checkpoint,
+      std::string &error) {
+    (void)checkpoint;
+    error = "communication model does not expose reservation checkpoints";
+    return false;
+  }
+  virtual void resetReservations() = 0;
+  virtual void beginTrial() = 0;
+  virtual void finishTrial(bool commit) = 0;
+  virtual bool getTransferReadyCycle(Operation *producer, Operation *consumer,
+                                     int source_row, int source_col,
+                                     int destination_row, int destination_col,
+                                     int64_t producer_finish, bool reserve,
+                                     int64_t &ready_cycle,
+                                     std::string &error) = 0;
+};
+
+// Caller-provided task priority; higher values are scheduled earlier among
+// tasks whose predecessors have already been placed.
+using TaskPriorityMap = llvm::DenseMap<Operation *, int>;
+
+struct TaskScheduleEntry {
+  Operation *task = nullptr;
+  int64_t startCycle = 0;
+  int64_t endCycle = 0;
+  llvm::SmallVector<std::pair<int, int>> positions;
+};
+
+// Reusable one-shot scheduler/placer for Taskflow task graphs.
+//
+// Builds the task-memory graph, schedules tasks using the provided priority,
+// places them on the CGRA grid, assigns SRAM locations, and emits
+// task_orchestration_info/profile_info metadata.
+class TaskScheduler {
+public:
+  TaskScheduler(int grid_rows = kCgraGridRows, int grid_cols = kCgraGridCols,
+                SchedulingMode mode = SchedulingMode::SpatialTemporal,
+                ShapeSelectionPolicy shape_selection_policy =
+                    ShapeSelectionPolicy::RotateOrEnumerateShapes,
+                TaskCommunicationModel *communication_model = nullptr);
+
+  // Schedules and places all Taskflow tasks in `func` using the caller-provided
+  // task priority map. Fixed-orientation production callers may set the
+  // optional positive i64 function attribute
+  // `joint_scheduling_fixed_point_max_iterations` to raise the default
+  // ten-iteration SRAM/placement fixed-point budget.
+  bool schedule(func::FuncOp func, const TaskPriorityMap &priority);
+
+  // Makespan of the placement in predicted cycles. A zero result means that
+  // no tasks were placed or the cycle count overflowed the representable range.
+  int64_t getScheduleMakespan() const { return schedule_makespan_; }
+  llvm::ArrayRef<TaskScheduleEntry> getScheduleEntries() const {
+    return schedule_entries_;
+  }
+  // Returns the dependency-respecting order actually used by the production
+  // scheduler.  Schedule entries intentionally remain in graph order for
+  // compatibility with existing IR consumers; callers that need dispatch
+  // order must use this vector (or the corresponding emitted IR attribute).
+  llvm::ArrayRef<Operation *> getDispatchOrder() const {
+    return dispatch_order_;
+  }
+
+private:
+  // Returns true if a CGRA grid coordinate is inside the configured grid.
+  bool posInBounds(const CgraPosition &pos) const;
+
+  // Returns true if a CGRA cell is already occupied during the requested
+  // time interval.
+  bool isOccupied(int row, int col, int64_t start_time, int64_t duration) const;
+
+  // Marks a CGRA cell as occupied for the half-open interval
+  // [start_time, start_time + duration).
+  void markOccupied(int row, int col, int64_t start_time, int64_t duration);
+
+  // Clears all task placements and CGRA occupancy state before another
+  // fixed-point placement iteration.
+  void resetTaskPlacements(TaskMemoryGraph &graph);
+
+  // Computes the earliest start time allowed by already-placed predecessor
+  // tasks.
+  int64_t computeEarliestStartTime(const TaskNode *task_node) const;
+
+  // Assigns every memory node to the SRAM location closest to its accessing
+  // tasks and returns whether any assignment changed.
+  bool assignAllSrams(TaskMemoryGraph &graph);
+
+  // Searches legal grid positions and returns the best-scoring placement for
+  // one task under the current scheduling mode.
+  TaskPlacement findBestPlacement(TaskNode *task_node, int cgra_count,
+                                  TaskMemoryGraph &graph);
+
+  // Parses a cgra_shape attribute string into its base placement shape.
+  CgraShape parseCgraShapeToBase(StringRef cgra_shape, int cgra_count);
+
+  // Generates all unique rotations of a placement shape.
+  llvm::SmallVector<CgraShape> rotationsOf(const CgraShape &base);
+
+  // Scores a candidate placement using proximity to dependent tasks, assigned
+  // SRAMs, and context reuse cost.
+  int computeScore(TaskNode *task_node, const TaskPlacement &placement,
+                   TaskMemoryGraph &graph);
+
+  int grid_rows_;
+  int grid_cols_;
+  SchedulingMode mode_;
+  ShapeSelectionPolicy shape_selection_policy_;
+  TaskCommunicationModel *communication_model_ = nullptr;
+  int64_t schedule_makespan_ = 0;
+  std::string communication_error_;
+  llvm::SmallVector<TaskScheduleEntry> schedule_entries_;
+  llvm::SmallVector<Operation *> dispatch_order_;
+  std::vector<std::vector<llvm::SmallVector<std::pair<int64_t, int64_t>, 4>>>
+      cgra_occupancy_;
+};
+
+} // namespace taskflow
+} // namespace mlir
+
+#endif // TASKFLOW_ORCHESTRATION_UTILS_H

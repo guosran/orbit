@@ -1,0 +1,3 @@
+add_subdirectory(Conversion)
+add_subdirectory(NeuraDialect)
+add_subdirectory(CAPI)

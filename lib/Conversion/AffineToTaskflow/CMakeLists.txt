@@ -1,0 +1,21 @@
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
+
+add_mlir_conversion_library(MLIRAffineToTaskflowPass
+  AffineToTaskflowPass.cpp
+  RepairLuAffineDeterminantCarryPass.cpp
+  FoldSubViewPass.cpp
+  ConvertCopyToAffineLoopsPass.cpp
+
+  DEPENDS
+  MLIRAmoebaConversionIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRTaskflow
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRIR
+  MLIRPass
+  MLIRTransforms
+  MLIRSupport
+)

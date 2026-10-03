@@ -1,0 +1,1584 @@
+// Shared CGRA orchestration utilities.
+
+#include "Backend/Neura/Orchestration/orchestration_utils.h"
+#include "TaskflowDialect/TaskflowOps.h"
+#include "mlir/IR/Builders.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <cassert>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <vector>
+
+using llvm::SmallVector;
+
+namespace mlir {
+namespace taskflow {
+
+// Internal helpers
+
+namespace {
+
+// Returns the set of non-rectangular shapes for `cgra_count` CGRAs.
+// Currently defined for cgra_count == 3 (L-shape) and cgra_count == 4
+// (L-shape and T-shape variants).
+SmallVector<CgraShape> getNonRectangularShapes(int cgra_count) {
+  SmallVector<CgraShape> shapes;
+
+  if (cgra_count == 3) {
+    // L-shape 3 CGRAs: (0,0)(1,0)(0,1) — bbox 2×2
+    shapes.push_back({2, 2, false, {{0, 0}, {1, 0}, {0, 1}}});
+  }
+
+  if (cgra_count == 4) {
+    // T-shape: three in a row + one below centre
+    //   (0,0)(1,0)(2,0)(1,1)  — bbox 2×3
+    shapes.push_back({2, 3, false, {{0, 0}, {1, 0}, {2, 0}, {1, 1}}});
+
+    // L-shape: three in a column + one offset
+    //   (0,0)(0,1)(0,2)(1,2)  — bbox 3×2
+    shapes.push_back({3, 2, false, {{0, 0}, {0, 1}, {0, 2}, {1, 2}}});
+  }
+
+  return shapes;
+}
+
+} // namespace
+
+// getAllPlacementShapes
+
+SmallVector<CgraShape> getAllPlacementShapes(int cgra_count) {
+  SmallVector<CgraShape> shapes;
+
+  // 1. Rectangular shapes with both orientations, deduplicated.
+  {
+    llvm::DenseSet<int64_t> seen_keys; // encodes (rows<<16)|cols
+    for (int row_dim = 1; row_dim <= kCgraGridRows; ++row_dim) {
+      for (int col_dim = 1; col_dim <= kCgraGridCols; ++col_dim) {
+        if (row_dim * col_dim == cgra_count) {
+          int64_t key = ((int64_t)row_dim << 16) | col_dim;
+          if (seen_keys.insert(key).second) {
+            shapes.push_back({row_dim, col_dim, true, {}});
+            // Adds the rotated orientation if different (e.g. 1×4 -> 4×1).
+            if (row_dim != col_dim) {
+              int64_t rotated_key = ((int64_t)col_dim << 16) | row_dim;
+              if (seen_keys.insert(rotated_key).second) {
+                shapes.push_back({col_dim, row_dim, true, {}});
+              }
+            }
+          }
+        }
+      }
+    }
+    // Sorts rectangles: prefer more square-like (smaller |rows-cols|), then
+    // smaller bounding-box area as tiebreaker.
+    llvm::sort(shapes, [](const CgraShape &lhs, const CgraShape &rhs) {
+      int squareness_lhs = std::abs(lhs.rows - lhs.cols);
+      int squareness_rhs = std::abs(rhs.rows - rhs.cols);
+      if (squareness_lhs != squareness_rhs)
+        return squareness_lhs < squareness_rhs;
+      return lhs.area() < rhs.area();
+    });
+  }
+
+  // 2. Non-rectangular shapes with all four 90° rotations.
+  auto base_non_rect = getNonRectangularShapes(cgra_count);
+  for (const auto &base : base_non_rect) {
+    // Generates 4 rotations of the cgra_positions list.
+    // Rotation by 90° CW: (col, row) -> (row, -col).
+    // Each rotation is normalised so that offsets start from (0, 0).
+    SmallVector<SmallVector<std::pair<int, int>>, 4> rotation_variants;
+    rotation_variants.push_back(
+        SmallVector<std::pair<int, int>>(base.cgra_positions));
+
+    auto prev_positions = base.cgra_positions;
+    for (int rotation_idx = 0; rotation_idx < 3; ++rotation_idx) {
+      SmallVector<std::pair<int, int>> rotated_positions;
+      for (auto &[col_off, row_off] : prev_positions)
+        rotated_positions.push_back(
+            {row_off, -col_off}); // 90° CW in (col, row) space
+
+      // Normalises to non-negative offsets starting from (0, 0).
+      int min_col = INT_MAX, min_row = INT_MAX;
+      for (auto &[col_off, row_off] : rotated_positions) {
+        min_col = std::min(min_col, col_off);
+        min_row = std::min(min_row, row_off);
+      }
+      for (auto &[col_off, row_off] : rotated_positions) {
+        col_off -= min_col;
+        row_off -= min_row;
+      }
+      rotation_variants.push_back(rotated_positions);
+      prev_positions = rotated_positions;
+    }
+
+    // Deduplicates rotations that produce the same position set.
+    // Hash parameters: multiplier 131 and positional weight 17 are chosen to
+    // give low collision rates for small integer coordinate sets.
+    llvm::DenseSet<int64_t> seen_hashes;
+    for (auto &positions : rotation_variants) {
+      auto sorted_positions = positions;
+      llvm::sort(sorted_positions,
+                 [](const std::pair<int, int> &lhs,
+                    const std::pair<int, int> &rhs) { return lhs < rhs; });
+      int64_t hash = 0;
+      for (auto &[col_off, row_off] : sorted_positions)
+        hash = hash * 131 + col_off * 17 + row_off;
+      if (!seen_hashes.insert(hash).second) {
+        continue;
+      }
+      // Computes bounding box for this rotation.
+      int max_col = 0, max_row = 0;
+      for (auto &[col_off, row_off] : positions) {
+        max_col = std::max(max_col, col_off);
+        max_row = std::max(max_row, row_off);
+      }
+      shapes.push_back({max_row + 1, max_col + 1, false, std::move(positions)});
+    }
+  }
+
+  return shapes;
+}
+
+// Task scheduling utilities
+
+// CGRA Grid Position (spatial + temporal)
+// Represents a spatial-temporal orchestration for a task on the 2D CGRA grid.
+//
+// A task assigned to (row, col) occupies that CGRA for the half-open interval
+// [start_time, start_time + duration).  Two tasks may share the same CGRA as
+// long as their intervals do not overlap, enabling time-multiplexed reuse.
+//
+// start_time and duration are internal scheduling quantities; they are not
+// written to the IR directly.  Instead the output attribute uses context_id —
+// the 0-based index of this task in the sorted list of tasks assigned to the
+// same (row, col) CGRA tile (sorted by start_time ascending).  context_id
+// maps directly to the hardware context-memory index.
+struct CgraPosition {
+  int row;
+  int col;
+  int64_t start_time = 0; // Internal scheduling; not emitted to IR.
+  int64_t duration = 1;   // Read from profile_info; not emitted to IR.
+  int context_id = 0;     // Emitted to IR as task_orchestration_info.
+
+  bool operator==(const CgraPosition &other) const {
+    return row == other.row && col == other.col;
+  }
+
+  bool operator!=(const CgraPosition &other) const { return !(*this == other); }
+
+  int manhattanDistance(const CgraPosition &other) const {
+    return std::abs(row - other.row) + std::abs(col - other.col);
+  }
+};
+
+// Task Placement Info
+// Stores the placement result for a task: the set of CGRAs assigned to it.
+// A task can span one or more contiguous CGRAs (rectangular or non-rect).
+struct TaskPlacement {
+  SmallVector<CgraPosition> cgra_positions; // CGRAs assigned to this task.
+};
+
+// Task-Memory Graph
+
+struct MemoryNode;
+
+// Represents a Task node in the dependency graph.
+struct TaskNode {
+  size_t id;
+  TaskflowTaskOp op;
+
+  // Edges based on original (pre-streaming-fusion) memory accesses.
+  SmallVector<MemoryNode *> read_memrefs;  // MemoryNodes this task reads.
+  SmallVector<MemoryNode *> write_memrefs; // MemoryNodes this task writes.
+  // Explicit taskflow dependency edges between tasks, including value inputs
+  // and dependency read/write token inputs.
+  SmallVector<TaskNode *> ssa_users;    // Tasks that depend on this task.
+  SmallVector<TaskNode *> ssa_operands; // Tasks this task depends on.
+
+  // Placement result.
+  SmallVector<CgraPosition> placement;
+
+  TaskNode(size_t id, TaskflowTaskOp op) : id(id), op(op) {}
+
+  // Returns the task's execution duration in time slots.
+  //
+  // A fixed analytical candidate can supply a predicted est_latency.
+  // Otherwise reads from profile_info.duration if present (written by
+  // ResourceAwareTaskOptimizationPass after profiling).
+  // Defaults to 1 when no profiling data is available.
+  int64_t getDuration() const {
+    if (op->hasAttr("amoeba.joint_shape_orientation_fixed")) {
+      if (auto estimate = op->getAttrOfType<IntegerAttr>("est_latency"))
+        return std::max<int64_t>(1, estimate.getInt());
+    }
+    if (auto profile = op->getAttrOfType<DictionaryAttr>("profile_info")) {
+      if (auto dur = dyn_cast_or_null<IntegerAttr>(profile.get("duration"))) {
+        return std::max<int64_t>(1, dur.getInt());
+      }
+    }
+    return 1;
+  }
+};
+
+// Represents a MemRef node in the dependency graph.
+struct MemoryNode {
+  Value memref;
+
+  // Access edges.
+  SmallVector<TaskNode *> readers; // Tasks that read this memref.
+  SmallVector<TaskNode *> writers; // Tasks that write this memref.
+
+  // SRAM assignment result, populated by TaskScheduler::assignAllSrams().
+  std::optional<CgraPosition> assigned_sram_pos;
+
+  MemoryNode(Value memref) : memref(memref) {}
+};
+
+class TaskMemoryGraph {
+public:
+  SmallVector<std::unique_ptr<TaskNode>> task_nodes;
+  SmallVector<std::unique_ptr<MemoryNode>> memory_nodes;
+  DenseMap<Value, MemoryNode *> memref_to_node;
+  DenseMap<Operation *, TaskNode *> op_to_node;
+
+  bool build(func::FuncOp func, TaskCommunicationModel *communication_model,
+             std::string &error) {
+    // Phase 1: Creates a TaskNode for every TaskflowTaskOp in the function.
+    size_t task_id = 0;
+    func.walk([&](TaskflowTaskOp task) {
+      auto node = std::make_unique<TaskNode>(task_id++, task);
+      op_to_node[task] = node.get();
+      task_nodes.push_back(std::move(node));
+    });
+
+    // Phase 2: Creates MemoryNodes using ORIGINAL memrefs (canonical identity).
+    // Uses original_read_memrefs / original_write_memrefs so that aliased
+    // memories (created by streaming-fusion) share the same MemoryNode.
+    for (auto &t_node : task_nodes) {
+      // Uses original_read_memrefs for canonical memory identity.
+      for (Value orig_memref : t_node->op.getOriginalReadMemrefs()) {
+        MemoryNode *m_node = getOrCreateMemoryNode(orig_memref);
+        t_node->read_memrefs.push_back(m_node);
+        m_node->readers.push_back(t_node.get());
+      }
+      // Uses original_write_memrefs for canonical memory identity.
+      for (Value orig_memref : t_node->op.getOriginalWriteMemrefs()) {
+        MemoryNode *m_node = getOrCreateMemoryNode(orig_memref);
+        t_node->write_memrefs.push_back(m_node);
+        m_node->writers.push_back(t_node.get());
+      }
+    }
+
+    // Phase 3: Build explicit task dependency edges. Keep scalar/value SSA
+    // dependencies visible through value_inputs, and also scan all operands to
+    // catch taskflow dependency_read_in/dependency_write_in token edges.
+    for (auto &consumer_node : task_nodes) {
+      for (Value value_input : consumer_node->op.getValueInputs()) {
+        addProducerDependency(value_input, consumer_node.get());
+      }
+
+      for (Value operand : consumer_node->op->getOperands()) {
+        addProducerDependency(operand, consumer_node.get());
+      }
+    }
+
+    if (communication_model) {
+      for (auto &consumer_node : task_nodes) {
+        SmallVector<Operation *> predecessors;
+        if (!communication_model->getTaskPredecessors(
+                consumer_node->op.getOperation(), predecessors, error))
+          return false;
+        for (Operation *predecessor_op : predecessors) {
+          auto found = op_to_node.find(predecessor_op);
+          if (found == op_to_node.end()) {
+            error = "communication predecessor is outside the function";
+            return false;
+          }
+          addDependencyEdge(found->second, consumer_node.get());
+        }
+      }
+    }
+    return true;
+  }
+
+private:
+  MemoryNode *getOrCreateMemoryNode(Value memref) {
+    if (memref_to_node.count(memref)) {
+      return memref_to_node[memref];
+    }
+    auto node = std::make_unique<MemoryNode>(memref);
+    MemoryNode *ptr = node.get();
+    memref_to_node[memref] = ptr;
+    memory_nodes.push_back(std::move(node));
+    return ptr;
+  }
+
+  void addProducerDependency(Value operand, TaskNode *consumer) {
+    llvm::DenseSet<Value> visited;
+    auto visit = [&](auto &&self, Value value) -> void {
+      if (!visited.insert(value).second)
+        return;
+      if (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
+        self(self, channel.getSource());
+        return;
+      }
+      if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
+        for (Value state : join.getTileStates())
+          self(self, state);
+        return;
+      }
+      if (auto producerOp = value.getDefiningOp<TaskflowTaskOp>())
+        if (auto *producer = op_to_node[producerOp])
+          addDependencyEdge(producer, consumer);
+    };
+    visit(visit, operand);
+  }
+
+  void addDependencyEdge(TaskNode *producer, TaskNode *consumer) {
+    if (producer == consumer) {
+      return;
+    }
+    if (!llvm::is_contained(producer->ssa_users, consumer)) {
+      producer->ssa_users.push_back(consumer);
+    }
+    if (!llvm::is_contained(consumer->ssa_operands, producer)) {
+      consumer->ssa_operands.push_back(producer);
+    }
+  }
+};
+
+// TaskScheduler
+// Orchestrates a task-memory graph onto a 2D multi-CGRA grid using the
+// priority provided by the caller.
+//
+// Uses a two-phase fixed-point iteration:
+//   Phase 1: Place tasks on the grid (scoring by SSA + memory proximity),
+//            processing tasks in dependency-ready priority order.
+//   Phase 2: Assign each MemRef to the nearest SRAM given task positions.
+// Iterates until SRAM assignments converge.
+//
+// In SpatialTemporal mode, ASAP scheduling is applied via
+// computeEarliestStartTime() so that each ready task starts as soon as all
+// explicit taskflow dependencies have completed.
+TaskScheduler::TaskScheduler(int grid_rows, int grid_cols, SchedulingMode mode,
+                             ShapeSelectionPolicy shape_selection_policy,
+                             TaskCommunicationModel *communication_model)
+    : grid_rows_(grid_rows), grid_cols_(grid_cols), mode_(mode),
+      shape_selection_policy_(shape_selection_policy),
+      communication_model_(communication_model) {
+  cgra_occupancy_.resize(grid_rows_);
+  for (auto &row : cgra_occupancy_) {
+    row.resize(grid_cols_);
+  }
+}
+
+// Schedules all tasks and performs iterative SRAM assignment for `func`.
+bool TaskScheduler::schedule(func::FuncOp func,
+                             const TaskPriorityMap &priority) {
+  schedule_makespan_ = 0;
+  schedule_entries_.clear();
+  dispatch_order_.clear();
+  communication_error_.clear();
+  SmallVector<TaskflowTaskOp> tasks;
+  func.walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
+
+  if (tasks.empty()) {
+    llvm::errs() << "No tasks to place.\n";
+    return true;
+  }
+
+  // Builds Task-Memory Graph.
+  TaskMemoryGraph graph;
+  std::string graph_error;
+  if (!graph.build(func, communication_model_, graph_error)) {
+    func.emitError() << graph_error;
+    return false;
+  }
+
+  if (graph.task_nodes.empty()) {
+    llvm::errs() << "No tasks to place.\n";
+    return true;
+  }
+
+  auto getPriority = [&](TaskNode *node) {
+    auto it = priority.find(node->op.getOperation());
+    return it == priority.end() ? 0 : it->second;
+  };
+
+  // Build a dependency-respecting placement order. Orchestration algorithms
+  // still control priority, but priority is only used to choose among tasks
+  // whose explicit taskflow predecessors have already been placed.
+  SmallVector<int> remaining_predecessors(graph.task_nodes.size(), 0);
+  SmallVector<TaskNode *> ready_tasks;
+  for (auto &node : graph.task_nodes) {
+    remaining_predecessors[node->id] =
+        static_cast<int>(node->ssa_operands.size());
+    if (remaining_predecessors[node->id] == 0) {
+      ready_tasks.push_back(node.get());
+    }
+  }
+
+  auto isHigherPriority = [&](TaskNode *lhs, TaskNode *rhs) {
+    int lhs_priority = getPriority(lhs);
+    int rhs_priority = getPriority(rhs);
+    if (lhs_priority != rhs_priority) {
+      return lhs_priority > rhs_priority;
+    }
+    return lhs->id < rhs->id;
+  };
+
+  SmallVector<TaskNode *> sorted_tasks;
+  sorted_tasks.reserve(graph.task_nodes.size());
+  while (!ready_tasks.empty()) {
+    auto best_it = ready_tasks.begin();
+    for (auto it = ready_tasks.begin() + 1; it != ready_tasks.end(); ++it) {
+      if (isHigherPriority(*it, *best_it)) {
+        best_it = it;
+      }
+    }
+
+    TaskNode *task_node = *best_it;
+    ready_tasks.erase(best_it);
+    sorted_tasks.push_back(task_node);
+
+    for (TaskNode *user : task_node->ssa_users) {
+      int &remaining = remaining_predecessors[user->id];
+      assert(remaining > 0 &&
+             "Task dependency bookkeeping should not underflow.\n");
+      --remaining;
+      if (remaining == 0) {
+        ready_tasks.push_back(user);
+      }
+    }
+  }
+
+  if (sorted_tasks.size() != graph.task_nodes.size()) {
+    func.emitError() << "task dependencies form a cycle";
+    return false;
+  }
+
+  if (auto order = func->getAttrOfType<ArrayAttr>("joint_scheduling_exact_dispatch_order")) {
+    SmallVector<TaskNode *> exactOrder;
+    llvm::DenseSet<TaskNode *> placed;
+    for (Attribute value : order) {
+      auto name = dyn_cast<StringAttr>(value);
+      auto found = llvm::find_if(graph.task_nodes, [&](const auto &node) {
+        return name && node->op.getTaskName() == name.getValue();
+      });
+      if (found == graph.task_nodes.end() || placed.contains(found->get()) ||
+          !llvm::all_of((*found)->ssa_operands, [&](TaskNode *p) { return placed.contains(p); })) {
+        func.emitError("exact replay dispatch must cover each task once in dependency order");
+        return false;
+      }
+      exactOrder.push_back(found->get());
+      placed.insert(found->get());
+    }
+    if (exactOrder.size() != sorted_tasks.size()) {
+      func.emitError("exact replay dispatch coverage differs"); return false;
+    }
+    sorted_tasks = std::move(exactOrder);
+  }
+
+  // Keep the actual production dispatch order separate from schedule_entries_
+  // below.  The latter is intentionally emitted in graph order for existing
+  // consumers, while this vector records the stable topological priority order
+  // that drove placement.
+  dispatch_order_.reserve(sorted_tasks.size());
+  for (TaskNode *task_node : sorted_tasks)
+    dispatch_order_.push_back(task_node->op.getOperation());
+
+  // Fixed-point iteration: placement scoring depends on SRAM positions, and
+  // SRAM assignment depends on task positions.  Converges when SRAMs are
+  // stable.  On iteration 0 SRAMs are unset, so placement is driven purely
+  // by SSA proximity.  The production adapter may raise this limit through
+  // the function attribute below; the legacy default remains ten iterations.
+  constexpr llvm::StringLiteral kFixedPointIterationLimitAttr =
+      "joint_scheduling_fixed_point_max_iterations";
+  constexpr int kDefaultFixedPointIterations = 10;
+  int max_fixed_point_iterations = kDefaultFixedPointIterations;
+  if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+    if (auto configured = func->getAttrOfType<IntegerAttr>(
+            kFixedPointIterationLimitAttr)) {
+      int64_t value = configured.getInt();
+      if (value <= 0 || value > std::numeric_limits<int>::max()) {
+        func.emitError() << kFixedPointIterationLimitAttr
+                         << " must be in the range [1, "
+                         << std::numeric_limits<int>::max() << "]";
+        return false;
+      }
+      max_fixed_point_iterations = static_cast<int>(value);
+    }
+  }
+
+  // The SRAM centroid is a deterministic function of the placement, but the
+  // placement score also uses that centroid.  A symmetric graph can therefore
+  // alternate between two equally legal placement/SRAM states.  Keep the
+  // complete state history only for fixed candidate shapes, where accepting an
+  // arbitrary final iteration would invalidate the candidate's declared
+  // mapping.  A repeated complete state is a safe cycle boundary because the
+  // current placement has already passed all placement and communication
+  // legality checks, and its SRAM assignment has just been recomputed from
+  // that placement.
+  struct FixedPointState {
+    std::vector<std::vector<CgraPosition>> placements;
+    std::vector<std::optional<std::pair<int, int>>> srams;
+  };
+  auto capture_fixed_point_state = [&]() {
+    FixedPointState state;
+    state.placements.reserve(graph.task_nodes.size());
+    for (const auto &task_node : graph.task_nodes) {
+      state.placements.emplace_back(task_node->placement.begin(),
+                                    task_node->placement.end());
+    }
+    state.srams.reserve(graph.memory_nodes.size());
+    for (const auto &mem_node : graph.memory_nodes) {
+      if (mem_node->assigned_sram_pos) {
+        state.srams.emplace_back(std::make_pair(
+            mem_node->assigned_sram_pos->row,
+            mem_node->assigned_sram_pos->col));
+      } else {
+        state.srams.emplace_back(std::nullopt);
+      }
+    }
+    return state;
+  };
+  auto same_fixed_point_state = [](const FixedPointState &lhs,
+                                   const FixedPointState &rhs) {
+    if (lhs.placements.size() != rhs.placements.size() ||
+        lhs.srams != rhs.srams)
+      return false;
+    for (size_t task_id = 0; task_id < lhs.placements.size(); ++task_id) {
+      const auto &left = lhs.placements[task_id];
+      const auto &right = rhs.placements[task_id];
+      if (left.size() != right.size())
+        return false;
+      for (size_t pos_id = 0; pos_id < left.size(); ++pos_id) {
+        const CgraPosition &a = left[pos_id];
+        const CgraPosition &b = right[pos_id];
+        if (a.row != b.row || a.col != b.col ||
+            a.start_time != b.start_time || a.duration != b.duration ||
+            a.context_id != b.context_id)
+          return false;
+      }
+    }
+    return true;
+  };
+  auto fixed_point_state_fingerprint =
+      [](const FixedPointState &state) -> uint64_t {
+    // FNV-1a gives a compact diagnostic identity while the complete state
+    // comparison above remains authoritative for cycle resolution.
+    uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&](uint64_t value) {
+      hash ^= value;
+      hash *= 1099511628211ULL;
+    };
+    mix(state.placements.size());
+    for (const auto &task : state.placements) {
+      mix(task.size());
+      for (const CgraPosition &position : task) {
+        mix(static_cast<uint64_t>(static_cast<int64_t>(position.row)));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(position.col)));
+        mix(static_cast<uint64_t>(position.start_time));
+        mix(static_cast<uint64_t>(position.duration));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(position.context_id)));
+      }
+    }
+    mix(state.srams.size());
+    for (const auto &sram : state.srams) {
+      mix(sram.has_value() ? 1 : 0);
+      if (sram) {
+        mix(static_cast<uint64_t>(static_cast<int64_t>(sram->first)));
+        mix(static_cast<uint64_t>(static_cast<int64_t>(sram->second)));
+      }
+    }
+    return hash;
+  };
+  auto current_placement_is_legal = [&]() {
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> intervals(
+        static_cast<size_t>(grid_rows_ * grid_cols_));
+    for (const auto &task_node : graph.task_nodes) {
+      if (task_node->placement.empty())
+        return false;
+      const CgraPosition &first = task_node->placement.front();
+      for (const CgraPosition &pos : task_node->placement) {
+        if (pos.start_time != first.start_time ||
+            pos.duration != first.duration)
+          return false;
+      }
+      for (const CgraPosition &pos : task_node->placement) {
+        if (!posInBounds(pos) || pos.start_time < 0 || pos.duration <= 0 ||
+            pos.start_time > std::numeric_limits<int64_t>::max() -
+                                 pos.duration)
+          return false;
+        auto &cell = intervals[static_cast<size_t>(pos.row * grid_cols_ +
+                                                    pos.col)];
+        const int64_t end = pos.start_time + pos.duration;
+        for (auto [other_start, other_end] : cell) {
+          if (pos.start_time < other_end && other_start < end)
+            return false;
+        }
+        cell.emplace_back(pos.start_time, end);
+      }
+    }
+    return true;
+  };
+
+  // Replay every final dependency and routed communication edge against the
+  // retained placement.  Placement decisions may have been scored while the
+  // previous iteration's SRAM assignment was active; the replay therefore
+  // resets reservations and recomputes each transfer in dependency order.
+  // This uses the same endpoint selection and reservation API as
+  // findBestPlacement, so a cycle state is accepted only when its final
+  // placement and communication timing are jointly valid.
+  auto validate_final_communication = [&]() {
+    // Dependency readiness is meaningful even without a routed communication
+    // model.  Keep this check unconditional; only reservation replay is
+    // conditional on an explicit communication model.
+    if (communication_model_)
+      communication_model_->resetReservations();
+    for (TaskNode *task_node : sorted_tasks) {
+      if (task_node->placement.empty()) {
+        communication_error_ =
+            "final communication replay task has no placement";
+        return false;
+      }
+
+      int64_t ready_time = computeEarliestStartTime(task_node);
+      if (!communication_model_) {
+        const CgraPosition &task_start = task_node->placement.front();
+        if (ready_time > task_start.start_time) {
+          communication_error_ =
+              "final placement starts before dependency ready cycle";
+          return false;
+        }
+        continue;
+      }
+
+      communication_model_->beginTrial();
+      for (TaskNode *producer : task_node->ssa_operands) {
+        if (producer->placement.empty()) {
+          communication_model_->finishTrial(false);
+          communication_error_ =
+              "final communication replay predecessor has no placement";
+          return false;
+        }
+
+        const CgraPosition &first_source = producer->placement.front();
+        if (first_source.start_time < 0 || first_source.duration <= 0 ||
+            first_source.start_time >
+                std::numeric_limits<int64_t>::max() -
+                    first_source.duration) {
+          communication_model_->finishTrial(false);
+          communication_error_ =
+              "final communication replay predecessor finish overflows";
+          return false;
+        }
+        const int64_t producer_finish =
+            first_source.start_time + first_source.duration;
+
+        bool found_endpoint = false;
+        int64_t best_ready = std::numeric_limits<int64_t>::max();
+        const CgraPosition *best_source = nullptr;
+        const CgraPosition *best_destination = nullptr;
+        for (const CgraPosition &source : producer->placement) {
+          for (const CgraPosition &destination : task_node->placement) {
+            int64_t endpoint_ready = 0;
+            std::string error;
+            if (!communication_model_->getTransferReadyCycle(
+                    producer->op.getOperation(), task_node->op.getOperation(),
+                    source.row, source.col, destination.row, destination.col,
+                    producer_finish, false, endpoint_ready, error)) {
+              communication_model_->finishTrial(false);
+              communication_error_ = error;
+              return false;
+            }
+            if (!found_endpoint || endpoint_ready < best_ready) {
+              found_endpoint = true;
+              best_ready = endpoint_ready;
+              best_source = &source;
+              best_destination = &destination;
+            }
+          }
+        }
+        if (!found_endpoint || !best_source || !best_destination) {
+          communication_model_->finishTrial(false);
+          communication_error_ =
+              "final communication replay transfer has no endpoint";
+          return false;
+        }
+
+        std::string error;
+        if (!communication_model_->getTransferReadyCycle(
+                producer->op.getOperation(), task_node->op.getOperation(),
+                best_source->row, best_source->col, best_destination->row,
+                best_destination->col, producer_finish, true, best_ready,
+                error)) {
+          communication_model_->finishTrial(false);
+          communication_error_ = error;
+          return false;
+        }
+        ready_time = std::max(ready_time, best_ready);
+      }
+      communication_model_->finishTrial(true);
+
+      const CgraPosition &task_start = task_node->placement.front();
+      if (ready_time > task_start.start_time) {
+        communication_error_ =
+            "final placement starts before dependency/communication ready cycle";
+        return false;
+      }
+    }
+    return true;
+  };
+
+  bool converged = false;
+  bool cycle_resolved = false;
+  int cycle_length = 0;
+  std::vector<FixedPointState> fixed_point_history;
+  std::vector<uint64_t> fixed_point_state_trace;
+  for (int iter = 0; iter < max_fixed_point_iterations; ++iter) {
+    if (iter > 0) {
+      resetTaskPlacements(graph);
+    }
+    if (communication_model_)
+      communication_model_->resetReservations();
+
+    // Phase 1: Place tasks.
+    for (TaskNode *task_node : sorted_tasks) {
+      int cgra_count = 1;
+      if (auto attr = task_node->op->getAttrOfType<IntegerAttr>("cgra_count")) {
+        cgra_count = attr.getInt();
+      }
+
+      TaskPlacement placement = findBestPlacement(task_node, cgra_count, graph);
+
+      if (placement.cgra_positions.empty()) {
+        if (!communication_error_.empty())
+          task_node->op.emitError() << communication_error_;
+        return false;
+      }
+
+      for (const auto &pos : placement.cgra_positions) {
+        task_node->placement.push_back(pos);
+      }
+
+      for (const auto &pos : placement.cgra_positions) {
+        if (posInBounds(pos)) {
+          markOccupied(pos.row, pos.col, pos.start_time, pos.duration);
+        }
+      }
+    }
+
+    // Phase 2: Assign SRAMs.
+    bool sram_moved = assignAllSrams(graph);
+
+    if (shape_selection_policy_ != ShapeSelectionPolicy::FixedOrientation) {
+      // Preserve the legacy rotating-shape strategy's historical convergence
+      // criterion and bounded heuristic behavior.
+      if (!sram_moved) {
+        converged = true;
+        break;
+      }
+      continue;
+    }
+
+    FixedPointState current_state = capture_fixed_point_state();
+    fixed_point_state_trace.push_back(
+        fixed_point_state_fingerprint(current_state));
+    bool placement_stable =
+        !fixed_point_history.empty() &&
+        same_fixed_point_state(current_state, fixed_point_history.back());
+    if (!sram_moved &&
+        (fixed_point_history.empty() || placement_stable)) {
+      converged = true;
+      break;
+    }
+
+    auto repeated_state = std::find_if(
+        fixed_point_history.begin(), fixed_point_history.end(),
+        [&](const FixedPointState &previous) {
+          return same_fixed_point_state(current_state, previous);
+        });
+    if (repeated_state != fixed_point_history.end()) {
+      cycle_resolved = true;
+      cycle_length = static_cast<int>(
+          fixed_point_history.end() - repeated_state);
+      // The current state is the repeated state and has just been assigned
+      // from the current placement.  Recheck both independent legality
+      // conditions before allowing it to leave the scheduler.
+      if (!current_placement_is_legal() || assignAllSrams(graph)) {
+        func.emitError()
+            << "scheduler cycle resolution produced an inconsistent state";
+        return false;
+      }
+      llvm::errs() << "warning: resolved deterministic scheduler cycle of "
+                   << cycle_length
+                   << " states by retaining the current legal state\n";
+      break;
+    }
+    fixed_point_history.push_back(std::move(current_state));
+  }
+  // Joint ranking must never score an arbitrary iteration from an oscillating
+  // placement. Preserve the legacy rotating-shape strategy's historical
+  // bounded heuristic behavior, but fail closed for fixed candidate shapes
+  // unless a complete legal cycle state was explicitly resolved above.
+  if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation &&
+      (converged || cycle_resolved)) {
+    // Recompute from the retained placement and require the assignment to be
+    // stable before replaying communication.  This guards against accepting a
+    // state whose scoring used a different SRAM assignment.
+    if (assignAllSrams(graph)) {
+      func.emitError()
+          << "final placement changed its SRAM assignment during validation";
+      return false;
+    }
+    if (!current_placement_is_legal() || !validate_final_communication()) {
+      if (!communication_error_.empty())
+        func.emitError() << communication_error_;
+      else
+        func.emitError() << "final placement/communication validation failed";
+      return false;
+    }
+  }
+  if (!converged && !cycle_resolved &&
+      shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+    std::string trace;
+    for (auto [index, fingerprint] : llvm::enumerate(fixed_point_state_trace)) {
+      if (index)
+        trace += ',';
+      trace += std::to_string(fingerprint);
+    }
+    func.emitError()
+        << "task placement and SRAM assignment did not converge after "
+        << fixed_point_state_trace.size()
+        << " iterations; fixed_point_state_trace=" << trace;
+    return false;
+  }
+
+  // Compute context_id for each task at each assigned CGRA cell.
+  // For every physical CGRA (row, col), sort all tasks assigned to it by
+  // their internal start_time, then assign context_id = 0, 1, 2, ...
+  // This maps directly to the hardware context-memory index.
+  using TaskInterval = std::pair<int64_t, TaskNode *>; // (start_time, node)
+  std::vector<std::vector<SmallVector<TaskInterval, 4>>> cell_tasks(
+      grid_rows_, std::vector<SmallVector<TaskInterval, 4>>(grid_cols_));
+
+  for (auto &task_node : graph.task_nodes) {
+    for (CgraPosition &pos : task_node->placement) {
+      if (posInBounds(pos)) {
+        cell_tasks[pos.row][pos.col].push_back(
+            {pos.start_time, task_node.get()});
+      }
+    }
+  }
+
+  for (int r = 0; r < grid_rows_; ++r) {
+    for (int c = 0; c < grid_cols_; ++c) {
+      auto &tasks_at_cell = cell_tasks[r][c];
+      std::stable_sort(tasks_at_cell.begin(), tasks_at_cell.end(),
+                       [](const TaskInterval &a, const TaskInterval &b) {
+                         return a.first < b.first;
+                       });
+      for (int ctx = 0; ctx < static_cast<int>(tasks_at_cell.size()); ++ctx) {
+        TaskNode *tn = tasks_at_cell[ctx].second;
+        for (CgraPosition &pos : tn->placement) {
+          if (pos.row == r && pos.col == c) {
+            pos.context_id = ctx;
+          }
+        }
+      }
+    }
+  }
+
+  // Placement uses exact predicted cycles on a 64-bit time axis.
+  for (const auto &task_node : graph.task_nodes) {
+    if (task_node->placement.empty())
+      continue;
+    int64_t start = task_node->placement.front().start_time;
+    int64_t duration = task_node->placement.front().duration;
+    if (start > std::numeric_limits<int64_t>::max() - duration) {
+      schedule_makespan_ = 0;
+      break;
+    }
+    schedule_makespan_ = std::max(schedule_makespan_, start + duration);
+    TaskScheduleEntry entry;
+    entry.task = task_node->op.getOperation();
+    entry.startCycle = start;
+    entry.endCycle = start + duration;
+    for (const CgraPosition &position : task_node->placement)
+      entry.positions.push_back({position.row, position.col});
+    schedule_entries_.push_back(std::move(entry));
+  }
+
+  // Write output attributes.
+  OpBuilder builder(func.getContext());
+  for (auto &task_node : graph.task_nodes) {
+    if (task_node->placement.empty()) {
+      continue;
+    }
+
+    SmallVector<NamedAttribute, 4> mapping_attrs;
+
+    // 1. CGRA positions.
+    // Keys are in alphabetical order as required by DictionaryAttr:
+    // col < context_id < row.
+    SmallVector<Attribute> pos_attrs;
+    for (const auto &pos : task_node->placement) {
+      SmallVector<NamedAttribute, 3> coord_attrs;
+      coord_attrs.push_back(
+          NamedAttribute(StringAttr::get(func.getContext(), "col"),
+                         builder.getI32IntegerAttr(pos.col)));
+      coord_attrs.push_back(
+          NamedAttribute(StringAttr::get(func.getContext(), "context_id"),
+                         builder.getI32IntegerAttr(pos.context_id)));
+      coord_attrs.push_back(
+          NamedAttribute(StringAttr::get(func.getContext(), "row"),
+                         builder.getI32IntegerAttr(pos.row)));
+      pos_attrs.push_back(DictionaryAttr::get(func.getContext(), coord_attrs));
+    }
+    mapping_attrs.push_back(
+        NamedAttribute(StringAttr::get(func.getContext(), "cgra_positions"),
+                       builder.getArrayAttr(pos_attrs)));
+
+    // 2. Reads SRAM locations.
+    SmallVector<Attribute> read_sram_attrs;
+    for (MemoryNode *mem : task_node->read_memrefs) {
+      if (mem->assigned_sram_pos) {
+        SmallVector<NamedAttribute, 2> sram_coord;
+        sram_coord.push_back(NamedAttribute(
+            StringAttr::get(func.getContext(), "col"),
+            builder.getI32IntegerAttr(mem->assigned_sram_pos->col)));
+        sram_coord.push_back(NamedAttribute(
+            StringAttr::get(func.getContext(), "row"),
+            builder.getI32IntegerAttr(mem->assigned_sram_pos->row)));
+        read_sram_attrs.push_back(
+            DictionaryAttr::get(func.getContext(), sram_coord));
+      }
+    }
+    mapping_attrs.push_back(NamedAttribute(
+        StringAttr::get(func.getContext(), "read_sram_locations"),
+        builder.getArrayAttr(read_sram_attrs)));
+
+    // 3. Writes SRAM locations.
+    SmallVector<Attribute> write_sram_attrs;
+    for (MemoryNode *mem : task_node->write_memrefs) {
+      if (mem->assigned_sram_pos) {
+        SmallVector<NamedAttribute, 2> sram_coord;
+        sram_coord.push_back(NamedAttribute(
+            StringAttr::get(func.getContext(), "col"),
+            builder.getI32IntegerAttr(mem->assigned_sram_pos->col)));
+        sram_coord.push_back(NamedAttribute(
+            StringAttr::get(func.getContext(), "row"),
+            builder.getI32IntegerAttr(mem->assigned_sram_pos->row)));
+        write_sram_attrs.push_back(
+            DictionaryAttr::get(func.getContext(), sram_coord));
+      }
+    }
+    mapping_attrs.push_back(NamedAttribute(
+        StringAttr::get(func.getContext(), "write_sram_locations"),
+        builder.getArrayAttr(write_sram_attrs)));
+
+    task_node->op->setAttr(
+        "task_orchestration_info",
+        DictionaryAttr::get(func.getContext(), mapping_attrs));
+
+    // Write profile_info = {duration: N} if not already present so that
+    // downstream passes can read the task duration without re-computing it.
+    if (!task_node->op->hasAttr("profile_info")) {
+      SmallVector<NamedAttribute, 1> profile_attrs;
+      int64_t duration = task_node->getDuration();
+      IntegerAttr durationAttr =
+          duration <= std::numeric_limits<int32_t>::max()
+              ? builder.getI32IntegerAttr(static_cast<int32_t>(duration))
+              : builder.getI64IntegerAttr(duration);
+      profile_attrs.push_back(NamedAttribute(
+          StringAttr::get(func.getContext(), "duration"), durationAttr));
+      task_node->op->setAttr(
+          "profile_info",
+          DictionaryAttr::get(func.getContext(), profile_attrs));
+    }
+
+    // Removes upstream resource-binding attributes that have been consumed.
+    task_node->op->removeAttr("cgra_count");
+    task_node->op->removeAttr("cgra_shape");
+  }
+
+  // Export the production scheduler's own dispatch and timing decisions for
+  // the candidate contract.  Legacy callers without a candidate id retain
+  // exactly their established IR surface; the in-memory dispatch vector is
+  // still available to callers that own the scheduler object.  These attrs do
+  // not replace task_orchestration_info/profile_info.  In particular,
+  // preserve the graph-order schedule_entries_ API and publish dispatch_order_
+  // separately.
+  if (func->hasAttr("joint_scheduling_candidate_id")) {
+    SmallVector<Attribute> dispatch_attrs;
+    dispatch_attrs.reserve(dispatch_order_.size());
+    for (Operation *operation : dispatch_order_) {
+      auto task = cast<TaskflowTaskOp>(operation);
+      dispatch_attrs.push_back(builder.getStringAttr(task.getTaskName()));
+    }
+    func->setAttr("joint_scheduling_production_dispatch_order",
+                  builder.getArrayAttr(dispatch_attrs));
+
+    SmallVector<Attribute> schedule_attrs;
+    schedule_attrs.reserve(schedule_entries_.size());
+    for (const TaskScheduleEntry &entry : schedule_entries_) {
+      auto task = cast<TaskflowTaskOp>(entry.task);
+      SmallVector<NamedAttribute> record;
+      record.push_back(builder.getNamedAttr(
+          "cgra_positions", [&]() {
+            SmallVector<Attribute> cells;
+            cells.reserve(entry.positions.size());
+            for (auto [row, col] : entry.positions) {
+              cells.push_back(builder.getDictionaryAttr({
+                  builder.getNamedAttr("col", builder.getI32IntegerAttr(col)),
+                  builder.getNamedAttr("row", builder.getI32IntegerAttr(row)),
+              }));
+            }
+            return builder.getArrayAttr(cells);
+          }()));
+      record.push_back(builder.getNamedAttr(
+          "end_cycle", builder.getI64IntegerAttr(entry.endCycle)));
+      record.push_back(builder.getNamedAttr(
+          "start_cycle", builder.getI64IntegerAttr(entry.startCycle)));
+      record.push_back(builder.getNamedAttr(
+          "task", builder.getStringAttr(task.getTaskName())));
+      schedule_attrs.push_back(builder.getDictionaryAttr(record));
+    }
+    func->setAttr("joint_scheduling_production_schedule",
+                  builder.getArrayAttr(schedule_attrs));
+  }
+  return true;
+}
+
+bool TaskScheduler::posInBounds(const CgraPosition &pos) const {
+  return pos.row >= 0 && pos.row < this->grid_rows_ && pos.col >= 0 &&
+         pos.col < this->grid_cols_;
+}
+
+// Returns true if CGRA (row, col) is occupied during
+// [start_time, start_time + duration).
+//
+// Spatial mode: occupied once any task is assigned (permanently taken).
+// SpatialTemporal mode: occupied if any existing interval overlaps.
+bool TaskScheduler::isOccupied(int row, int col, int64_t start_time,
+                               int64_t duration) const {
+  if (mode_ == SchedulingMode::Spatial) {
+    return !cgra_occupancy_[row][col].empty();
+  }
+  int64_t end_time = start_time + duration;
+  for (auto [occupied_start, occupied_end] : cgra_occupancy_[row][col]) {
+    if (start_time < occupied_end && end_time > occupied_start) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TaskScheduler::markOccupied(int row, int col, int64_t start_time,
+                                 int64_t duration) {
+  cgra_occupancy_[row][col].push_back({start_time, start_time + duration});
+}
+
+void TaskScheduler::resetTaskPlacements(TaskMemoryGraph &graph) {
+  for (auto &task : graph.task_nodes) {
+    task->placement.clear();
+  }
+  for (auto &row : this->cgra_occupancy_) {
+    for (auto &col_intervals : row) {
+      col_intervals.clear();
+    }
+  }
+}
+
+// Computes the earliest feasible start time for `task_node` such that all
+// explicit taskflow dependencies have completed.
+int64_t
+TaskScheduler::computeEarliestStartTime(const TaskNode *task_node) const {
+  int64_t min_time = 0;
+
+  auto updateFromPlacement = [&](const TaskNode *other) {
+    if (other != task_node && !other->placement.empty()) {
+      const CgraPosition &pos = other->placement[0];
+      if (pos.start_time > std::numeric_limits<int64_t>::max() - pos.duration)
+        min_time = std::numeric_limits<int64_t>::max();
+      else
+        min_time = std::max(min_time, pos.start_time + pos.duration);
+    }
+  };
+
+  for (const TaskNode *pred : task_node->ssa_operands) {
+    updateFromPlacement(pred);
+  }
+  return min_time;
+}
+
+// Assigns each MemoryNode to the SRAM at the centroid of all accessing
+// CGRAs.  Returns true if any assignment changed (convergence criterion).
+bool TaskScheduler::assignAllSrams(TaskMemoryGraph &graph) {
+  bool changed = false;
+  for (auto &mem_node : graph.memory_nodes) {
+    int total_row = 0, total_col = 0, count = 0;
+    for (TaskNode *reader : mem_node->readers) {
+      for (const CgraPosition &pos : reader->placement) {
+        total_row += pos.row;
+        total_col += pos.col;
+        count++;
+      }
+    }
+    for (TaskNode *writer : mem_node->writers) {
+      for (const CgraPosition &pos : writer->placement) {
+        total_row += pos.row;
+        total_col += pos.col;
+        count++;
+      }
+    }
+
+    std::optional<CgraPosition> new_sram_pos;
+    if (count > 0) {
+      int avg_row = (total_row + count / 2) / count;
+      int avg_col = (total_col + count / 2) / count;
+      new_sram_pos = CgraPosition{avg_row, avg_col, 0, 0};
+    }
+
+    if (mem_node->assigned_sram_pos != new_sram_pos) {
+      mem_node->assigned_sram_pos = new_sram_pos;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// Finds the best placement for `task_node` on the 2D multi-CGRA grid.
+//
+// In SpatialTemporal mode the task is tested at its dependency-ready time and
+// every resource-release event. A new placement can become feasible only at
+// one of those times, so this is both exact and independent of cycle counts.
+TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
+                                               int cgra_count,
+                                               TaskMemoryGraph &graph) {
+  SmallVector<CgraShape> shapes_to_try;
+  auto shape_attr = task_node->op->getAttrOfType<StringAttr>("cgra_shape");
+  if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+    // A fixed-shape schedule is driven entirely by the materialized candidate.
+    // Do not rotate its shape or enumerate a fallback when it is absent.
+    if (!shape_attr || shape_attr.getValue().empty()) {
+      return TaskPlacement{};
+    }
+    shapes_to_try.push_back(
+        parseCgraShapeToBase(shape_attr.getValue(), cgra_count));
+  } else if (shape_attr) {
+    StringRef cgra_shape_str = shape_attr.getValue();
+    if (!cgra_shape_str.empty()) {
+      CgraShape base = parseCgraShapeToBase(cgra_shape_str, cgra_count);
+      shapes_to_try = rotationsOf(base);
+    }
+  }
+  if (shapes_to_try.empty()) {
+    if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+      return TaskPlacement{};
+    }
+    shapes_to_try = getAllPlacementShapes(cgra_count);
+  }
+
+  int64_t task_duration = task_node->getDuration();
+
+  int64_t t_start = (mode_ == SchedulingMode::SpatialTemporal)
+                        ? computeEarliestStartTime(task_node)
+                        : 0;
+  auto exact = task_node->op->getAttrOfType<DictionaryAttr>("amoeba.exact_schedule");
+  bool mappedTiming = exact && task_node->op->hasAttr("amoeba.exact_replay_mapped_timing");
+  auto idleAttr = exact ? exact.getAs<IntegerAttr>("idle_cycles") : IntegerAttr();
+  int64_t idle = idleAttr ? idleAttr.getInt() : 0;
+  if (exact && !mappedTiming) {
+    auto start = exact.getAs<IntegerAttr>("start_cycle");
+    if (!start || start.getInt() < t_start) {
+      communication_error_ = "mapped duration makes the selected exact start dependency-infeasible";
+      return TaskPlacement{};
+    }
+    t_start = start.getInt();
+  }
+  if (mappedTiming) {
+    if (idle < 0 || t_start > std::numeric_limits<int64_t>::max() - idle) return TaskPlacement{};
+    t_start += idle;
+  }
+  SmallVector<int64_t> candidate_times{t_start};
+  if ((!exact || mappedTiming) && mode_ == SchedulingMode::SpatialTemporal) {
+    for (const auto &row : cgra_occupancy_)
+      for (const auto &cell : row)
+        for (auto [unusedStart, occupiedEnd] : cell)
+          if (occupiedEnd >= t_start && occupiedEnd <= std::numeric_limits<int64_t>::max() - (mappedTiming ? idle : 0))
+            candidate_times.push_back(occupiedEnd + (mappedTiming ? idle : 0));
+    llvm::sort(candidate_times);
+    candidate_times.erase(
+        std::unique(candidate_times.begin(), candidate_times.end()),
+        candidate_times.end());
+  }
+
+  for (size_t time_index = 0; time_index < candidate_times.size();
+       ++time_index) {
+    int64_t t = candidate_times[time_index];
+    if (t > std::numeric_limits<int64_t>::max() - task_duration)
+      continue;
+    int best_score = INT_MIN;
+    TaskPlacement best_at_t;
+    SmallVector<int64_t> discovered_times;
+
+    auto communicationReady = [&](const TaskPlacement &candidate, bool commit,
+                                  int64_t &ready_time) -> bool {
+      ready_time = computeEarliestStartTime(task_node);
+      if (!communication_model_)
+        return true;
+      communication_model_->beginTrial();
+      for (TaskNode *producer : task_node->ssa_operands) {
+        if (producer->placement.empty()) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication predecessor has no placement";
+          return false;
+        }
+        const CgraPosition &first_source = producer->placement.front();
+        if (first_source.start_time >
+            std::numeric_limits<int64_t>::max() - first_source.duration) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication predecessor finish overflows";
+          return false;
+        }
+        const int64_t producer_finish =
+            first_source.start_time + first_source.duration;
+        bool found_endpoint = false;
+        int64_t best_ready = std::numeric_limits<int64_t>::max();
+        const CgraPosition *best_source = nullptr;
+        const CgraPosition *best_destination = nullptr;
+        for (const CgraPosition &source : producer->placement) {
+          for (const CgraPosition &destination : candidate.cgra_positions) {
+            int64_t endpoint_ready = 0;
+            std::string error;
+            if (!communication_model_->getTransferReadyCycle(
+                    producer->op.getOperation(), task_node->op.getOperation(),
+                    source.row, source.col, destination.row, destination.col,
+                    producer_finish, false, endpoint_ready, error)) {
+              communication_model_->finishTrial(false);
+              communication_error_ = error;
+              return false;
+            }
+            if (!found_endpoint || endpoint_ready < best_ready) {
+              found_endpoint = true;
+              best_ready = endpoint_ready;
+              best_source = &source;
+              best_destination = &destination;
+            }
+          }
+        }
+        if (!found_endpoint) {
+          communication_model_->finishTrial(false);
+          communication_error_ = "communication transfer has no endpoint";
+          return false;
+        }
+        std::string error;
+        if (!communication_model_->getTransferReadyCycle(
+                producer->op.getOperation(), task_node->op.getOperation(),
+                best_source->row, best_source->col, best_destination->row,
+                best_destination->col, producer_finish, true, best_ready,
+                error)) {
+          communication_model_->finishTrial(false);
+          communication_error_ = error;
+          return false;
+        }
+        ready_time = std::max(ready_time, best_ready);
+      }
+      communication_model_->finishTrial(commit);
+      return true;
+    };
+
+    if (exact) {
+      auto row = exact.getAs<IntegerAttr>("row"), col = exact.getAs<IntegerAttr>("col");
+      auto rows = exact.getAs<IntegerAttr>("rows"), cols = exact.getAs<IntegerAttr>("cols");
+      if (!row || !col || !rows || !cols || shapes_to_try.size() != 1 ||
+          rows.getInt() != shapes_to_try[0].rows || cols.getInt() != shapes_to_try[0].cols) {
+        communication_error_ = "selected exact rectangle differs from the mapper rectangle";
+        return TaskPlacement{};
+      }
+      TaskPlacement candidate;
+      bool fits = true;
+      for (int64_t r = row.getInt(); r < row.getInt() + rows.getInt(); ++r)
+        for (int64_t c = col.getInt(); c < col.getInt() + cols.getInt(); ++c) {
+          if (r < 0 || c < 0 || r >= grid_rows_ || c >= grid_cols_ || isOccupied(r, c, t, task_duration)) {
+            if (mappedTiming && r >= 0 && c >= 0 && r < grid_rows_ && c < grid_cols_) { fits = false; continue; }
+            communication_error_ = "mapped duration or rectangle violates exact replay cell occupancy";
+            return TaskPlacement{};
+          }
+          candidate.cgra_positions.push_back({static_cast<int>(r), static_cast<int>(c), t, task_duration, 0});
+        }
+      if (!fits) continue;
+      int64_t ready = 0;
+      if (!communicationReady(candidate, false, ready)) return TaskPlacement{};
+      if (mappedTiming && ready > t - idle) {
+        if (ready > std::numeric_limits<int64_t>::max() - idle) return TaskPlacement{};
+        candidate_times.push_back(ready + idle);
+        llvm::sort(candidate_times);
+        candidate_times.erase(std::unique(candidate_times.begin(), candidate_times.end()), candidate_times.end());
+        continue;
+      }
+      if (ready > t) {
+        communication_error_ = "mapped communication makes selected exact start infeasible";
+        return TaskPlacement{};
+      }
+      if (!communicationReady(candidate, true, ready)) return TaskPlacement{};
+      return candidate;
+    }
+
+    for (const CgraShape &shape : shapes_to_try) {
+      SmallVector<std::pair<int, int>> shape_offsets;
+      if (shape.is_rectangular) {
+        for (int r = 0; r < shape.rows; ++r) {
+          for (int c = 0; c < shape.cols; ++c) {
+            shape_offsets.push_back({c, r});
+          }
+        }
+      } else {
+        shape_offsets = SmallVector<std::pair<int, int>>(
+            shape.cgra_positions.begin(), shape.cgra_positions.end());
+      }
+
+      for (int origin_row = 0; origin_row < grid_rows_; ++origin_row) {
+        for (int origin_col = 0; origin_col < grid_cols_; ++origin_col) {
+          bool valid = true;
+          TaskPlacement candidate;
+          for (auto &[col_off, row_off] : shape_offsets) {
+            int abs_row = origin_row + row_off;
+            int abs_col = origin_col + col_off;
+            if (abs_row < 0 || abs_row >= grid_rows_ || abs_col < 0 ||
+                abs_col >= grid_cols_ ||
+                isOccupied(abs_row, abs_col, t, task_duration)) {
+              valid = false;
+              break;
+            }
+            candidate.cgra_positions.push_back(
+                {abs_row, abs_col, t, task_duration, 0});
+          }
+          if (!valid) {
+            continue;
+          }
+          int64_t ready_time = 0;
+          if (!communicationReady(candidate, false, ready_time))
+            return TaskPlacement{};
+          if (ready_time > t) {
+            discovered_times.push_back(ready_time);
+            continue;
+          }
+          int score = computeScore(task_node, candidate, graph);
+          if (score > best_score) {
+            best_score = score;
+            best_at_t = candidate;
+          }
+        }
+      }
+    }
+
+    if (!best_at_t.cgra_positions.empty()) {
+      int64_t ignored_ready = 0;
+      if (!communicationReady(best_at_t, true, ignored_ready))
+        return TaskPlacement{};
+      return best_at_t;
+    }
+
+    candidate_times.append(discovered_times.begin(), discovered_times.end());
+    llvm::sort(candidate_times);
+    candidate_times.erase(
+        std::unique(candidate_times.begin(), candidate_times.end()),
+        candidate_times.end());
+
+    if (mode_ == SchedulingMode::Spatial) {
+      break;
+    }
+  }
+
+  return TaskPlacement{};
+}
+
+CgraShape TaskScheduler::parseCgraShapeToBase(StringRef cgra_shape,
+                                              int cgra_count) {
+  size_t bracket_pos = cgra_shape.find('[');
+  auto [rows_str, rest] = cgra_shape.split('x');
+  int rows = 1, cols = 1;
+  rows_str.getAsInteger(10, rows);
+
+  if (bracket_pos == StringRef::npos) {
+    rest.getAsInteger(10, cols);
+    return CgraShape{rows, cols, /*is_rectangular=*/true, {}};
+  }
+
+  StringRef cols_str = rest.take_until([](char c) { return c == '['; });
+  cols_str.getAsInteger(10, cols);
+
+  SmallVector<std::pair<int, int>> positions;
+  StringRef positions_str = cgra_shape.substr(bracket_pos);
+  size_t pos = 0;
+  while (pos < positions_str.size()) {
+    size_t open = positions_str.find('(', pos);
+    if (open == StringRef::npos) {
+      break;
+    }
+    size_t close = positions_str.find(')', open);
+    if (close == StringRef::npos) {
+      break;
+    }
+    StringRef pair_str = positions_str.slice(open + 1, close);
+    auto [col_str, row_str] = pair_str.split(',');
+    int col_off = 0, row_off = 0;
+    col_str.getAsInteger(10, col_off);
+    row_str.getAsInteger(10, row_off);
+    positions.push_back({col_off, row_off});
+    pos = close + 1;
+  }
+  return CgraShape{rows, cols, /*is_rectangular=*/false, std::move(positions)};
+}
+
+SmallVector<CgraShape> TaskScheduler::rotationsOf(const CgraShape &base) {
+  SmallVector<CgraShape> result;
+
+  if (base.is_rectangular) {
+    result.push_back(base);
+    if (base.rows != base.cols) {
+      result.push_back(CgraShape{base.cols, base.rows, true, {}});
+    }
+    return result;
+  }
+
+  llvm::DenseSet<int64_t> seen_hashes;
+  auto current_positions = SmallVector<std::pair<int, int>>(
+      base.cgra_positions.begin(), base.cgra_positions.end());
+
+  for (int rotation_count = 0; rotation_count < 4; ++rotation_count) {
+    int min_col = INT_MAX, min_row = INT_MAX;
+    for (auto &[col, row] : current_positions) {
+      min_col = std::min(min_col, col);
+      min_row = std::min(min_row, row);
+    }
+
+    SmallVector<std::pair<int, int>> normalised_positions;
+    for (auto &[col, row] : current_positions) {
+      normalised_positions.push_back({col - min_col, row - min_row});
+    }
+
+    auto sorted_positions = normalised_positions;
+    llvm::sort(sorted_positions,
+               [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
+                 return a < b;
+               });
+
+    int64_t position_hash = 0;
+    for (auto &[col, row] : sorted_positions) {
+      position_hash = position_hash * 131 + col * 17 + row;
+    }
+
+    if (seen_hashes.insert(position_hash).second) {
+      int max_col = 0, max_row = 0;
+      for (auto &[col, row] : normalised_positions) {
+        max_col = std::max(max_col, col);
+        max_row = std::max(max_row, row);
+      }
+      result.push_back(
+          CgraShape{max_row + 1, max_col + 1, false, normalised_positions});
+    }
+
+    SmallVector<std::pair<int, int>> rotated_positions;
+    for (auto &[col, row] : current_positions) {
+      rotated_positions.push_back({row, -col});
+    }
+    current_positions = rotated_positions;
+  }
+  return result;
+}
+
+// Computes the placement score for `task_node` at `placement`.
+//
+// Score = α·SSA_Dist + β·Mem_Dist - γ·Context_Reuse.
+//   SSA_Dist : sum of distances to already-placed SSA predecessors and
+//              successors (negative; penalises far-away neighbours).
+//   Mem_Dist : sum of distances to assigned SRAMs for read/write memrefs
+//              (negative; memory proximity is weighted more heavily).
+//   Context_Reuse : penalty for reusing a CGRA that already has another
+//                   task in a different context.
+//
+// Higher score is better; 0 means all neighbours are co-located.
+int TaskScheduler::computeScore(TaskNode *task_node,
+                                const TaskPlacement &placement,
+                                TaskMemoryGraph &graph) {
+  // Weight constants (tunable).
+  constexpr int kAlpha = 10;   // SSA proximity weight.
+  constexpr int kBeta = 50;    // Memory proximity weight (high priority).
+  constexpr int kGamma = 1000; // Context switch cost is higher than NoC.
+
+  int ssa_score = 0, mem_score = 0, context_reuse_penalty = 0;
+
+  auto minDistToPlacement = [&](const SmallVector<CgraPosition> &other) -> int {
+    int min_dist = INT_MAX;
+    for (const auto &pos : placement.cgra_positions) {
+      for (const auto &opos : other) {
+        min_dist = std::min(min_dist, pos.manhattanDistance(opos));
+      }
+    }
+    return min_dist;
+  };
+
+  auto minDistToTarget = [&](const CgraPosition &target) -> int {
+    int min_dist = INT_MAX;
+    for (const auto &pos : placement.cgra_positions) {
+      min_dist = std::min(min_dist, pos.manhattanDistance(target));
+    }
+    return min_dist;
+  };
+
+  // 1. SSA proximity — penalise distance to producers and consumers.
+  for (TaskNode *producer : task_node->ssa_operands) {
+    if (!producer->placement.empty()) {
+      // Uses negative distance: closer = higher score.
+      ssa_score -= minDistToPlacement(producer->placement);
+    }
+  }
+  for (TaskNode *consumer : task_node->ssa_users) {
+    if (!consumer->placement.empty()) {
+      ssa_score -= minDistToPlacement(consumer->placement);
+    }
+  }
+
+  // 2. Memory proximity — penalise distance to assigned SRAMs.
+  // For read memrefs (data sources).
+  for (MemoryNode *mem : task_node->read_memrefs) {
+    if (mem->assigned_sram_pos) {
+      mem_score -= minDistToTarget(*mem->assigned_sram_pos);
+    }
+  }
+  // For write memrefs: if the SRAM is already assigned (e.g. read by a
+  // previous task), we want to be close to it too.
+  for (MemoryNode *mem : task_node->write_memrefs) {
+    if (mem->assigned_sram_pos) {
+      mem_score -= minDistToTarget(*mem->assigned_sram_pos);
+    }
+  }
+
+  if (mode_ == SchedulingMode::SpatialTemporal) {
+    for (const CgraPosition &pos : placement.cgra_positions) {
+      if (!cgra_occupancy_[pos.row][pos.col].empty()) {
+        ++context_reuse_penalty;
+      }
+    }
+  }
+
+  return kAlpha * ssa_score + kBeta * mem_score -
+         kGamma * context_reuse_penalty;
+}
+
+} // namespace taskflow
+} // namespace mlir

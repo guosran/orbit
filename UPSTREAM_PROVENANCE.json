@@ -1,0 +1,28 @@
+{
+  "schema": "orbit-published-source-provenance-v1",
+  "collected_source_version": "v11-neighborhood",
+  "upstream": {
+    "amoeba": {
+      "repository": "https://github.com/guosran/amoeba",
+      "base_commit": "a57376e7043b1681e64e7169c5a8cb02eb192331",
+      "modified": true
+    },
+    "neura": {
+      "repository": "https://github.com/coredac/neura",
+      "base_commit": "2c8f524f81135d50bcce507ec1599a264aa03571",
+      "vendored": true,
+      "modified": true
+    },
+    "predictor": {
+      "repository": "https://github.com/guosran/cgra-ii-predictor",
+      "base_commit": "ed00ea6d960ca086f071fa4f815c4a3b21526163",
+      "vendored": false,
+      "modified": true,
+      "usage": "Serialized weights in the companion artifact; source-owned C++ inference is part of ORBIT."
+    }
+  },
+  "llvm_mlir_commit": "6146a88f60492b520a36f8f8f3231e15f3cc6082",
+  "binding_policy": "exact source/model payload comparison; no SHA-256",
+  "source_payloads_checked": 102,
+  "publication_revision": "Repository Git HEAD"
+}
