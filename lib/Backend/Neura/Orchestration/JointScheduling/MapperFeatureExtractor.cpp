@@ -4,6 +4,7 @@
 
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
@@ -72,6 +73,11 @@ constexpr std::array<std::pair<int, int>, 16> kMapperShapes = {{
     {4, 4},   {4, 8},   {8, 4},   {4, 12},  {12, 4},  {4, 16},
     {8, 8},   {16, 4},  {8, 12},  {12, 8},  {8, 16},  {16, 8},
     {12, 12}, {12, 16}, {16, 12}, {16, 16},
+}};
+
+constexpr std::array<std::pair<int, int>, 8> kPerCgra2x2MapperShapes = {{
+    {2, 2}, {2, 4}, {4, 2}, {2, 6},
+    {6, 2}, {2, 8}, {8, 2}, {4, 4},
 }};
 
 bool inSet(llvm::StringRef value, const char *const *values,
@@ -255,9 +261,10 @@ bool containsEdge(const std::vector<Edge> &edges, Edge wanted) {
 
 } // namespace
 
-const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
-  static const std::array<std::string, kFeatureWidth> names = [] {
-    std::array<std::string, kFeatureWidth> result{};
+template <std::size_t Width, std::size_t ShapeCount>
+std::array<std::string, Width> buildMapperFeatureNames(
+    const std::array<std::pair<int, int>, ShapeCount> &shapes) {
+    std::array<std::string, Width> result{};
     std::size_t index = 0;
     for (const char *operation : kOperationTypes)
       result[index++] = std::string("log_count_") + operation;
@@ -294,7 +301,7 @@ const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
     };
     for (const char *name : kContextNames)
       result[index++] = name;
-    for (auto shape : kMapperShapes)
+    for (auto shape : shapes)
       result[index++] = "shape_" + std::to_string(shape.first) + "x" +
                         std::to_string(shape.second);
     constexpr const char *kContextTail[] = {
@@ -322,10 +329,22 @@ const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
     };
     for (const char *name : kTraversalNames)
       result[index++] = name;
-    if (index != kFeatureWidth)
+    if (index != Width)
       std::abort();
     return result;
-  }();
+}
+
+const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
+  static const std::array<std::string, kFeatureWidth> names =
+      buildMapperFeatureNames<kFeatureWidth>(kMapperShapes);
+  return names;
+}
+
+const std::array<std::string, kPerCgra2x2FeatureWidth> &
+perCgra2x2MapperFeatureNames() {
+  static const std::array<std::string, kPerCgra2x2FeatureWidth> names =
+      buildMapperFeatureNames<kPerCgra2x2FeatureWidth>(
+          kPerCgra2x2MapperShapes);
   return names;
 }
 
@@ -582,17 +601,21 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
   return true;
 }
 
-bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
-                           int columns, double recMii, double resMii,
-                           double lowerBound, FeatureVector &features,
-                           std::string &error) {
+template <std::size_t Width>
+static bool computeMapperFeaturesForProtocol(
+    const RouteExpandedGraph &graph, int rows, int columns, double recMii,
+    double resMii, double lowerBound,
+    llvm::ArrayRef<std::pair<int, int>> supportedShapes, double maxRows,
+    double maxColumns, double maxTiles, double maxDirectedLinks,
+    double maxBisectionLinks, double mapperIICeiling,
+    std::array<double, Width> &features, std::string &error) {
   auto validShape = [&] {
-    return std::find(kMapperShapes.begin(), kMapperShapes.end(),
+    return std::find(supportedShapes.begin(), supportedShapes.end(),
                      std::pair<int, int>{rows, columns}) !=
-           kMapperShapes.end();
+           supportedShapes.end();
   };
   if (!validShape()) {
-    error = "mapper shape is outside the complete max-four protocol";
+    error = "mapper shape is outside the selected static shape protocol";
     return false;
   }
   if (!std::isfinite(recMii) || !std::isfinite(resMii) ||
@@ -604,7 +627,7 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
     error = "lower_bound must equal max(rec_mii, res_mii)";
     return false;
   }
-  if (lowerBound < 0.0 || lowerBound > 20.0) {
+  if (lowerBound < 0.0 || lowerBound > mapperIICeiling) {
     error = "lower_bound is outside the mapper search interval";
     return false;
   }
@@ -758,8 +781,8 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
       1, nodeCount * (nodeCount - 1)));
   std::size_t index = 0;
   auto push = [&](double value) {
-    if (index < kFeatureWidth)
-      features.values[index++] = value;
+    if (index < Width)
+      features[index++] = value;
   };
   for (int count : typeCounts)
     push(std::log1p(static_cast<double>(count)));
@@ -783,16 +806,16 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
   push(static_cast<double>(graph.edges.size()) / possibleEdges);
   push(static_cast<double>(graph.semanticEdges.size()) / possibleEdges);
   push(std::log1p(static_cast<double>(recurrenceCount)));
-  push(static_cast<double>(rows) / 16.0);
-  push(static_cast<double>(columns) / 16.0);
-  push(tiles / 64.0);
+  push(static_cast<double>(rows) / maxRows);
+  push(static_cast<double>(columns) / maxColumns);
+  push(tiles / maxTiles);
   push(std::log(static_cast<double>(columns) / static_cast<double>(rows)));
-  push(links / 224.0);
-  push(bisectionLinks / 16.0);
-  push(recMii / 20.0);
-  push(resMii / 20.0);
-  push(lowerBound / 20.0);
-  for (auto shape : kMapperShapes)
+  push(links / maxDirectedLinks);
+  push(bisectionLinks / maxBisectionLinks);
+  push(recMii / mapperIICeiling);
+  push(resMii / mapperIICeiling);
+  push(lowerBound / mapperIICeiling);
+  for (auto shape : supportedShapes)
     push(static_cast<double>(rows == shape.first && columns == shape.second));
   push(std::log1p(static_cast<double>(nodeCount) / tiles));
   push(std::log1p(static_cast<double>(materializedCount) / tiles));
@@ -828,17 +851,36 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
   push(bucketQuadraticOccupancy /
        std::max(1.0, tiles * tiles * lowerBound));
 
-  if (index != kFeatureWidth) {
+  if (index != Width) {
     error = "internal mapper feature contract width mismatch";
     return false;
   }
-  for (double value : features.values) {
+  for (double value : features) {
     if (!std::isfinite(value)) {
       error = "mapper features must be finite";
       return false;
     }
   }
   return true;
+}
+
+bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
+                           int columns, double recMii, double resMii,
+                           double lowerBound, FeatureVector &features,
+                           std::string &error) {
+  return computeMapperFeaturesForProtocol(
+      graph, rows, columns, recMii, resMii, lowerBound, kMapperShapes, 16.0,
+      16.0, 256.0, 224.0, 16.0, 20.0, features.values, error);
+}
+
+bool computePerCgra2x2MapperFeatures(
+    const RouteExpandedGraph &graph, int rows, int columns, double recMii,
+    double resMii, double lowerBound, PerCgra2x2FeatureVector &features,
+    std::string &error) {
+  return computeMapperFeaturesForProtocol(
+      graph, rows, columns, recMii, resMii, lowerBound,
+      kPerCgra2x2MapperShapes, 8.0, 8.0, 16.0, 48.0, 8.0, 20.0,
+      features.values, error);
 }
 
 } // namespace mapper_features

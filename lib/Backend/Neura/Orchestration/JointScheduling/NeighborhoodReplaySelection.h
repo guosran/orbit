@@ -17,7 +17,7 @@ inline constexpr llvm::StringLiteral kNeighborhoodShapeSelectionSchema =
 inline std::string neighborhoodReplaySourceText(ModuleOp module) {
   std::string text;
   llvm::raw_string_ostream stream(text);
-  module.print(stream);
+  module.print(stream, OpPrintingFlags().printGenericOpForm());
   stream.flush();
   return text;
 }

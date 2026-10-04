@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -33,6 +34,16 @@ inline constexpr llvm::StringLiteral kArchitectureSchema =
     "neura-architecture-v1";
 inline constexpr llvm::StringLiteral kCandidateIdScheme =
     "candidate-<sequential-index>";
+inline constexpr llvm::StringLiteral kModelDomainUnsupportedStatus =
+    "unsupported-model-domain";
+inline constexpr llvm::StringLiteral kModelDomainUnsupportedReason =
+    "analytical-lower-bound-exceeds-model-ceiling";
+inline constexpr llvm::StringLiteral kSupportedShapeBootstrapPolicy =
+    "minimum-area-supported-model-shape-v1";
+inline constexpr double kFormalMax4ModelCeilingII = 20.0;
+inline constexpr std::array<std::pair<int64_t, int64_t>, 8>
+    kFormalMax4CostShapes = {{{4, 4}, {4, 8}, {8, 4}, {4, 12},
+                              {12, 4}, {4, 16}, {8, 8}, {16, 4}}};
 
 // Stores one predictor result. Unsupported queries remain explicit catalogue
 // entries so every candidate can be visited and audited.
@@ -40,6 +51,10 @@ struct TaskShapeCost {
   double predictedII = 0.0;
   double startupCycles = 0.0;
   bool supported = false;
+  bool modelDomainUnsupported = false;
+  double analyticalLowerBound = 0.0;
+  double modelIntervalMaxII = 0.0;
+  std::string unsupportedReason;
 };
 
 struct RankedCandidate {
@@ -72,7 +87,9 @@ public:
             llvm::StringRef expectedSourceRepository,
             llvm::StringRef expectedSourceCommit,
             llvm::StringRef expectedArchitecturePath,
-            llvm::StringRef expectedGraphId, std::string &error);
+            llvm::StringRef expectedGraphId, std::string &error,
+            bool allowModelDomainUnsupported = false,
+            llvm::StringRef expectedCanonicalModuleWitness = {});
   const TaskShapeCost *get(const TaskShapeChoice &choice, std::string &error);
 
   llvm::StringRef nameSpace() const { return namespace_; }

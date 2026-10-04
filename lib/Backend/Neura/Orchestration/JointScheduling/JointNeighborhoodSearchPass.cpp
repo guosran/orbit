@@ -15,6 +15,11 @@
 #include "AnalyticalTaskCostCatalog.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
+#include "NeuraDialect/Architecture/Architecture.h"
+#include "Backend/Neura/Orchestration/JointScheduling/InterTaskNetwork.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
+#include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
 #include "JointNeighborhoodActions.h"
 #include "NeighborhoodReplaySelection.h"
 #include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
@@ -24,6 +29,8 @@
 #include "NeuraDialect/NeuraOps.h"
 
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -49,6 +56,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -60,12 +68,39 @@ namespace {
 
 constexpr StringLiteral kSearchSchema = "orbit-neighborhood-search-v1";
 constexpr StringLiteral kCheckpointSchema =
-    "orbit-neighborhood-search-checkpoint-v2";
+    "orbit-neighborhood-search-checkpoint-v4";
+constexpr StringLiteral kTypedActionHistorySchema =
+    "orbit-joint-neighborhood-typed-actions-v1";
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
+constexpr StringLiteral kActiveTransferProofSchema =
+    "orbit-static-active-transfer-proof-v1";
+constexpr StringLiteral kActiveTransferWitnessEncoding =
+    "exact-byte-interned-active-transfer-v1";
 constexpr int64_t kDefaultRounds = 20;
 constexpr int64_t kDefaultCandidates = 20000;
 constexpr int64_t kDefaultBeam = 16;
 constexpr int64_t kDefaultDiversity = 4;
+// The artifact and validation contract reserve twelve CPUs for this scorer.
+// Keep the option bounded even when a caller requests an accidentally larger
+// worker pool; serial execution remains the exact default.
+constexpr int64_t kMaxScoringWorkers = 12;
+static constexpr int64_t kFormalMax4CgraRows[] = {1, 1, 2, 1, 3, 1, 2, 4};
+static constexpr int64_t kFormalMax4CgraCols[] = {1, 2, 1, 3, 1, 4, 2, 1};
+
+static bool cgraShapeToMapperTileShape(int64_t cgraRows, int64_t cgraCols,
+                                       int64_t perCgraRows,
+                                       int64_t perCgraCols,
+                                       int64_t &mapperRows,
+                                       int64_t &mapperCols) {
+  if (cgraRows <= 0 || cgraCols <= 0 || perCgraRows <= 0 ||
+      perCgraCols <= 0 ||
+      cgraRows > std::numeric_limits<int64_t>::max() / perCgraRows ||
+      cgraCols > std::numeric_limits<int64_t>::max() / perCgraCols)
+    return false;
+  mapperRows = cgraRows * perCgraRows;
+  mapperCols = cgraCols * perCgraCols;
+  return true;
+}
 
 static std::string jsonText(const json::Value &value) {
   std::string text;
@@ -84,6 +119,30 @@ static std::string quoteOption(StringRef value) {
   }
   quoted += '"';
   return quoted;
+}
+
+static bool parseActiveTransferArguments(StringRef text,
+                                         SmallVectorImpl<unsigned> &arguments,
+                                         std::string &error) {
+  arguments.clear();
+  if (text.trim().empty())
+    return true;
+  SmallVector<StringRef, 8> pieces;
+  text.split(pieces, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
+  std::set<unsigned> seen;
+  for (StringRef piece : pieces) {
+    unsigned index = 0;
+    piece = piece.trim();
+    if (piece.empty() || piece.getAsInteger(10, index) ||
+        !seen.insert(index).second) {
+      error = "active-transfer-arguments must be an ordered comma-separated "
+              "list of unique non-negative argument indices";
+      arguments.clear();
+      return false;
+    }
+    arguments.push_back(index);
+  }
+  return true;
 }
 
 static bool writeTextAtomically(StringRef path, StringRef text,
@@ -320,6 +379,15 @@ struct SearchState {
   std::string parentId;
   std::string rejectReason;
   std::vector<std::string> path;
+  struct TypedActionHistory {
+    bool known = false;
+    std::string canonicalFactKey;
+    std::vector<NeighborhoodShape> initialShapes;
+    std::vector<NeighborhoodAction> actions;
+    std::string unknownReason;
+    std::vector<std::vector<uint64_t>> dependencies;
+    std::map<std::string, uint64_t> taskProducers;
+  } actionHistory;
   std::vector<NeighborhoodShape> shapes;
   OwningOpRef<ModuleOp> module;
   int64_t score = std::numeric_limits<int64_t>::max();
@@ -334,6 +402,12 @@ struct SearchState {
   bool scored = false;
 };
 
+struct ControlRoleProvenance {
+  std::string candidatePath;
+  std::vector<std::string> path;
+  SearchState::TypedActionHistory actionHistory;
+};
+
 struct ArchiveRecord {
   std::string id;
   std::string key;
@@ -341,6 +415,7 @@ struct ArchiveRecord {
   std::string parentId;
   std::string candidatePath;
   std::vector<std::string> path;
+  SearchState::TypedActionHistory actionHistory;
   std::vector<NeighborhoodShape> shapes;
   SmallVector<TaskShapeChoice> choices;
   SmallVector<int64_t> durations;
@@ -348,6 +423,7 @@ struct ArchiveRecord {
   ProductionScheduledResult schedule;
   std::string costPath;
   std::vector<std::string> controlRoles;
+  std::map<std::string, ControlRoleProvenance> controlRoleProvenance;
   std::string graphId;
   bool control = false;
   std::vector<std::vector<std::string>> alternatePaths;
@@ -355,6 +431,138 @@ struct ArchiveRecord {
   bool valid = false;
   std::string rejectReason;
   int64_t round = 0;
+};
+
+static json::Object shapeObject(const NeighborhoodShape &shape);
+static json::Object typedActionObject(const NeighborhoodAction &action);
+static bool parseShapeArray(const json::Array *array,
+                            std::vector<NeighborhoodShape> &shapes);
+static json::Array stringArray(ArrayRef<std::string> values);
+static bool parseTypedAction(const json::Object &object,
+                             NeighborhoodAction &action);
+
+static json::Object typedActionHistoryObject(
+    const SearchState::TypedActionHistory &history) {
+  json::Array initialShapes, actions;
+  for (const NeighborhoodShape &shape : history.initialShapes)
+    initialShapes.push_back(shapeObject(shape));
+  for (const NeighborhoodAction &action : history.actions)
+    actions.push_back(typedActionObject(action));
+  return json::Object{
+      {"schema", kTypedActionHistorySchema}, {"known", history.known},
+      {"canonicalFactKey", history.canonicalFactKey},
+      {"initialShapes", std::move(initialShapes)},
+      {"actions", std::move(actions)},
+      {"unknownReason", history.unknownReason}};
+}
+
+static json::Object controlRoleProvenanceObject(
+    const ControlRoleProvenance &provenance) {
+  return json::Object{
+      {"candidate_path", provenance.candidatePath},
+      {"action_path", stringArray(provenance.path)},
+      {"action_history", typedActionHistoryObject(provenance.actionHistory)}};
+}
+
+static json::Object controlRoleProvenanceMapObject(
+    const std::map<std::string, ControlRoleProvenance> &provenance) {
+  json::Object object;
+  for (const auto &[role, state] : provenance)
+    object[role] = controlRoleProvenanceObject(state);
+  return object;
+}
+
+static bool parseTypedActionHistoryObject(
+    const json::Object &object,
+    SearchState::TypedActionHistory &history) {
+  auto schema = object.getString("schema");
+  auto known = object.getBoolean("known");
+  auto canonicalFactKey = object.getString("canonicalFactKey");
+  const json::Array *initialShapes = object.getArray("initialShapes");
+  const json::Array *actions = object.getArray("actions");
+  if (!schema || *schema != kTypedActionHistorySchema || !known ||
+      !canonicalFactKey || !initialShapes || !actions ||
+      !parseShapeArray(initialShapes, history.initialShapes))
+    return false;
+  history.known = *known;
+  history.canonicalFactKey = canonicalFactKey->str();
+  history.unknownReason = object.getString("unknownReason").value_or("").str();
+  history.actions.clear();
+  for (const json::Value &value : *actions) {
+    const json::Object *actionObject = value.getAsObject();
+    NeighborhoodAction action;
+    if (!actionObject || !parseTypedAction(*actionObject, action))
+      return false;
+    history.actions.push_back(std::move(action));
+  }
+  if (history.known &&
+      (history.canonicalFactKey.empty() || history.initialShapes.empty() ||
+       !history.unknownReason.empty()))
+    return false;
+  if (!history.known) {
+    if (history.unknownReason.empty())
+      history.unknownReason = "typed_action_history_not_authenticated";
+    history.canonicalFactKey.clear();
+    history.initialShapes.clear();
+    history.actions.clear();
+  }
+  history.dependencies.clear();
+  history.taskProducers.clear();
+  return true;
+}
+
+static SearchState::TypedActionHistory portableActionHistory(
+    const SearchState::TypedActionHistory &history) {
+  SearchState::TypedActionHistory result;
+  result.known = history.known;
+  result.canonicalFactKey = history.canonicalFactKey;
+  result.initialShapes = history.initialShapes;
+  result.actions = history.actions;
+  result.unknownReason = history.unknownReason;
+  return result;
+}
+
+static void markActionHistoryUnknown(
+    SearchState::TypedActionHistory &history, StringRef reason) {
+  history.known = false;
+  history.unknownReason = reason.empty()
+                              ? "typed_action_history_not_authenticated"
+                              : reason.str();
+  history.canonicalFactKey.clear();
+  history.initialShapes.clear();
+  history.actions.clear();
+  history.dependencies.clear();
+  history.taskProducers.clear();
+}
+
+static void importTypedActionHistory(
+    const json::Object &record,
+    SearchState::TypedActionHistory &history) {
+  const json::Object *object = record.getObject("action_history");
+  if (!object) {
+    markActionHistoryUnknown(history,
+                             "seed_missing_authenticated_typed_action_history");
+    return;
+  }
+  SearchState::TypedActionHistory imported;
+  if (!parseTypedActionHistoryObject(*object, imported)) {
+    markActionHistoryUnknown(history,
+                             "seed_typed_action_history_malformed");
+    return;
+  }
+  if (!imported.known) {
+    markActionHistoryUnknown(history, imported.unknownReason);
+    return;
+  }
+  history = std::move(imported);
+}
+
+struct UnsupportedUnitQuery {
+  std::string task;
+  int64_t mapperRows = 0;
+  int64_t mapperCols = 0;
+  double lowerBound = 0.0;
+  std::string reason;
 };
 
 static std::vector<int64_t> numericTieKey(ArrayRef<TaskShapeChoice> choices,
@@ -464,6 +672,13 @@ static json::Array indexArray(ArrayRef<unsigned> values,
   return result;
 }
 
+static json::Array uint64Array(ArrayRef<uint64_t> values) {
+  json::Array result;
+  for (uint64_t value : values)
+    result.push_back(static_cast<int64_t>(value));
+  return result;
+}
+
 static json::Object archiveObject(const ArchiveRecord &record) {
   json::Object object{
       {"record_type", "candidate"},
@@ -474,6 +689,7 @@ static json::Object archiveObject(const ArchiveRecord &record) {
       {"parent_candidate_id", record.parentId},
       {"candidate_path", record.candidatePath},
       {"action_path", stringArray(record.path)},
+      {"action_history", typedActionHistoryObject(record.actionHistory)},
       {"alternate_action_paths", json::Array{}},
       {"shapes", json::Array{}},
       {"task_choices", choiceRecords(record.choices)},
@@ -489,6 +705,8 @@ static json::Object archiveObject(const ArchiveRecord &record) {
       {"cost_catalogue_path", record.costPath},
       {"control_candidate", record.control},
       {"control_roles", stringArray(record.controlRoles)},
+      {"control_role_provenance",
+       controlRoleProvenanceMapObject(record.controlRoleProvenance)},
       {"graph_variant_id", record.graphId},
       {"predicted_whole_program_cycles", record.valid
                                              ? json::Value(record.score)
@@ -545,6 +763,20 @@ static bool parseStringArray(const json::Array *array,
   return true;
 }
 
+static bool parseUInt64Array(const json::Array *array,
+                             std::vector<uint64_t> &values) {
+  if (!array)
+    return false;
+  values.clear();
+  for (const json::Value &value : *array) {
+    auto integer = value.getAsInteger();
+    if (!integer || *integer < 0)
+      return false;
+    values.push_back(static_cast<uint64_t>(*integer));
+  }
+  return true;
+}
+
 static std::optional<std::string> readCatalogGraphId(StringRef path) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -573,9 +805,12 @@ static std::string decimal128(unsigned __int128 value) {
 }
 
 static bool writeFiniteShapeDomain(StringRef path, func::FuncOp function,
-                                   StringRef graphId, std::string &error) {
-  static constexpr int64_t kRows[] = {1, 1, 2, 1, 3, 1, 2, 4};
-  static constexpr int64_t kCols[] = {1, 2, 1, 3, 1, 4, 2, 1};
+                                   StringRef graphId, int64_t perCgraRows,
+                                   int64_t perCgraCols, std::string &error) {
+  if (perCgraRows <= 0 || perCgraCols <= 0) {
+    error = "architecture has non-positive per-CGRA mapper dimensions";
+    return false;
+  }
   json::Array factors;
   unsigned __int128 candidateCount = 1;
   SmallVector<TaskMetadata> metadata;
@@ -590,15 +825,22 @@ static bool writeFiniteShapeDomain(StringRef path, func::FuncOp function,
   for (const TaskMetadata &task : metadata) {
     json::Array shapes;
     for (unsigned index = 0; index < 8; ++index) {
+      int64_t mapperRows = 0, mapperCols = 0;
+      if (!cgraShapeToMapperTileShape(
+              kFormalMax4CgraRows[index], kFormalMax4CgraCols[index],
+              perCgraRows, perCgraCols, mapperRows, mapperCols)) {
+        error = "formal CGRA shape cannot be represented in mapper tiles";
+        return false;
+      }
       shapes.push_back(json::Object{{"kind", "rect"},
-                                    {"rows", kRows[index]},
-                                    {"cols", kCols[index]},
-                                    {"cgra_count", kRows[index] * kCols[index]},
+                                    {"rows", kFormalMax4CgraRows[index]},
+                                    {"cols", kFormalMax4CgraCols[index]},
+                                    {"cgra_count", kFormalMax4CgraRows[index] * kFormalMax4CgraCols[index]},
                                     {"cgra_shape",
-                                     std::to_string(kRows[index]) + "x" +
-                                         std::to_string(kCols[index])},
-                                    {"mapper_tile_rows", kRows[index] * 4},
-                                    {"mapper_tile_cols", kCols[index] * 4}});
+                                     std::to_string(kFormalMax4CgraRows[index]) + "x" +
+                                         std::to_string(kFormalMax4CgraCols[index])},
+                                    {"mapper_tile_rows", mapperRows},
+                                    {"mapper_tile_cols", mapperCols}});
     }
     factors.push_back(json::Object{{"task", task.name},
                                    {"trip_count", task.tripCount},
@@ -636,8 +878,10 @@ static bool runCurrentCostPredictor(
     StringRef candidateId, StringRef outputDirectory, StringRef modelFile,
     StringRef cacheFile, StringRef checkpointDirectory,
     StringRef architectureContract, StringRef architecturePath,
+    int64_t perCgraRows, int64_t perCgraCols,
     StringRef sourceRepository, StringRef sourceCommit,
     StringRef architectureTransferCatalog, StringRef modelNamespace,
+    bool allowUnsupportedAboveModelCeiling,
     std::string &costPath, std::string &error, bool &fatalFailure) {
   fatalFailure = false;
   if (modelFile.empty() || cacheFile.empty() || architectureContract.empty() ||
@@ -654,7 +898,8 @@ static bool runCurrentCostPredictor(
   }
   costPath = outputDirectory.str() + "/costs-" + candidateId.str() + ".json";
   std::string spacePath = spacesDirectory + "/" + candidateId.str() + ".jsonl";
-  if (!writeFiniteShapeDomain(spacePath, function, candidateId, error)) {
+  if (!writeFiniteShapeDomain(spacePath, function, candidateId,
+                              perCgraRows, perCgraCols, error)) {
     fatalFailure = true;
     return false;
   }
@@ -671,6 +916,8 @@ static bool runCurrentCostPredictor(
       " model-namespace=" + quoteOption(modelNamespace) +
       " cache=" + quoteOption(cacheFile) + " output=" +
       quoteOption(costPath);
+  if (allowUnsupportedAboveModelCeiling)
+    outputOptions += " allow-unsupported-above-model-ceiling=true";
   if (!architectureTransferCatalog.empty())
     outputOptions += " architecture-transfer-catalog=" +
                      quoteOption(architectureTransferCatalog);
@@ -703,7 +950,7 @@ static bool writeModule(ModuleOp module, StringRef path, std::string &error) {
   return writeAtomically(
       path,
       [&](llvm::raw_ostream &stream) {
-        module.print(stream);
+        module.print(stream, OpPrintingFlags().printGenericOpForm());
         stream << "\n";
         return true;
       },
@@ -753,6 +1000,59 @@ static json::Object actionObject(const NeighborhoodAction &action) {
       {"primitives", std::move(primitives)}};
 }
 
+static json::Object typedActionObject(const NeighborhoodAction &action) {
+  json::Array primitives;
+  for (const auto &primitive : action.primitives)
+    primitives.push_back(json::Object{
+        {"kind", primitive.kind}, {"firstTask", primitive.firstTask},
+        {"secondTask", primitive.secondTask}, {"axis", primitive.axis},
+        {"factor", primitive.factor}, {"mode", primitive.mode}});
+  return json::Object{
+      {"family", action.family}, {"label", action.label},
+      {"primitives", std::move(primitives)},
+      {"shapeTask", action.shapeTask}, {"shapeRows", action.shapeRows},
+      {"shapeCols", action.shapeCols},
+      {"canonicalReset", action.canonicalReset}};
+}
+
+static bool parseTypedAction(const json::Object &object,
+                             NeighborhoodAction &action) {
+  auto family = object.getString("family");
+  auto label = object.getString("label");
+  auto shapeTask = object.getString("shapeTask");
+  auto shapeRows = object.getInteger("shapeRows");
+  auto shapeCols = object.getInteger("shapeCols");
+  auto canonicalReset = object.getBoolean("canonicalReset");
+  const json::Array *primitives = object.getArray("primitives");
+  if (!family || !label || !shapeTask || !shapeRows || !shapeCols ||
+      !canonicalReset || !primitives)
+    return false;
+  action.family = family->str();
+  action.label = label->str();
+  action.shapeTask = shapeTask->str();
+  action.shapeRows = *shapeRows;
+  action.shapeCols = *shapeCols;
+  action.canonicalReset = *canonicalReset;
+  action.primitives.clear();
+  for (const json::Value &value : *primitives) {
+    const json::Object *primitive = value.getAsObject();
+    auto kind = primitive ? primitive->getString("kind") : std::nullopt;
+    auto firstTask = primitive ? primitive->getString("firstTask")
+                               : std::nullopt;
+    auto secondTask = primitive ? primitive->getString("secondTask")
+                                 : std::nullopt;
+    auto mode = primitive ? primitive->getString("mode") : std::nullopt;
+    auto axis = primitive ? primitive->getInteger("axis") : std::nullopt;
+    auto factor = primitive ? primitive->getInteger("factor") : std::nullopt;
+    if (!kind || !firstTask || !secondTask || !mode || !axis || !factor)
+      return false;
+    action.primitives.push_back({kind->str(), firstTask->str(),
+                                 secondTask->str(), mode->str(), *axis,
+                                 *factor});
+  }
+  return true;
+}
+
 static bool parseAction(const json::Object &object, NeighborhoodAction &action) {
   auto family = object.getString("family"), label = object.getString("label"),
        task = object.getString("shape_task");
@@ -782,6 +1082,418 @@ struct PendingNeighbor {
   NeighborhoodAction action;
 };
 
+struct CostGuidedAction {
+  uint64_t targetCycles = 0;
+  NeighborhoodAction action;
+  std::string signature;
+};
+
+struct TargetActionStream {
+  std::string target;
+  uint64_t targetCycles = 0;
+  std::vector<CostGuidedAction> actions;
+  size_t nextAction = 0;
+};
+
+struct ParentFamilyActionStream {
+  uint64_t parent = 0;
+  std::string family;
+  std::vector<TargetActionStream> targets;
+  size_t nextTarget = 0;
+
+  bool take(PendingNeighbor &neighbor) {
+    if (targets.empty())
+      return false;
+    for (size_t attempt = 0; attempt < targets.size(); ++attempt) {
+      const size_t index = (nextTarget + attempt) % targets.size();
+      TargetActionStream &target = targets[index];
+      if (target.nextAction >= target.actions.size())
+        continue;
+      neighbor.parent = parent;
+      neighbor.action = target.actions[target.nextAction++].action;
+      nextTarget = (index + 1) % targets.size();
+      return true;
+    }
+    return false;
+  }
+};
+
+static std::string actionTargetKey(const NeighborhoodAction &action) {
+  std::set<std::string> targets;
+  if (!action.shapeTask.empty())
+    targets.insert(action.shapeTask);
+  for (const NeighborhoodPrimitive &primitive : action.primitives) {
+    if (!primitive.firstTask.empty())
+      targets.insert(primitive.firstTask);
+    if (!primitive.secondTask.empty())
+      targets.insert(primitive.secondTask);
+  }
+  if (targets.empty())
+    return "<global>";
+  std::string result;
+  for (const std::string &target : targets) {
+    if (!result.empty())
+      result += "|";
+    result += target;
+  }
+  return result;
+}
+
+static uint64_t currentTargetCycles(const SearchState &parent,
+                                    const NeighborhoodAction &action) {
+  std::set<std::string> targets;
+  if (!action.shapeTask.empty())
+    targets.insert(action.shapeTask);
+  for (const NeighborhoodPrimitive &primitive : action.primitives) {
+    if (!primitive.firstTask.empty())
+      targets.insert(primitive.firstTask);
+    if (!primitive.secondTask.empty())
+      targets.insert(primitive.secondTask);
+  }
+  uint64_t priority = 0;
+  for (const std::string &target : targets)
+    for (unsigned index = 0; index < parent.choices.size() &&
+                             index < parent.durations.size(); ++index)
+      if (parent.choices[index].task == target)
+        priority = std::max<uint64_t>(
+            priority, static_cast<uint64_t>(
+                          std::max<int64_t>(0, parent.durations[index])));
+  return priority;
+}
+
+static uint64_t perRoundScoreQuota(uint64_t scoredCount,
+                                   uint64_t maxCandidates,
+                                   int64_t roundsRemaining) {
+  if (roundsRemaining <= 0 || scoredCount >= maxCandidates)
+    return 0;
+  const uint64_t remaining = maxCandidates - scoredCount;
+  const uint64_t divisor = static_cast<uint64_t>(roundsRemaining);
+  return remaining / divisor + (remaining % divisor != 0 ? 1 : 0);
+}
+
+static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
+    ArrayRef<SearchState> beam, StringRef functionName, StringRef stage,
+    unsigned round, unsigned maxPartitionFactor) {
+  using TargetMap = std::map<std::string, TargetActionStream>;
+  using FamilyMap = std::map<std::string, TargetMap>;
+  std::vector<FamilyMap> grouped(beam.size());
+  std::set<std::string> familyNames;
+
+  for (auto indexed : llvm::enumerate(beam)) {
+    auto actions = enumerateNeighborhoodActions(
+        indexed.value().module.get(), functionName, indexed.value().shapes,
+        stage, round, maxPartitionFactor);
+    FamilyMap &families = grouped[indexed.index()];
+    for (NeighborhoodAction &action : actions) {
+      const std::string family = action.family;
+      const std::string target = actionTargetKey(action);
+      const uint64_t targetCycles =
+          currentTargetCycles(indexed.value(), action);
+      TargetActionStream &stream = families[family][target];
+      stream.target = target;
+      stream.targetCycles = std::max(stream.targetCycles, targetCycles);
+      stream.actions.push_back(
+          {targetCycles, std::move(action), {}});
+      CostGuidedAction &queued = stream.actions.back();
+      queued.signature = actionSignature(queued.action);
+      familyNames.insert(family);
+    }
+  }
+
+  std::vector<std::map<std::string, ParentFamilyActionStream>> streams(
+      beam.size());
+  for (size_t parent = 0; parent < grouped.size(); ++parent)
+    for (auto &[family, targets] : grouped[parent]) {
+      ParentFamilyActionStream &familyStream = streams[parent][family];
+      familyStream.parent = parent;
+      familyStream.family = family;
+      for (auto &[target, targetStream] : targets) {
+        llvm::sort(targetStream.actions, [](const CostGuidedAction &left,
+                                             const CostGuidedAction &right) {
+          if (left.targetCycles != right.targetCycles)
+            return left.targetCycles > right.targetCycles;
+          return left.signature < right.signature;
+        });
+        familyStream.targets.push_back(std::move(targetStream));
+      }
+      llvm::stable_sort(familyStream.targets,
+                        [](const TargetActionStream &left,
+                           const TargetActionStream &right) {
+        if (left.targetCycles != right.targetCycles)
+          return left.targetCycles > right.targetCycles;
+        return left.target < right.target;
+      });
+    }
+
+  std::vector<PendingNeighbor> pending;
+  bool emitted = true;
+  while (emitted) {
+    emitted = false;
+    for (const std::string &family : familyNames)
+      for (size_t parent = 0; parent < streams.size(); ++parent) {
+        auto familyIt = streams[parent].find(family);
+        if (familyIt == streams[parent].end())
+          continue;
+        PendingNeighbor neighbor;
+        if (familyIt->second.take(neighbor)) {
+          pending.push_back(std::move(neighbor));
+          emitted = true;
+        }
+      }
+  }
+  return pending;
+}
+
+static std::map<std::string, uint64_t>
+successfulActionFamilyScores(ArrayRef<ArchiveRecord> archive, int64_t round) {
+  std::map<std::string, uint64_t> scores;
+  for (const ArchiveRecord &record : archive) {
+    if (!record.valid || record.control || record.parentId.empty() ||
+        record.round != round || record.path.empty())
+      continue;
+    // Generated records append one source-owned action signature to their
+    // path. Using that final signature also covers lineage replacement, whose
+    // authenticated replay deliberately removes the replaced action history.
+    StringRef signature(record.path.back());
+    const size_t separator = signature.find(':');
+    if (separator == StringRef::npos || separator == 0)
+      continue;
+    ++scores[signature.take_front(separator).str()];
+  }
+  return scores;
+}
+
+static std::map<std::string, uint64_t> pendingActionFamilyCounts(
+    ArrayRef<PendingNeighbor> pending, size_t cursor) {
+  std::map<std::string, uint64_t> counts;
+  for (size_t index = cursor; index < pending.size(); ++index)
+    ++counts[pending[index].action.family];
+  return counts;
+}
+
+static void consumePendingActionFamily(
+    std::map<std::string, uint64_t> &remaining, StringRef family) {
+  auto found = remaining.find(family.str());
+  if (found == remaining.end())
+    return;
+  if (--found->second == 0)
+    remaining.erase(found);
+}
+
+static void prioritizeNextPendingActionFamily(
+    std::vector<PendingNeighbor> &pending, size_t cursor,
+    const std::map<std::string, uint64_t> &successfulScores,
+    const std::map<std::string, uint64_t> &reservedScores,
+    const std::map<std::string, uint64_t> &remainingFamilies) {
+  if (cursor >= pending.size())
+    return;
+
+  std::map<std::string, size_t> firstByFamily;
+  for (size_t index = cursor;
+       index < pending.size() && firstByFamily.size() < remainingFamilies.size();
+       ++index)
+    if (remainingFamilies.count(pending[index].action.family))
+      firstByFamily.try_emplace(pending[index].action.family, index);
+  if (firstByFamily.empty())
+    return;
+
+  size_t selected = cursor;
+  uint64_t selectedScore = std::numeric_limits<uint64_t>::max();
+  for (const auto &[family, index] : firstByFamily) {
+    const auto successful = successfulScores.find(family);
+    const auto reserved = reservedScores.find(family);
+    const uint64_t score =
+        (successful == successfulScores.end() ? 0 : successful->second) +
+        (reserved == reservedScores.end() ? 0 : reserved->second);
+    if (score < selectedScore || (score == selectedScore && index < selected)) {
+      selected = index;
+      selectedScore = score;
+    }
+  }
+  if (selected != cursor)
+    std::rotate(pending.begin() + cursor, pending.begin() + selected,
+                pending.begin() + selected + 1);
+}
+
+// A worker receives only immutable, source-owned score inputs.  In particular,
+// it never receives the parent-context module, cost cache, catalogue path, or
+// diagnostic handler.  The owner commits the result in pending-frontier order.
+struct ParallelScoreJob {
+  std::string moduleIR;
+  std::string functionName;
+  std::string candidateID;
+  SmallVector<TaskShapeChoice> choices;
+  SmallVector<int64_t> durations;
+  bool fixedDispatch = false;
+};
+
+struct ParallelScoreResult {
+  bool finished = false;
+  bool fatal = false;
+  bool scored = false;
+  ProductionScheduledResult schedule;
+  std::string error;
+};
+
+enum class ParallelBatchItemKind { Rejected, Duplicate, Score };
+
+struct ParallelBatchItem {
+  size_t pendingIndex = 0;
+  std::string actionFamily;
+  ParallelBatchItemKind kind = ParallelBatchItemKind::Rejected;
+  size_t jobIndex = 0;
+  SearchState state;
+};
+
+// A worker owns its context and exact serialized-module cache for the whole
+// pass. The cache is keyed by complete IR bytes, so it memoizes only parsing
+// and verification of byte-identical modules. Cache modules are declared after
+// the context and are therefore destroyed before it during teardown.
+constexpr size_t kPrivateModuleCacheCapacity = 16;
+
+struct PrivateModuleCacheEntry {
+  std::string moduleIR;
+  OwningOpRef<ModuleOp> module;
+};
+
+struct PersistentParallelWorker {
+  std::unique_ptr<MLIRContext> context;
+  std::vector<PrivateModuleCacheEntry> moduleCache;
+  uint64_t cacheHits = 0;
+  uint64_t cacheMisses = 0;
+};
+
+struct PersistentParallelWorkerPool {
+  std::vector<std::unique_ptr<PersistentParallelWorker>> workers;
+
+  void ensure(unsigned count, const DialectRegistry &registry) {
+    while (workers.size() < count) {
+      auto worker = std::make_unique<PersistentParallelWorker>();
+      worker->context = std::make_unique<MLIRContext>(
+          registry, MLIRContext::Threading::DISABLED);
+      workers.push_back(std::move(worker));
+    }
+  }
+};
+
+static bool runPrivateProductionScores(
+    ArrayRef<ParallelScoreJob> jobs, const DialectRegistry &registry,
+    unsigned requestedWorkers, PersistentParallelWorkerPool &workerPool,
+    std::vector<ParallelScoreResult> &results, uint64_t &cacheHits,
+    uint64_t &cacheMisses, std::string &error) {
+  results.assign(jobs.size(), ParallelScoreResult{});
+  if (jobs.empty())
+    return true;
+
+  const unsigned workerCount = std::max<unsigned>(
+      1, std::min<unsigned>(requestedWorkers, jobs.size()));
+  // Context construction and registry mutation stay on the owner thread.
+  // Each worker then reuses exactly one disabled-threading context and its
+  // bounded exact-IR cache across all batches in this pass.
+  workerPool.ensure(workerCount, registry);
+  std::vector<uint64_t> cacheHitsBefore(workerCount);
+  std::vector<uint64_t> cacheMissesBefore(workerCount);
+  for (unsigned index = 0; index < workerCount; ++index) {
+    cacheHitsBefore[index] = workerPool.workers[index]->cacheHits;
+    cacheMissesBefore[index] = workerPool.workers[index]->cacheMisses;
+  }
+
+  std::vector<std::thread> workers;
+  workers.reserve(workerCount);
+  for (unsigned worker = 0; worker < workerCount; ++worker) {
+    workers.emplace_back([&, worker]() {
+      PersistentParallelWorker &workerState = *workerPool.workers[worker];
+      MLIRContext &context = *workerState.context;
+      for (size_t index = worker; index < jobs.size(); index += workerCount) {
+          const ParallelScoreJob &job = jobs[index];
+          ParallelScoreResult &result = results[index];
+          std::string diagnostic;
+          std::string localError;
+          ModuleOp module;
+          FailureOr<func::FuncOp> selected = failure();
+          {
+            ScopedDiagnosticHandler capture(
+                &context, [&](Diagnostic &entry) {
+                  if (diagnostic.empty()) {
+                    llvm::raw_string_ostream stream(diagnostic);
+                    entry.print(stream);
+                  }
+                  return success();
+                });
+            for (PrivateModuleCacheEntry &entry : workerState.moduleCache) {
+              if (entry.moduleIR == job.moduleIR) {
+                module = entry.module.get();
+                ++workerState.cacheHits;
+                break;
+              }
+            }
+            if (!module) {
+              ++workerState.cacheMisses;
+              OwningOpRef<ModuleOp> parsed =
+                  parseSourceString<ModuleOp>(job.moduleIR, &context);
+              if (!parsed || failed(verify(parsed->getOperation()))) {
+                result.fatal = true;
+                result.error = diagnostic.empty()
+                                   ? "parallel worker could not parse or verify candidate"
+                                   : diagnostic;
+                result.finished = true;
+                continue;
+              }
+              if (workerState.moduleCache.size() >=
+                  kPrivateModuleCacheCapacity)
+                workerState.moduleCache.erase(workerState.moduleCache.begin());
+              workerState.moduleCache.push_back(
+                  {job.moduleIR, std::move(parsed)});
+              module = workerState.moduleCache.back().module.get();
+            }
+            selected = selectTaskFunction(module, job.functionName, localError);
+            if (failed(selected)) {
+              result.fatal = true;
+              result.error = localError.empty()
+                                 ? "parallel worker could not select candidate function"
+                                 : localError;
+              result.finished = true;
+              continue;
+            }
+            if (!scheduleWithAmoebaProductionPass(
+                    module, *selected, job.choices, job.durations,
+                    job.candidateID, job.fixedDispatch, result.schedule,
+                    localError)) {
+              // A production scheduler rejection is a normal candidate
+              // result.  Parse/selection failures above are infrastructure
+              // failures and discard the whole unfinished batch.
+              result.error = localError.empty()
+                                 ? "production scheduler rejected candidate"
+                                 : localError;
+              result.finished = true;
+              continue;
+            }
+            result.scored = true;
+            result.finished = true;
+          }
+      }
+    });
+  }
+  for (std::thread &worker : workers)
+    worker.join();
+  for (unsigned worker = 0; worker < workerCount; ++worker) {
+    cacheHits += workerPool.workers[worker]->cacheHits - cacheHitsBefore[worker];
+    cacheMisses +=
+        workerPool.workers[worker]->cacheMisses - cacheMissesBefore[worker];
+  }
+  for (const ParallelScoreResult &result : results) {
+    if (result.fatal) {
+      error = result.error.empty() ? "parallel scoring worker failed" : result.error;
+      return false;
+    }
+    if (!result.finished) {
+      error = "parallel scoring worker did not complete its assigned job";
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record,
                                std::string &error) {
   auto id = object.getString("candidate_id"), key = object.getString("candidate_key"),
@@ -807,7 +1519,54 @@ static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record
     error = "checkpoint archive action or shape state is malformed";
     return false;
   }
-  parseStringArray(object.getArray("control_roles"), record.controlRoles);
+  if (!parseStringArray(object.getArray("control_roles"),
+                        record.controlRoles)) {
+    error = "checkpoint archive control-role list is malformed";
+    return false;
+  }
+  const json::Object *actionHistory = object.getObject("action_history");
+  if (!actionHistory ||
+      !parseTypedActionHistoryObject(*actionHistory, record.actionHistory)) {
+    error = "checkpoint archive typed action history is malformed";
+    return false;
+  }
+  const json::Object *roleProvenance =
+      object.getObject("control_role_provenance");
+  if (!roleProvenance) {
+    error = "checkpoint archive control-role provenance is malformed";
+    return false;
+  }
+  for (const auto &[roleRef, value] : *roleProvenance) {
+    std::string role = roleRef.str();
+    const json::Object *entry = value.getAsObject();
+    auto candidatePath = entry ? entry->getString("candidate_path")
+                               : std::optional<StringRef>();
+    const json::Object *history = entry ? entry->getObject("action_history")
+                                        : nullptr;
+    ControlRoleProvenance provenance;
+    if (!entry || !candidatePath || !history ||
+        !parseStringArray(entry->getArray("action_path"), provenance.path) ||
+        !parseTypedActionHistoryObject(*history, provenance.actionHistory) ||
+        std::find(record.controlRoles.begin(), record.controlRoles.end(),
+                  role) == record.controlRoles.end()) {
+      error = "checkpoint archive control-role provenance entry is malformed";
+      return false;
+    }
+    provenance.candidatePath = candidatePath->str();
+    if (!record.controlRoleProvenance.emplace(std::move(role),
+                                               std::move(provenance)).second) {
+      error = "checkpoint archive repeats a control-role provenance entry";
+      return false;
+    }
+  }
+  if (record.controlRoleProvenance.size() != record.controlRoles.size()) {
+    error = "checkpoint archive control roles and provenance differ";
+    return false;
+  }
+  if (record.control != !record.controlRoles.empty()) {
+    error = "checkpoint archive control marker and named roles differ";
+    return false;
+  }
   if (auto alternatives = object.getArray("alternate_action_paths"))
     for (const auto &value : *alternatives) {
       std::vector<std::string> path;
@@ -872,10 +1631,18 @@ static ArchiveRecord stateRecord(const SearchState &state) {
   ArchiveRecord record;
   record.id = state.id; record.key = state.key; record.factKey = state.factKey;
   record.parentId = state.parentId; record.path = state.path;
+  record.actionHistory = portableActionHistory(state.actionHistory);
   record.shapes = state.shapes; record.choices = state.choices;
   record.costs = state.costs; record.durations = state.durations;
   record.schedule = state.schedule; record.costPath = state.costPath;
   record.control = state.control; record.controlRoles = state.controlRoles;
+  for (const std::string &role : record.controlRoles) {
+    ControlRoleProvenance provenance;
+    provenance.path = state.path;
+    provenance.actionHistory =
+        portableActionHistory(state.actionHistory);
+    record.controlRoleProvenance.emplace(role, std::move(provenance));
+  }
   record.score = state.score; record.valid = state.scored;
   record.rejectReason = state.rejectReason;
   return record;
@@ -898,6 +1665,7 @@ static bool parseState(const json::Object &object, MLIRContext *context,
   if (!state.module) { error = "checkpoint materialized module snapshot does not parse"; return false; }
   state.id = record.id; state.key = record.key; state.factKey = record.factKey;
   state.parentId = record.parentId; state.path = std::move(record.path);
+  state.actionHistory = std::move(record.actionHistory);
   state.shapes = std::move(record.shapes); state.choices = std::move(record.choices);
   state.costs = std::move(record.costs); state.durations = std::move(record.durations);
   state.schedule = std::move(record.schedule); state.costPath = record.costPath;
@@ -980,7 +1748,7 @@ public:
   Option<std::string> cachePath{*this, "cache", llvm::cl::init("")};
   Option<std::string> architectureContract{
       *this, "architecture-contract",
-      llvm::cl::init("neura-architecture-v1:amoeba_4x4_full_mesh_context12")};
+      llvm::cl::init("")};
   Option<std::string> architectureTransferCatalog{
       *this, "architecture-transfer-catalog", llvm::cl::init("")};
   Option<std::string> modelNamespace{
@@ -989,6 +1757,27 @@ public:
   Option<std::string> seedManifest{*this, "seed-manifest", llvm::cl::init("")};
   Option<std::string> previousWinner{*this, "previous-winner",
                                      llvm::cl::init("")};
+  Option<std::string> historicalNativeWinner{
+      *this, "historical-native-winner", llvm::cl::init("")};
+  Option<std::string> activeTransferArgumentsText{
+      *this, "active-transfer-arguments",
+      llvm::cl::desc("Ordered comma-separated memref arguments whose static "
+                      "active-transfer proofs participate in search identity."),
+      llvm::cl::init("")};
+  Option<bool> activeTransferRequireProven{
+      *this, "active-transfer-require-proven",
+      llvm::cl::desc("Reject candidates unless every opted-in active-transfer "
+                     "argument remains statically proven."),
+      llvm::cl::init(true)};
+  Option<bool> requireSourceIterationDomain{*this, "require-source-iteration-domain",
+      llvm::cl::desc("Require complete source-domain proofs on every canonical task"),
+      llvm::cl::init(false)};
+  Option<bool> bootstrapSupportedShapes{
+      *this, "bootstrap-supported-shapes",
+      llvm::cl::desc("When a validated unit-shape query is explicitly outside "
+                     "the model interval, initialize that task to the "
+                     "minimum-area supported model shape"),
+      llvm::cl::init(false)};
   Option<int64_t> maxRounds{*this, "max-rounds", llvm::cl::init(kDefaultRounds)};
   Option<int64_t> maxCandidates{*this, "max-candidates",
                                 llvm::cl::init(kDefaultCandidates)};
@@ -1004,6 +1793,11 @@ public:
   Option<int64_t> checkpointActions{*this, "checkpoint-actions", llvm::cl::init(128)};
   Option<int64_t> pauseAfterCandidates{*this, "test-pause-after-candidates", llvm::cl::init(0)};
   Option<int64_t> minimumFreeBytes{*this, "minimum-free-bytes", llvm::cl::init(16777216)};
+  // One preserves the pre-existing serial scorer exactly.  Values above one
+  // parallelize only the production scheduler invocation after all candidate
+  // preparation and identity decisions have been committed by the owner.
+  Option<int64_t> scoringWorkers{*this, "scoring-workers", llvm::cl::init(1)};
+  Option<int64_t> maxPartitionFactor{*this, "max-partition-factor", llvm::cl::init(4)};
 
   void runOnOperation() override {
     ModuleOp canonical = getOperation();
@@ -1015,11 +1809,39 @@ public:
     if (outputDir.empty() || functionName.empty() || stage.empty() ||
         maxRounds <= 0 || maxCandidates <= 0 || beamWidth <= 0 ||
         diversitySlots <= 0 || diversitySlots > beamWidth || checkpointActions <= 0 ||
-        minimumFreeBytes < 0 || sourceContractFile.empty()) {
+        minimumFreeBytes < 0 || scoringWorkers <= 0 ||
+        scoringWorkers > kMaxScoringWorkers ||
+        (maxPartitionFactor != 4 && maxPartitionFactor != 8) ||
+        sourceContractFile.empty()) {
       fatal("neighborhood search requires positive budgets, valid beam/diversity limits, and source-contract-file");
       return;
     }
     if (!stageNumber(stage)) { fatal("unknown cumulative ablation stage"); return; }
+    if (bootstrapSupportedShapes) {
+      std::string protocolBytes;
+      if (!readFileBytes(protocolFile, protocolBytes, error)) {
+        fatal(error);
+        return;
+      }
+      auto protocolValue = json::parse(protocolBytes);
+      if (!protocolValue) {
+        error = "bound protocol is not JSON: " +
+                llvm::toString(protocolValue.takeError());
+        fatal(error);
+        return;
+      }
+      const json::Object *protocolObject = protocolValue->getAsObject();
+      const json::Object *protocolSearch =
+          protocolObject ? protocolObject->getObject("search") : nullptr;
+      std::optional<StringRef> policy = protocolSearch
+          ? protocolSearch->getString("supported_shape_bootstrap_policy")
+          : std::nullopt;
+      if (!policy || *policy != kSupportedShapeBootstrapPolicy) {
+        fatal("supported-shape bootstrap requires the matching policy in the "
+              "bound common protocol");
+        return;
+      }
+    }
     if (!parseStageFixed(stage) && maxCandidates < 2) {
       fatal("S2-S5 candidate budget must accommodate identity and previous measured control"); return;
     }
@@ -1043,6 +1865,51 @@ public:
         return;
       }
     }
+    const ::mlir::neura::Architecture &architecture =
+        ::mlir::neura::getArchitecture();
+    perCgraRows = architecture.getPerCgraRows();
+    perCgraCols = architecture.getPerCgraColumns();
+    if (perCgraRows <= 0 || perCgraCols <= 0) {
+      fatal("architecture has non-positive per-CGRA mapper dimensions");
+      return;
+    }
+    interTaskNetworkSpecOverrideBytes.reset();
+    StringRef networkOverridePath = getInterTaskNetworkSpecOverridePath();
+    if (!networkOverridePath.empty()) {
+      std::string networkBytes;
+      if (!readFileBytes(networkOverridePath, networkBytes, error)) {
+        fatal("cannot read inter-task network override: " + error);
+        return;
+      }
+      FailureOr<std::optional<InterTaskNetworkSpec>> network =
+          loadInterTaskNetworkSpec(networkOverridePath,
+                                   /*require_network=*/true, error);
+      if (failed(network) || !network->has_value()) {
+        fatal("invalid inter-task network override: " +
+              (error.empty() ? "network section is missing" : error));
+        return;
+      }
+      if (!network->value().validateForGrid(architecture.getMultiCgraRows(),
+                                            architecture.getMultiCgraColumns(),
+                                            error)) {
+        fatal("inter-task network override does not match the production "
+              "CGRA grid: " + error);
+        return;
+      }
+      interTaskNetworkSpecOverrideBytes = std::move(networkBytes);
+    }
+    if (architectureContract.empty()) {
+      StringRef architectureId =
+          llvm::sys::path::stem(architecturePath.getValue());
+      if (architectureId.empty()) {
+        fatal("cannot derive architecture contract from architecture-path");
+        return;
+      }
+      effectiveArchitectureContract =
+          "neura-architecture-v1:" + architectureId.str();
+    } else {
+      effectiveArchitectureContract = architectureContract.getValue();
+    }
     if (!ensureDirectory(outputDir, error) ||
         !ensureDirectory(outputDir + "/candidates", error)) { fatal(error); return; }
     const std::string candidatesDir = outputDir + "/candidates";
@@ -1050,20 +1917,170 @@ public:
     journalPath = outputDir + "/archive.journal.jsonl";
     FailureOr<func::FuncOp> selected = selectTaskFunction(canonical, functionName, error);
     if (failed(selected)) { fatal(error); return; }
+    if (!parseActiveTransferArguments(activeTransferArgumentsText.getValue(),
+                                      activeTransferArguments, error)) {
+      fatal(error);
+      return;
+    }
+    for (unsigned index : activeTransferArguments) {
+      if (index >= selected->getNumArguments() ||
+          !isa<MemRefType>(selected->getArgument(index).getType())) {
+        fatal("active-transfer-arguments contains a non-memref or out-of-range "
+              "function argument");
+        return;
+      }
+    }
+    sourceDomainCanonical = *selected;
+    sourceDomainEnabled = requireSourceIterationDomain;
+    selected->walk([&](taskflow::TaskflowTaskOp task) {
+      sourceDomainEnabled |= task->hasAttr(kSourceIterationDomainAttr);
+    });
+    if (sourceDomainEnabled &&
+        failed(verifySourceIterationDomainPartition(*selected, *selected, error))) {
+      fatal("canonical source-domain proof failed: " + error); return;
+    }
     auto metadata = collectAnalyticalTaskMetadata(*selected, error);
     if (failed(metadata) || metadata->empty()) { fatal(error.empty() ? "function has no analytical tasks" : error); return; }
     TaskShapeCostCache costCache;
     bool costCacheLoaded = false;
+    canonicalCostPath.clear();
     if (!parentCostFile.empty()) {
       auto graphId = readCatalogGraphId(parentCostFile);
+      if (bootstrapSupportedShapes &&
+          !mlir::amoeba::neura::verifyCurrentModelDomainCostCatalog(
+              canonical, functionName, parentCostFile, error)) {
+        fatal("parent model-domain cost proof does not match current source: " +
+              error);
+        return;
+      }
+      std::string expectedWitness =
+          bootstrapSupportedShapes ? neighborhoodReplaySourceText(canonical)
+                                  : std::string();
       if (!graphId || !costCache.load(parentCostFile, functionName, *metadata,
-          sourceRepository, sourceCommit, architecturePath, *graphId, error)) {
+          sourceRepository, sourceCommit, architecturePath, *graphId, error,
+          bootstrapSupportedShapes, expectedWitness)) {
         fatal("parent cost catalogue does not match current cost protocol: " + error); return;
+      }
+      costCacheLoaded = true;
+      canonicalCostPath = parentCostFile;
+    } else if (bootstrapSupportedShapes) {
+      if (modelPath.empty()) {
+        fatal("supported-shape bootstrap requires a validated parent "
+              "catalogue or the C++ predictor model");
+        return;
+      }
+      OwningOpRef<ModuleOp> predictorModule = canonical.clone();
+      auto predictorFunction =
+          selectTaskFunction(*predictorModule, functionName, error);
+      if (failed(predictorFunction)) { fatal(error); return; }
+      const std::string catalogueId = "canonical-supported-bootstrap";
+      bool fatalPredictorFailure = false;
+      if (!runCurrentCostPredictor(
+              *predictorModule, *predictorFunction, functionName, catalogueId,
+              outputDir, modelPath, cachePath, checkpointDirectoryForModel(),
+              effectiveArchitectureContract, architecturePath, perCgraRows,
+              perCgraCols, sourceRepository,
+              sourceCommit, architectureTransferCatalog, modelNamespace,
+              /*allowUnsupportedAboveModelCeiling=*/true, canonicalCostPath,
+              error, fatalPredictorFailure)) {
+        fatal("cannot generate canonical supported-shape catalogue: " + error);
+        return;
+      }
+      auto graphId = readCatalogGraphId(canonicalCostPath);
+      std::string expectedWitness =
+          neighborhoodReplaySourceText(*predictorModule);
+      if (!graphId ||
+          !mlir::amoeba::neura::verifyCurrentModelDomainCostCatalog(
+              *predictorModule, functionName, canonicalCostPath, error) ||
+          !costCache.load(
+              canonicalCostPath, functionName, *metadata, sourceRepository,
+              sourceCommit, architecturePath, *graphId, error,
+              /*allowModelDomainUnsupported=*/true,
+              expectedWitness)) {
+        fatal("generated canonical model-domain catalogue failed source "
+              "validation: " + error);
+        return;
       }
       costCacheLoaded = true;
     }
     if (!costCacheLoaded && modelPath.empty()) { fatal("validated parent costs or C++ predictor required"); return; }
+    canonicalBootstrapApplied = false;
+    canonicalAllUnitCostStatus = "supported";
+    canonicalAllUnitControlScored = false;
+    canonicalAllUnitUnsupportedQueries.clear();
+    canonicalIdentityShapes = initialShapes(*selected);
+    bool sourceIdentityWasAllUnit = llvm::all_of(
+        canonicalIdentityShapes, [](const NeighborhoodShape &shape) {
+          return shape.rows == 1 && shape.cols == 1;
+        });
+    if (bootstrapSupportedShapes) {
+      for (const TaskMetadata &task : *metadata) {
+        auto shapeIt = llvm::find_if(canonicalIdentityShapes,
+                                     [&](const NeighborhoodShape &shape) {
+                                       return shape.task == task.name;
+                                     });
+        if (shapeIt == canonicalIdentityShapes.end() ||
+            shapeIt->rows != 1 || shapeIt->cols != 1)
+          continue;
+        TaskShapeChoice unitChoice{
+            task.name, task.tripCount,
+            RectShape{1, 1, perCgraRows, perCgraCols}};
+        std::string costError;
+        const TaskShapeCost *unitCost = costCache.get(unitChoice, costError);
+        if (!unitCost) {
+          fatal("canonical unit-shape cost lookup failed: " + costError);
+          return;
+        }
+        if (unitCost->supported)
+          continue;
+        if (!unitCost->modelDomainUnsupported) {
+          fatal("canonical unit-shape query is unsupported without a "
+                "validated model-domain proof for task=" + task.name);
+          return;
+        }
+        canonicalBootstrapApplied = true;
+        canonicalAllUnitCostStatus = kModelDomainUnsupportedStatus.str();
+        canonicalAllUnitUnsupportedQueries.push_back(
+            {task.name, perCgraRows, perCgraCols,
+             unitCost->analyticalLowerBound,
+             unitCost->unsupportedReason});
+        bool foundSupported = false;
+        for (unsigned index = 0; index < 8; ++index) {
+          int64_t mapperRows = 0, mapperCols = 0;
+          if (!cgraShapeToMapperTileShape(
+                  kFormalMax4CgraRows[index], kFormalMax4CgraCols[index],
+                  perCgraRows, perCgraCols, mapperRows, mapperCols)) {
+            fatal("formal CGRA shape cannot be represented in mapper tiles");
+            return;
+          }
+          TaskShapeChoice choice{
+              task.name, task.tripCount,
+              RectShape{kFormalMax4CgraRows[index],
+                        kFormalMax4CgraCols[index], mapperRows,
+                        mapperCols}};
+          const TaskShapeCost *shapeCost = costCache.get(choice, costError);
+          if (!shapeCost) {
+            fatal("canonical supported-shape lookup failed: " + costError);
+            return;
+          }
+          if (!shapeCost->supported)
+            continue;
+          shapeIt->rows = kFormalMax4CgraRows[index];
+          shapeIt->cols = kFormalMax4CgraCols[index];
+          foundSupported = true;
+          break;
+        }
+        if (!foundSupported) {
+          fatal("task has no supported model shape for canonical identity: " +
+                task.name);
+          return;
+        }
+      }
+      canonicalAllUnitControlScored = sourceIdentityWasAllUnit &&
+                                      !canonicalBootstrapApplied;
+    }
     std::string binding;
+    historicalNativeWinnerBoundBytes.clear();
     if (!buildBinding(canonical, binding, error)) { fatal(error); return; }
     bindingPath = checkpointPath + ".binding.json";
     if (resume) {
@@ -1097,15 +2114,30 @@ public:
     } else {
       SearchState identity;
       identity.id = "neighborhood-" + std::to_string(nextSerial++);
-      identity.module = canonical.clone(); identity.shapes = initialShapes(*selected);
+      identity.module = canonical.clone(); identity.shapes = canonicalIdentityShapes;
       identity.control = true; identity.controlRoles.push_back("identity");
+      if (!prepareInitialActiveTransferFacts(identity.module.get(), functionName,
+                                             error)) {
+        fatal(error);
+        return;
+      }
       if (!prepareCandidateKey(identity, functionName, outputDir, nextSerial, error) ||
-          identity.key.empty()) { fatal(error.empty() ? "canonical identity facts unknown" : error); return; }
+          identity.key.empty()) {
+        fatal(error.empty()
+                  ? "canonical identity facts unknown: " +
+                        identity.rejectReason
+                  : error);
+        return;
+      }
       canonicalFactKey = identity.factKey;
+      identity.actionHistory.known = true;
+      identity.actionHistory.canonicalFactKey = canonicalFactKey;
+      identity.actionHistory.initialShapes = canonicalIdentityShapes;
       seenKeys.insert(identity.key); identity.keyReserved = true;
       if (!evaluateCandidate(identity, canonical, functionName, stage, outputDir,
           candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
-          scoredCount, nextSerial, error) || !identity.scored) {
+          scoredCount, /*chargeRoundQuota=*/false, nextSerial, error) ||
+          !identity.scored) {
         fatal(error.empty() ? "canonical identity cost/schedule unknown: " + identity.rejectReason : error); return;
       }
       if (!registerCandidate(identity, archive, seenKeys, rejectedCount,
@@ -1113,20 +2145,99 @@ public:
       beam.push_back(std::move(identity));
       auto ingest = [&](StringRef path, StringRef controlRole, bool required) -> bool {
         if (path.empty()) return !required;
+        const bool strictHistoricalSelection =
+            controlRole == "historical_measured_winner";
         std::string text;
-        if (!readFileBytes(path, text, error)) {
+        if (strictHistoricalSelection) {
+          text = historicalNativeWinnerBoundBytes;
+        } else if (!readFileBytes(path, text, error)) {
           if (!required) { error.clear(); return true; }
           return false;
+        }
+        if (strictHistoricalSelection) {
+          auto validationBuffer = llvm::MemoryBuffer::getMemBuffer(text);
+          unsigned nonemptyLines = 0;
+          for (llvm::line_iterator lines(*validationBuffer, true);
+               !lines.is_at_end(); ++lines) {
+            StringRef line = *lines;
+            if (line.trim().empty())
+              continue;
+            if (++nonemptyLines != 1) {
+              error = "historical native winner must contain exactly one selection record";
+              return false;
+            }
+            auto parsed = json::parse(line);
+            if (!parsed) {
+              llvm::consumeError(parsed.takeError());
+              error = "historical native winner selection is malformed JSON";
+              return false;
+            }
+            const json::Object *object = parsed->getAsObject();
+            auto recordType = object
+                                  ? object->getString("record_type")
+                                  : std::optional<StringRef>();
+            auto schema = object ? object->getString("schema")
+                                 : std::optional<StringRef>();
+            auto candidateId = object ? object->getString("candidate_id")
+                                      : std::optional<StringRef>();
+            auto declaredFunction = object ? object->getString("function")
+                                           : std::optional<StringRef>();
+            auto declaredRepository =
+                object ? object->getString("source_repository")
+                       : std::optional<StringRef>();
+            auto declaredCommit = object ? object->getString("source_commit")
+                                        : std::optional<StringRef>();
+            bool bestFound = object &&
+                             object->getBoolean("best_found").value_or(false);
+            bool valid = object && object->getBoolean("valid").value_or(false);
+            auto candidatePath = object ? object->getString("candidate_path")
+                                        : std::optional<StringRef>();
+            if (!object || !recordType || *recordType != "selection" ||
+                !schema || *schema != kSearchSchema || !candidateId ||
+                candidateId->empty() || !declaredFunction ||
+                *declaredFunction != functionName.getValue() ||
+                !declaredRepository ||
+                *declaredRepository != sourceRepository.getValue() ||
+                !declaredCommit || *declaredCommit != sourceCommit.getValue() ||
+                !bestFound || !valid || !candidatePath ||
+                candidatePath->empty()) {
+              error = "historical native winner lacks a valid source-owned selection record";
+              return false;
+            }
+          }
+          if (nonemptyLines != 1) {
+            error = "historical native winner selection file is empty";
+            return false;
+          }
         }
         auto buffer = llvm::MemoryBuffer::getMemBuffer(text);
         unsigned imported = 0;
         for (llvm::line_iterator lines(*buffer, true); !lines.is_at_end() && imported < 16; ++lines) {
           auto value = json::parse(*lines);
-          if (!value) { llvm::consumeError(value.takeError()); continue; }
+          if (!value) {
+            llvm::consumeError(value.takeError());
+            if (strictHistoricalSelection) {
+              error = "historical native winner selection is malformed JSON";
+              return false;
+            }
+            continue;
+          }
           const auto *object = value->getAsObject();
-          if (!object) continue;
+          if (!object) {
+            if (strictHistoricalSelection) {
+              error = "historical native winner selection is not a JSON object";
+              return false;
+            }
+            continue;
+          }
           auto type = object->getString("record_type").value_or("");
-          if (type != "selection" && type != "control" && type != "score") continue;
+          if (type != "selection" && type != "control" && type != "score") {
+            if (strictHistoricalSelection) {
+              error = "historical native winner record type is not selection";
+              return false;
+            }
+            continue;
+          }
           std::string sourcePath = object->getString("candidate_path").value_or(
               object->getString("mapper_replay_path").value_or(
                   object->getString("mlir_path").value_or(""))).str();
@@ -1138,44 +2249,151 @@ public:
           seed.id = "neighborhood-seed-" + std::to_string(nextSerial++);
           seed.module = sourcePath.empty() ? canonical.clone() :
               parseSourceFile<ModuleOp>(sourcePath, canonical.getContext());
-          if (!seed.module) { if (required) { error = "previous winner module missing: " + sourcePath; return false; } continue; }
-          if (!validateStageSeed(seed.module.get(), stage, error)) {
+          if (!seed.module) {
+            if (required) {
+              error = strictHistoricalSelection
+                          ? "historical native winner module missing: " + sourcePath
+                          : "previous winner module missing: " + sourcePath;
+              return false;
+            }
+            continue;
+          }
+          if (!validateStageSeed(seed.module.get(), stage,
+                                 sourceDomainEnabled, error)) {
             if (required) return false;
+            const std::string reason =
+                "seed_stage_gate_rejected:" + error;
+            appendRejected(archive, seed, reason, 0);
+            ++rejectedCount;
             error.clear(); continue;
           }
           auto function = selectTaskFunction(seed.module.get(), functionName, error);
-          if (failed(function)) { if (required) return false; error.clear(); continue; }
-          if (!parseShapeArrayFromObject(*object, seed.shapes)) {
-            const auto *score = object->getObject("score_record");
-            const auto *costs = score ? score->getArray("task_costs") : object->getArray("task_costs");
-            if (costs) for (const auto &entry : *costs) {
-              const auto *cost = entry.getAsObject();
-              if (!cost) continue;
-              auto task = cost->getString("task");
-              auto rows = cost->getInteger("mapper_tile_rows"), cols = cost->getInteger("mapper_tile_cols");
-              if (task && rows && cols && *rows > 0 && *cols > 0 && *rows % 4 == 0 && *cols % 4 == 0)
-                seed.shapes.push_back({task->str(), *rows / 4, *cols / 4});
-            }
+          if (failed(function)) {
+            if (required)
+              return false;
+            const std::string reason =
+                "seed_function_rejected:" +
+                (error.empty() ? "unknown_function_failure" : error);
+            appendRejected(archive, seed, reason, 0);
+            ++rejectedCount;
+            error.clear();
+            continue;
           }
-          if (seed.shapes.empty()) seed.shapes = initialShapes(*function);
+          if (!prepareInitialActiveTransferFacts(seed.module.get(), functionName,
+                                                 error)) {
+            if (required)
+              return false;
+            const std::string reason =
+                "seed_active_transfer_rejected:" +
+                (error.empty() ? "unknown_active_transfer_failure" : error);
+            appendRejected(archive, seed, reason, 0);
+            ++rejectedCount;
+            error.clear();
+            continue;
+          }
+          bool parsedShapes = parseShapeArrayFromObject(*object, seed.shapes);
+          if (strictHistoricalSelection && !parsedShapes) {
+            error = "historical native winner selection lacks complete task shapes";
+            return false;
+          }
+          const auto *score = object->getObject("score_record");
+          const auto *costs = score ? score->getArray("task_costs")
+                                    : object->getArray("task_costs");
+          std::vector<NeighborhoodShape> costShapes;
+          std::string invalidMapperShapeReason;
+          if (costs) for (const auto &entry : *costs) {
+            const auto *cost = entry.getAsObject();
+            if (!cost)
+              continue;
+            auto task = cost->getString("task");
+            auto rows = cost->getInteger("mapper_tile_rows");
+            auto cols = cost->getInteger("mapper_tile_cols");
+            if (!task || !rows || !cols)
+              continue;
+            if (*rows <= 0 || *cols <= 0 || *rows % perCgraRows != 0 ||
+                *cols % perCgraCols != 0) {
+              invalidMapperShapeReason =
+                  "seed_mapper_shape_not_aligned_to_architecture_cgra:" +
+                  task->str() + ":mapper=" + std::to_string(*rows) + "x" +
+                  std::to_string(*cols) + ":per-cgra=" +
+                  std::to_string(perCgraRows) + "x" +
+                  std::to_string(perCgraCols);
+              break;
+            }
+            costShapes.push_back(
+                {task->str(), *rows / perCgraRows, *cols / perCgraCols});
+          }
+          if (!invalidMapperShapeReason.empty()) {
+            if (required) {
+              error = invalidMapperShapeReason;
+              return false;
+            }
+            appendRejected(archive, seed, invalidMapperShapeReason, 0);
+            ++rejectedCount;
+            error.clear();
+            continue;
+          }
+          if (!parsedShapes)
+            seed.shapes = std::move(costShapes);
+          if (seed.shapes.empty()) {
+            if (strictHistoricalSelection) {
+              error = "historical native winner selection has no task shapes";
+              return false;
+            }
+            seed.shapes = initialShapes(*function);
+          }
+          if (!parseStringArray(object->getArray("action_path"), seed.path))
+            seed.path.clear();
+          importTypedActionHistory(*object, seed.actionHistory);
           seed.control = !controlRole.empty();
           if (seed.control) seed.controlRoles.push_back(controlRole.str());
           if (!prepareCandidateKey(seed, functionName, outputDir, nextSerial, error) || seed.key.empty()) {
-            if (required) { if (error.empty()) error = "previous winner canonical facts unknown"; return false; }
+            if (required) {
+              if (error.empty())
+                error = "previous winner canonical facts unknown: " +
+                        seed.rejectReason;
+              return false;
+            }
+            const std::string reason =
+                "seed_candidate_facts_unknown:" +
+                (seed.rejectReason.empty() ? error : seed.rejectReason);
+            appendRejected(archive, seed, reason, 0);
+            ++rejectedCount;
             error.clear(); continue;
           }
+          if (!authenticateTypedActionHistory(seed, canonical, functionName,
+                                              outputDir, nextSerial, error))
+            return false;
           if (!seenKeys.insert(seed.key).second) {
-            if (!mergeDuplicate(seed, archive, candidatesDir, error)) return false;
+            if (!mergeDuplicate(seed, canonical, functionName, archive,
+                                outputDir, candidatesDir, nextSerial, error))
+              return false;
             ++imported; continue;
           }
           seed.keyReserved = true;
-          if (!required && scoredCount + (!previousWinner.empty() ? 1 : 0) >= uint64_t(maxCandidates)) {
+          if (strictHistoricalSelection &&
+              scoredCount >= static_cast<uint64_t>(maxCandidates)) {
+            error = "distinct historical native winner exceeds max-candidates budget";
+            return false;
+          }
+          const uint64_t reservedControlScores =
+              (!previousWinner.empty() ? 1 : 0) +
+              (!historicalNativeWinner.empty() ? 1 : 0);
+          if (!required && scoredCount + reservedControlScores >=
+                               uint64_t(maxCandidates)) {
             seenKeys.erase(seed.key); break;
           }
           if (!evaluateCandidate(seed, canonical, functionName, stage, outputDir,
               candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
-              scoredCount, nextSerial, error)) return false;
-          if (required && !seed.scored) { error = "previous measured winner could not be scored: " + seed.rejectReason; return false; }
+              scoredCount, /*chargeRoundQuota=*/false, nextSerial, error))
+            return false;
+          if (required && !seed.scored) {
+            error = (strictHistoricalSelection
+                         ? "historical native winner could not be rescored: "
+                         : "previous measured winner could not be scored: ") +
+                    seed.rejectReason;
+            return false;
+          }
           if (!registerCandidate(seed, archive, seenKeys, rejectedCount, candidatesDir, error)) return false;
           if (seed.scored) beam.push_back(std::move(seed));
           ++imported;
@@ -1185,14 +2403,23 @@ public:
         return true;
       };
       if (!ingest(seedManifest, "", false) ||
-          !ingest(previousWinner, "previous_stage_measured_winner", !previousWinner.empty())) {
+          !ingest(previousWinner, "previous_stage_measured_winner", !previousWinner.empty()) ||
+          !ingest(historicalNativeWinner, "historical_measured_winner",
+                  !historicalNativeWinner.empty())) {
         fatal(error.empty() ? "seed import failed" : error); return;
       }
       beam = selectBeam(std::move(beam), beamWidth, diversitySlots);
       if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
+      roundScoredCount = 0;
+      roundScoreLimit = perRoundScoreQuota(
+          scoredCount, static_cast<uint64_t>(maxCandidates.getValue()),
+          maxRounds.getValue() - round);
       if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
           canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
     }
+    std::map<std::string, uint64_t> successfulFamilyScores =
+        successfulActionFamilyScores(archive, round);
+    const std::map<std::string, uint64_t> noReservedFamilyScores;
     auto began = std::chrono::steady_clock::now();
     const int64_t previousElapsed = elapsedMilliseconds;
     uint64_t actionsSinceCheckpoint = 0;
@@ -1200,16 +2427,24 @@ public:
       if (beam.empty()) { stopReason = "no-new-legal-candidates"; break; }
       if (pending.empty()) {
         generated.clear(); pendingCursor = 0;
-        for (auto indexed : llvm::enumerate(beam)) {
-          auto actions = enumerateNeighborhoodActions(indexed.value().module.get(),
-              functionName, indexed.value().shapes, stage, static_cast<unsigned>(round));
-          for (auto &action : actions) pending.push_back({indexed.index(), std::move(action)});
-        }
+        pending = enumerateBalancedPendingNeighbors(
+            beam, functionName, stage, static_cast<unsigned>(round),
+            static_cast<unsigned>(maxPartitionFactor.getValue()));
         if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
             canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
       }
-      while (pendingCursor < pending.size() && scoredCount < static_cast<uint64_t>(maxCandidates)) {
+      std::map<std::string, uint64_t> remainingPendingFamilies =
+          pendingActionFamilyCounts(pending, pendingCursor);
+      if (scoringWorkers <= 1) {
+      while (pendingCursor < pending.size() &&
+             scoredCount < static_cast<uint64_t>(maxCandidates) &&
+             roundScoredCount < roundScoreLimit) {
+        prioritizeNextPendingActionFamily(pending, pendingCursor,
+                                          successfulFamilyScores,
+                                          noReservedFamilyScores,
+                                          remainingPendingFamilies);
         const auto &neighbor = pending[pendingCursor];
+        const std::string actionFamily = neighbor.action.family;
         if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
         SearchState &parent = beam[neighbor.parent];
         SearchState child;
@@ -1217,40 +2452,56 @@ public:
         child.parentId = parent.id; child.path = parent.path;
         child.path.push_back(actionSignature(neighbor.action));
         child.shapes = parent.shapes; child.module = parent.module->clone();
-        std::string reason, diagnostic;
-        bool materialized = applyNeighborhoodAction(child.module.get(), canonical,
-            functionName, neighbor.action, child.shapes, reason, diagnostic);
-        if (!materialized) {
-          if (fatalStorageError(diagnostic) || fatalStorageError(reason)) { fatal(reason + ":" + diagnostic); return; }
+        std::string reason, diagnostic, materializeError;
+        NeighborMaterialization materialization = materializeNeighbor(
+            child, parent, canonical, functionName, outputDir,
+            neighbor.action, canonicalFactKey, nextSerial, reason, diagnostic,
+            materializeError);
+        if (materialization == NeighborMaterialization::Fatal) {
+          fatal(materializeError);
+          return;
+        }
+        if (materialization == NeighborMaterialization::Rejected) {
           ++rejectedCount; appendRejected(archive, child,
               (reason.empty() ? "unsupported_or_unknown_action" : reason) + ":" + diagnostic, round);
         } else {
-          auto function = selectTaskFunction(child.module.get(), functionName, error);
-          if (failed(function)) { fatal(error); return; }
-          auto oldShapes = child.shapes; synchronizeShapes(*function, oldShapes, child.shapes);
-          if (!prepareCandidateKey(child, functionName, outputDir, nextSerial, error)) { fatal(error); return; }
-          if (child.key.empty()) {
-            ++rejectedCount; appendRejected(archive, child, child.rejectReason, round);
-          } else if (!seenKeys.insert(child.key).second) {
-            ++rejectedCount;
-            if (!mergeDuplicate(child, archive, candidatesDir, error)) { fatal(error); return; }
-          } else {
-            child.keyReserved = true;
-            if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
-                candidatesDir, canonicalFactKey, costCacheLoaded, costCache,
-                round, scoredCount, nextSerial, error) ||
-                !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error)) { fatal(error); return; }
-            archive.back().round = round;
-            if (child.scored) {
-              generated.push_back(std::move(child));
-              // Keep the expansion frontier bounded rather than serializing
-              // every evaluated program in a round. Four diverse slots remain
-              // available independently of the twelve cost-selected slots.
-              generated = selectBeam(std::move(generated), beamWidth, diversitySlots);
+          if (!child.key.empty() && child.rejectReason.empty()) {
+            if (!seenKeys.insert(child.key).second) {
+              ++rejectedCount;
+              if (!mergeDuplicate(child, canonical, functionName, archive,
+                                  outputDir, candidatesDir, nextSerial, error)) {
+                fatal(error);
+                return;
+              }
+            } else {
+              child.keyReserved = true;
+              if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
+                  candidatesDir, canonicalFactKey, costCacheLoaded, costCache,
+                  round, scoredCount, /*chargeRoundQuota=*/true, nextSerial,
+                  error) ||
+                  !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error)) { fatal(error); return; }
+              archive.back().round = round;
+              if (child.scored) {
+                ++successfulFamilyScores[neighbor.action.family];
+                generated.push_back(std::move(child));
+                // Keep the expansion frontier bounded rather than serializing
+                // every evaluated program in a round. Four diverse slots remain
+                // available independently of the twelve cost-selected slots.
+                generated = selectBeam(std::move(generated), beamWidth, diversitySlots);
+              }
             }
+          } else if (child.key.empty() && child.rejectReason.empty()) {
+            ++rejectedCount;
+            appendRejected(archive, child,
+                           "active_transfer_proof_unsupported:"
+                               "proof preparation returned no candidate key",
+                           round);
+          } else if (child.key.empty()) {
+            ++rejectedCount; appendRejected(archive, child, child.rejectReason, round);
           }
         }
         ++pendingCursor; ++actionsSinceCheckpoint;
+        consumePendingActionFamily(remainingPendingFamilies, actionFamily);
         bool pause = pauseAfterCandidates > 0 && scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
         if (actionsSinceCheckpoint >= static_cast<uint64_t>(checkpointActions) || pause) {
           if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
@@ -1260,8 +2511,259 @@ public:
         }
         if (pause) { stopReason = "explicit-pause"; break; }
       }
-      if (stopReason == "explicit-pause" || scoredCount >= static_cast<uint64_t>(maxCandidates)) break;
+      } else {
+        // The worker path below keeps all action application, graph-fact and
+        // catalogue work in this owner thread.  Only the already-prepared
+        // production scheduler calls cross the context boundary.
+        const unsigned requestedWorkers =
+            static_cast<unsigned>(scoringWorkers.getValue());
+        const DialectRegistry &workerRegistry =
+            canonical.getContext()->getDialectRegistry();
+        while (pendingCursor < pending.size() &&
+               scoredCount < static_cast<uint64_t>(maxCandidates) &&
+               roundScoredCount < roundScoreLimit) {
+          const uint64_t scoreBudget =
+              static_cast<uint64_t>(maxCandidates) - scoredCount;
+          const uint64_t roundScoreBudget =
+              roundScoreLimit - roundScoredCount;
+          const uint64_t pauseBudget =
+              pauseAfterCandidates > 0 &&
+                      scoredCount < static_cast<uint64_t>(pauseAfterCandidates)
+                  ? static_cast<uint64_t>(pauseAfterCandidates) - scoredCount
+                  : scoreBudget;
+          const uint64_t batchScoreLimit =
+              std::min({scoreBudget, roundScoreBudget, pauseBudget});
+          if (batchScoreLimit == 0)
+            break;
+          const uint64_t checkpointBudget =
+              static_cast<uint64_t>(checkpointActions) -
+              std::min<uint64_t>(actionsSinceCheckpoint,
+                                 static_cast<uint64_t>(checkpointActions));
+          const size_t batchItemLimit = std::max<size_t>(
+              1, std::min<uint64_t>(requestedWorkers * 4ULL,
+                                    std::max<uint64_t>(1, checkpointBudget)));
+
+          std::vector<ParallelBatchItem> items;
+          std::vector<ParallelScoreJob> jobs;
+          std::map<std::string, uint64_t> reservedFamilyScores;
+          items.reserve(batchItemLimit);
+          jobs.reserve(std::min<uint64_t>(batchScoreLimit, batchItemLimit));
+          uint64_t cursor = pendingCursor;
+          const auto preparationBegan = std::chrono::steady_clock::now();
+          while (cursor < pending.size() && jobs.size() < batchScoreLimit &&
+                 items.size() < batchItemLimit) {
+            prioritizeNextPendingActionFamily(pending, cursor,
+                                              successfulFamilyScores,
+                                              reservedFamilyScores,
+                                              remainingPendingFamilies);
+            const PendingNeighbor &neighbor = pending[cursor];
+            if (neighbor.parent >= beam.size()) {
+              fatal("checkpoint pending parent outside beam");
+              return;
+            }
+            SearchState &parent = beam[neighbor.parent];
+            SearchState child;
+            child.id = "neighborhood-" + std::to_string(nextSerial++);
+            child.parentId = parent.id;
+            child.path = parent.path;
+            child.path.push_back(actionSignature(neighbor.action));
+            child.shapes = parent.shapes;
+            child.module = parent.module->clone();
+            ParallelBatchItem item;
+            item.pendingIndex = cursor;
+            item.actionFamily = neighbor.action.family;
+            item.state = std::move(child);
+            std::string reason, diagnostic, materializeError;
+            NeighborMaterialization materialization = materializeNeighbor(
+                item.state, parent, canonical, functionName, outputDir,
+                neighbor.action, canonicalFactKey, nextSerial, reason,
+                diagnostic, materializeError);
+            if (materialization == NeighborMaterialization::Fatal) {
+              fatal(materializeError);
+              return;
+            }
+            if (materialization == NeighborMaterialization::Rejected) {
+              item.kind = ParallelBatchItemKind::Rejected;
+              item.state.rejectReason =
+                  (reason.empty() ? "unsupported_or_unknown_action" : reason) +
+                  ":" + diagnostic;
+            } else {
+              if (item.state.key.empty()) {
+                item.kind = ParallelBatchItemKind::Rejected;
+                item.state.rejectReason = "graph_facts_unknown";
+              } else if (!seenKeys.insert(item.state.key).second) {
+                // A duplicate whose key was reserved by an earlier item in
+                // this batch is committed in order below, after that earlier
+                // archive record exists.  Duplicates from an older batch can
+                // be merged immediately at the same ordered commit point.
+                item.kind = ParallelBatchItemKind::Duplicate;
+              } else {
+                item.state.keyReserved = true;
+                if (!prepareParallelCandidate(
+                        item.state, canonical, functionName, stage, outputDir,
+                        canonicalFactKey, costCacheLoaded, costCache,
+                        nextSerial, error)) {
+                  fatal(error);
+                  return;
+                }
+                if (item.state.rejectReason.empty() &&
+                    !item.state.choices.empty()) {
+                  item.kind = ParallelBatchItemKind::Score;
+                  ParallelScoreJob job;
+                  job.moduleIR = neighborhoodReplaySourceText(
+                      item.state.module.get());
+                  job.functionName = functionName.getValue();
+                  job.candidateID = item.state.id;
+                  job.choices = item.state.choices;
+                  job.durations = item.state.durations;
+                  job.fixedDispatch = parseStageFixed(stage);
+                  item.jobIndex = jobs.size();
+                  jobs.push_back(std::move(job));
+                  ++reservedFamilyScores[item.actionFamily];
+                } else {
+                  item.kind = ParallelBatchItemKind::Rejected;
+                }
+              }
+            }
+            items.push_back(std::move(item));
+            consumePendingActionFamily(remainingPendingFamilies,
+                                       neighbor.action.family);
+            ++cursor;
+          }
+          parallelPreparationMilliseconds +=
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - preparationBegan)
+                  .count();
+          if (items.empty())
+            break;
+          parallelBatchItemSizes.push_back(items.size());
+          parallelBatchScoreJobSizes.push_back(jobs.size());
+          parallelScoredJobs += jobs.size();
+
+          std::vector<ParallelScoreResult> results;
+          std::string workerError;
+          const auto scoringBegan = std::chrono::steady_clock::now();
+          if (!runPrivateProductionScores(jobs, workerRegistry,
+                                          requestedWorkers, parallelWorkerPool,
+                                          results, parallelModuleCacheHits,
+                                          parallelModuleCacheMisses,
+                                          workerError)) {
+            // No archive, ranking, budget, or frontier state has been
+            // committed for this batch.  The last durable checkpoint remains
+            // a safe replay cursor if the pass is resumed after this failure.
+            fatal(workerError);
+            return;
+          }
+          parallelScoringMilliseconds +=
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - scoringBegan)
+                  .count();
+
+          bool batchFailed = false;
+          for (const ParallelBatchItem &item : items)
+            if (item.kind == ParallelBatchItemKind::Score &&
+                (item.jobIndex >= results.size() ||
+                 !results[item.jobIndex].finished ||
+                 results[item.jobIndex].fatal)) {
+              batchFailed = true;
+              workerError = item.jobIndex < results.size()
+                                ? results[item.jobIndex].error
+                                : "parallel scoring result index is invalid";
+              break;
+            }
+          if (batchFailed) {
+            fatal(workerError.empty() ? "parallel scoring worker failed"
+                                      : workerError);
+            return;
+          }
+
+          const auto commitBegan = std::chrono::steady_clock::now();
+          for (ParallelBatchItem &item : items) {
+            SearchState &child = item.state;
+            if (item.kind == ParallelBatchItemKind::Rejected) {
+              ++rejectedCount;
+              appendRejected(archive, child,
+                             child.rejectReason.empty()
+                                 ? "unsupported_or_unknown_action"
+                                 : child.rejectReason,
+                             round);
+            } else if (item.kind == ParallelBatchItemKind::Duplicate) {
+              ++rejectedCount;
+              if (!mergeDuplicate(child, canonical, functionName, archive,
+                                  outputDir, candidatesDir, nextSerial, error)) {
+                fatal(error);
+                return;
+              }
+            } else {
+              ParallelScoreResult &result = results[item.jobIndex];
+              // Every production invocation consumes one budget unit, even
+              // when the unchanged scheduler rejects the candidate.
+              ++scoredCount;
+              ++productionSchedulerCalls;
+              ++roundScoredCount;
+              if (result.scored) {
+                child.schedule = std::move(result.schedule);
+                child.score = child.schedule.makespan;
+                child.scored = true;
+                child.rejectReason.clear();
+                ++successfulFamilyScores[item.actionFamily];
+              } else {
+                child.rejectReason = "production_scheduler_rejected";
+                if (!result.error.empty())
+                  child.rejectReason += ":" + result.error;
+                child.scored = false;
+              }
+              if (!registerCandidate(child, archive, seenKeys, rejectedCount,
+                                     candidatesDir, error)) {
+                fatal(error);
+                return;
+              }
+              archive.back().round = round;
+              if (child.scored) {
+                generated.push_back(std::move(child));
+                generated = selectBeam(std::move(generated), beamWidth,
+                                       diversitySlots);
+              }
+            }
+            ++actionsSinceCheckpoint;
+          }
+          parallelCommitMilliseconds +=
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - commitBegan)
+                  .count();
+          pendingCursor = cursor;
+          const bool pause =
+              pauseAfterCandidates > 0 &&
+              scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
+          if (actionsSinceCheckpoint >=
+                  static_cast<uint64_t>(checkpointActions) ||
+              pause) {
+            if (!saveCheckpoint(
+                    checkpointPath, round, nextSerial, scoredCount,
+                    rejectedCount, canonicalFactKey, archive, beam, generated,
+                    pending, pendingCursor, pause ? "explicit-pause" : "",
+                    error)) {
+              fatal(error);
+              return;
+            }
+            actionsSinceCheckpoint = 0;
+          }
+          if (pause) {
+            stopReason = "explicit-pause";
+            break;
+          }
+        }
+      }
+      if (stopReason == "explicit-pause" ||
+          scoredCount >= static_cast<uint64_t>(maxCandidates))
+        break;
       ++round; pending.clear(); pendingCursor = 0;
+      remainingPendingFamilies.clear();
+      successfulFamilyScores.clear();
+      roundScoredCount = 0;
+      roundScoreLimit = perRoundScoreQuota(
+          scoredCount, static_cast<uint64_t>(maxCandidates.getValue()),
+          maxRounds.getValue() - round);
       if (generated.empty()) { stopReason = "no-new-legal-candidates"; break; }
       beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
       if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
@@ -1278,10 +2780,15 @@ public:
         sourceRepository, sourceCommit, architecturePath, protocolFile,
         maxRounds, maxCandidates, beamWidth, diversitySlots, round,
         scoredCount, rejectedCount, costCacheLoaded, !previousWinner.empty(),
+        !historicalNativeWinner.empty(),
         archive, stopReason, error)) { fatal(error); return; }
   }
 
 private:
+  int64_t perCgraRows = 0;
+  int64_t perCgraCols = 0;
+  std::string effectiveArchitectureContract;
+
   std::string checkpointDirectoryForModel() const {
     if (modelPath.empty())
       return {};
@@ -1297,6 +2804,9 @@ private:
     record.parentId = state.parentId;
     record.key = state.key; record.factKey = state.factKey;
     record.path = state.path;
+    record.actionHistory = portableActionHistory(state.actionHistory);
+    markActionHistoryUnknown(record.actionHistory,
+                             "rejected_candidate_history_not_materialized");
     record.shapes = state.shapes;
     record.rejectReason = reason.str();
     record.round = round;
@@ -1314,6 +2824,725 @@ private:
     }
   }
 
+  bool collectHistoryTaskNames(ModuleOp module, StringRef functionName,
+                               std::vector<std::string> &names,
+                               std::string &error) const {
+    FailureOr<func::FuncOp> function =
+        selectTaskFunction(module, functionName, error);
+    if (failed(function))
+      return false;
+    FailureOr<SmallVector<TaskMetadata>> metadata =
+        collectAnalyticalTaskMetadata(*function, error);
+    if (failed(metadata))
+      return false;
+    names.clear();
+    for (const TaskMetadata &task : *metadata)
+      names.push_back(task.name);
+    return !names.empty();
+  }
+
+  static void recordTypedAction(
+      SearchState::TypedActionHistory &history,
+      const NeighborhoodAction &action,
+      ArrayRef<std::string> beforeNames,
+      ArrayRef<std::string> afterNames) {
+    if (action.canonicalReset) {
+      history.actions.clear();
+      history.dependencies.clear();
+      history.taskProducers.clear();
+    }
+
+    std::set<uint64_t> dependencies;
+    auto addDependency = [&](StringRef task) {
+      auto producer = history.taskProducers.find(task.str());
+      if (producer != history.taskProducers.end() &&
+          producer->second < history.actions.size())
+        dependencies.insert(producer->second);
+    };
+    if (!action.canonicalReset) {
+      if (!action.shapeTask.empty())
+        addDependency(action.shapeTask);
+      for (const NeighborhoodPrimitive &primitive : action.primitives) {
+        if (!primitive.firstTask.empty())
+          addDependency(primitive.firstTask);
+        if (!primitive.secondTask.empty())
+          addDependency(primitive.secondTask);
+      }
+    }
+
+    const uint64_t actionIndex = history.actions.size();
+    history.actions.push_back(action);
+    history.dependencies.emplace_back(dependencies.begin(), dependencies.end());
+
+    if (action.canonicalReset)
+      return;
+    std::set<std::string> after(afterNames.begin(), afterNames.end());
+    std::set<std::string> before(beforeNames.begin(), beforeNames.end());
+    for (auto it = history.taskProducers.begin();
+         it != history.taskProducers.end();) {
+      if (!after.count(it->first))
+        it = history.taskProducers.erase(it);
+      else
+        ++it;
+    }
+    for (const std::string &name : afterNames)
+      if (!before.count(name))
+        history.taskProducers[name] = actionIndex;
+
+    // Some source-owned edits preserve a task name while changing its
+    // lineage. Attribute that surviving name to the latest typed primitive;
+    // replay, rather than attrs, remains the authority for this relation.
+    for (const NeighborhoodPrimitive &primitive : action.primitives) {
+      if (!primitive.firstTask.empty() && after.count(primitive.firstTask))
+        history.taskProducers[primitive.firstTask] = actionIndex;
+      if (!primitive.secondTask.empty() && after.count(primitive.secondTask))
+        history.taskProducers[primitive.secondTask] = actionIndex;
+    }
+  }
+
+  bool replayTypedActionHistory(
+      const SearchState::TypedActionHistory &history, ModuleOp canonical,
+      StringRef functionName, StringRef outputDirectory, uint64_t serial,
+      SearchState &replayed, std::string &reason,
+      std::string &fatalError) {
+    reason.clear();
+    fatalError.clear();
+    if (!history.known || history.canonicalFactKey.empty() ||
+        history.initialShapes.empty()) {
+      reason = "typed_action_history_not_authenticated";
+      return false;
+    }
+    replayed = SearchState();
+    replayed.module = canonical.clone();
+    replayed.shapes = history.initialShapes;
+    replayed.actionHistory = portableActionHistory(history);
+    for (const NeighborhoodShape &shape : replayed.shapes)
+      if (shape.rows <= 0 || shape.cols <= 0 || shape.rows > 4 ||
+          shape.cols > 4 || shape.rows * shape.cols > 4) {
+        reason = "typed_action_history_initial_shape_outside_area_four";
+        return false;
+      }
+    if (!prepareInitialActiveTransferFacts(replayed.module.get(), functionName,
+                                           reason)) {
+      reason = "typed_action_history_initial_proof_unsupported:" + reason;
+      return false;
+    }
+    std::vector<std::string> names;
+    std::string taskError;
+    FailureOr<func::FuncOp> canonicalFunction =
+        selectTaskFunction(replayed.module.get(), functionName, taskError);
+    if (failed(canonicalFunction)) {
+      reason = "typed_action_history_initial_function_missing:" + taskError;
+      return false;
+    }
+    FailureOr<SmallVector<TaskMetadata>> canonicalMetadata =
+        collectAnalyticalTaskMetadata(*canonicalFunction, taskError);
+    if (!collectHistoryTaskNames(replayed.module.get(), functionName, names,
+                                 taskError) ||
+        failed(canonicalMetadata) ||
+        !sameTaskSet(*canonicalMetadata, replayed.shapes)) {
+      reason = "typed_action_history_initial_shapes_do_not_cover_canonical_tasks";
+      if (!taskError.empty())
+        reason += ":" + taskError;
+      return false;
+    }
+    if (!prepareCandidateKey(replayed, functionName, outputDirectory, serial,
+                             fatalError)) {
+      if (!fatalStorageError(fatalError)) {
+        reason = "typed_action_history_canonical_facts_unavailable:" +
+                 fatalError;
+        fatalError.clear();
+      }
+      return false;
+    }
+    if (replayed.key.empty() ||
+        replayed.factKey != history.canonicalFactKey) {
+      reason = replayed.rejectReason.empty()
+                   ? "typed_action_history_canonical_fact_key_mismatch"
+                   : "typed_action_history_canonical_facts_unknown:" +
+                         replayed.rejectReason;
+      return false;
+    }
+
+    replayed.actionHistory = portableActionHistory(history);
+    replayed.actionHistory.actions.clear();
+    replayed.actionHistory.dependencies.clear();
+    replayed.actionHistory.taskProducers.clear();
+    for (const NeighborhoodAction &action : history.actions) {
+      if (action.family == "lineage-replacement") {
+        reason = "typed_action_history_contains_nonreplayable_lineage_replacement";
+        return false;
+      }
+      std::vector<std::string> beforeNames;
+      if (!collectHistoryTaskNames(replayed.module.get(), functionName,
+                                   beforeNames, taskError)) {
+        reason = "typed_action_history_task_set_unknown:" + taskError;
+        return false;
+      }
+      std::string applyReason, diagnostic;
+      if (!applyTrustedNeighborhoodAction(
+              replayed.module.get(), canonical, functionName, action,
+              replayed.shapes, applyReason, diagnostic,
+              static_cast<unsigned>(maxPartitionFactor.getValue()))) {
+        reason = "typed_action_history_replay_unsupported:";
+        if (applyReason.empty())
+          reason += "unknown_action";
+        else
+          reason += applyReason;
+        if (!diagnostic.empty())
+          reason += ":" + diagnostic;
+        if (fatalStorageError(reason)) {
+          fatalError = reason;
+          reason.clear();
+        }
+        return false;
+      }
+      FailureOr<func::FuncOp> function =
+          selectTaskFunction(replayed.module.get(), functionName, taskError);
+      if (failed(function)) {
+        reason = "typed_action_history_replay_function_missing:" + taskError;
+        return false;
+      }
+      if (!refreshActiveTransferFactsAfterTrustedRewrite(*function, taskError)) {
+        reason = "typed_action_history_replay_proof_unsupported:" + taskError;
+        return false;
+      }
+      std::vector<NeighborhoodShape> priorShapes = replayed.shapes;
+      synchronizeShapes(*function, priorShapes, replayed.shapes);
+      replayed.key.clear();
+      replayed.factKey.clear();
+      replayed.rejectReason.clear();
+      if (!prepareCandidateKey(replayed, functionName, outputDirectory, serial,
+                               fatalError)) {
+        if (!fatalStorageError(fatalError)) {
+          reason = "typed_action_history_replay_facts_unavailable:" +
+                   fatalError;
+          fatalError.clear();
+        }
+        return false;
+      }
+      if (replayed.key.empty()) {
+        reason = "typed_action_history_replay_facts_unknown:" +
+                 replayed.rejectReason;
+        return false;
+      }
+      std::vector<std::string> afterNames;
+      if (!collectHistoryTaskNames(replayed.module.get(), functionName,
+                                   afterNames, taskError)) {
+        reason = "typed_action_history_result_task_set_unknown:" + taskError;
+        return false;
+      }
+      recordTypedAction(replayed.actionHistory, action, beforeNames,
+                        afterNames);
+    }
+    return true;
+  }
+
+  bool authenticateTypedActionHistory(SearchState &candidate,
+                                      ModuleOp canonical,
+                                      StringRef functionName,
+                                      StringRef outputDirectory,
+                                      uint64_t serial,
+                                      std::string &fatalError) {
+    if (!candidate.actionHistory.known)
+      return true;
+    SearchState replayed;
+    std::string reason;
+    if (!replayTypedActionHistory(candidate.actionHistory, canonical,
+                                  functionName, outputDirectory, serial,
+                                  replayed, reason, fatalError)) {
+      if (!fatalError.empty())
+        return false;
+      markActionHistoryUnknown(candidate.actionHistory,
+                               "typed_action_history_replay_failed:" + reason);
+      return true;
+    }
+    if (replayed.key != candidate.key ||
+        replayed.factKey != candidate.factKey ||
+        shapeSignature(replayed.shapes) != shapeSignature(candidate.shapes) ||
+        neighborhoodReplaySourceText(replayed.module.get()) !=
+            neighborhoodReplaySourceText(candidate.module.get())) {
+      markActionHistoryUnknown(candidate.actionHistory,
+                               "typed_action_history_canonical_replay_mismatch");
+      return true;
+    }
+    candidate.actionHistory = std::move(replayed.actionHistory);
+    return true;
+  }
+
+  bool replayLineageReplacement(
+      SearchState &child, const SearchState &parent, ModuleOp canonical,
+      StringRef functionName, StringRef outputDirectory,
+      const NeighborhoodAction &action, uint64_t serial,
+      std::string &reason, std::string &fatalError) {
+    if (!parent.actionHistory.known) {
+      reason = "lineage_replacement_requires_authenticated_path_replay";
+      return false;
+    }
+    if (action.primitives.size() != 1 ||
+        action.primitives.front().firstTask.empty()) {
+      reason = "lineage_replacement_target_unknown";
+      return false;
+    }
+    const std::string &target = action.primitives.front().firstTask;
+    auto producer = parent.actionHistory.taskProducers.find(target);
+    if (producer == parent.actionHistory.taskProducers.end() ||
+        producer->second >= parent.actionHistory.actions.size() ||
+        parent.actionHistory.dependencies.size() !=
+            parent.actionHistory.actions.size()) {
+      reason = "lineage_replacement_target_has_no_authenticated_producer:" +
+               target;
+      return false;
+    }
+    std::set<uint64_t> removed{producer->second};
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (uint64_t index = 0;
+           index < parent.actionHistory.dependencies.size(); ++index) {
+        if (removed.count(index))
+          continue;
+        for (uint64_t dependency :
+             parent.actionHistory.dependencies[index]) {
+          if (removed.count(dependency)) {
+            removed.insert(index);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+    SearchState::TypedActionHistory filtered =
+        portableActionHistory(parent.actionHistory);
+    filtered.actions.clear();
+    for (uint64_t index = 0; index < parent.actionHistory.actions.size();
+         ++index)
+      if (!removed.count(index))
+        filtered.actions.push_back(parent.actionHistory.actions[index]);
+    SearchState replayed;
+    std::string replayReason;
+    if (!replayTypedActionHistory(filtered, canonical, functionName,
+                                  outputDirectory, serial, replayed,
+                                  replayReason, fatalError)) {
+      if (fatalError.empty())
+        reason = "lineage_replacement_canonical_replay_unsupported:" +
+                 replayReason;
+      return false;
+    }
+    child.module = std::move(replayed.module);
+    child.shapes = std::move(replayed.shapes);
+    child.key = std::move(replayed.key);
+    child.factKey = std::move(replayed.factKey);
+    child.rejectReason.clear();
+    child.actionHistory = std::move(replayed.actionHistory);
+    return true;
+  }
+
+  enum class NeighborMaterialization { Applied, Rejected, Fatal };
+
+  NeighborMaterialization materializeNeighbor(
+      SearchState &child, const SearchState &parent, ModuleOp canonical,
+      StringRef functionName, StringRef outputDirectory,
+      const NeighborhoodAction &action, StringRef canonicalFactKey,
+      uint64_t serial, std::string &reason, std::string &diagnostic,
+      std::string &fatalError) {
+    child.actionHistory = parent.actionHistory;
+    if (action.family == "lineage-replacement") {
+      if (!replayLineageReplacement(child, parent, canonical, functionName,
+                                    outputDirectory, action, serial, reason,
+                                    fatalError))
+        return fatalError.empty() ? NeighborMaterialization::Rejected
+                                  : NeighborMaterialization::Fatal;
+      return NeighborMaterialization::Applied;
+    }
+
+    std::vector<std::string> beforeNames;
+    if (!collectHistoryTaskNames(child.module.get(), functionName, beforeNames,
+                                 diagnostic)) {
+      reason = "action_source_task_set_unknown";
+      return NeighborMaterialization::Rejected;
+    }
+    if (!applyTrustedNeighborhoodAction(
+            child.module.get(), canonical, functionName, action,
+            child.shapes, reason, diagnostic,
+            static_cast<unsigned>(maxPartitionFactor.getValue()))) {
+      if (fatalStorageError(diagnostic) || fatalStorageError(reason)) {
+        fatalError = reason + ":" + diagnostic;
+        return NeighborMaterialization::Fatal;
+      }
+      return NeighborMaterialization::Rejected;
+    }
+    FailureOr<func::FuncOp> function =
+        selectTaskFunction(child.module.get(), functionName, diagnostic);
+    if (failed(function)) {
+      reason = "task_function_missing_after_action";
+      return NeighborMaterialization::Rejected;
+    }
+    if (!refreshActiveTransferFactsAfterTrustedRewrite(*function, diagnostic)) {
+      reason = "active_transfer_proof_unsupported:" + diagnostic;
+      return NeighborMaterialization::Rejected;
+    }
+    std::vector<NeighborhoodShape> priorShapes = child.shapes;
+    synchronizeShapes(*function, priorShapes, child.shapes);
+    child.key.clear();
+    child.factKey.clear();
+    child.rejectReason.clear();
+    if (!prepareCandidateKey(child, functionName, outputDirectory, serial,
+                             fatalError))
+      return NeighborMaterialization::Fatal;
+    if (child.key.empty()) {
+      reason = child.rejectReason.empty()
+                   ? "graph_facts_unknown"
+                   : child.rejectReason;
+      return NeighborMaterialization::Rejected;
+    }
+
+    if (action.canonicalReset) {
+      SearchState::TypedActionHistory resetHistory;
+      resetHistory.known = true;
+      resetHistory.canonicalFactKey = canonicalFactKey.str();
+      resetHistory.initialShapes = canonicalIdentityShapes;
+      child.actionHistory = std::move(resetHistory);
+    }
+    if (child.actionHistory.known) {
+      std::vector<std::string> afterNames;
+      if (!collectHistoryTaskNames(child.module.get(), functionName, afterNames,
+                                   diagnostic)) {
+        markActionHistoryUnknown(child.actionHistory,
+                                 "typed_action_history_result_task_set_unknown");
+      } else {
+        recordTypedAction(child.actionHistory, action, beforeNames,
+                          afterNames);
+      }
+    }
+    return NeighborMaterialization::Applied;
+  }
+
+  bool prepareInitialActiveTransferFacts(ModuleOp module,
+                                         StringRef functionName,
+                                         std::string &error) const {
+    if (activeTransferArguments.empty())
+      return true;
+    FailureOr<func::FuncOp> function =
+        selectTaskFunction(module, functionName, error);
+    if (failed(function))
+      return false;
+    for (unsigned index = 0; index < function->getNumArguments(); ++index) {
+      if (!isa<MemRefType>(function->getArgument(index).getType()))
+        continue;
+      bool requested = llvm::is_contained(activeTransferArguments, index);
+      if (hasStaticActiveTransferShapeFacts(*function, index)) {
+        if (failed(verifyStaticActiveTransferShapeProof(*function, index,
+                                                        &error))) {
+          error = (Twine("active-transfer seed has stale or malformed facts "
+                         "for argument ") +
+                   Twine(index) + ": " + error)
+                      .str();
+          return false;
+        }
+      } else if (requested &&
+                 failed(rederiveAndStoreStaticActiveTransferShapeProof(
+                     *function, index, &error))) {
+        error = (Twine("cannot derive active-transfer facts for argument ") +
+                 Twine(index) + ": " + error)
+                    .str();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool refreshActiveTransferFactsAfterTrustedRewrite(func::FuncOp function,
+                                                     std::string &error) const {
+    if (activeTransferArguments.empty())
+      return true;
+    if (!function) {
+      error = "active-transfer rewrite has no selected function";
+      return false;
+    }
+    for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+      if (!isa<MemRefType>(function.getArgument(index).getType()))
+        continue;
+      if (!llvm::is_contained(activeTransferArguments, index) &&
+          !hasStaticActiveTransferShapeFacts(function, index))
+        continue;
+      if (failed(rederiveAndStoreStaticActiveTransferShapeProof(function, index,
+                                                                &error))) {
+        error = (Twine("cannot refresh active-transfer facts for argument ") +
+                 Twine(index) + ": " + error)
+                    .str();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool applyTrustedNeighborhoodAction(ModuleOp cloned, ModuleOp canonical,
+                                      StringRef selectedFunction,
+                                      const NeighborhoodAction &action,
+                                      std::vector<NeighborhoodShape> &shapes,
+                                      std::string &reason,
+                                      std::string &diagnostic,
+                                      unsigned maxPartitionFactor) const {
+    if (!sourceDomainEnabled)
+      return applyActiveTransferNeighborhoodAction(cloned, canonical,
+          selectedFunction, action, shapes, reason, diagnostic, maxPartitionFactor);
+    std::string error;
+    auto child = selectTaskFunction(cloned, selectedFunction, error);
+    if (failed(child) || failed(verifySourceIterationDomainPartition(
+            sourceDomainCanonical, *child, error))) {
+      reason = "source_iteration_domain_seed_unproven"; diagnostic = error;
+      return false;
+    }
+    auto suspend = [](ModuleOp module) {
+      module.walk([&](taskflow::TaskflowTaskOp task) {
+        task->removeAttr(kSourceIterationDomainAttr);
+        task->removeAttr(kSourceIterationControlBindingAttr);
+        task->removeAttr(kSourceIterationSourceControlBindingAttr);
+        task->removeAttr(kSourceIterationPartitionProofAttr);
+        task->removeAttr(kSourceIterationCapturePendingAttr);
+      });
+    };
+    // Nested materializers see only current counters during the atomic edit;
+    // no stale predecessor proof can authorize a half-built shard group.
+    OwningOpRef<ModuleOp> actionCanonical = canonical.clone();
+    suspend(cloned); suspend(*actionCanonical);
+    if (!applyActiveTransferNeighborhoodAction(cloned, *actionCanonical,
+          selectedFunction, action, shapes, reason, diagnostic, maxPartitionFactor))
+      return false;
+    child = selectTaskFunction(cloned, selectedFunction, error);
+    if (failed(child) || failed(proveAndRefreshSourceIterationDomainPartition(
+            sourceDomainCanonical, *child, error))) {
+      reason = "source_iteration_domain_rewrite_unproven"; diagnostic = error;
+      return false;
+    }
+    return true;
+  }
+
+  bool applyActiveTransferNeighborhoodAction(ModuleOp cloned, ModuleOp canonical,
+                                      StringRef selectedFunction,
+                                      const NeighborhoodAction &action,
+                                      std::vector<NeighborhoodShape> &shapes,
+                                      std::string &reason,
+                                      std::string &diagnostic,
+                                      unsigned maxPartitionFactor) const {
+    if (activeTransferArguments.empty())
+      return applyNeighborhoodAction(cloned, canonical, selectedFunction,
+                                     action, shapes, reason, diagnostic,
+                                     maxPartitionFactor);
+
+    std::string selectError;
+    FailureOr<func::FuncOp> function =
+        selectTaskFunction(cloned, selectedFunction, selectError);
+    if (failed(function)) {
+      reason = "active_transfer_seed_invalid";
+      diagnostic = selectError;
+      return false;
+    }
+
+    // Do not let an intermediate verifier mistake proof metadata from the
+    // parent graph for facts about a graph partway through this atomic action.
+    // Keep logical_transfer_shape intact: it is the conservative capacity
+    // fallback used while completion joins are being rebuilt.
+    std::set<unsigned> savedArguments;
+    for (unsigned index = 0; index < function->getNumArguments(); ++index) {
+      if (!hasStaticActiveTransferShapeFacts(*function, index))
+        continue;
+      std::string proofError;
+      if (failed(verifyStaticActiveTransferShapeProof(*function, index,
+                                                      &proofError))) {
+        reason = "active_transfer_seed_invalid";
+        diagnostic =
+            (Twine("argument ") + Twine(index) + ": " + proofError).str();
+        return false;
+      }
+      savedArguments.insert(index);
+    }
+
+    // Canonical-reset actions clone the canonical module inside the action
+    // controller, so verify and suspend its derived facts too. The original
+    // canonical module remains untouched and available to later actions.
+    OwningOpRef<ModuleOp> proofFreeCanonical;
+    if (action.canonicalReset) {
+      FailureOr<func::FuncOp> canonicalFunction =
+          selectTaskFunction(canonical, selectedFunction, selectError);
+      if (failed(canonicalFunction)) {
+        reason = "active_transfer_seed_invalid";
+        diagnostic = selectError;
+        return false;
+      }
+      for (unsigned index = 0; index < canonicalFunction->getNumArguments();
+           ++index) {
+        if (!hasStaticActiveTransferShapeFacts(*canonicalFunction, index))
+          continue;
+        std::string proofError;
+        if (failed(verifyStaticActiveTransferShapeProof(*canonicalFunction,
+                                                        index, &proofError))) {
+          reason = "active_transfer_seed_invalid";
+          diagnostic =
+              (Twine("canonical argument ") + Twine(index) + ": " + proofError)
+                  .str();
+          return false;
+        }
+        savedArguments.insert(index);
+      }
+      proofFreeCanonical = canonical.clone();
+      if (!proofFreeCanonical) {
+        reason = "candidate_clone_failed";
+        return false;
+      }
+      canonicalFunction = selectTaskFunction(proofFreeCanonical.get(),
+                                             selectedFunction, selectError);
+      if (failed(canonicalFunction)) {
+        reason = "active_transfer_seed_invalid";
+        diagnostic = selectError;
+        return false;
+      }
+      for (unsigned index : savedArguments) {
+        if (index >= canonicalFunction->getNumArguments())
+          continue;
+        canonicalFunction->removeArgAttr(index, "amoeba.active_transfer_shape");
+        canonicalFunction->removeArgAttr(
+            index, "amoeba.active_transfer_capacity_shape");
+        canonicalFunction->removeArgAttr(index, "amoeba.active_transfer_proof");
+      }
+    }
+
+    for (unsigned index : savedArguments) {
+      if (index >= function->getNumArguments())
+        continue;
+      function->removeArgAttr(index, "amoeba.active_transfer_shape");
+      function->removeArgAttr(index, "amoeba.active_transfer_capacity_shape");
+      function->removeArgAttr(index, "amoeba.active_transfer_proof");
+    }
+
+    // Suspend facts through the complete action, including every primitive in
+    // a combined edit, since its nested pass managers verify intermediate IR.
+    ModuleOp canonicalForAction =
+        proofFreeCanonical ? proofFreeCanonical.get() : canonical;
+    if (!applyNeighborhoodAction(cloned, canonicalForAction, selectedFunction,
+                                 action, shapes, reason, diagnostic,
+                                 maxPartitionFactor))
+      return false;
+
+    function = selectTaskFunction(cloned, selectedFunction, selectError);
+    if (failed(function)) {
+      reason = "active_transfer_proof_unsupported";
+      diagnostic = selectError;
+      return false;
+    }
+    for (unsigned index : savedArguments) {
+      if (index >= function->getNumArguments()) {
+        reason = "active_transfer_proof_unsupported";
+        diagnostic =
+            "trusted neighborhood action changed the function signature";
+        return false;
+      }
+      std::string proofError;
+      if (failed(rederiveAndStoreStaticActiveTransferShapeProof(
+              *function, index, &proofError))) {
+        reason = "active_transfer_proof_unsupported";
+        diagnostic = (Twine("cannot restore argument ") + Twine(index) +
+                      " after trusted neighborhood action: " + proofError)
+                         .str();
+        return false;
+      }
+    }
+
+    if (failed(verify(cloned.getOperation()))) {
+      reason = "active_transfer_module_verification_failed";
+      diagnostic =
+          "module verification failed after restoring active-transfer facts";
+      return false;
+    }
+    return true;
+  }
+
+  bool collectVerifiedActiveTransferSignature(func::FuncOp function,
+                                              std::string &signature,
+                                              std::string &error) const {
+    signature.clear();
+    if (activeTransferArguments.empty())
+      return true;
+    for (unsigned requested : activeTransferArguments) {
+      if (!hasStaticActiveTransferShapeFacts(function, requested)) {
+        error = (Twine("active-transfer proof is missing for argument ") +
+                 Twine(requested))
+                    .str();
+        return false;
+      }
+    }
+    for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+      if (!hasStaticActiveTransferShapeFacts(function, index))
+        continue;
+      std::string verificationError;
+      if (failed(verifyStaticActiveTransferShapeProof(function, index,
+                                                      &verificationError))) {
+        error = (Twine("active-transfer proof is stale for argument ") +
+                 Twine(index) + ": " + verificationError)
+                    .str();
+        return false;
+      }
+      StaticActiveTransferShapeProof proof =
+          analyzeStaticActiveTransferShape(function, index);
+      if (activeTransferRequireProven &&
+          llvm::is_contained(activeTransferArguments, index) && !proof.proven) {
+        error =
+            (Twine("active-transfer proof is unknown for required argument ") +
+             Twine(index))
+                .str();
+        return false;
+      }
+      Attribute attribute =
+          function.getArgAttr(index, "amoeba.active_transfer_proof");
+      std::string proofText;
+      llvm::raw_string_ostream proofStream(proofText);
+      attribute.print(proofStream);
+      proofStream.flush();
+      signature += (Twine("argument=") + Twine(index) +
+                    ";bytes=" + Twine(proofText.size()) + ":" + proofText + ";")
+                       .str();
+    }
+    return true;
+  }
+
+  bool verifyActiveTransferWitnessInKey(StringRef signature, StringRef key,
+                                        std::string &error) const {
+    if (activeTransferArguments.empty())
+      return true;
+    if (signature.empty()) {
+      error = "active-transfer replay has no verified proof signature";
+      return false;
+    }
+    const std::string witnessBytes =
+        kActiveTransferProofSchema.str() + "\n" + signature.str();
+    auto witness = activeTransferWitnessIds.find(witnessBytes);
+    if (witness == activeTransferWitnessIds.end()) {
+      error = "active-transfer replay proof has no interned exact witness";
+      return false;
+    }
+    const std::string keySuffix = "|active-transfer-proof:" + witness->second;
+    if (!key.ends_with(keySuffix)) {
+      error = "replay candidate key does not bind its active-transfer proof "
+              "witness";
+      return false;
+    }
+    auto path = witnessPaths.find(witness->second);
+    std::string persistedBytes;
+    if (path == witnessPaths.end() ||
+        !readFileBytes(path->second, persistedBytes, error)) {
+      if (error.empty())
+        error = "active-transfer replay proof witness file is missing";
+      return false;
+    }
+    if (persistedBytes != witnessBytes) {
+      error = "active-transfer replay proof witness bytes differ from "
+              "re-derived facts";
+      return false;
+    }
+    return true;
+  }
+
   bool prepareCandidateKey(SearchState &state, StringRef function,
                            StringRef outputDirectory, uint64_t serial,
                            std::string &error) {
@@ -1326,10 +3555,19 @@ private:
       error.clear();
       return true;
     }
+    if (sourceDomainEnabled && failed(verifySourceIterationDomainPartition(
+            sourceDomainCanonical, *selected, error))) {
+      state.rejectReason = "source_iteration_domain_unproven:" + error;
+      error.clear(); return true;
+    }
     FailureOr<SmallVector<TaskMetadata>> metadata =
         collectAnalyticalTaskMetadata(*selected, error);
     if (failed(metadata)) {
+      if (fatalStorageError(error))
+        return false;
       state.rejectReason = "task_metadata_unknown";
+      if (!error.empty())
+        state.rejectReason += ":" + error;
       error.clear();
       return true;
     }
@@ -1338,13 +3576,27 @@ private:
       error.clear();
       return true;
     }
+    std::string activeTransferSignature;
+    if (!collectVerifiedActiveTransferSignature(*selected,
+                                                activeTransferSignature,
+                                                error)) {
+      state.rejectReason = "active_transfer_proof_unsupported:" + error;
+      error.clear();
+      return true;
+    }
+    std::string factsDiagnostic;
     if (!extractStructuralFacts(state.module.get(), function, outputDirectory,
                                 serial, state.factKey, state.rejectReason,
-                                error)) {
-      if (fatalStorageError(error) || fatalStorageError(state.rejectReason))
+                                factsDiagnostic)) {
+      if (fatalStorageError(factsDiagnostic) ||
+          fatalStorageError(state.rejectReason)) {
+        error = factsDiagnostic.empty() ? state.rejectReason : factsDiagnostic;
         return false;
+      }
       if (state.rejectReason.empty())
         state.rejectReason = "graph_facts_unknown";
+      if (!factsDiagnostic.empty())
+        state.rejectReason += ":" + factsDiagnostic;
       error.clear();
       return true;
     }
@@ -1373,9 +3625,182 @@ private:
         {"canonical_structural_facts", state.factKey}, {"typed_kernel_body_ids", std::move(bodies)},
         {"partition_lineages", std::move(lineages)}}));
     if (!internWitness(graphWitness, false, state.factKey, error)) return false;
+    std::string activeTransferWitnessID;
+    if (!activeTransferSignature.empty()) {
+      const std::string activeTransferWitness =
+          kActiveTransferProofSchema.str() + "\n" + activeTransferSignature;
+      if (!internActiveTransferWitness(activeTransferWitness,
+                                       activeTransferWitnessID, error))
+        return false;
+    }
     state.key = state.factKey + "|" + shapeSignature(state.shapes);
+    if (!activeTransferWitnessID.empty())
+      state.key += "|active-transfer-proof:" + activeTransferWitnessID;
     (*selected)->setAttr("amoeba.graph_variant_id",
                         StringAttr::get(state.module->getContext(), state.factKey));
+    return true;
+  }
+
+  // Perform every mutable, source-owned part of candidate evaluation before
+  // handing a job to a worker.  TaskShapeCostCache::get updates hit/miss
+  // counters, and graph catalogue creation may publish files, so this helper
+  // intentionally runs only on the owner thread.  It stops immediately before
+  // the production scheduler call made by evaluateCandidate.
+  bool prepareParallelCandidate(
+      SearchState &state, ModuleOp canonical, StringRef function,
+      StringRef stageName, StringRef outputDirectory,
+      StringRef canonicalFactKey, bool costCacheLoaded,
+      TaskShapeCostCache &costCache, uint64_t serial, std::string &error) {
+    FailureOr<func::FuncOp> selected =
+        selectTaskFunction(state.module.get(), function, error);
+    if (failed(selected))
+      return false;
+    FailureOr<SmallVector<TaskMetadata>> metadata =
+        collectAnalyticalTaskMetadata(*selected, error);
+    if (failed(metadata))
+      return false;
+    state.rejectReason.clear();
+    state.scored = false;
+    if (!sameTaskSet(*metadata, state.shapes)) {
+      error.clear();
+      state.rejectReason = "shape_state_does_not_cover_task_set";
+      return true;
+    }
+    if (state.key.empty() &&
+        !prepareCandidateKey(state, function, outputDirectory, serial, error))
+      return false;
+    if (state.key.empty()) {
+      error.clear();
+      return true;
+    }
+
+    state.choices.clear();
+    state.durations.clear();
+    state.costs.clear();
+    state.schedule = {};
+    TaskShapeCostCache *activeCostCache = nullptr;
+    if (state.factKey == canonicalFactKey && costCacheLoaded) {
+      activeCostCache = &costCache;
+      state.costPath = canonicalCostPath;
+    } else {
+      // Catalogues bind source task names, while candidate dedup uses ordered
+      // graph facts. Names can differ across equivalent rewrite paths, so bind
+      // the memoization key to the current catalogue task vocabulary as well.
+      std::string graphCostKey = state.factKey;
+      for (const auto &task : *metadata)
+        graphCostKey += "|" + task.name;
+      auto cached = graphCostCaches.find(graphCostKey);
+      if (cached == graphCostCaches.end()) {
+        auto knownPath = graphCostPaths.find(graphCostKey);
+        if (knownPath != graphCostPaths.end()) {
+          state.costPath = knownPath->second;
+        } else {
+          if (!diskGuard(error))
+            return false;
+          OwningOpRef<ModuleOp> predictorModule = state.module->clone();
+          auto predictorFunction =
+              selectTaskFunction(*predictorModule, function, error);
+          if (failed(predictorFunction))
+            return false;
+          const std::string catalogueId =
+              "graph-catalogue-" + std::to_string(graphCostPaths.size());
+          bool fatalPredictorFailure = false;
+          if (!runCurrentCostPredictor(
+                  *predictorModule, *predictorFunction, function, catalogueId,
+                  outputDirectory, modelPath, cachePath,
+                  checkpointDirectoryForModel(),
+                  effectiveArchitectureContract, architecturePath,
+                  perCgraRows, perCgraCols, sourceRepository, sourceCommit,
+                  architectureTransferCatalog, modelNamespace,
+                  bootstrapSupportedShapes, state.costPath, error,
+                  fatalPredictorFailure)) {
+            if (fatalPredictorFailure || fatalStorageError(error))
+              return false;
+            state.rejectReason = "current_graph_cost_unknown:" + error;
+            error.clear();
+            return true;
+          }
+          graphCostPaths[graphCostKey] = state.costPath;
+        }
+        auto graphId = readCatalogGraphId(state.costPath);
+        auto oracle = std::make_unique<TaskShapeCostCache>();
+        std::string expectedWitness =
+            neighborhoodReplaySourceText(state.module.get());
+        if (!graphId || !oracle->load(state.costPath, function, *metadata,
+                                      sourceRepository, sourceCommit,
+                                      architecturePath, *graphId, error,
+                                      bootstrapSupportedShapes,
+                                      expectedWitness)) {
+          if (error.empty())
+            error = "generated cost catalogue has no bound graph ID";
+          error = "generated_cost_catalogue_binding_failed:" + error;
+          return false;
+        }
+        cached = graphCostCaches.emplace(graphCostKey, std::move(oracle)).first;
+      }
+      state.costPath = graphCostPaths[graphCostKey];
+      activeCostCache = cached->second.get();
+    }
+
+    std::map<std::string, const NeighborhoodShape *> shapeMap;
+    for (const NeighborhoodShape &shape : state.shapes)
+      shapeMap[shape.task] = &shape;
+    for (const TaskMetadata &task : *metadata) {
+      const NeighborhoodShape *shape = shapeMap[task.name];
+      if (!shape || shape->rows <= 0 || shape->cols <= 0 ||
+          shape->rows > std::numeric_limits<int64_t>::max() / shape->cols ||
+          shape->rows * shape->cols > 4) {
+        state.rejectReason = "invalid_or_oversized_shape";
+        error.clear();
+        return true;
+      }
+      int64_t mapperRows = 0, mapperCols = 0;
+      if (!cgraShapeToMapperTileShape(shape->rows, shape->cols, perCgraRows,
+                                      perCgraCols, mapperRows, mapperCols)) {
+        state.rejectReason = "invalid_architecture_mapper_shape";
+        error.clear();
+        return true;
+      }
+      RectShape rectangle{shape->rows, shape->cols, mapperRows, mapperCols};
+      TaskShapeChoice choice{task.name, task.tripCount, rectangle};
+      std::string costError;
+      const uint64_t oldHits = activeCostCache ? activeCostCache->hits() : 0;
+      const uint64_t oldMisses = activeCostCache ? activeCostCache->misses() : 0;
+      const TaskShapeCost *cost = activeCostCache
+                                      ? activeCostCache->get(choice, costError)
+                                      : nullptr;
+      if (activeCostCache) {
+        costCacheHits += activeCostCache->hits() - oldHits;
+        costCacheMisses += activeCostCache->misses() - oldMisses;
+      }
+      if (!cost || !cost->supported) {
+        if (cost && cost->modelDomainUnsupported)
+          state.rejectReason = "unsupported_model_domain_shape:" +
+                               cost->unsupportedReason;
+        else
+          state.rejectReason = costError.empty()
+                                   ? "unsupported_task_shape_cost"
+                                   : "unsupported_task_shape_cost:" + costError;
+        error.clear();
+        return true;
+      }
+      std::optional<int64_t> duration =
+          durationFromCost(*cost, task.tripCount, costError);
+      if (!duration || *duration <= 0) {
+        state.rejectReason = "invalid_task_shape_duration";
+        error.clear();
+        return true;
+      }
+      state.choices.push_back(choice);
+      state.durations.push_back(*duration);
+      state.costs.push_back(*cost);
+    }
+    if (state.choices.empty()) {
+      state.rejectReason = "empty_candidate";
+      error.clear();
+    }
+    (void)canonical;
+    (void)stageName;
     return true;
   }
 
@@ -1385,6 +3810,7 @@ private:
                          StringRef canonicalFactKey, bool costCacheLoaded,
                          TaskShapeCostCache &costCache,
                          int64_t round, uint64_t &scoredCount,
+                         bool chargeRoundQuota,
                          uint64_t serial, std::string &error) {
     FailureOr<func::FuncOp> selected = selectTaskFunction(
         state.module.get(), function, error);
@@ -1417,7 +3843,7 @@ private:
     state.schedule = {};
     TaskShapeCostCache *activeCostCache = nullptr;
     if (state.factKey == canonicalFactKey && costCacheLoaded) {
-      activeCostCache = &costCache; state.costPath = parentCostFile;
+      activeCostCache = &costCache; state.costPath = canonicalCostPath;
     } else {
       // Catalogues bind source task names, while candidate dedup uses ordered
       // graph facts. Names can differ across equivalent rewrite paths, so bind
@@ -1437,10 +3863,12 @@ private:
           bool fatalPredictorFailure = false;
           if (!runCurrentCostPredictor(*predictorModule, *predictorFunction,
                   function, catalogueId, outputDirectory, modelPath, cachePath,
-                  checkpointDirectoryForModel(), architectureContract,
-                  architecturePath, sourceRepository, sourceCommit,
-                  architectureTransferCatalog, modelNamespace, state.costPath,
-                  error, fatalPredictorFailure)) {
+                  checkpointDirectoryForModel(),
+                  effectiveArchitectureContract, architecturePath,
+                  perCgraRows, perCgraCols, sourceRepository, sourceCommit,
+                  architectureTransferCatalog, modelNamespace,
+                  bootstrapSupportedShapes, state.costPath, error,
+                  fatalPredictorFailure)) {
             if (fatalPredictorFailure || fatalStorageError(error)) return false;
             state.rejectReason = "current_graph_cost_unknown:" + error;
             state.scored = false; error.clear(); return true;
@@ -1449,8 +3877,11 @@ private:
         }
         auto graphId = readCatalogGraphId(state.costPath);
         auto oracle = std::make_unique<TaskShapeCostCache>();
+        std::string expectedWitness =
+            neighborhoodReplaySourceText(state.module.get());
         if (!graphId || !oracle->load(state.costPath, function, *metadata,
-            sourceRepository, sourceCommit, architecturePath, *graphId, error)) {
+            sourceRepository, sourceCommit, architecturePath, *graphId, error,
+            bootstrapSupportedShapes, expectedWitness)) {
           if (error.empty()) error = "generated cost catalogue has no bound graph ID";
           error = "generated_cost_catalogue_binding_failed:" + error;
           state.scored = false; return false;
@@ -1473,8 +3904,15 @@ private:
         error.clear();
         return true;
       }
-      RectShape rectangle{shape->rows, shape->cols, shape->rows * 4,
-                          shape->cols * 4};
+      int64_t mapperRows = 0, mapperCols = 0;
+      if (!cgraShapeToMapperTileShape(shape->rows, shape->cols, perCgraRows,
+                                      perCgraCols, mapperRows, mapperCols)) {
+        state.rejectReason = "invalid_architecture_mapper_shape";
+        state.scored = false;
+        error.clear();
+        return true;
+      }
+      RectShape rectangle{shape->rows, shape->cols, mapperRows, mapperCols};
       TaskShapeChoice choice{task.name, task.tripCount, rectangle};
       std::string costError;
       const uint64_t oldHits = activeCostCache ? activeCostCache->hits() : 0;
@@ -1487,9 +3925,13 @@ private:
         costCacheMisses += activeCostCache->misses() - oldMisses;
       }
       if (!cost || !cost->supported) {
-        state.rejectReason = costError.empty()
-                                 ? "unsupported_task_shape_cost"
-                                 : "unsupported_task_shape_cost:" + costError;
+        if (cost && cost->modelDomainUnsupported)
+          state.rejectReason = "unsupported_model_domain_shape:" +
+                               cost->unsupportedReason;
+        else
+          state.rejectReason = costError.empty()
+                                   ? "unsupported_task_shape_cost"
+                                   : "unsupported_task_shape_cost:" + costError;
         state.scored = false;
         error.clear();
         return true;
@@ -1514,7 +3956,10 @@ private:
     }
     bool fixedDispatch = parseStageFixed(stageName);
     std::string scheduleError;
-    ++scoredCount; ++productionSchedulerCalls;
+    ++scoredCount;
+    ++productionSchedulerCalls;
+    if (chargeRoundQuota)
+      ++roundScoredCount;
     if (!scheduleWithAmoebaProductionPass(
             state.module.get(), *selected, state.choices, state.durations,
             state.id, fixedDispatch, state.schedule, scheduleError)) {
@@ -1557,6 +4002,7 @@ private:
     record.factKey = state.factKey;
     record.parentId = state.parentId;
     record.path = state.path;
+    record.actionHistory = portableActionHistory(state.actionHistory);
     record.shapes = state.shapes;
     record.choices = state.choices;
     record.durations = state.durations;
@@ -1565,6 +4011,18 @@ private:
     record.costPath = state.costPath;
     record.control = state.control;
     record.controlRoles = state.controlRoles;
+    if (record.control && record.controlRoles.empty()) {
+      error = "stage control candidate has no named control role";
+      return false;
+    }
+    {
+      std::set<std::string> uniqueRoles;
+      for (const std::string &role : record.controlRoles)
+        if (role.empty() || !uniqueRoles.insert(role).second) {
+          error = "stage control candidate has an empty or duplicate control role";
+          return false;
+        }
+    }
     auto function = selectTaskFunction(state.module.get(), "", error);
     if (failed(function)) return false;
     auto graph = (*function)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
@@ -1587,6 +4045,14 @@ private:
       if (!diskGuard(error) || !writeModule(state.module.get(), candidatePath, error))
         return false;
       record.candidatePath = candidatePath;
+    }
+    for (const std::string &role : record.controlRoles) {
+      ControlRoleProvenance provenance;
+      provenance.candidatePath = record.candidatePath;
+      provenance.path = state.path;
+      provenance.actionHistory =
+          portableActionHistory(state.actionHistory);
+      record.controlRoleProvenance.emplace(role, std::move(provenance));
     }
     const std::vector<size_t> previousPrefix = rankedArchivePrefix;
     archive.push_back(std::move(record));
@@ -1639,6 +4105,7 @@ private:
     state.id = identity->id; state.key = identity->key;
     state.factKey = identity->factKey; state.parentId = identity->parentId;
     state.path = identity->path; state.shapes = identity->shapes;
+    state.actionHistory = portableActionHistory(identity->actionHistory);
     state.choices = identity->choices; state.durations = identity->durations;
     state.costs = identity->costs; state.schedule = identity->schedule;
     state.costPath = identity->costPath; state.score = identity->score;
@@ -1700,31 +4167,77 @@ private:
     return 0;
   }
 
-  static bool validateStageSeed(ModuleOp module, StringRef stageName,
-                                std::string &error) {
+  static bool hasCompleteSharedReplicaOutputRegion(
+      Operation *operation) {
+    auto task = dyn_cast<taskflow::TaskflowTaskOp>(operation);
+    if (!task)
+      return false;
+    auto parent = task->getAttrOfType<StringAttr>(
+        "amoeba.replica.parent_task");
+    auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+    auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+    auto lowers = task->getAttrOfType<ArrayAttr>(
+        "amoeba.tiling.output_region_lowers");
+    auto uppers = task->getAttrOfType<ArrayAttr>(
+        "amoeba.tiling.output_region_uppers");
+    return parent && !parent.getValue().empty() && id && count &&
+           id.getInt() >= 0 && count.getInt() > 1 &&
+           id.getInt() < count.getInt() && lowers && uppers &&
+           !lowers.empty() && lowers.size() == uppers.size();
+  }
+
+  static bool validateStageSeed(
+      ModuleOp module, StringRef stageName,
+      bool sourceDomainWillAuthenticateReplicaRegions,
+      std::string &error) {
     const int number = stageNumber(stageName);
     bool valid = number != 0;
     module.walk([&](Operation *operation) {
       for (const NamedAttribute &attribute : operation->getAttrs()) {
         StringRef name = attribute.getName().strref();
-        if ((number < 3 && name.starts_with("amoeba.replica.")) ||
+        const bool sharedReplicaOutputRegion =
+            sourceDomainWillAuthenticateReplicaRegions &&
+            (name == "amoeba.tiling.output_region_lowers" ||
+             name == "amoeba.tiling.output_region_uppers") &&
+            hasCompleteSharedReplicaOutputRegion(operation);
+        const bool outsideStage =
+            (number < 3 && name.starts_with("amoeba.replica.")) ||
             (number < 4 && (name.starts_with("amoeba.neura.tiling.") ||
-                           name.starts_with("amoeba.tiling.") ||
+                           (name.starts_with("amoeba.tiling.") &&
+                            !sharedReplicaOutputRegion) ||
                            name.starts_with("amoeba.semantic.k_block") ||
                            name == "amoeba.semantic.K_range")) ||
             (number < 5 && (name.starts_with("amoeba.neura.fusion.") ||
-                           name.starts_with("amoeba.fusion.")))) valid = false;
+                           name.starts_with("amoeba.fusion.")));
+        if (outsideStage) {
+          valid = false;
+          if (error.empty()) {
+            if (sourceDomainWillAuthenticateReplicaRegions &&
+                (name == "amoeba.tiling.output_region_lowers" ||
+                 name == "amoeba.tiling.output_region_uppers") &&
+                !hasCompleteSharedReplicaOutputRegion(operation))
+              error = "replica output-region annotation lacks complete parent/id/count metadata";
+            else
+              error = "seed contains forbidden rewrite annotation " +
+                      name.str() + " for cumulative stage " +
+                      stageName.str();
+          }
+        }
       }
     });
-    if (!valid) error = "seed contains a rewrite dimension outside this cumulative stage";
+    if (!valid && error.empty())
+      error = "seed contains a rewrite dimension outside this cumulative stage";
     return valid;
   }
 
   bool buildBinding(ModuleOp canonical, std::string &text, std::string &error) {
     json::Object files;
-    auto bind = [&](StringRef role, StringRef path, bool optional = false) {
+    auto bind = [&](StringRef role, StringRef path, bool optional = false,
+                    std::string *boundBytes = nullptr) {
       std::string bytes;
       if (!readFileBytes(path, bytes, error, optional)) return false;
+      if (boundBytes)
+        *boundBytes = bytes;
       files[role] = json::Object{{"path", path}, {"exact_bytes", std::move(bytes)}};
       return true;
     };
@@ -1733,16 +4246,38 @@ private:
         !bind("parent_costs", parentCostFile, true) ||
         !bind("architecture_transfer", architectureTransferCatalog, true) ||
         !bind("seed_manifest", seedManifest, true) || !bind("previous_winner", previousWinner, true)) return false;
+    if (!historicalNativeWinner.empty() &&
+        !bind("historical_native_winner", historicalNativeWinner,
+              /*optional=*/false, &historicalNativeWinnerBoundBytes))
+      return false;
     auto protocolBytes = files.getObject("protocol")->getString("exact_bytes");
     auto value = json::parse(*protocolBytes);
     if (!value) { llvm::consumeError(value.takeError()); error = "bound protocol is not JSON"; return false; }
     auto object = value->getAsObject();
     auto search = object ? object->getObject("search") : nullptr;
+    std::optional<StringRef> supportedShapeBootstrapPolicy =
+        search ? search->getString("supported_shape_bootstrap_policy")
+               : std::nullopt;
     if (!search || search->getInteger("max_rounds") != maxRounds.getValue() ||
         search->getInteger("max_unique_complete_candidates_scored") != maxCandidates.getValue() ||
         search->getInteger("beam_width") != beamWidth.getValue() ||
-        search->getInteger("diversity_min_slots") != diversitySlots.getValue()) {
+        search->getInteger("diversity_min_slots") != diversitySlots.getValue() ||
+        search->getInteger("max_partition_factor").value_or(4) !=
+            maxPartitionFactor.getValue()) {
       error = "search budgets do not match the bound common protocol"; return false;
+    }
+    if (bootstrapSupportedShapes &&
+        (!supportedShapeBootstrapPolicy ||
+         *supportedShapeBootstrapPolicy != kSupportedShapeBootstrapPolicy)) {
+      error = "supported-shape bootstrap requires the matching policy in the "
+              "bound common protocol";
+      return false;
+    }
+    if (supportedShapeBootstrapPolicy &&
+        *supportedShapeBootstrapPolicy != kSupportedShapeBootstrapPolicy) {
+      error = "bound protocol names an unknown supported-shape bootstrap "
+              "policy";
+      return false;
     }
     json::Object objectBinding{
         {"schema", "orbit-neighborhood-exact-binding-v1"},
@@ -1750,21 +4285,59 @@ private:
         {"files", std::move(files)}, {"function", functionName.getValue()},
         {"stage", stage.getValue()}, {"source_repository", sourceRepository.getValue()},
         {"source_commit", sourceCommit.getValue()}, {"model_namespace", modelNamespace.getValue()},
-        {"cache_path", cachePath.getValue()}, {"architecture_contract", architectureContract.getValue()},
+        {"cache_path", cachePath.getValue()},
+        {"architecture_contract", effectiveArchitectureContract},
         {"max_rounds", maxRounds.getValue()}, {"max_candidates", maxCandidates.getValue()},
         {"beam_width", beamWidth.getValue()}, {"diversity_slots", diversitySlots.getValue()},
+        {"scoring_workers", scoringWorkers.getValue()},
+        {"max_partition_factor", maxPartitionFactor.getValue()},
         {"tie_key_policy", "cost-numeric-shape-schedule-graph-key-v1"},
         {"search_contract", kSearchSchema}, {"checkpoint_contract", kCheckpointSchema}};
+    // Network costs are independent of mapper-II cache entries, but the
+    // production schedule depends on this exact resource. Bind its bytes
+    // without its path so identical network documents share the same search
+    // continuation identity even when staged at different locations.
+    if (interTaskNetworkSpecOverrideBytes)
+      objectBinding["inter_task_network_spec_override"] = json::Object{
+          {"exact_bytes", *interTaskNetworkSpecOverrideBytes}};
+    if (bootstrapSupportedShapes) {
+      objectBinding["bootstrap_supported_shapes"] = true;
+      objectBinding["supported_shape_bootstrap_policy"] =
+          kSupportedShapeBootstrapPolicy.str();
+    }
+    if (!activeTransferArguments.empty()) {
+      json::Array arguments;
+      for (unsigned index : activeTransferArguments)
+        arguments.push_back(static_cast<int64_t>(index));
+      objectBinding["active_transfer_proof"] = json::Object{
+          {"schema", kActiveTransferProofSchema},
+          {"arguments_option", activeTransferArgumentsText.getValue()},
+          {"arguments", std::move(arguments)},
+          {"require_proven", activeTransferRequireProven.getValue()},
+          {"witness_encoding", kActiveTransferWitnessEncoding}};
+    }
+    if (!historicalNativeWinner.empty()) {
+      json::Array requiredControlRoles;
+      requiredControlRoles.push_back("identity");
+      if (!previousWinner.empty())
+        requiredControlRoles.push_back("previous_stage_measured_winner");
+      requiredControlRoles.push_back("historical_measured_winner");
+      objectBinding["historical_native_winner_option"] =
+          historicalNativeWinner.getValue();
+      objectBinding["required_control_roles"] =
+          std::move(requiredControlRoles);
+    }
     text = jsonText(json::Value(std::move(objectBinding))) + "\n";
     return true;
   }
 
-  bool internWitness(StringRef bytes, bool body, std::string &id,
-                     std::string &error) {
-    auto &dictionary = body ? bodyWitnessIds : graphWitnessIds;
+  bool internWitnessInNamespace(
+      StringRef bytes, StringRef idPrefix,
+      std::map<std::string, std::string> &dictionary, std::string &id,
+      std::string &error) {
     auto existing = dictionary.find(bytes.str());
     if (existing != dictionary.end()) { id = existing->second; return true; }
-    id = (body ? "body-" : "graph-") + std::to_string(dictionary.size());
+    id = idPrefix.str() + std::to_string(dictionary.size());
     const std::string directory = outputDir + "/witnesses";
     const std::string path = directory + "/" + id + ".txt";
     if (!ensureDirectory(directory, error) || !diskGuard(error)) return false;
@@ -1774,12 +4347,25 @@ private:
       // A crash may leave an uncommitted immutable dictionary entry. It is
       // reusable only by direct byte equality, never by a numeric ID alone.
       if (old != bytes) {
-        error = "immutable graph/body witness file has different exact bytes";
+        error = "immutable source witness file has different exact bytes";
         return false;
       }
     } else if (!writeTextAtomically(path, bytes, error)) return false;
     dictionary.emplace(bytes.str(), id); witnessPaths[id] = path;
     return true;
+  }
+
+  bool internWitness(StringRef bytes, bool body, std::string &id,
+                     std::string &error) {
+    auto &dictionary = body ? bodyWitnessIds : graphWitnessIds;
+    return internWitnessInNamespace(bytes, body ? "body-" : "graph-",
+                                    dictionary, id, error);
+  }
+
+  bool internActiveTransferWitness(StringRef bytes, std::string &id,
+                                   std::string &error) {
+    return internWitnessInNamespace(bytes, "active-transfer-",
+                                    activeTransferWitnessIds, id, error);
   }
 
   bool diskGuard(std::string &error) const {
@@ -1793,8 +4379,24 @@ private:
     return true;
   }
 
-  bool mergeDuplicate(const SearchState &state, std::vector<ArchiveRecord> &archive,
-                      StringRef candidatesDirectory, std::string &error) {
+  bool mergeDuplicate(SearchState &state, ModuleOp canonical,
+                      StringRef functionName,
+                      std::vector<ArchiveRecord> &archive,
+                      StringRef outputDirectory,
+                      StringRef candidatesDirectory, uint64_t &nextSerial,
+                      std::string &error) {
+    if (state.control != !state.controlRoles.empty()) {
+      error = "stage control duplicate marker and named roles differ";
+      return false;
+    }
+    {
+      std::set<std::string> uniqueRoles;
+      for (const std::string &role : state.controlRoles)
+        if (role.empty() || !uniqueRoles.insert(role).second) {
+          error = "stage control duplicate has an empty or repeated role";
+          return false;
+        }
+    }
     for (size_t index = 0; index < archive.size(); ++index) {
       ArchiveRecord &record = archive[index];
       if (record.key != state.key || record.key.empty()) continue;
@@ -1802,16 +4404,75 @@ private:
         error = "required stage control duplicates a candidate without a legal production score";
         return false;
       }
+      if (state.control &&
+          !authenticateTypedActionHistory(state, canonical, functionName,
+                                          outputDirectory, nextSerial, error))
+        return false;
       if (record.path != state.path &&
           !llvm::is_contained(record.alternatePaths, state.path))
         record.alternatePaths.push_back(state.path);
-      for (const auto &role : state.controlRoles)
-        if (!llvm::is_contained(record.controlRoles, role)) record.controlRoles.push_back(role);
-      record.control |= state.control;
-      if (state.control && record.candidatePath.empty()) {
+      bool needsRoleSnapshot = false;
+      for (const std::string &role : state.controlRoles)
+        needsRoleSnapshot |= !record.controlRoleProvenance.count(role);
+      std::string roleCandidatePath;
+      if (needsRoleSnapshot) {
+        if (state.controlRoles.empty()) {
+          error = "stage control duplicate has no named control role";
+          return false;
+        }
         if (!diskGuard(error)) return false;
-        record.candidatePath = candidatesDirectory.str() + "/" + record.id + ".mlir";
-        if (!writeModule(state.module.get(), record.candidatePath, error)) return false;
+        for (;;) {
+          roleCandidatePath =
+              candidatesDirectory.str() + "/" + state.id + "-control-" +
+              std::to_string(nextSerial++) + ".mlir";
+          if (!llvm::sys::fs::exists(roleCandidatePath)) {
+            if (!writeModule(state.module.get(), roleCandidatePath, error))
+              return false;
+            break;
+          }
+          OwningOpRef<ModuleOp> existing =
+              parseSourceFile<ModuleOp>(roleCandidatePath,
+                                        state.module.get().getContext());
+          if (existing && neighborhoodReplaySourceText(*existing) ==
+                              neighborhoodReplaySourceText(
+                                  state.module.get()))
+            break;
+        }
+      }
+      for (const std::string &role : state.controlRoles) {
+        if (record.controlRoleProvenance.count(role)) continue;
+        if (!llvm::is_contained(record.controlRoles, role))
+          record.controlRoles.push_back(role);
+        ControlRoleProvenance provenance;
+        provenance.candidatePath = roleCandidatePath;
+        provenance.path = state.path;
+        provenance.actionHistory =
+            portableActionHistory(state.actionHistory);
+        record.controlRoleProvenance.emplace(role, std::move(provenance));
+      }
+      record.control |= state.control;
+      // The archive's primary history belongs to its original retained
+      // representative. An equivalent duplicate may add a distinct control
+      // role, but must not replace that representative's authenticated path.
+      // Upgrade an unknown primary history only when its own immutable module
+      // snapshot is retained and byte-equal to this authenticated candidate.
+      if (!record.actionHistory.known && state.actionHistory.known &&
+          !record.candidatePath.empty()) {
+        OwningOpRef<ModuleOp> archived =
+            parseSourceFile<ModuleOp>(record.candidatePath,
+                                      state.module.get().getContext());
+        if (archived &&
+            neighborhoodReplaySourceText(*archived) ==
+                neighborhoodReplaySourceText(state.module.get())) {
+          if (!authenticateTypedActionHistory(state, canonical, functionName,
+                                              outputDirectory, nextSerial,
+                                              error))
+            return false;
+          if (state.actionHistory.known) {
+            record.actionHistory = portableActionHistory(state.actionHistory);
+            record.path = state.path;
+          }
+        }
       }
       dirtyJournalIndices.insert(index);
       ++duplicateCandidates;
@@ -1871,8 +4532,20 @@ private:
         {"binding_witness_path", bindingPath}, {"canonical_fact_key", canonicalFactKey},
         {"round", round}, {"next_serial", int64_t(nextSerial)},
         {"scored_candidates", int64_t(scoredCount)}, {"rejected_candidates", int64_t(rejectedCount)},
+        {"round_scored_candidates", int64_t(roundScoredCount)},
+        {"round_score_limit", int64_t(roundScoreLimit)},
         {"duplicate_candidates", int64_t(duplicateCandidates)},
         {"production_scheduler_calls", int64_t(productionSchedulerCalls)},
+        {"scoring_workers", scoringWorkers.getValue()},
+        {"max_partition_factor", maxPartitionFactor.getValue()},
+        {"parallel_preparation_milliseconds", parallelPreparationMilliseconds},
+        {"parallel_scoring_milliseconds", parallelScoringMilliseconds},
+        {"parallel_commit_milliseconds", parallelCommitMilliseconds},
+        {"parallel_module_cache_hits", int64_t(parallelModuleCacheHits)},
+        {"parallel_module_cache_misses", int64_t(parallelModuleCacheMisses)},
+        {"parallel_scored_jobs", int64_t(parallelScoredJobs)},
+        {"parallel_batch_item_sizes", uint64Array(parallelBatchItemSizes)},
+        {"parallel_batch_score_job_sizes", uint64Array(parallelBatchScoreJobSizes)},
         {"cost_cache_hits", int64_t(costCacheHits)}, {"cost_cache_misses", int64_t(costCacheMisses)},
         {"elapsed_milliseconds", elapsedMilliseconds},
         {"pending_action_cursor", int64_t(pendingCursor)}, {"pending_neighbors", std::move(neighbors)},
@@ -1910,18 +4583,44 @@ private:
         sourceCommit, architecturePath, protocolFile, error)) return false;
     auto savedRound = root->getInteger("round"), serial = root->getInteger("next_serial"),
          count = root->getInteger("scored_candidates"), rejected = root->getInteger("rejected_candidates"),
+         roundCount = root->getInteger("round_scored_candidates"),
+         roundLimit = root->getInteger("round_score_limit"),
          cursor = root->getInteger("pending_action_cursor"), prefix = root->getInteger("archive_journal_bytes"),
          archiveCount = root->getInteger("archive_count");
     auto beamRecords = root->getArray("beam"), generatedRecords = root->getArray("generated"),
          neighbors = root->getArray("pending_neighbors");
     auto facts = root->getString("canonical_fact_key"), witness = root->getString("binding_witness_path"),
          savedJournal = root->getString("archive_journal_path");
-    if (!savedRound || !serial || !count || !rejected || !cursor || !prefix || !archiveCount ||
+    if (!savedRound || !serial || !count || !rejected || !roundCount ||
+        !roundLimit || !cursor || !prefix || !archiveCount ||
         !beamRecords || !generatedRecords || !neighbors || !facts || !witness || !savedJournal ||
         *witness != bindingPath || *savedJournal != journalPath || *savedRound < 0 || *serial < 0 ||
-        *count < 0 || *rejected < 0 || *cursor < 0 || uint64_t(*cursor) > neighbors->size() ||
+        *count < 0 || *rejected < 0 || *roundCount < 0 || *roundLimit < 0 ||
+        *roundCount > *roundLimit || *cursor < 0 || uint64_t(*cursor) > neighbors->size() ||
         *prefix < 0 || *archiveCount < 0) {
       error = "checkpoint lacks exact frontier/journal continuation state"; return false;
+    }
+    const uint64_t configuredMaxCandidates =
+        static_cast<uint64_t>(maxCandidates.getValue());
+    if (*savedRound > maxRounds.getValue() ||
+        static_cast<uint64_t>(*count) > configuredMaxCandidates ||
+        static_cast<uint64_t>(*roundCount) > static_cast<uint64_t>(*count)) {
+      error = "checkpoint round/score counters exceed protocol budgets";
+      return false;
+    }
+    const uint64_t scoresBeforeRound =
+        static_cast<uint64_t>(*count) - static_cast<uint64_t>(*roundCount);
+    const uint64_t expectedRoundLimit = perRoundScoreQuota(
+        scoresBeforeRound, configuredMaxCandidates,
+        maxRounds.getValue() - *savedRound);
+    const uint64_t remainingScoreBound =
+        configuredMaxCandidates - scoresBeforeRound;
+    if (static_cast<uint64_t>(*roundLimit) != expectedRoundLimit ||
+        static_cast<uint64_t>(*roundLimit) > remainingScoreBound ||
+        (*savedRound == maxRounds.getValue() &&
+         (*roundCount != 0 || *roundLimit != 0))) {
+      error = "checkpoint per-round score quota differs from protocol-derived budget";
+      return false;
     }
     if (!readFileBytes(journalPath, bytes, error) || bytes.size() < uint64_t(*prefix)) {
       if (error.empty()) error = "checkpoint committed archive journal prefix is truncated";
@@ -1951,7 +4650,9 @@ private:
       for (const auto &value : records) {
         const auto *object = value.getAsObject(); SearchState state;
         if (!object || !parseState(*object, canonical.getContext(), state, error)) return false;
-        if (!validateStageSeed(state.module.get(), stage, error)) return false;
+        if (!validateStageSeed(state.module.get(), stage,
+                               sourceDomainEnabled, error))
+          return false;
         out.push_back(std::move(state));
       }
       return true;
@@ -1968,7 +4669,7 @@ private:
     }
     for (const auto &record : archive) if (!record.key.empty()) seenKeys.insert(record.key);
     const auto *witnesses = root->getArray("witness_dictionary");
-    if (!witnesses) { error = "checkpoint missing exact graph/body witness dictionary"; return false; }
+    if (!witnesses) { error = "checkpoint missing exact graph/body/active-transfer witness dictionary"; return false; }
     for (const auto &value : *witnesses) {
       const auto *object = value.getAsObject();
       auto id = object ? object->getString("id") : std::nullopt;
@@ -1976,12 +4677,130 @@ private:
       std::string witnessBytes;
       if (!id || !witnessPath || !readFileBytes(*witnessPath, witnessBytes, error) ||
           witnessPaths.count(id->str())) { if (error.empty()) error = "malformed witness dictionary"; return false; }
-      bool body = id->starts_with("body-");
-      auto &dictionary = body ? bodyWitnessIds : graphWitnessIds;
-      if (!dictionary.emplace(witnessBytes, id->str()).second) {
+      std::map<std::string, std::string> *dictionary = nullptr;
+      if (id->starts_with("body-"))
+        dictionary = &bodyWitnessIds;
+      else if (id->starts_with("active-transfer-"))
+        dictionary = &activeTransferWitnessIds;
+      else if (id->starts_with("graph-"))
+        dictionary = &graphWitnessIds;
+      if (!dictionary || !dictionary->emplace(witnessBytes, id->str()).second) {
         error = "duplicate exact dictionary witness with distinct ID"; return false;
       }
       witnessPaths[id->str()] = witnessPath->str();
+    }
+    for (size_t index = 0; index < archive.size(); ++index) {
+      ArchiveRecord &record = archive[index];
+      if (!record.actionHistory.known)
+        continue;
+      if (!record.valid || record.candidatePath.empty()) {
+        markActionHistoryUnknown(
+            record.actionHistory,
+            "checkpoint_archive_history_has_no_retained_candidate_module");
+        dirtyJournalIndices.insert(index);
+        continue;
+      }
+      SearchState candidate;
+      candidate.module = parseSourceFile<ModuleOp>(record.candidatePath,
+                                                   canonical.getContext());
+      if (!candidate.module) {
+        error = "checkpoint retained archive candidate module is missing: " +
+                record.candidatePath;
+        return false;
+      }
+      candidate.shapes = record.shapes;
+      candidate.key = record.key;
+      candidate.factKey = record.factKey;
+      candidate.actionHistory = record.actionHistory;
+      candidate.key.clear();
+      candidate.factKey.clear();
+      const size_t oldWitnessCount = witnessPaths.size();
+      if (!prepareCandidateKey(candidate, functionName, outputDir,
+                               nextSerial, error) ||
+          candidate.key != record.key || candidate.factKey != record.factKey ||
+          witnessPaths.size() != oldWitnessCount) {
+        if (error.empty())
+          error = "restored archive module differs from exact source-owned candidate key";
+        return false;
+      }
+      auto candidateFunction =
+          selectTaskFunction(candidate.module.get(), functionName, error);
+      if (failed(candidateFunction))
+        return false;
+      auto graph = (*candidateFunction)->getAttrOfType<StringAttr>(
+          "amoeba.graph_variant_id");
+      if (!graph || graph.getValue() != record.graphId) {
+        error = "restored archive graph label differs from its exact candidate record";
+        return false;
+      }
+      if (!authenticateTypedActionHistory(candidate, canonical, functionName,
+                                          outputDir, nextSerial, error))
+        return false;
+      record.actionHistory = portableActionHistory(candidate.actionHistory);
+      dirtyJournalIndices.insert(index);
+    }
+    for (size_t index = 0; index < archive.size(); ++index) {
+      ArchiveRecord &record = archive[index];
+      if (record.controlRoleProvenance.empty())
+        continue;
+      if (!record.valid || !record.control) {
+        error = "checkpoint control-role provenance is attached to a non-control archive row";
+        return false;
+      }
+      for (auto &[role, provenance] : record.controlRoleProvenance) {
+        if (provenance.candidatePath.empty()) {
+          error = "checkpoint control role has no retained exact source module: " +
+                  role;
+          return false;
+        }
+        SearchState candidate;
+        candidate.module = parseSourceFile<ModuleOp>(
+            provenance.candidatePath, canonical.getContext());
+        if (!candidate.module) {
+          error = "checkpoint retained control-role module is missing: " +
+                  provenance.candidatePath;
+          return false;
+        }
+        candidate.shapes = record.shapes;
+        candidate.key = record.key;
+        candidate.factKey = record.factKey;
+        candidate.actionHistory = provenance.actionHistory;
+        candidate.key.clear();
+        candidate.factKey.clear();
+        const size_t oldWitnessCount = witnessPaths.size();
+        if (!prepareCandidateKey(candidate, functionName, outputDir,
+                                 nextSerial, error) ||
+            candidate.key != record.key ||
+            candidate.factKey != record.factKey ||
+            witnessPaths.size() != oldWitnessCount) {
+          if (error.empty())
+            error = "restored control-role module differs from exact source-owned candidate key";
+          return false;
+        }
+        auto candidateFunction =
+            selectTaskFunction(candidate.module.get(), functionName, error);
+        if (failed(candidateFunction))
+          return false;
+        auto graph = (*candidateFunction)->getAttrOfType<StringAttr>(
+            "amoeba.graph_variant_id");
+        if (!graph || graph.getValue() != record.graphId) {
+          error = "restored control-role graph label differs from its exact candidate record";
+          return false;
+        }
+        const std::string previousHistory =
+            jsonText(json::Value(typedActionHistoryObject(
+                provenance.actionHistory)));
+        if (!authenticateTypedActionHistory(candidate, canonical,
+                                            functionName, outputDir,
+                                            nextSerial, error))
+          return false;
+        provenance.actionHistory =
+            portableActionHistory(candidate.actionHistory);
+        if (previousHistory !=
+            jsonText(json::Value(typedActionHistoryObject(
+                provenance.actionHistory))))
+          dirtyJournalIndices.insert(index);
+      }
     }
     auto validateRestoredStates = [&](std::vector<SearchState> &states) {
       for (auto &state : states) {
@@ -1991,13 +4810,23 @@ private:
         if (!prepareCandidateKey(state, functionName, outputDir, nextSerial,
                                  error) || state.key != key || state.factKey != graphKey ||
             witnessPaths.size() != oldWitnessCount) {
-          if (error.empty()) error = "restored module differs from exact canonical graph/body/lineage witnesses";
+          if (error.empty()) error = "restored module differs from exact canonical graph/body/active-transfer/lineage witnesses";
           return false;
         }
       }
       return true;
     };
     if (!validateRestoredStates(beam) || !validateRestoredStates(generated)) return false;
+    auto authenticateRestoredStates = [&](std::vector<SearchState> &states) {
+      for (SearchState &state : states)
+        if (!authenticateTypedActionHistory(state, canonical, functionName,
+                                            outputDir, nextSerial, error))
+          return false;
+      return true;
+    };
+    if (!authenticateRestoredStates(beam) ||
+        !authenticateRestoredStates(generated))
+      return false;
     if (const auto *costs = root->getArray("graph_cost_catalogues"))
       for (const auto &value : *costs) {
         const auto *object = value.getAsObject();
@@ -2007,12 +4836,36 @@ private:
         graphCostPaths[key->str()] = costPath->str();
       }
     round = *savedRound; nextSerial = *serial; scoredCount = *count; rejectedCount = *rejected;
+    roundScoredCount = *roundCount; roundScoreLimit = *roundLimit;
     pendingCursor = *cursor; canonicalFactKey = facts->str();
     journalBytes = *prefix; journalArchiveCount = archive.size();
     duplicateCandidates = root->getInteger("duplicate_candidates").value_or(0);
     productionSchedulerCalls = root->getInteger("production_scheduler_calls").value_or(0);
     costCacheHits = root->getInteger("cost_cache_hits").value_or(0);
     costCacheMisses = root->getInteger("cost_cache_misses").value_or(0);
+    parallelPreparationMilliseconds =
+        root->getInteger("parallel_preparation_milliseconds").value_or(0);
+    parallelScoringMilliseconds =
+        root->getInteger("parallel_scoring_milliseconds").value_or(0);
+    parallelCommitMilliseconds =
+        root->getInteger("parallel_commit_milliseconds").value_or(0);
+    parallelModuleCacheHits =
+        root->getInteger("parallel_module_cache_hits").value_or(0);
+    parallelModuleCacheMisses =
+        root->getInteger("parallel_module_cache_misses").value_or(0);
+    parallelScoredJobs = root->getInteger("parallel_scored_jobs").value_or(0);
+    if (const auto *sizes = root->getArray("parallel_batch_item_sizes")) {
+      if (!parseUInt64Array(sizes, parallelBatchItemSizes)) {
+        error = "checkpoint parallel batch item sizes are malformed";
+        return false;
+      }
+    }
+    if (const auto *sizes = root->getArray("parallel_batch_score_job_sizes")) {
+      if (!parseUInt64Array(sizes, parallelBatchScoreJobSizes)) {
+        error = "checkpoint parallel batch score job sizes are malformed";
+        return false;
+      }
+    }
     elapsedMilliseconds = root->getInteger("elapsed_milliseconds").value_or(0);
     (void)binding;
     return true;
@@ -2041,6 +4894,14 @@ private:
     if (!module) { error = "retained native candidate module does not parse"; return false; }
     auto selected = selectTaskFunction(*module, function, error);
     if (failed(selected)) return false;
+    std::string activeTransferSignature;
+    if (!collectVerifiedActiveTransferSignature(*selected,
+                                                activeTransferSignature,
+                                                error))
+      return false;
+    if (!verifyActiveTransferWitnessInKey(activeTransferSignature, record.key,
+                                          error))
+      return false;
     auto graph = (*selected)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     if (!graph || graph.getValue() != record.graphId) {
       error = "replay candidate graph label differs from saved C++ archive"; return false;
@@ -2093,7 +4954,8 @@ private:
       int64_t maxCandidatesValue, int64_t beamWidthValue,
       int64_t diversityValue, int64_t round, uint64_t scoredCount,
       uint64_t rejectedCount, bool costCacheLoaded,
-      bool previousWinnerRequested, ArrayRef<ArchiveRecord> archive,
+      bool previousWinnerRequested, bool historicalWinnerRequested,
+      ArrayRef<ArchiveRecord> archive,
       StringRef stopReason, std::string &error) {
     std::vector<const ArchiveRecord *> ranked;
     json::Object reasons;
@@ -2117,6 +4979,27 @@ private:
     for (const auto &record : archive) archiveStream << json::Value(archiveObject(record)) << "\n";
     archiveStream.flush();
     if (!diskGuard(error) || !writeTextAtomically(outputDirectory.str() + "/archive.jsonl", archiveText, error)) return false;
+    auto identityShapeRecords = [&]() {
+      json::Array result;
+      for (const NeighborhoodShape &shape : canonicalIdentityShapes)
+        result.push_back(shapeObject(shape));
+      return result;
+    };
+    auto unsupportedUnitRecords = [&]() {
+      json::Array result;
+      for (const UnsupportedUnitQuery &query :
+           canonicalAllUnitUnsupportedQueries) {
+        result.push_back(json::Object{
+            {"task", query.task},
+            {"mapper_tile_rows", query.mapperRows},
+            {"mapper_tile_cols", query.mapperCols},
+            {"status", kModelDomainUnsupportedStatus.str()},
+            {"unsupported_reason", query.reason},
+            {"analytical_lower_bound", query.lowerBound},
+            {"model_interval_max_ii", kFormalMax4ModelCeilingII}});
+      }
+      return result;
+    };
     json::Object metadata{
         {"schema", kSearchSchema}, {"search_scope", kSearchScope}, {"function", function},
         {"stage", stageName}, {"source_repository", repository}, {"source_commit", commit},
@@ -2127,6 +5010,17 @@ private:
         {"unique_complete_candidates_scored", int64_t(scoredCount)},
         {"unique_scored_candidates", int64_t(scoredCount)}, {"unique_valid_candidates", int64_t(validCount)},
         {"rejected_or_duplicate_candidates", int64_t(rejectedCount)},
+        {"scoring_workers", scoringWorkers.getValue()},
+        {"max_partition_factor", maxPartitionFactor.getValue()},
+        {"parallel_phase_elapsed_milliseconds",
+         json::Object{{"candidate_preparation", parallelPreparationMilliseconds},
+                      {"worker_scoring", parallelScoringMilliseconds},
+                      {"ordered_commit", parallelCommitMilliseconds}}},
+        {"parallel_module_cache_hits", int64_t(parallelModuleCacheHits)},
+        {"parallel_module_cache_misses", int64_t(parallelModuleCacheMisses)},
+        {"parallel_scored_jobs", int64_t(parallelScoredJobs)},
+        {"parallel_batch_item_sizes", uint64Array(parallelBatchItemSizes)},
+        {"parallel_batch_score_job_sizes", uint64Array(parallelBatchScoreJobSizes)},
         {"cache_hits", int64_t(costCacheHits)}, {"cache_misses", int64_t(costCacheMisses)},
         {"reject_reasons", std::move(reasons)}, {"elapsed_seconds", elapsedMilliseconds / 1000.0},
         {"production_scheduler_calls", int64_t(productionSchedulerCalls)},
@@ -2136,6 +5030,37 @@ private:
         {"identity_control_retained", true}, {"previous_winner_requested", previousWinnerRequested},
         {"native_top5_required", true}, {"numeric_trace_sram_separate", true},
         {"native_shortlist_count", int64_t(ranked.size())}};
+    if (bootstrapSupportedShapes) {
+      metadata["supported_shape_bootstrap_policy"] =
+          kSupportedShapeBootstrapPolicy.str();
+      metadata["canonical_bootstrap_applied"] = canonicalBootstrapApplied;
+      metadata["canonical_all_unit_cost_status"] =
+          canonicalAllUnitCostStatus;
+      metadata["canonical_all_unit_control_scored"] =
+          canonicalAllUnitControlScored;
+      metadata["canonical_actual_identity_shapes"] = identityShapeRecords();
+      metadata["canonical_all_unit_unsupported_queries"] =
+          unsupportedUnitRecords();
+    }
+    if (!activeTransferArguments.empty()) {
+      json::Array arguments;
+      for (unsigned index : activeTransferArguments)
+        arguments.push_back(static_cast<int64_t>(index));
+      metadata["active_transfer_proof"] = json::Object{
+          {"schema", kActiveTransferProofSchema},
+          {"arguments", std::move(arguments)},
+          {"require_proven", activeTransferRequireProven.getValue()},
+          {"witness_encoding", kActiveTransferWitnessEncoding}};
+    }
+    if (historicalWinnerRequested) {
+      json::Array requiredControlRoles;
+      requiredControlRoles.push_back("identity");
+      if (previousWinnerRequested)
+        requiredControlRoles.push_back("previous_stage_measured_winner");
+      requiredControlRoles.push_back("historical_measured_winner");
+      metadata["historical_native_winner_requested"] = true;
+      metadata["required_control_roles"] = std::move(requiredControlRoles);
+    }
     json::Object header = metadata; header["record_type"] = "header";
     std::string topText = jsonText(json::Value(std::move(header))) + "\n";
     for (size_t rank = 0; rank < ranked.size(); ++rank) {
@@ -2152,13 +5077,48 @@ private:
       if (!record.valid || !record.control) continue;
       for (const auto &role : record.controlRoles) {
         if (!roles.insert(role).second) { error = "duplicate stage control role"; return false; }
+        auto provenance = record.controlRoleProvenance.find(role);
+        if (provenance == record.controlRoleProvenance.end() ||
+            provenance->second.candidatePath.empty()) {
+          error = "stage control role lacks its retained exact candidate provenance: " +
+                  role;
+          return false;
+        }
+        ArchiveRecord roleRecord = record;
+        roleRecord.candidatePath = provenance->second.candidatePath;
+        roleRecord.path = provenance->second.path;
+        roleRecord.actionHistory =
+            portableActionHistory(provenance->second.actionHistory);
+        roleRecord.controlRoles = {role};
+        roleRecord.controlRoleProvenance.clear();
+        roleRecord.controlRoleProvenance.emplace(role, provenance->second);
         json::Object selection;
-        if (!replaySelection(record, function, stageName, outputDirectory, selection, error)) return false;
+        if (!replaySelection(roleRecord, function, stageName, outputDirectory,
+                             selection, error))
+          return false;
         selection["record_type"] = "control"; selection["control_role"] = role;
+        if (bootstrapSupportedShapes && role == "identity") {
+          selection["supported_shape_bootstrap_policy"] =
+              kSupportedShapeBootstrapPolicy.str();
+          selection["canonical_bootstrap_applied"] =
+              canonicalBootstrapApplied;
+          selection["canonical_all_unit_cost_status"] =
+              canonicalAllUnitCostStatus;
+          selection["canonical_all_unit_control_scored"] =
+              canonicalAllUnitControlScored;
+          selection["canonical_actual_identity_shapes"] =
+              identityShapeRecords();
+          selection["canonical_all_unit_unsupported_queries"] =
+              unsupportedUnitRecords();
+        }
         controlsText += jsonText(json::Value(std::move(selection))) + "\n";
       }
     }
-    if (!roles.count("identity") || (previousWinnerRequested && !roles.count("previous_stage_measured_winner"))) {
+    if (!roles.count("identity") ||
+        (previousWinnerRequested &&
+         !roles.count("previous_stage_measured_winner")) ||
+        (historicalWinnerRequested &&
+         !roles.count("historical_measured_winner"))) {
       error = "required stage native controls missing from C++ archive"; return false;
     }
     return writeTextAtomically(outputDirectory.str() + "/top5.jsonl", topText, error) &&
@@ -2166,15 +5126,36 @@ private:
            writeTextAtomically(outputDirectory.str() + "/search-summary.json", jsonText(json::Value(std::move(metadata))) + "\n", error);
   }
 
-  std::string journalPath, bindingPath;
+  std::string journalPath, bindingPath, historicalNativeWinnerBoundBytes;
+  std::optional<std::string> interTaskNetworkSpecOverrideBytes;
   uint64_t journalBytes = 0, journalArchiveCount = 0, duplicateCandidates = 0;
   uint64_t productionSchedulerCalls = 0, costCacheHits = 0, costCacheMisses = 0;
+  uint64_t roundScoredCount = 0, roundScoreLimit = 0;
   int64_t elapsedMilliseconds = 0;
+  int64_t parallelPreparationMilliseconds = 0;
+  int64_t parallelScoringMilliseconds = 0;
+  int64_t parallelCommitMilliseconds = 0;
+  uint64_t parallelModuleCacheHits = 0;
+  uint64_t parallelModuleCacheMisses = 0;
+  uint64_t parallelScoredJobs = 0;
+  func::FuncOp sourceDomainCanonical;
+  bool sourceDomainEnabled = false;
+  SmallVector<unsigned, 8> activeTransferArguments;
+  std::vector<uint64_t> parallelBatchItemSizes;
+  std::vector<uint64_t> parallelBatchScoreJobSizes;
+  PersistentParallelWorkerPool parallelWorkerPool;
   std::set<size_t> dirtyJournalIndices;
   std::vector<std::string> obsoleteCandidatePaths;
   std::vector<size_t> rankedArchivePrefix;
   std::map<std::string, std::string> graphCostPaths;
-  std::map<std::string, std::string> bodyWitnessIds, graphWitnessIds, witnessPaths;
+  std::string canonicalCostPath;
+  std::vector<NeighborhoodShape> canonicalIdentityShapes;
+  std::vector<UnsupportedUnitQuery> canonicalAllUnitUnsupportedQueries;
+  std::string canonicalAllUnitCostStatus = "supported";
+  bool canonicalAllUnitControlScored = false;
+  bool canonicalBootstrapApplied = false;
+  std::map<std::string, std::string> bodyWitnessIds, graphWitnessIds;
+  std::map<std::string, std::string> activeTransferWitnessIds, witnessPaths;
   std::map<std::string, std::unique_ptr<TaskShapeCostCache>> graphCostCaches;
 
 };

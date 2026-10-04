@@ -11,9 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCandidateCommon.h"
+#include "mlir/IR/Verifier.h"
 #include "AnalyticalTaskCostCatalog.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
+#include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraTypes.h"
@@ -40,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -60,6 +65,8 @@ namespace {
 constexpr StringLiteral kInheritanceSchema =
     "orbit-replica-cost-inheritance-v1";
 constexpr StringLiteral kFactoredSpaceSchema = "amoeba-analytical-task-space";
+constexpr StringLiteral kNeighborhoodPartitionLineageAttr =
+    "amoeba.neighborhood.partition_lineage.v1";
 
 struct ShapeKey {
   std::string task;
@@ -384,6 +391,10 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
                  neura::KernelOp kernel = neura::KernelOp()) {
   if (!value)
     return std::nullopt;
+  if (!kernel) {
+    llvm::DenseSet<Value> active;
+    if (auto folded = sourceStaticIndex(value, task, active)) return folded;
+  }
   if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
     return constant.value();
   if (auto constant = value.getDefiningOp<arith::ConstantOp>())
@@ -610,6 +621,12 @@ static bool isSequentialKDerivedTaskAttr(StringRef name) {
 static bool isIgnoredTaskAttr(StringRef name) {
   return name == "task_name" || name == "trip_count" ||
          name == "amoeba.selected_trip_count" ||
+         name == kSourceIterationDomainAttr ||
+         name == kSourceIterationControlBindingAttr ||
+         name == kSourceIterationSourceControlBindingAttr ||
+         name == kSourceIterationPartitionProofAttr ||
+         name == kSourceIterationCapturePendingAttr ||
+         name == kNeighborhoodPartitionLineageAttr ||
          name.starts_with("amoeba.replica.") ||
          name == "amoeba.semantic.incoming_edges" ||
          name == "amoeba.tiling.parent_task" ||
@@ -719,18 +736,71 @@ static bool validateOutputRegionAgainstProof(
   auto upper = dyn_cast<DenseI64ArrayAttr>(uppers[writeIndex]);
   if (!lower || !upper ||
       static_cast<size_t>(lower.size()) != proof.outputCounterAxes.size() ||
-      upper.size() != lower.size()) {
+      upper.size() != lower.size() ||
+      proof.producedLowers.size() != proof.outputCounterAxes.size() ||
+      proof.producedShape.size() != proof.outputCounterAxes.size()) {
     error = "ordinary dual-output replica " + task.getTaskName().str() +
             " has malformed output-region rank";
     return false;
   }
-  for (auto [dimension, counter] : llvm::enumerate(proof.outputCounterAxes)) {
-    if (counter >= proof.taskLowers.size() ||
-        lower[dimension] != proof.taskLowers[counter] ||
-        upper[dimension] != proof.taskUppers[counter]) {
+  SmallVector<int64_t> expectedUpper(proof.producedLowers.begin(),
+                                     proof.producedLowers.end());
+  for (auto [dimension, extent] : llvm::enumerate(proof.producedShape)) {
+    int64_t start = proof.producedLowers[dimension];
+    if (start < 0 || extent <= 0 ||
+        start > std::numeric_limits<int64_t>::max() - extent) {
       error = "ordinary dual-output replica " + task.getTaskName().str() +
-              " output-region metadata disagrees with actual indexed "
-              "coordinates";
+              " has an invalid proven output region";
+      return false;
+    }
+    expectedUpper[dimension] = start + extent;
+  }
+  if (!llvm::equal(lower.asArrayRef(), proof.producedLowers) ||
+      !llvm::equal(upper.asArrayRef(), expectedUpper)) {
+    error = "ordinary dual-output replica " + task.getTaskName().str() +
+            " output-region metadata disagrees with actual indexed "
+            "coordinates";
+    return false;
+  }
+  return true;
+}
+
+static bool validateReplicaOutputShardMap(TaskflowTaskOp parentTask,
+                                          TaskflowTaskOp childTask,
+                                          int64_t outputAxis,
+                                          int64_t shardAxis,
+                                          std::string &error) {
+  if (outputAxis < 0 || shardAxis < 0 ||
+      parentTask.getWillWrites().size() != childTask.getWillWrites().size() ||
+      parentTask.getOriginalWriteMemrefs().size() !=
+          parentTask.getWillWrites().size() ||
+      childTask.getOriginalWriteMemrefs().size() !=
+          childTask.getWillWrites().size()) {
+    error = "ordinary replica " + childTask.getTaskName().str() +
+            " has incompatible output-axis or write metadata";
+    return false;
+  }
+  for (unsigned writeIndex = 0;
+       writeIndex < childTask.getWillWrites().size(); ++writeIndex) {
+    ReplicaOutputCoordinateProof parentProof =
+        analyzeReplicaOutputCoordinates(parentTask, -1, writeIndex);
+    ReplicaOutputCoordinateProof childProof =
+        analyzeReplicaOutputCoordinates(childTask, outputAxis, writeIndex);
+    if (!parentProof.proven || !childProof.proven) {
+      error = "ordinary replica " + childTask.getTaskName().str() +
+              " lacks an actual Taskflow/Neura output proof: " +
+              (childProof.proven ? parentProof.reason : childProof.reason);
+      return false;
+    }
+    if (parentProof.outputCounterAxes != childProof.outputCounterAxes ||
+        outputAxis >= static_cast<int64_t>(
+                          childProof.outputCounterAxes.size()) ||
+        childProof.outputCounterAxes[outputAxis] ==
+            ReplicaOutputCoordinateProof::kConstantAxis ||
+        childProof.outputCounterAxes[outputAxis] !=
+            static_cast<unsigned>(shardAxis)) {
+      error = "ordinary replica " + childTask.getTaskName().str() +
+              " output shard axis does not map to its actual counter axis";
       return false;
     }
   }
@@ -777,6 +847,16 @@ static bool validateOrdinaryReplicaOutputs(const TaskMetadata &parent,
       error = "ordinary dual-output replica " + childTask.getTaskName().str() +
               " changed the actual output counter map for slot " +
               std::to_string(writeIndex);
+      return false;
+    }
+    if (outputAxis >= static_cast<int64_t>(
+                          childProof.outputCounterAxes.size()) ||
+        childProof.outputCounterAxes[outputAxis] ==
+            ReplicaOutputCoordinateProof::kConstantAxis ||
+        childProof.outputCounterAxes[outputAxis] !=
+            static_cast<unsigned>(record.shardAxis)) {
+      error = "ordinary dual-output replica " + childTask.getTaskName().str() +
+              " output shard axis does not map to its actual counter axis";
       return false;
     }
     if (!validateOutputRegionAgainstProof(
@@ -906,9 +986,28 @@ static bool validateOrdinaryReplicaGroup(
     }
     intervals.push_back(
         {childBounds[shardAxis].lower, childBounds[shardAxis].upper});
+    auto childOutputAxis = child->getAttrOfType<IntegerAttr>(
+        "amoeba.replica.output_shard_axis");
+    if (child->hasAttr("amoeba.replica.output_shard_axis") &&
+        !childOutputAxis) {
+      error = "ordinary replica " + child.getTaskName().str() +
+              " has malformed output shard axis";
+      return false;
+    }
+    if (childOutputAxis) {
+      if (outputAxis < 0)
+        outputAxis = childOutputAxis.getInt();
+      if (outputAxis != childOutputAxis.getInt()) {
+        error = "ordinary replica group changes output shard axis";
+        return false;
+      }
+      if (child.getWillWrites().size() == 1 &&
+          !validateReplicaOutputShardMap(parent.op, child,
+                                         childOutputAxis.getInt(), shardAxis,
+                                         error))
+        return false;
+    }
     if (child.getWillWrites().size() > 1) {
-      auto childOutputAxis = child->getAttrOfType<IntegerAttr>(
-          "amoeba.replica.output_shard_axis");
       if (!childOutputAxis || childOutputAxis.getInt() < 0) {
         error = "ordinary dual-output replica " + child.getTaskName().str() +
                 " has no valid output shard axis";
@@ -988,17 +1087,333 @@ static bool validateSourceOwnedTilingTask(TaskflowTaskOp task,
 // source-owned nested path; ordinary replica and sequential-K paths retain
 // their established validators below.
 struct SourceOwnedPartitionBox {
-  CounterBounds bounds[2];
+  SmallVector<CounterBounds, 3> bounds;
   const ReplicaRecord *record = nullptr;
 };
+
+static bool decodeLineageCounterBounds(Attribute attribute,
+                                       MutableArrayRef<CounterBounds> bounds) {
+  auto encoded = dyn_cast_or_null<DenseI64ArrayAttr>(attribute);
+  if (!encoded || bounds.empty() || bounds.size() > 3 ||
+      encoded.size() != static_cast<int64_t>(bounds.size() * 3))
+    return false;
+  for (size_t axis = 0; axis < bounds.size(); ++axis) {
+    bounds[axis] = {encoded[axis * 3], encoded[axis * 3 + 1],
+                    encoded[axis * 3 + 2]};
+    if (bounds[axis].lower < 0 || bounds[axis].upper <= bounds[axis].lower ||
+        bounds[axis].step != 1)
+      return false;
+  }
+  return true;
+}
+
+// The serialized root is only a lookup hint for a candidate whose immediate
+// parent has already been replaced.  Callers must still prove the complete
+// interval chain and bind its final step to the task's typed counters and
+// lineage attributes before using this name as a canonical parent.
+static std::optional<std::string>
+sourceOwnedPartitionRootHint(TaskflowTaskOp task) {
+  auto roots = dyn_cast_or_null<ArrayAttr>(
+      task->getAttr(kNeighborhoodPartitionLineageAttr));
+  if (!roots || roots.size() != 1)
+    return std::nullopt;
+  auto root = dyn_cast<DictionaryAttr>(roots[0]);
+  auto name = root ? root.getAs<StringAttr>("root") : StringAttr{};
+  if (!name || name.getValue().empty())
+    return std::nullopt;
+  return name.getValue().str();
+}
+
+static bool lineagePartitionMatches(StringRef family, int64_t axis,
+                                    int64_t factor, int64_t part,
+                                    ArrayRef<CounterBounds> before,
+                                    ArrayRef<CounterBounds> after) {
+  if ((family != "tiling" && family != "replica") || before.size() < 2 ||
+      before.size() > 3 || before.size() != after.size() || axis < 0 ||
+      axis > 1 || factor < 2 || factor > 8 || part < 0 || part >= factor)
+    return false;
+  for (size_t dimension = 0; dimension < before.size(); ++dimension) {
+    const CounterBounds &source = before[dimension];
+    if (source.lower < 0 || source.upper <= source.lower || source.step != 1)
+      return false;
+    if (static_cast<int64_t>(dimension) != axis) {
+      if (!equalBounds(source, after[dimension]))
+        return false;
+      continue;
+    }
+    int64_t extent = source.upper - source.lower;
+    if (extent < factor)
+      return false;
+    int64_t quotient = extent / factor;
+    int64_t remainder = extent % factor;
+    int64_t lower = source.lower + quotient * part + std::min(part, remainder);
+    int64_t upper = lower + quotient + (part < remainder ? 1 : 0);
+    if (after[dimension].lower != lower || after[dimension].upper != upper ||
+        after[dimension].step != 1)
+      return false;
+  }
+  return true;
+}
+
+// Authenticate a nested tile's immediate parent interval from the replayed
+// source-owned partition chain. The chain is checked from the canonical root
+// through every actual interval split and is finally tied to the task's
+// current Taskflow/Neura bounds, task name, and tiling attributes.
+static bool sourceOwnedImmediateTilingBounds(
+    TaskflowTaskOp task, StringRef canonicalName,
+    ArrayRef<CounterBounds> canonicalBounds,
+    ArrayRef<CounterBounds> current,
+    SmallVectorImpl<CounterBounds> &immediateBounds,
+    bool &finalStepIsTiling, std::string &error) {
+  finalStepIsTiling = false;
+  const size_t rank = canonicalBounds.size();
+  if (rank < 2 || rank > 3 || current.size() != rank) {
+    error = "source-owned tiling has an unsupported counter rank";
+    return false;
+  }
+  Attribute ledgerAttribute = task->getAttr(kNeighborhoodPartitionLineageAttr);
+  if (!ledgerAttribute) {
+    if (rank == 3) {
+      error = "source-owned rank-three partition requires an authenticated "
+              "full-rank lineage ledger";
+      return false;
+    }
+    auto declaredParent =
+        task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
+    auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
+    auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto part = task->getAttrOfType<IntegerAttr>(
+        "amoeba.neura.tiling.part_index");
+    if (!declaredParent || declaredParent.getValue() != canonicalName) {
+      error = "nested source-owned tiling requires authenticated partition "
+              "lineage";
+      return false;
+    }
+    auto originalRange = task->getAttrOfType<DenseI64ArrayAttr>(
+        "amoeba.neura.tiling.original_range");
+    auto derivedRange = task->getAttrOfType<DenseI64ArrayAttr>(
+        "amoeba.neura.tiling.derived_range");
+    if (!axis || !factor || !part || axis.getInt() < 0 || axis.getInt() > 1 ||
+        !originalRange ||
+        !derivedRange || originalRange.size() != 2 ||
+        derivedRange.size() != 2 ||
+        originalRange[0] != canonicalBounds[axis.getInt()].lower ||
+        originalRange[1] != canonicalBounds[axis.getInt()].upper ||
+        derivedRange[0] != current[axis.getInt()].lower ||
+        derivedRange[1] != current[axis.getInt()].upper ||
+        (rank == 3 && !equalBounds(current[2], canonicalBounds[2])) ||
+        !lineagePartitionMatches("tiling", axis.getInt(),
+                                 factor.getInt(), part.getInt(),
+                                 canonicalBounds, current)) {
+      error = "source-owned tiling range attributes disagree with canonical "
+              "or current counter bounds";
+      return false;
+    }
+    immediateBounds.assign(canonicalBounds.begin(), canonicalBounds.end());
+    finalStepIsTiling = true;
+    return true;
+  }
+
+  auto roots = dyn_cast<ArrayAttr>(ledgerAttribute);
+  if (!roots || roots.size() != 1) {
+    error = "source-owned tiling has malformed or multi-root partition lineage";
+    return false;
+  }
+  auto root = dyn_cast<DictionaryAttr>(roots[0]);
+  auto rootName = root ? root.getAs<StringAttr>("root") : StringAttr{};
+  auto steps = root ? root.getAs<ArrayAttr>("steps") : ArrayAttr{};
+  SmallVector<CounterBounds, 3> original(rank);
+  if (!rootName || rootName.getValue() != canonicalName || !steps ||
+      steps.empty() ||
+      !decodeLineageCounterBounds(root.get("original"), original) ||
+      !llvm::equal(original, canonicalBounds, equalBounds)) {
+    error = "source-owned tiling partition lineage does not match its "
+            "canonical root";
+    return false;
+  }
+
+  SmallVector<CounterBounds, 3> domain(original.begin(), original.end());
+  SmallVector<CounterBounds, 3> lastBefore;
+  struct StepContract {
+    bool present = false;
+    std::string parent;
+    int64_t axis = -1;
+    int64_t factor = -1;
+    int64_t part = -1;
+    SmallVector<CounterBounds, 3> before;
+    SmallVector<CounterBounds, 3> after;
+  } latestTiling, latestReplica;
+  std::string derivedName = canonicalName.str();
+  std::string immediateName;
+  std::string lastFamily;
+  for (Attribute stepAttribute : steps) {
+    auto step = dyn_cast<DictionaryAttr>(stepAttribute);
+    auto family = step ? step.getAs<StringAttr>("family") : StringAttr{};
+    auto axis = step ? step.getAs<IntegerAttr>("axis") : IntegerAttr{};
+    auto factor = step ? step.getAs<IntegerAttr>("factor") : IntegerAttr{};
+    auto part = step ? step.getAs<IntegerAttr>("part") : IntegerAttr{};
+    SmallVector<CounterBounds, 3> before(rank);
+    SmallVector<CounterBounds, 3> after(rank);
+    if (!family || !axis || !factor || !part || !axis.getType().isInteger(64) ||
+        !factor.getType().isInteger(64) || !part.getType().isInteger(64) ||
+        !decodeLineageCounterBounds(step.get("before"), before) ||
+        !decodeLineageCounterBounds(step.get("after"), after) ||
+        !llvm::equal(domain, before, equalBounds) ||
+        !lineagePartitionMatches(family.getValue(), axis.getInt(),
+                                 factor.getInt(), part.getInt(), before,
+                                 after)) {
+      error = "source-owned tiling partition lineage has a broken interval "
+              "chain";
+      return false;
+    }
+    immediateName = derivedName;
+    StepContract &familyContract = family.getValue() == "tiling"
+                                       ? latestTiling
+                                       : latestReplica;
+    familyContract.present = true;
+    familyContract.parent = derivedName;
+    familyContract.axis = axis.getInt();
+    familyContract.factor = factor.getInt();
+    familyContract.part = part.getInt();
+    familyContract.before.assign(before.begin(), before.end());
+    familyContract.after.assign(after.begin(), after.end());
+    if (family.getValue() == "tiling") {
+      derivedName +=
+          (Twine(".tile.") + Twine(axis.getInt()) + "." + Twine(part.getInt()))
+              .str();
+    } else {
+      derivedName += (Twine(".replica.") + Twine(part.getInt())).str();
+    }
+    lastBefore.assign(before.begin(), before.end());
+    domain.assign(after.begin(), after.end());
+    lastFamily = family.getValue().str();
+  }
+  finalStepIsTiling = lastFamily == "tiling";
+  auto finalParent = task->getAttrOfType<StringAttr>(
+      finalStepIsTiling ? "amoeba.neura.tiling.parent_task"
+                        : "amoeba.replica.parent_task");
+  if (derivedName != task.getTaskName() || !finalParent ||
+      immediateName != finalParent.getValue() ||
+      !llvm::equal(domain, current, equalBounds)) {
+    error = "source-owned tiling partition lineage disagrees with its "
+            "immediate parent or current bounds";
+    return false;
+  }
+
+  auto hasTilingMetadata = task->hasAttr("amoeba.neura.tiling.parent_task") ||
+                           task->hasAttr("amoeba.neura.tiling.axis") ||
+                           task->hasAttr("amoeba.neura.tiling.factor") ||
+                           task->hasAttr("amoeba.neura.tiling.part_index") ||
+                           task->hasAttr("amoeba.neura.tiling.original_range") ||
+                           task->hasAttr("amoeba.neura.tiling.derived_range");
+  // Replica materialization strips every amoeba.neura.tiling.* attribute
+  // from its output tasks. When the authenticated ledger ends in a replica,
+  // that complete absence is valid because the ledger and replica counters
+  // still prove the tile boundary. Partial metadata is never accepted.
+  bool replicaMaterializerStrippedTileMetadata =
+      latestTiling.present && lastFamily == "replica" && !hasTilingMetadata;
+  if ((!latestTiling.present && hasTilingMetadata) ||
+      (latestTiling.present && !hasTilingMetadata &&
+       !replicaMaterializerStrippedTileMetadata)) {
+    error = "source-owned tiling attributes do not match their latest "
+            "authenticated lineage step";
+    return false;
+  }
+  if (latestTiling.present && hasTilingMetadata) {
+    auto parent = task->getAttrOfType<StringAttr>(
+        "amoeba.neura.tiling.parent_task");
+    auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
+    auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto part = task->getAttrOfType<IntegerAttr>(
+        "amoeba.neura.tiling.part_index");
+    auto originalRange = task->getAttrOfType<DenseI64ArrayAttr>(
+        "amoeba.neura.tiling.original_range");
+    auto derivedRange = task->getAttrOfType<DenseI64ArrayAttr>(
+        "amoeba.neura.tiling.derived_range");
+    int64_t axisIndex = latestTiling.axis;
+    if (!parent || parent.getValue() != latestTiling.parent || !axis ||
+        !factor || !part || !originalRange || !derivedRange ||
+        axis.getInt() != axisIndex || factor.getInt() != latestTiling.factor ||
+        part.getInt() != latestTiling.part || originalRange.size() != 2 ||
+        derivedRange.size() != 2 ||
+        originalRange[0] != latestTiling.before[axisIndex].lower ||
+        originalRange[1] != latestTiling.before[axisIndex].upper ||
+        derivedRange[0] != latestTiling.after[axisIndex].lower ||
+        derivedRange[1] != latestTiling.after[axisIndex].upper) {
+      error = "source-owned tiling attributes do not match their latest "
+              "authenticated lineage step";
+      return false;
+    }
+    immediateBounds.assign(latestTiling.before.begin(),
+                           latestTiling.before.end());
+  } else {
+    immediateBounds.assign(lastBefore.begin(), lastBefore.end());
+  }
+
+  auto hasReplicaMetadata = task->hasAttr("amoeba.replica.parent_task") ||
+                            task->hasAttr("amoeba.replica.id") ||
+                            task->hasAttr("amoeba.replica.count") ||
+                            task->hasAttr("amoeba.replica.shard_axis") ||
+                            task->hasAttr("amoeba.replica.shard_lower") ||
+                            task->hasAttr("amoeba.replica.shard_upper");
+  if (latestReplica.present != hasReplicaMetadata) {
+    error = "source-owned replica attributes do not match their latest "
+            "authenticated lineage step";
+    return false;
+  }
+  if (latestReplica.present) {
+    auto parent = task->getAttrOfType<StringAttr>(
+        "amoeba.replica.parent_task");
+    auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+    auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+    auto axis = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
+    auto lower = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
+    auto upper = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
+    auto shardTripCount = task->getAttrOfType<IntegerAttr>(
+        "amoeba.replica.shard_trip_count");
+    int64_t axisIndex = latestReplica.axis;
+    if (!parent || parent.getValue() != latestReplica.parent || !id || !count ||
+        !axis || !lower || !upper || id.getInt() != latestReplica.part ||
+        count.getInt() != latestReplica.factor ||
+        axis.getInt() != axisIndex ||
+        lower.getInt() != latestReplica.after[axisIndex].lower ||
+        upper.getInt() != latestReplica.after[axisIndex].upper) {
+      error = "source-owned replica attributes do not match their latest "
+              "authenticated lineage step";
+      return false;
+    }
+    int64_t historicalReplicaTripCount = 0;
+    if (!shardTripCount || !shardTripCount.getType().isInteger(64) ||
+        !checkedCounterVolume(latestReplica.after,
+                              historicalReplicaTripCount) ||
+        shardTripCount.getInt() != historicalReplicaTripCount) {
+      error = "source-owned replica shard trip count disagrees with "
+              "authenticated replica bounds";
+      return false;
+    }
+    // If no later tile narrowed this replica, the historical replica volume
+    // is also the current task volume.  A replica followed by a tile keeps
+    // the replica's original shard_trip_count while its task trip count
+    // reflects only the smaller current box.
+    if (lastFamily == "replica") {
+      int64_t currentTripCount = 0;
+      if (!checkedCounterVolume(current, currentTripCount) ||
+          shardTripCount.getInt() != currentTripCount) {
+        error = "source-owned final replica shard trip count disagrees with "
+                "current counter volume";
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 // Indexed output coordinates are authenticated from the actual Neura DFG.
 // A copied region attribute is only a witness: forwarding through predication
 // or a phi is accepted when every incoming value names the same counter, while
 // arithmetic or an opaque value is rejected.
 static std::optional<unsigned>
-sourceOwnedOutputCounterAxis(Value value,
-                             ArrayRef<neura::CounterOp> counters,
+sourceOwnedOutputCounterAxis(Value value, ArrayRef<neura::CounterOp> counters,
                              unsigned depth = 0) {
   for (auto [axis, counterRef] : llvm::enumerate(counters)) {
     neura::CounterOp counter = counterRef;
@@ -1028,21 +1443,27 @@ sourceOwnedOutputCounterAxis(Value value,
 
 static bool validateSourceOwnedTaskBox(
     const TaskMetadata &parent, const ReplicaRecord &record,
-    const CounterBounds parentBounds[2], SourceOwnedPartitionBox &box,
+    ArrayRef<CounterBounds> parentBounds, SourceOwnedPartitionBox &box,
     std::string &error) {
   TaskflowTaskOp task = record.child;
-  SmallVector<TaskflowCounterOp> taskCounters;
-  task.walk([&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
-  if (taskCounters.size() != 2) {
-    error = "source-owned nested task " + task.getTaskName().str() +
-            " must have exactly two Taskflow M/N counters";
+  const size_t rank = parentBounds.size();
+  if (rank < 2 || rank > 3) {
+    error = "source-owned nested partition has an unsupported M/N/K rank";
     return false;
   }
-  for (int64_t id = 0; id < 2; ++id) {
+  box.bounds.assign(rank, CounterBounds{});
+  SmallVector<TaskflowCounterOp> taskCounters;
+  task.walk([&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
+  if (taskCounters.size() != rank) {
+    error = "source-owned nested task " + task.getTaskName().str() +
+            " must retain exactly its canonical M/N[/K] counters";
+    return false;
+  }
+  for (size_t id = 0; id < rank; ++id) {
     unsigned matches = 0;
     for (TaskflowCounterOp counter : taskCounters)
       if (auto counterId = counter->getAttrOfType<IntegerAttr>("counter_id");
-          counterId && counterId.getInt() == id)
+          counterId && counterId.getInt() == static_cast<int64_t>(id))
         ++matches;
     if (matches != 1) {
       error = "source-owned nested task " + task.getTaskName().str() +
@@ -1071,16 +1492,16 @@ static bool validateSourceOwnedTaskBox(
   SmallVector<neura::CounterOp> neuraCounters;
   kernels.front().walk(
       [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
-  if (neuraCounters.size() != 2) {
+  if (neuraCounters.size() != rank) {
     error = "source-owned nested task " + task.getTaskName().str() +
-            " must have exactly two Neura M/N counters";
+            " must retain exactly its canonical Neura M/N[/K] counters";
     return false;
   }
-  for (int64_t id = 0; id < 2; ++id) {
+  for (size_t id = 0; id < rank; ++id) {
     unsigned matches = 0;
     for (neura::CounterOp counter : neuraCounters)
       if (auto counterId = counter->getAttrOfType<IntegerAttr>("counter_id");
-          counterId && counterId.getInt() == id)
+          counterId && counterId.getInt() == static_cast<int64_t>(id))
         ++matches;
     if (matches != 1) {
       error = "source-owned nested task " + task.getTaskName().str() +
@@ -1097,14 +1518,17 @@ static bool validateSourceOwnedTaskBox(
     }
   }
 
-  __int128 volume = static_cast<__int128>(box.bounds[0].upper -
-                                           box.bounds[0].lower) *
-                    static_cast<__int128>(box.bounds[1].upper -
-                                           box.bounds[1].lower);
-  if (volume <= 0 || volume > std::numeric_limits<int64_t>::max() ||
-      record.childTripCount != static_cast<int64_t>(volume)) {
+  if (rank == 3 && !equalBounds(box.bounds[2], parentBounds[2])) {
+    error = "source-owned rank-three child changed its canonical K "
+            "reduction bounds";
+    return false;
+  }
+
+  int64_t volume = 0;
+  if (!checkedCounterVolume(box.bounds, volume) ||
+      record.childTripCount != volume) {
     error = "source-owned nested task " + task.getTaskName().str() +
-            " trip count does not match its actual M/N counter volume";
+            " trip count does not match its actual M/N[/K] counter volume";
     return false;
   }
 
@@ -1152,20 +1576,22 @@ static bool validateSourceOwnedTaskBox(
   kernels.front().walk([&](neura::StoreIndexedOp store) {
     if (!error.empty())
       return;
-    auto outputInput = parseKernelInputReference(store->getAttr("rhs_value"));
+    auto outputInput =
+        mlir::amoeba::neura::joint_scheduling::detail::accessInput(
+            store, store.getBase(), kernels.front());
     auto outputIt = outputInput
                        ? llvm::find(outputKernelInputByWrite, *outputInput)
                        : outputKernelInputByWrite.end();
+    if (!outputInput || !outputKernelInputs.contains(*outputInput)) {
+      error = "source-owned nested task " + task.getTaskName().str() +
+              " has an indexed store outside its authenticated task outputs";
+      return;
+    }
     if (outputIt == outputKernelInputByWrite.end() ||
         store.getIndices().size() != 2) {
-      if (!outputInput || !outputKernelInputs.contains(*outputInput)) {
-        error = "source-owned nested task " + task.getTaskName().str() +
-                " has an unclassified indexed output store";
-      } else {
-        error = "source-owned nested task " + task.getTaskName().str() +
-                " has an indexed output store with a non-rectangular "
-                "coordinate route";
-      }
+      error = "source-owned nested task " + task.getTaskName().str() +
+              " has an indexed output store with a non-rectangular "
+              "coordinate route";
       return;
     }
     unsigned outputIndex = outputIt - outputKernelInputByWrite.begin();
@@ -1180,6 +1606,15 @@ static bool validateSourceOwnedTaskBox(
         return;
       }
       route.push_back(*axis);
+    }
+    if (rank == 3) {
+      SmallVector<unsigned> sortedRoute(route);
+      llvm::sort(sortedRoute);
+      if (sortedRoute != SmallVector<unsigned>{0, 1}) {
+        error = "source-owned rank-three output must be indexed by M/N "
+                "counters while retaining the full K reduction";
+        return;
+      }
     }
     if (outputCounterAxes.empty())
       outputCounterAxes = route;
@@ -1220,27 +1655,40 @@ static bool validateSourceOwnedTaskBox(
     (void)regionIndex;
   }
 
-  // A source-owned tiling task may move only its declared M or N axis.  The
-  // untouched axis must remain the canonical parent's exact interval.
-  if (auto axis = task->getAttrOfType<IntegerAttr>(
-          "amoeba.neura.tiling.axis")) {
-    auto original = task->getAttrOfType<DenseI64ArrayAttr>(
-        "amoeba.neura.tiling.original_range");
-    if (axis.getInt() < 0 || axis.getInt() > 1 || !original ||
-        original.size() != 2 ||
-        original[0] != parentBounds[axis.getInt()].lower ||
-        original[1] != parentBounds[axis.getInt()].upper) {
-      error = "source-owned nested task " + task.getTaskName().str() +
-              " tiling axis/range does not match the canonical parent";
+  // Authenticate all source-owned partition steps, including a replica after
+  // a tile or a tile after a replica.  The latest tile's range attributes
+  // describe that intermediate tile even when the final task is a later
+  // replica, so they are checked against their own ledger step rather than
+  // against the final task box.
+  bool hasPartitionLineage =
+      task->hasAttr(kNeighborhoodPartitionLineageAttr) ||
+      task->hasAttr("amoeba.neura.tiling.axis") ||
+      task->hasAttr("amoeba.replica.parent_task");
+  if (hasPartitionLineage) {
+    SmallVector<CounterBounds, 3> latestTilingParentBounds;
+    bool finalStepIsTiling = false;
+    if (!sourceOwnedImmediateTilingBounds(
+            task, parent.name, parentBounds, box.bounds,
+            latestTilingParentBounds, finalStepIsTiling, error))
       return false;
-    }
-    for (int64_t dimension = 0; dimension < 2; ++dimension)
-      if (dimension != axis.getInt() &&
-          !equalBounds(box.bounds[dimension], parentBounds[dimension])) {
+    if (finalStepIsTiling) {
+      auto axis = task->getAttrOfType<IntegerAttr>(
+          "amoeba.neura.tiling.axis");
+      if (!axis || axis.getInt() < 0 || axis.getInt() > 1) {
         error = "source-owned nested task " + task.getTaskName().str() +
-                " changed an unsharded M/N axis";
+                " has no valid final tiling axis";
         return false;
       }
+      for (size_t dimension = 0; dimension < rank; ++dimension)
+        if (static_cast<int64_t>(dimension) != axis.getInt() &&
+            !equalBounds(box.bounds[dimension],
+                         latestTilingParentBounds[dimension])) {
+          error = "source-owned nested task " + task.getTaskName().str() +
+                  " changed an unsharded M/N axis of its immediate tile "
+                  "parent";
+          return false;
+        }
+    }
   }
   box.record = &record;
   return true;
@@ -1257,6 +1705,440 @@ static TaskflowTaskOp sourceOwnedStateTask(Value state) {
   return state.getDefiningOp<TaskflowTaskOp>();
 }
 
+struct SourceOwnedLineageStep {
+  std::string family;
+  int64_t axis = -1;
+  int64_t factor = 0;
+  int64_t part = -1;
+  SmallVector<CounterBounds, 3> before;
+  SmallVector<CounterBounds, 3> after;
+};
+
+static bool decodeSourceOwnedLineageSteps(
+    TaskflowTaskOp task, StringRef canonicalName,
+    ArrayRef<CounterBounds> canonicalBounds,
+    SmallVectorImpl<SourceOwnedLineageStep> &steps, std::string &error) {
+  auto roots = dyn_cast_or_null<ArrayAttr>(
+      task->getAttr(kNeighborhoodPartitionLineageAttr));
+  auto root = roots && roots.size() == 1
+                  ? dyn_cast<DictionaryAttr>(roots[0])
+                  : DictionaryAttr{};
+  auto rootName = root ? root.getAs<StringAttr>("root") : StringAttr{};
+  auto original = root ? root.getAs<DenseI64ArrayAttr>("original")
+                       : DenseI64ArrayAttr{};
+  auto encodedSteps = root ? root.getAs<ArrayAttr>("steps") : ArrayAttr{};
+  SmallVector<CounterBounds, 3> originalBounds(canonicalBounds.size());
+  if (!rootName || rootName.getValue() != canonicalName || !original ||
+      !decodeLineageCounterBounds(original, originalBounds) ||
+      !llvm::equal(originalBounds, canonicalBounds, equalBounds) ||
+      !encodedSteps || encodedSteps.empty()) {
+    error = "source-owned mixed partition has no complete canonical typed "
+            "lineage";
+    return false;
+  }
+
+  std::string derivedName = canonicalName.str();
+  SmallVector<CounterBounds, 3> current(canonicalBounds.begin(),
+                                        canonicalBounds.end());
+  for (Attribute attribute : encodedSteps) {
+    auto encoded = dyn_cast<DictionaryAttr>(attribute);
+    auto family = encoded ? encoded.getAs<StringAttr>("family") : StringAttr{};
+    auto axis = encoded ? encoded.getAs<IntegerAttr>("axis") : IntegerAttr{};
+    auto factor = encoded ? encoded.getAs<IntegerAttr>("factor")
+                          : IntegerAttr{};
+    auto part = encoded ? encoded.getAs<IntegerAttr>("part") : IntegerAttr{};
+    SourceOwnedLineageStep step;
+    step.before.resize(canonicalBounds.size());
+    step.after.resize(canonicalBounds.size());
+    if (!family || !axis || !factor || !part ||
+        !decodeLineageCounterBounds(encoded.get("before"), step.before) ||
+        !decodeLineageCounterBounds(encoded.get("after"), step.after) ||
+        !llvm::equal(step.before, current, equalBounds) ||
+        !lineagePartitionMatches(family.getValue(), axis.getInt(),
+                                 factor.getInt(), part.getInt(), step.before,
+                                 step.after)) {
+      error = "source-owned mixed partition has a broken typed lineage "
+              "step";
+      return false;
+    }
+    step.family = family.getValue().str();
+    step.axis = axis.getInt();
+    step.factor = factor.getInt();
+    step.part = part.getInt();
+    if (step.family == "tiling")
+      derivedName += (Twine(".tile.") + Twine(step.axis) + "." +
+                      Twine(step.part))
+                         .str();
+    else
+      derivedName += (Twine(".replica.") + Twine(step.part)).str();
+    current.assign(step.after.begin(), step.after.end());
+    steps.push_back(std::move(step));
+  }
+  if (derivedName != task.getTaskName()) {
+    error = "source-owned mixed partition lineage does not derive the "
+            "current task name";
+    return false;
+  }
+  return true;
+}
+
+static bool collectSourceOwnedJoinLeaves(
+    Value state, SmallVectorImpl<TaskflowTaskOp> &leaves,
+    DenseSet<Operation *> &activeJoins) {
+  state = stripSourceOwnedMemrefCasts(state);
+  if (TaskflowTaskOp task = state.getDefiningOp<TaskflowTaskOp>()) {
+    leaves.push_back(task);
+    return true;
+  }
+  TaskflowJoinOp join = state.getDefiningOp<TaskflowJoinOp>();
+  if (!join || !activeJoins.insert(join.getOperation()).second)
+    return false;
+  if (join.getTileStates().empty())
+    return false;
+  for (Value childState : join.getTileStates())
+    if (!collectSourceOwnedJoinLeaves(childState, leaves, activeJoins))
+      return false;
+  activeJoins.erase(join.getOperation());
+  return true;
+}
+
+static bool sameSourceOwnedLineageStepKey(const SourceOwnedLineageStep &lhs,
+                                          const SourceOwnedLineageStep &rhs) {
+  return lhs.family == rhs.family && lhs.axis == rhs.axis &&
+         lhs.factor == rhs.factor &&
+         llvm::equal(lhs.before, rhs.before, equalBounds);
+}
+
+static bool sameSourceOwnedLineageStep(const SourceOwnedLineageStep &lhs,
+                                       const SourceOwnedLineageStep &rhs) {
+  return sameSourceOwnedLineageStepKey(lhs, rhs) && lhs.part == rhs.part &&
+         llvm::equal(lhs.after, rhs.after, equalBounds);
+}
+
+static bool sourceOwnedBoxesCoverRegion(
+    ArrayRef<unsigned> indices, ArrayRef<SourceOwnedPartitionBox> boxes,
+    ArrayRef<CounterBounds> region, std::string &error) {
+  if (region.size() < 2 || region.size() > 3) {
+    error = "source-owned completion-join branch has an unsupported typed "
+            "region rank";
+    return false;
+  }
+  __int128 volume = 0;
+  for (unsigned index : indices) {
+    ArrayRef<CounterBounds> box = boxes[index].bounds;
+    if (box[0].lower < region[0].lower || box[0].upper > region[0].upper ||
+        box[1].lower < region[1].lower || box[1].upper > region[1].upper) {
+      error = "source-owned completion-join branch has a leaf outside its "
+              "typed output region";
+      return false;
+    }
+    if (region.size() == 3 &&
+        !equalBounds(box[2], region[2])) {
+      error = "source-owned completion-join branch changes its retained K "
+              "reduction bounds";
+      return false;
+    }
+    volume += static_cast<__int128>(box[0].upper - box[0].lower) *
+              static_cast<__int128>(box[1].upper - box[1].lower);
+    for (unsigned other : indices) {
+      if (other <= index)
+        continue;
+      bool overlap = box[0].lower < boxes[other].bounds[0].upper &&
+                     boxes[other].bounds[0].lower < box[0].upper &&
+                     box[1].lower < boxes[other].bounds[1].upper &&
+                     boxes[other].bounds[1].lower < box[1].upper;
+      if (overlap) {
+        error = "source-owned completion-join branch contains overlapping "
+                "actual leaf boxes";
+        return false;
+      }
+    }
+  }
+  __int128 expected = static_cast<__int128>(region[0].upper - region[0].lower) *
+                      static_cast<__int128>(region[1].upper - region[1].lower);
+  if (expected <= 0 || volume != expected) {
+    error = "source-owned completion-join branch leaves do not cover their "
+            "typed output region";
+    return false;
+  }
+  return true;
+}
+
+// A mixed replica/tile state is an intermediate tree: one replica branch
+// may already be replaced by a nested tile join while sibling branches remain
+// leaf tasks. Authenticate the entire result tree against each leaf's typed
+// partition ledger, and link every join state to the exact child completion
+// result. The task-box checks performed by validateSourceOwnedPartition
+// independently prove current Taskflow/Neura bounds and indexed output
+// coordinates before this structural check runs.
+static bool validateSourceOwnedMixedJoinTree(
+    StringRef canonicalName, ArrayRef<CounterBounds> canonicalBounds,
+    ArrayRef<ReplicaRecord> records,
+    ArrayRef<SourceOwnedPartitionBox> boxes, size_t canonicalDoneReadCount,
+    std::string &error) {
+  if (canonicalDoneReadCount != 0) {
+    error = "source-owned mixed partition with sparse done-read outputs is "
+            "unsupported";
+    return false;
+  }
+  func::FuncOp function =
+      records.front().child->getParentOfType<func::FuncOp>();
+  if (!function) {
+    error = "source-owned mixed partition has no enclosing function";
+    return false;
+  }
+
+  SmallVector<SmallVector<SourceOwnedLineageStep>> lineages(records.size());
+  std::map<Operation *, unsigned> recordByTask;
+  for (auto [index, record] : llvm::enumerate(records)) {
+    TaskflowTaskOp child = record.child;
+    if (!recordByTask.emplace(child.getOperation(), index).second ||
+        !decodeSourceOwnedLineageSteps(child, canonicalName,
+                                       canonicalBounds, lineages[index],
+                                       error))
+      return false;
+    if (child.getWillWrites().size() != 1 ||
+        child.getDoneWrites().size() != 1 ||
+        child.getOriginalWriteMemrefs().size() != 1) {
+      error = "source-owned mixed partition requires one exact output and "
+              "completion result per leaf";
+      return false;
+    }
+  }
+
+  auto indicesForState = [&](Value state, SmallVectorImpl<unsigned> &indices) {
+    SmallVector<TaskflowTaskOp> leaves;
+    DenseSet<Operation *> activeJoins;
+    if (!collectSourceOwnedJoinLeaves(state, leaves, activeJoins))
+      return false;
+    DenseSet<unsigned> seen;
+    for (TaskflowTaskOp leaf : leaves) {
+      auto found = recordByTask.find(leaf.getOperation());
+      if (found == recordByTask.end() || !seen.insert(found->second).second)
+        return false;
+      indices.push_back(found->second);
+    }
+    return !indices.empty();
+  };
+
+  std::function<bool(TaskflowJoinOp, ArrayRef<unsigned>,
+                     DenseSet<Operation *> &)> validateNode;
+  validateNode = [&](TaskflowJoinOp join, ArrayRef<unsigned> indices,
+                     DenseSet<Operation *> &active) {
+    if (!join || indices.size() < 2 ||
+        !active.insert(join.getOperation()).second ||
+        failed(verify(join.getOperation()))) {
+      error = "source-owned mixed partition has an invalid or cyclic "
+              "completion join";
+      return false;
+    }
+    auto leaveActive = [&]() { active.erase(join.getOperation()); };
+
+    size_t split = 0;
+    for (;; ++split) {
+      if (llvm::any_of(indices, [&](unsigned index) {
+            return lineages[index].size() <= split;
+          })) {
+        error = "source-owned mixed completion tree ends before its leaf "
+                "lineages diverge";
+        leaveActive();
+        return false;
+      }
+      bool common = llvm::all_of(indices.drop_front(), [&](unsigned index) {
+        return sameSourceOwnedLineageStep(
+            lineages[indices.front()][split], lineages[index][split]);
+      });
+      if (!common)
+        break;
+    }
+    const SourceOwnedLineageStep &splitStep =
+        lineages[indices.front()][split];
+    for (unsigned index : indices)
+      if (!sameSourceOwnedLineageStepKey(splitStep,
+                                         lineages[index][split])) {
+        error = "source-owned mixed completion join does not correspond to "
+                "one typed partition step";
+        leaveActive();
+        return false;
+      }
+    if (splitStep.factor != static_cast<int64_t>(join.getTileStates().size()) ||
+        join.getAxis() != static_cast<uint64_t>(splitStep.axis) ||
+        join.getRegionLower().size() != 2 ||
+        join.getRegionUpper().size() != 2) {
+      error = "source-owned mixed completion join has a mismatched typed "
+              "factor, axis, or region rank";
+      leaveActive();
+      return false;
+    }
+    for (int64_t dimension = 0; dimension < 2; ++dimension)
+      if (join.getRegionLower()[dimension] !=
+              splitStep.before[dimension].lower ||
+          join.getRegionUpper()[dimension] !=
+              splitStep.before[dimension].upper) {
+        error = "source-owned mixed completion join region disagrees with "
+                "its typed before bounds";
+        leaveActive();
+        return false;
+      }
+    if (!join->hasAttr("amoeba.semantic.completion_only")) {
+      error = "source-owned mixed completion join lacks semantic "
+              "completion-only marking";
+      leaveActive();
+      return false;
+    }
+    if (splitStep.family == "replica") {
+      if (!join->hasAttr("amoeba.replica.completion_only") ||
+          join->hasAttr("amoeba.neura.joint_rewrite")) {
+        error = "source-owned mixed replica split has the wrong completion "
+                "join identity";
+        leaveActive();
+        return false;
+      }
+    } else {
+      auto rewrite = join->getAttrOfType<StringAttr>(
+          "amoeba.neura.joint_rewrite");
+      if (!rewrite || rewrite.getValue() != "post-neura-mn-tiling" ||
+          join->hasAttr("amoeba.replica.completion_only")) {
+        error = "source-owned mixed tile split has the wrong completion "
+                "join identity";
+        leaveActive();
+        return false;
+      }
+    }
+
+    Value joinBase = stripSourceOwnedMemrefCasts(join.getBase());
+    if (!joinBase) {
+      error = "source-owned mixed completion join has no storage base";
+      leaveActive();
+      return false;
+    }
+    for (unsigned index : indices) {
+      TaskflowTaskOp child = records[index].child;
+      if (stripSourceOwnedMemrefCasts(child.getWillWrites().front()) !=
+              joinBase ||
+          stripSourceOwnedMemrefCasts(
+              child.getOriginalWriteMemrefs().front()) != joinBase) {
+        error = "source-owned mixed completion join changes a leaf output "
+                "storage root";
+        leaveActive();
+        return false;
+      }
+    }
+
+    DenseSet<unsigned> joinedIndices;
+    DenseSet<int64_t> joinedParts;
+    for (Value state : join.getTileStates()) {
+      SmallVector<unsigned> branchIndices;
+      if (!indicesForState(state, branchIndices)) {
+        error = "source-owned mixed completion join has a state outside its "
+                "authenticated leaf set";
+        leaveActive();
+        return false;
+      }
+      for (unsigned index : branchIndices)
+        if (!llvm::is_contained(indices, index) ||
+            !joinedIndices.insert(index).second) {
+          error = "source-owned mixed completion join duplicates or escapes "
+                  "a leaf";
+          leaveActive();
+          return false;
+        }
+      const SourceOwnedLineageStep &branchStep =
+          lineages[branchIndices.front()][split];
+      if (!sameSourceOwnedLineageStepKey(splitStep, branchStep) ||
+          !joinedParts.insert(branchStep.part).second) {
+        error = "source-owned mixed completion join has duplicate or "
+                "inconsistent typed partition parts";
+        leaveActive();
+        return false;
+      }
+      for (unsigned index : branchIndices)
+        if (!sameSourceOwnedLineageStep(branchStep,
+                                        lineages[index][split]) ||
+            lineages[index][split].part != branchStep.part) {
+          error = "source-owned mixed join state combines different typed "
+                  "partition parts";
+          leaveActive();
+          return false;
+        }
+      if (branchStep.part < 0 || branchStep.part >= splitStep.factor ||
+          !sourceOwnedBoxesCoverRegion(branchIndices, boxes,
+                                       branchStep.after, error)) {
+        if (error.empty())
+          error = "source-owned mixed completion join has an invalid typed "
+                  "branch interval";
+        leaveActive();
+        return false;
+      }
+
+      Value stateRoot = stripSourceOwnedMemrefCasts(state);
+      if (TaskflowTaskOp leaf = stateRoot.getDefiningOp<TaskflowTaskOp>()) {
+        if (branchIndices.size() != 1 || leaf != records[branchIndices.front()].child ||
+            leaf.getDoneWrites().size() != 1 ||
+            stripSourceOwnedMemrefCasts(leaf.getDoneWrites().front()) !=
+                stateRoot) {
+          error = "source-owned mixed join state is not the exact leaf "
+                  "completion result";
+          leaveActive();
+          return false;
+        }
+      } else if (TaskflowJoinOp nested =
+                     stateRoot.getDefiningOp<TaskflowJoinOp>()) {
+        if (stripSourceOwnedMemrefCasts(nested.getJoined()) != stateRoot ||
+            !validateNode(nested, branchIndices, active)) {
+          if (error.empty())
+            error = "source-owned mixed join state is not the exact nested "
+                    "completion result";
+          leaveActive();
+          return false;
+        }
+      } else {
+        error = "source-owned mixed join state is neither a leaf task nor a "
+                "nested completion join";
+        leaveActive();
+        return false;
+      }
+    }
+    if (joinedIndices.size() != indices.size() ||
+        static_cast<int64_t>(joinedParts.size()) != splitStep.factor) {
+      error = "source-owned mixed completion join omits a typed leaf or "
+              "partition part";
+      leaveActive();
+      return false;
+    }
+    for (int64_t part = 0; part < splitStep.factor; ++part)
+      if (!joinedParts.contains(part)) {
+        error = "source-owned mixed completion join is missing typed part " +
+                std::to_string(part);
+        leaveActive();
+        return false;
+      }
+    leaveActive();
+    return true;
+  };
+
+  SmallVector<unsigned> expectedIndices;
+  for (unsigned index = 0; index < records.size(); ++index)
+    expectedIndices.push_back(index);
+  SmallVector<TaskflowJoinOp> rootJoins;
+  function.walk([&](TaskflowJoinOp candidate) {
+    SmallVector<unsigned> indices;
+    if (!indicesForState(candidate.getJoined(), indices) ||
+        indices.size() != records.size())
+      return;
+    llvm::sort(indices);
+    if (llvm::equal(indices, expectedIndices))
+      rootJoins.push_back(candidate);
+  });
+  if (rootJoins.size() != 1) {
+    error = "source-owned mixed partition does not have one unique root "
+            "completion join for its complete leaf set";
+    return false;
+  }
+  DenseSet<Operation *> active;
+  return validateNode(rootJoins.front(), expectedIndices, active);
+}
+
 // The final partition check proves global coverage.  This second check proves
 // each replaced intermediate tile's own completion join: the children must
 // cover that join's region along exactly its selected axis and must agree on
@@ -1264,7 +2146,8 @@ static TaskflowTaskOp sourceOwnedStateTask(Value state) {
 // done-write roots, so a forged parent name cannot borrow an unrelated join.
 static bool validateSourceOwnedNestedJoins(
     ArrayRef<ReplicaRecord> records,
-    ArrayRef<SourceOwnedPartitionBox> boxes, std::string &error) {
+    ArrayRef<SourceOwnedPartitionBox> boxes, size_t canonicalDoneReadCount,
+    std::string &error) {
   if (records.size() != boxes.size() || records.empty())
     return false;
   func::FuncOp function =
@@ -1419,8 +2302,398 @@ static bool validateSourceOwnedNestedJoins(
               "axis";
       return false;
     }
+
+    // Sparse done-read results carry WAR completion just as output joins
+    // carry write completion. Every source read result must be preserved by
+    // a distinct typed fan-in linked to this exact output join; forwarding a
+    // single replica's read token would let a later writer race sibling reads.
+    TaskflowTaskOp firstChild = records.front().child;
+    const size_t doneReadCount = firstChild.getDoneReads().size();
+    if (doneReadCount != canonicalDoneReadCount || doneReadCount > 1 ||
+        !llvm::all_of(records, [&](const ReplicaRecord &record) {
+          TaskflowTaskOp child = record.child;
+          return child.getDoneReads().size() == doneReadCount;
+        })) {
+      error = "source-owned replica has inconsistent or unsupported sparse "
+              "done-read outputs";
+      return false;
+    }
+    SmallVector<TaskflowReadCompletionJoinOp> readJoins;
+    function.walk([&](TaskflowReadCompletionJoinOp candidate) {
+      if (candidate.getWriteCompletion() == completionJoin.getJoined())
+        readJoins.push_back(candidate);
+    });
+    if (readJoins.size() != doneReadCount) {
+      error = "source-owned replica read completion join count does not "
+              "preserve its sparse done-read outputs";
+      return false;
+    }
+    for (unsigned readResult = 0; readResult < doneReadCount; ++readResult) {
+      DenseSet<Value> expectedReadStates;
+      for (unsigned index : indices) {
+        TaskflowTaskOp child = records[index].child;
+        expectedReadStates.insert(child.getDoneReads()[readResult]);
+      }
+      TaskflowReadCompletionJoinOp readJoin;
+      for (TaskflowReadCompletionJoinOp candidate : readJoins) {
+        DenseSet<Value> actualReadStates;
+        for (Value state : candidate.getTileStates())
+          actualReadStates.insert(state);
+        if (actualReadStates.size() == expectedReadStates.size() &&
+            llvm::all_of(expectedReadStates, [&](Value state) {
+              return actualReadStates.contains(state);
+            }))
+          readJoin = candidate;
+      }
+      if (!readJoin || failed(verify(readJoin.getOperation()))) {
+        error = "source-owned replica done-read fan-in does not match every "
+                "child and its output completion join";
+        return false;
+      }
+      for (Value state : expectedReadStates) {
+        if (!llvm::hasSingleElement(state.getUses()) ||
+            state.use_begin()->getOwner() != readJoin.getOperation()) {
+          error = "source-owned replica done-read state has an escaped or "
+                  "missing join use";
+          return false;
+        }
+      }
+    }
   }
   return true;
+}
+
+static bool validateSourceOwnedRankOneTilingMetadata(
+    TaskflowTaskOp task, StringRef canonicalName,
+    const CounterBounds &canonicalBounds, const CounterBounds &currentBounds,
+    std::string &error) {
+  auto parent =
+      task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
+  auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
+  auto part =
+      task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
+  auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+  auto original = task->getAttrOfType<DenseI64ArrayAttr>(
+      "amoeba.neura.tiling.original_range");
+  auto derived = task->getAttrOfType<DenseI64ArrayAttr>(
+      "amoeba.neura.tiling.derived_range");
+  auto rewrite = task->getAttrOfType<StringAttr>("amoeba.neura.joint_rewrite");
+  std::string expectedName =
+      (Twine(canonicalName) + ".tile.0." + Twine(part ? part.getInt() : -1))
+          .str();
+  if (!parent || parent.getValue() != canonicalName || !axis ||
+      axis.getInt() != 0 || !part || part.getInt() < 0 || !factor ||
+      (factor.getInt() != 2 && factor.getInt() != 4 && factor.getInt() != 8) ||
+      part.getInt() >= factor.getInt() || !original || original.size() != 2 ||
+      !derived || derived.size() != 2 || original[0] != canonicalBounds.lower ||
+      original[1] != canonicalBounds.upper ||
+      derived[0] != currentBounds.lower || derived[1] != currentBounds.upper ||
+      !rewrite || rewrite.getValue() != "post-neura-mn-tiling" ||
+      task.getTaskName() != StringRef(expectedName) ||
+      task->hasAttr("amoeba.replica.parent_task")) {
+    error = "source-owned rank-1 tile attributes disagree with its canonical "
+            "parent, part, or current counter bounds";
+    return false;
+  }
+  int64_t extent = canonicalBounds.upper - canonicalBounds.lower;
+  int64_t width = extent / factor.getInt();
+  int64_t remainder = extent % factor.getInt();
+  int64_t expectedLower = canonicalBounds.lower + part.getInt() * width +
+                          std::min(part.getInt(), remainder);
+  int64_t expectedUpper = expectedLower + width +
+                          (part.getInt() < remainder ? 1 : 0);
+  if (currentBounds.lower != expectedLower ||
+      currentBounds.upper != expectedUpper) {
+    error = "source-owned rank-1 tile interval does not match its ordered part";
+    return false;
+  }
+  Attribute lineageAttribute = task->getAttr(kNeighborhoodPartitionLineageAttr);
+  if (!lineageAttribute)
+    return true;
+  auto roots = dyn_cast<ArrayAttr>(lineageAttribute);
+  auto root = roots && roots.size() == 1 ? dyn_cast<DictionaryAttr>(roots[0])
+                                         : DictionaryAttr{};
+  auto rootName = root ? root.getAs<StringAttr>("root") : StringAttr{};
+  auto originalDomain =
+      root ? root.getAs<DenseI64ArrayAttr>("original") : DenseI64ArrayAttr{};
+  auto steps = root ? root.getAs<ArrayAttr>("steps") : ArrayAttr{};
+  auto tripleMatches = [](DenseI64ArrayAttr encoded,
+                          const CounterBounds &bounds) {
+    return encoded && encoded.size() == 3 && encoded[0] == bounds.lower &&
+           encoded[1] == bounds.upper && encoded[2] == bounds.step;
+  };
+  auto step = steps && steps.size() == 1 ? dyn_cast<DictionaryAttr>(steps[0])
+                                         : DictionaryAttr{};
+  auto family = step ? step.getAs<StringAttr>("family") : StringAttr{};
+  auto lineageAxis = step ? step.getAs<IntegerAttr>("axis") : IntegerAttr{};
+  auto lineageFactor = step ? step.getAs<IntegerAttr>("factor") : IntegerAttr{};
+  auto lineagePart = step ? step.getAs<IntegerAttr>("part") : IntegerAttr{};
+  auto before =
+      step ? step.getAs<DenseI64ArrayAttr>("before") : DenseI64ArrayAttr{};
+  auto after =
+      step ? step.getAs<DenseI64ArrayAttr>("after") : DenseI64ArrayAttr{};
+  if (!rootName || rootName.getValue() != canonicalName || !originalDomain ||
+      !tripleMatches(originalDomain, canonicalBounds) || !step || !family ||
+      family.getValue() != "tiling" || !lineageAxis ||
+      lineageAxis.getInt() != 0 || !lineageFactor ||
+      lineageFactor.getInt() != factor.getInt() || !lineagePart ||
+      lineagePart.getInt() != part.getInt() ||
+      !tripleMatches(before, canonicalBounds) ||
+      !tripleMatches(after, currentBounds)) {
+    error = "source-owned rank-1 typed partition lineage does not match its "
+            "single tile step";
+    return false;
+  }
+  return true;
+}
+
+static std::optional<unsigned> sourceOwnedNoAliasArgumentIndex(Value value) {
+  FailureOr<Value> root = resolveTaskflowMemoryRoot(value);
+  if (failed(root))
+    return std::nullopt;
+  value = *root;
+  auto argument = dyn_cast<BlockArgument>(value);
+  if (!argument || !argument.getOwner())
+    return std::nullopt;
+  auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+  if (!function || argument.getOwner() != &function.getBody().front() ||
+      !function.getArgAttr(argument.getArgNumber(), "amoeba.noalias"))
+    return std::nullopt;
+  return argument.getArgNumber();
+}
+
+static bool validateSourceOwnedRankOneOutput(
+    TaskflowTaskOp task, unsigned expectedArgument,
+    ArrayRef<int64_t> expectedShape, bool requireMetadata,
+    ReplicaOutputCoordinateProof &proof, std::string &error) {
+  if (task.getWillWrites().size() != 1 ||
+      task.getOriginalWriteMemrefs().size() != 1) {
+    error = "source-owned rank-1 task must have one output and write root";
+    return false;
+  }
+  std::optional<unsigned> argument =
+      sourceOwnedNoAliasArgumentIndex(task.getOriginalWriteMemrefs().front());
+  if (!argument || *argument != expectedArgument) {
+    error = "source-owned rank-1 output no longer names the canonical "
+            "noalias argument";
+    return false;
+  }
+  proof = analyzeReplicaOutputCoordinates(task, /*requestedAxis=*/0,
+                                          /*outputWriteIndex=*/0);
+  if (!proof.proven || !proof.sawOutputLoad || !proof.sawOutputStore ||
+      proof.outputCounterAxes.size() != 1 ||
+      proof.outputCounterAxes.front() != 0 || proof.callerShape.size() != 1 ||
+      proof.callerShape.front() <= 0 ||
+      (!expectedShape.empty() &&
+       !llvm::equal(proof.callerShape, expectedShape)) ||
+      proof.taskLowers.size() != 1 || proof.taskUppers.size() != 1 ||
+      proof.kernelLowers.size() != 1 || proof.kernelUppers.size() != 1 ||
+      proof.producedLowers.size() != 1 || proof.producedShape.size() != 1 ||
+      proof.taskLowers.front() < 0 ||
+      proof.taskUppers.front() <= proof.taskLowers.front() ||
+      proof.producedLowers.front() != proof.taskLowers.front() ||
+      proof.producedShape.front() !=
+          proof.taskUppers.front() - proof.taskLowers.front()) {
+    error = "source-owned rank-1 output coordinates do not prove the actual "
+            "counter interval: " +
+            proof.reason;
+    return false;
+  }
+  return validateOutputRegionAgainstProof(task, /*writeIndex=*/0, proof,
+                                          requireMetadata, error);
+}
+
+static bool validateSourceOwnedRankOneJoin(const TaskMetadata &parent,
+                                           ArrayRef<ReplicaRecord> records,
+                                           const CounterBounds &parentBounds,
+                                           unsigned outputArgument,
+                                           std::string &error) {
+  if (records.empty())
+    return false;
+  func::FuncOp function =
+      records.front().child->getParentOfType<func::FuncOp>();
+  if (!function) {
+    error = "source-owned rank-1 partition has no enclosing function";
+    return false;
+  }
+  DenseSet<Value> expectedStates;
+  for (const ReplicaRecord &record : records) {
+    TaskflowTaskOp child = record.child;
+    if (child.getDoneWrites().size() != 1 ||
+        !expectedStates.insert(child.getDoneWrites().front()).second) {
+      error = "source-owned rank-1 partition has missing or duplicate tile "
+              "completion states";
+      return false;
+    }
+  }
+  TaskflowJoinOp completionJoin;
+  unsigned matchingJoins = 0;
+  function.walk([&](TaskflowJoinOp candidate) {
+    if (candidate.getTileStates().size() != expectedStates.size())
+      return;
+    DenseSet<Value> actualStates;
+    for (Value state : candidate.getTileStates())
+      if (!actualStates.insert(state).second || !expectedStates.contains(state))
+        return;
+    if (actualStates.size() == expectedStates.size()) {
+      ++matchingJoins;
+      completionJoin = candidate;
+    }
+  });
+  if (matchingJoins != 1 || !completionJoin ||
+      !completionJoin->hasAttr("amoeba.semantic.completion_only") ||
+      completionJoin->hasAttr("amoeba.replica.completion_only") ||
+      failed(verify(completionJoin.getOperation()))) {
+    error = "source-owned rank-1 tiles lack one verified completion join "
+            "linked to their exact done-write leaf set";
+    return false;
+  }
+  auto rewrite =
+      completionJoin->getAttrOfType<StringAttr>("amoeba.neura.joint_rewrite");
+  if (!rewrite || rewrite.getValue() != "post-neura-mn-tiling" ||
+      completionJoin.getAxis() != 0 ||
+      completionJoin.getRegionLower().size() != 1 ||
+      completionJoin.getRegionUpper().size() != 1 ||
+      completionJoin.getRegionLower().front() != parentBounds.lower ||
+      completionJoin.getRegionUpper().front() != parentBounds.upper) {
+    error = "source-owned rank-1 completion join has a mismatched region or "
+            "rewrite identity";
+    return false;
+  }
+  std::optional<unsigned> joinArgument =
+      sourceOwnedNoAliasArgumentIndex(completionJoin.getBase());
+  std::optional<unsigned> parentArgument;
+  TaskflowTaskOp parentTask = parent.op;
+  if (parentTask.getOriginalWriteMemrefs().size() == 1)
+    parentArgument = sourceOwnedNoAliasArgumentIndex(
+        parentTask.getOriginalWriteMemrefs().front());
+  if (!joinArgument || *joinArgument != outputArgument || !parentArgument ||
+      *parentArgument != outputArgument) {
+    error = "source-owned rank-1 completion join is not based on the "
+            "canonical noalias output";
+    return false;
+  }
+  for (Value state : expectedStates)
+    if (!llvm::hasSingleElement(state.getUses()) ||
+        state.use_begin()->getOwner() != completionJoin.getOperation()) {
+      error = "source-owned rank-1 tile completion state escapes its exact "
+              "join";
+      return false;
+    }
+  return true;
+}
+
+static bool validateSourceOwnedRankOnePartition(const TaskMetadata &parent,
+                                                ArrayRef<ReplicaRecord> records,
+                                                std::string &error) {
+  TaskflowTaskOp parentTask = parent.op;
+  if (records.size() < 2 || parentTask.getWillWrites().size() != 1 ||
+      parentTask.getOriginalWriteMemrefs().size() != 1) {
+    error = "source-owned rank-1 partition requires at least two tiles and "
+            "one canonical output";
+    return false;
+  }
+  std::optional<unsigned> outputArgument = sourceOwnedNoAliasArgumentIndex(
+      parentTask.getOriginalWriteMemrefs().front());
+  if (!outputArgument) {
+    error = "canonical source rank-1 output is not a noalias function "
+            "argument";
+    return false;
+  }
+  ReplicaOutputCoordinateProof parentProof;
+  if (!validateSourceOwnedRankOneOutput(
+          parentTask, *outputArgument, /*expectedShape=*/{},
+          /*requireMetadata=*/false, parentProof, error))
+    return false;
+  CounterBounds parentBounds{parentProof.taskLowers.front(),
+                             parentProof.taskUppers.front(), 1};
+  int64_t parentExtent = parentBounds.upper - parentBounds.lower;
+  if (parent.tripCount != parentExtent ||
+      parent.taskflowTripCount != parentExtent) {
+    error = "canonical source task " + parent.name +
+            " trip count does not match its actual rank-1 counter extent";
+    return false;
+  }
+  int64_t factor = -1;
+  SmallVector<std::pair<int64_t, int64_t>> intervals;
+  std::set<int64_t> seenParts;
+  for (const ReplicaRecord &record : records) {
+    TaskflowTaskOp child = record.child;
+    if (!record.sourceOwnedTiling || record.sequentialK ||
+        child.getWillWrites().size() != 1) {
+      error = "source-owned rank-1 partition is mixed with a non-tile child";
+      return false;
+    }
+    for (NamedAttribute attribute : child->getAttrs())
+      if (attribute.getName().strref().starts_with("amoeba.replica.")) {
+        error = "source-owned rank-1 pure tiling rejects replica metadata";
+        return false;
+      }
+    ReplicaOutputCoordinateProof childProof;
+    if (!validateSourceOwnedRankOneOutput(
+            child, *outputArgument, parentProof.callerShape,
+            /*requireMetadata=*/true, childProof, error)) {
+      error = "source-owned rank-1 tile output proof failed: " + error;
+      return false;
+    }
+    CounterBounds childBounds{childProof.taskLowers.front(),
+                              childProof.taskUppers.front(), 1};
+    if (childBounds.lower < parentBounds.lower ||
+        childBounds.upper > parentBounds.upper) {
+      error = "source-owned rank-1 tile has invalid actual counter bounds: " +
+              error;
+      return false;
+    }
+    auto childFactor =
+        child->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto childPart =
+        child->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
+    if (!childFactor || !childPart ||
+        (factor >= 0 && factor != childFactor.getInt()) ||
+        !seenParts.insert(childPart.getInt()).second) {
+      error = "source-owned rank-1 tiles have inconsistent factors or "
+              "duplicate part indices";
+      return false;
+    }
+    factor = childFactor.getInt();
+    if (!validateSourceOwnedRankOneTilingMetadata(
+            child, parent.name, parentBounds, childBounds, error))
+      return false;
+    int64_t childExtent = childBounds.upper - childBounds.lower;
+    if (record.childTripCount != childExtent) {
+      error = "source-owned rank-1 tile trip count does not match its actual "
+              "counter extent";
+      return false;
+    }
+    intervals.push_back({childBounds.lower, childBounds.upper});
+  }
+  if (factor != static_cast<int64_t>(records.size()) ||
+      static_cast<int64_t>(seenParts.size()) != factor) {
+    error = "source-owned rank-1 tile family is incomplete";
+    return false;
+  }
+  for (int64_t part = 0; part < factor; ++part)
+    if (seenParts.find(part) == seenParts.end()) {
+      error = "source-owned rank-1 tile family is missing a part";
+      return false;
+    }
+  llvm::sort(intervals);
+  int64_t cursor = parentBounds.lower;
+  for (auto [lower, upper] : intervals) {
+    if (lower != cursor || upper <= lower) {
+      error = "source-owned rank-1 tiles overlap or leave a gap in actual "
+              "counter bounds";
+      return false;
+    }
+    cursor = upper;
+  }
+  if (cursor != parentBounds.upper) {
+    error = "source-owned rank-1 tiles do not cover the canonical counter "
+            "interval";
+    return false;
+  }
+  return validateSourceOwnedRankOneJoin(parent, records, parentBounds,
+                                        *outputArgument, error);
 }
 
 static bool validateSourceOwnedPartition(const TaskMetadata &parent,
@@ -1430,26 +2703,49 @@ static bool validateSourceOwnedPartition(const TaskMetadata &parent,
     error = "source-owned nested partition is empty";
     return false;
   }
-  CounterBounds parentBounds[2];
-  CounterBounds parentNeuraBounds[2];
-  for (int64_t id = 0; id < 2; ++id) {
-    if (!findTaskflowCounterBounds(parent.op, id, parentBounds[id], error) ||
-        !findNeuraCounterBounds(parent.op, id, parentNeuraBounds[id], error) ||
-        !equalBounds(parentBounds[id], parentNeuraBounds[id]) ||
-        parentBounds[id].step != 1) {
+  TaskflowTaskOp parentTask = parent.op;
+  if (parentTask.getBody().hasOneBlock()) {
+    unsigned taskflowCounterCount = 0;
+    for (Operation &operation : parentTask.getBody().front())
+      taskflowCounterCount += isa<TaskflowCounterOp>(operation);
+    if (taskflowCounterCount == 1)
+      return validateSourceOwnedRankOnePartition(parent, records, error);
+  }
+  SmallVector<int64_t> parentCounterIds;
+  if (!collectCounterIds(parentTask, parentCounterIds, error) ||
+      parentCounterIds.size() < 2 || parentCounterIds.size() > 3) {
+    if (error.empty())
       error = "canonical source task " + parent.name +
-              " has invalid or drifting M/N counter bounds";
+              " must have two M/N counters or three M/N/K counters";
+    return false;
+  }
+  const size_t rank = parentCounterIds.size();
+  SmallVector<CounterBounds, 3> parentBounds(rank);
+  SmallVector<neura::CounterOp> parentNeuraCounters;
+  parentTask.walk([&](neura::CounterOp counter) {
+    parentNeuraCounters.push_back(counter);
+  });
+  if (parentNeuraCounters.size() != rank) {
+    error = "canonical source task " + parent.name +
+            " must retain exactly its M/N[/K] Neura counters";
+    return false;
+  }
+  for (size_t axis = 0; axis < rank; ++axis) {
+    CounterBounds neuraBounds;
+    if (!findTaskflowCounterBounds(parentTask, axis, parentBounds[axis], error) ||
+        !findNeuraCounterBounds(parentTask, axis, neuraBounds, error) ||
+        !equalBounds(parentBounds[axis], neuraBounds) ||
+        parentBounds[axis].step != 1) {
+      error = "canonical source task " + parent.name +
+              " has invalid or drifting M/N[/K] counter bounds";
       return false;
     }
   }
-  __int128 parentVolume = static_cast<__int128>(
-                              parentBounds[0].upper - parentBounds[0].lower) *
-                          static_cast<__int128>(
-                              parentBounds[1].upper - parentBounds[1].lower);
-  if (parentVolume <= 0 || parentVolume > std::numeric_limits<int64_t>::max() ||
-      parent.tripCount != static_cast<int64_t>(parentVolume)) {
+  int64_t parentVolume = 0;
+  if (!checkedCounterVolume(parentBounds, parentVolume) ||
+      parent.tripCount != parentVolume) {
     error = "canonical source task " + parent.name +
-            " trip count does not match its M/N counter volume";
+            " trip count does not match its full M/N[/K] counter volume";
     return false;
   }
 
@@ -1460,30 +2756,64 @@ static bool validateSourceOwnedPartition(const TaskMetadata &parent,
     SourceOwnedPartitionBox box;
     if (!validateSourceOwnedTaskBox(parent, record, parentBounds, box, error))
       return false;
-    volume += static_cast<__int128>(box.bounds[0].upper -
-                                    box.bounds[0].lower) *
-              static_cast<__int128>(box.bounds[1].upper -
-                                    box.bounds[1].lower);
-    boxes.push_back(box);
+    int64_t childVolume = 0;
+    if (!checkedCounterVolume(box.bounds, childVolume)) {
+      error = "source-owned nested child has an invalid or overflowing full "
+              "M/N[/K] counter volume";
+      return false;
+    }
+    volume += static_cast<__int128>(childVolume);
+    if (volume > static_cast<__int128>(parentVolume)) {
+      error = "source-owned nested child volumes exceed the canonical parent";
+      return false;
+    }
+    boxes.push_back(std::move(box));
   }
   for (size_t lhs = 0; lhs < boxes.size(); ++lhs)
     for (size_t rhs = lhs + 1; rhs < boxes.size(); ++rhs) {
-      bool overlap = boxes[lhs].bounds[0].lower < boxes[rhs].bounds[0].upper &&
-                     boxes[rhs].bounds[0].lower < boxes[lhs].bounds[0].upper &&
-                     boxes[lhs].bounds[1].lower < boxes[rhs].bounds[1].upper &&
-                     boxes[rhs].bounds[1].lower < boxes[lhs].bounds[1].upper;
+      bool overlap = true;
+      for (size_t axis = 0; axis < rank; ++axis)
+        if (boxes[lhs].bounds[axis].lower >= boxes[rhs].bounds[axis].upper ||
+            boxes[rhs].bounds[axis].lower >= boxes[lhs].bounds[axis].upper) {
+          overlap = false;
+          break;
+        }
       if (overlap) {
-        error = "source-owned nested partition has overlapping actual M/N "
-                "counter boxes";
+        error = "source-owned nested partition has overlapping actual "
+                "M/N[/K] counter boxes";
         return false;
       }
     }
-  if (volume != parentVolume) {
-    error = "source-owned nested partition actual M/N boxes do not cover "
-            "the canonical parent";
+  if (volume != static_cast<__int128>(parentVolume)) {
+    error = "source-owned nested partition actual M/N[/K] boxes do not "
+            "cover the canonical parent";
     return false;
   }
-  if (!validateSourceOwnedNestedJoins(records, boxes, error))
+  TaskflowTaskOp canonicalTask = parent.op;
+  // A replica followed by tiling leaves the historical replica attributes on
+  // each narrower tile. Classify the proof from the authenticated ledger
+  // families, not from the final task's attributes: mixed join validation
+  // checks the historical shard step and the current leaf boxes separately.
+  bool hasLineageTiling = false;
+  bool hasLineageReplica = false;
+  for (const ReplicaRecord &record : records) {
+    if (!record.child->hasAttr(kNeighborhoodPartitionLineageAttr))
+      continue;
+    SmallVector<SourceOwnedLineageStep> steps;
+    if (!decodeSourceOwnedLineageSteps(record.child, parent.name,
+                                       parentBounds, steps, error))
+      return false;
+    for (const SourceOwnedLineageStep &step : steps) {
+      hasLineageTiling |= step.family == "tiling";
+      hasLineageReplica |= step.family == "replica";
+    }
+  }
+  if (hasLineageTiling && hasLineageReplica)
+    return validateSourceOwnedMixedJoinTree(
+        parent.name, parentBounds, records, boxes,
+        canonicalTask.getDoneReads().size(), error);
+  if (!validateSourceOwnedNestedJoins(
+          records, boxes, canonicalTask.getDoneReads().size(), error))
     return false;
   return true;
 }
@@ -1496,7 +2826,8 @@ static bool isIgnoredCounterAttr(StringRef name) {
 
 static bool isSourceOwnedTilingAttr(StringRef name) {
   return name == "amoeba.neura.joint_rewrite" ||
-         name.starts_with("amoeba.neura.tiling.");
+         name.starts_with("amoeba.neura.tiling.") ||
+         name == kNeighborhoodPartitionLineageAttr;
 }
 
 static bool attrsEquivalent(Operation *lhs, Operation *rhs, bool taskAttrs,
@@ -2455,8 +3786,17 @@ static bool collectReplicaLayout(
     bool sourceOwnedTiling = sourceTilingParent != nullptr;
     if (parents.find(parentName) == parents.end()) {
       std::string resolved;
-      if (!resolveSourceOwnedFamily(declaredParent, resolved) ||
-          parents.find(resolved) == parents.end()) {
+      bool foundRoot = resolveSourceOwnedFamily(declaredParent, resolved);
+      if (!foundRoot && !sequentialKParent &&
+          (sourceTilingParent || replicaParent)) {
+        std::optional<std::string> rootHint =
+            sourceOwnedPartitionRootHint(task.op);
+        if (rootHint && parents.find(*rootHint) != parents.end()) {
+          resolved = std::move(*rootHint);
+          foundRoot = true;
+        }
+      }
+      if (!foundRoot || parents.find(resolved) == parents.end()) {
         error = "replica task " + task.name +
                 " names an unknown parent task";
         return false;
@@ -2505,12 +3845,9 @@ static bool collectReplicaLayout(
                                 error) ||
            record.id < 0 || record.count <= 0 || record.id >= record.count))
         return false;
-      if (auto declared = task.op->getAttrOfType<IntegerAttr>(
-              "amoeba.replica.shard_trip_count");
-          declared && declared.getInt() != record.childTripCount) {
-        error = "replica shard trip count does not match child metadata";
-        return false;
-      }
+      // Nested lineage authenticates shard_trip_count against the volume at
+      // the latest replica step. A later tile reduces this task's current
+      // trip count without changing that historical replica attribute.
     } else {
       if (!parseReplicaInteger(task.op, "amoeba.replica.shard_axis",
                               record.shardAxis, error) ||
@@ -2571,13 +3908,6 @@ static bool collectReplicaLayout(
           return record.sourceOwnedTiling;
         });
     if (hasSourceOwnedTiling) {
-      if (!llvm::all_of(groupRecords, [](const ReplicaRecord &record) {
-            return record.sourceOwnedTiling;
-          })) {
-        error = "source-owned nested partition is mixed with an ordinary "
-                "replica set";
-        return false;
-      }
       int64_t tripSum = 0;
       for (const ReplicaRecord &record : groupRecords) {
         if (record.childTripCount <= 0 ||
@@ -3000,6 +4330,266 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
 };
 
 } // namespace
+
+namespace mlir::amoeba::neura::joint_scheduling {
+
+static LogicalResult processSourceIterationDomainPartition(
+    func::FuncOp canonicalParent, func::FuncOp currentChild, std::string &error,
+    bool refreshBindings) {
+  if (!canonicalParent || !currentChild ||
+      canonicalParent.getSymName() != currentChild.getSymName()) {
+    error = "source-domain partition proof requires matching canonical and "
+            "child functions";
+    return failure();
+  }
+
+  FailureOr<SmallVector<TaskMetadata>> parentTasks =
+      collectAnalyticalTaskMetadata(canonicalParent, error);
+  if (failed(parentTasks))
+    return failure();
+
+  // Candidate rewrites may have narrowed or replaced Taskflow counters, and
+  // their exact current bindings are intentionally stale until the complete
+  // group is checked. Work on a private clone and remove only source-domain
+  // certificates whose current bindings are about to be recomputed. Retain
+  // the neighborhood partition ledger: nested tiling uses its authenticated
+  // immediate-parent interval, while body comparison ignores this provenance
+  // attribute as nonsemantic task-shell metadata.
+  // Group counts, typed counter bounds, replica lineage, outputs, joins, and
+  // bodies remain unchanged for the C++ proofs below.
+  OwningOpRef<func::FuncOp> childProofFunction =
+      cast<func::FuncOp>(currentChild->clone());
+  func::FuncOp proofFunction = *childProofFunction;
+  proofFunction.walk([&](TaskflowTaskOp task) {
+    if (task->hasAttr(kSourceIterationCapturePendingAttr))
+      error = "child task " + task.getTaskName().str() +
+              " still has a pending source-domain capture";
+    task->removeAttr(kSourceIterationDomainAttr);
+    task->removeAttr(kSourceIterationControlBindingAttr);
+    task->removeAttr(kSourceIterationSourceControlBindingAttr);
+    task->removeAttr(kSourceIterationPartitionProofAttr);
+    task->removeAttr(kSourceIterationCapturePendingAttr);
+  });
+  if (!error.empty())
+    return failure();
+
+  FailureOr<SmallVector<TaskMetadata>> childTasks =
+      collectAnalyticalTaskMetadataForSourcePartitionProof(proofFunction,
+                                                           error);
+  if (failed(childTasks))
+    return failure();
+
+  std::map<std::string, TaskMetadata> parents;
+  std::map<std::string, TaskMetadata> children;
+  std::map<std::string, std::vector<ReplicaRecord>> replicas;
+  std::map<std::string, bool> sourceOwnedLineage;
+  if (!collectReplicaLayout(*parentTasks, *childTasks, parents, children,
+                            replicas, sourceOwnedLineage, error))
+    return failure();
+
+  std::map<std::string, TaskflowTaskOp> actualChildren;
+  currentChild.walk([&](TaskflowTaskOp task) {
+    actualChildren.emplace(task.getTaskName().str(), task);
+  });
+  struct PendingRefresh {
+    TaskflowTaskOp task;
+    DictionaryAttr domain;
+    StringAttr sourceBinding;
+    std::string domainWitness;
+    std::string currentBinding;
+  };
+  SmallVector<PendingRefresh> pendingRefreshes;
+  pendingRefreshes.reserve(childTasks->size());
+
+  for (const TaskMetadata &child : *childTasks) {
+    auto lineage = sourceOwnedLineage.find(child.name);
+    std::string sourceName =
+        lineage == sourceOwnedLineage.end() || !lineage->second
+            ? sourceTaskName(child.op)
+            : [&]() {
+                for (const auto &group : replicas)
+                  for (const ReplicaRecord &record : group.second)
+                    if (record.child == child.op)
+                      return record.parent;
+                return std::string();
+              }();
+    if (sourceName.empty()) {
+      error = "source-domain child has no canonical parent: " + child.name;
+      return failure();
+    }
+    auto parent = parents.find(sourceName);
+    auto actual = actualChildren.find(child.name);
+    if (parent == parents.end() || actual == actualChildren.end()) {
+      error = "source-domain child or canonical parent is missing for " +
+              child.name;
+      return failure();
+    }
+    TaskflowTaskOp canonicalTask = parent->second.op;
+    TaskflowTaskOp actualTask = actual->second;
+    auto canonicalDomain = canonicalTask->getAttrOfType<DictionaryAttr>(
+        kSourceIterationDomainAttr);
+    auto canonicalSourceBinding = canonicalTask->getAttrOfType<StringAttr>(
+        kSourceIterationSourceControlBindingAttr);
+    if (!canonicalDomain || !canonicalSourceBinding ||
+        canonicalSourceBinding.getValue().empty()) {
+      error = "canonical parent " + sourceName +
+              " has no complete source-domain origin witness";
+      return failure();
+    }
+    if (actualTask->hasAttr(kSourceIterationCapturePendingAttr)) {
+      error = "source-domain child " + child.name +
+              " has a pending source capture";
+      return failure();
+    }
+    auto existingDomain = actualTask->getAttrOfType<DictionaryAttr>(
+        kSourceIterationDomainAttr);
+    if (actualTask->hasAttr(kSourceIterationDomainAttr) &&
+        (!existingDomain || existingDomain != canonicalDomain)) {
+      error = "source-domain child " + child.name +
+              " has a certificate different from its canonical source";
+      return failure();
+    }
+    if (!refreshBindings &&
+        (!existingDomain || existingDomain != canonicalDomain)) {
+      error = "imported source-domain child " + child.name +
+              " is missing the exact canonical source certificate";
+      return failure();
+    }
+    auto existingSourceBinding = actualTask->getAttrOfType<StringAttr>(
+        kSourceIterationSourceControlBindingAttr);
+    if (actualTask->hasAttr(kSourceIterationSourceControlBindingAttr) &&
+        (!existingSourceBinding ||
+         existingSourceBinding != canonicalSourceBinding)) {
+      error = "source-domain child " + child.name +
+              " has a source-origin binding different from its canonical "
+              "source";
+      return failure();
+    }
+    if (!refreshBindings &&
+        (!existingSourceBinding ||
+         existingSourceBinding != canonicalSourceBinding)) {
+      error = "imported source-domain child " + child.name +
+              " is missing the exact canonical source-origin witness";
+      return failure();
+    }
+
+    if (lineage != sourceOwnedLineage.end() && !lineage->second &&
+        !actualTask->hasAttr("amoeba.replica.parent_task") &&
+        !actualTask->hasAttr("amoeba.tiling.parent_task")) {
+      auto domainInfo = parseSourceIterationDomain(canonicalTask, error);
+      if (failed(domainInfo)) return failure();
+      for (const SourceIterationAxis &axis : domainInfo->axes) {
+        if (!axis.representedByTaskflow) continue;
+        CounterBounds parentTF, childTF, parentNeura, childNeura;
+        if (!findTaskflowCounterBounds(canonicalTask, axis.ordinal, parentTF, error) ||
+            !findTaskflowCounterBounds(child.op, axis.ordinal, childTF, error) ||
+            !findNeuraCounterBounds(canonicalTask, axis.ordinal, parentNeura, error) ||
+            !findNeuraCounterBounds(child.op, axis.ordinal, childNeura, error) ||
+            !equalBounds(parentTF, childTF) || !equalBounds(parentNeura, childNeura)) {
+          error = "unchanged source-domain task " + child.name +
+                  " changed exact counter bounds: " + error;
+          return failure();
+        }
+      }
+    }
+    BodyProof bodyProof;
+    if (!proveTaskBody(canonicalTask, child.op, bodyProof, error,
+                       isSequentialKLineage(child.op),
+                       lineage != sourceOwnedLineage.end() &&
+                           lineage->second)) {
+      error = "source-domain child body proof failed for " + child.name +
+              ": " + error;
+      return failure();
+    }
+
+    std::string parseError;
+    FailureOr<SourceIterationDomainInfo> sourceInfo =
+        parseSourceIterationDomain(canonicalTask, parseError);
+    if (failed(sourceInfo)) {
+      error = "canonical parent source-domain proof failed for " + sourceName +
+              ": " + parseError;
+      return failure();
+    }
+    std::string domainWitness =
+        sourceIterationDomainCanonicalWitness(*sourceInfo);
+    std::string currentBinding = currentSourceIterationControlBinding(
+        actualTask, domainWitness);
+    if (currentBinding.empty()) {
+      error = "source-domain child " + child.name +
+              " has no exact current body witness";
+      return failure();
+    }
+    if (!refreshBindings) {
+      auto storedCurrentBinding = actualTask->getAttrOfType<StringAttr>(
+          kSourceIterationControlBindingAttr);
+      if (!storedCurrentBinding ||
+          storedCurrentBinding.getValue() != currentBinding) {
+        error = "imported source-domain child " + child.name +
+                " has a stale or forged current body binding";
+        return failure();
+      }
+      auto partitionProof = actualTask->getAttrOfType<StringAttr>(
+          kSourceIterationPartitionProofAttr);
+      if (partitionProof && partitionProof.getValue() != domainWitness) {
+        error = "imported source-domain child " + child.name +
+                " has a stale or forged partition marker";
+        return failure();
+      }
+      if (child.tripCount != parent->second.tripCount &&
+          (!partitionProof || partitionProof.getValue() != domainWitness)) {
+        error = "imported sharded source-domain child " + child.name +
+                " has no matching verified partition marker";
+        return failure();
+      }
+      if (child.tripCount == parent->second.tripCount && !partitionProof &&
+          currentBinding != canonicalSourceBinding.getValue()) {
+        error = "imported unsharded source-domain child " + child.name +
+                " changed its current body without a trusted refresh";
+        return failure();
+      }
+    }
+    pendingRefreshes.push_back({actualTask, canonicalDomain,
+                                canonicalSourceBinding,
+                                std::move(domainWitness),
+                                std::move(currentBinding)});
+  }
+
+  if (!refreshBindings)
+    return success();
+
+  // Refresh only after every candidate shard, body, counter mirror, output
+  // region, join, and state-carry proof has passed for the full task graph.
+  OpBuilder builder(currentChild.getContext());
+  for (PendingRefresh &refresh : pendingRefreshes) {
+    refresh.task->setAttr(kSourceIterationDomainAttr, refresh.domain);
+    refresh.task->setAttr(kSourceIterationSourceControlBindingAttr,
+                          refresh.sourceBinding);
+    refresh.task->setAttr(kSourceIterationControlBindingAttr,
+                          builder.getStringAttr(refresh.currentBinding));
+    refresh.task->setAttr(kSourceIterationPartitionProofAttr,
+                          builder.getStringAttr(refresh.domainWitness));
+    refresh.task->removeAttr(kSourceIterationCapturePendingAttr);
+  }
+  return success();
+}
+
+LogicalResult proveAndRefreshSourceIterationDomainPartition(
+    func::FuncOp canonicalParent, func::FuncOp currentChild,
+    std::string &error) {
+  return processSourceIterationDomainPartition(canonicalParent, currentChild,
+                                               error,
+                                               /*refreshBindings=*/true);
+}
+
+LogicalResult verifySourceIterationDomainPartition(
+    func::FuncOp canonicalParent, func::FuncOp currentChild,
+    std::string &error) {
+  return processSourceIterationDomainPartition(canonicalParent, currentChild,
+                                               error,
+                                               /*refreshBindings=*/false);
+}
+
+} // namespace mlir::amoeba::neura::joint_scheduling
 
 namespace mlir::amoeba::neura {
 std::unique_ptr<Pass> createInheritReplicaAnalyticalTaskCostCatalogPass() {

@@ -115,6 +115,10 @@ FailureOr<std::optional<InterTaskNetworkSpec>>
 loadInterTaskNetworkSpec(llvm::StringRef architecture_path,
                          bool require_network, std::string &error);
 
+// Optional separately bound explicit task network. This does not alter the
+// physical Neura architecture or the mapper model's exact YAML contract.
+llvm::StringRef getInterTaskNetworkSpecOverridePath();
+
 } // namespace joint_scheduling
 } // namespace neura
 } // namespace amoeba

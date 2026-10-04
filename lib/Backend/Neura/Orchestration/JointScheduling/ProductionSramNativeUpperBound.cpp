@@ -258,6 +258,9 @@ static FailureOr<Value> resolveBackingRoot(Value value,
 
   if (auto channel = dyn_cast<taskflow::TaskflowChannelOp>(defining))
     return resolveBackingRoot(channel.getSource(), visited, error);
+  if (auto join =
+          dyn_cast<taskflow::TaskflowReadCompletionJoinOp>(defining))
+    return resolveBackingRoot(join.getBaseState(), visited, error);
   if (auto join = dyn_cast<taskflow::TaskflowJoinOp>(defining))
     return resolveBackingRoot(join.getBase(), visited, error);
   if (auto cast = dyn_cast<memref::CastOp>(defining))

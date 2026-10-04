@@ -196,6 +196,22 @@ static bool isSupportedReplicaCount(int64_t count) {
 // additionally require a complete, unique replica set. The final consumer
 // edges are still taken from TaskEdgeGraph, so both RAW and WAW endpoints are
 // preserved exactly as the graph derives them.
+static bool hasVerifiedReadCompletionFanIn(TaskflowTaskOp task,
+                                           TaskflowJoinOp outputJoin) {
+  if (task.getDoneReads().empty())
+    return true;
+  if (task.getDoneReads().size() != 1)
+    return false;
+  Value state = task.getDoneReads().front();
+  if (!llvm::hasSingleElement(state.getUses()))
+    return false;
+  auto join = dyn_cast<TaskflowReadCompletionJoinOp>(
+      state.use_begin()->getOwner());
+  return join && join.getWriteCompletion() == outputJoin.getJoined() &&
+         llvm::is_contained(join.getTileStates(), state) &&
+         succeeded(verify(join.getOperation()));
+}
+
 static LogicalResult appendTypedCompletionJoinIncomingEdges(
     TaskflowTaskOp consumer, Value input,
     SmallVectorImpl<Attribute> &incoming, OpBuilder &builder) {
@@ -304,11 +320,16 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
           static_cast<unsigned>(result - task.getDoneWrites().begin());
       if (task.getWillWrites().size() != task.getDoneWrites().size() ||
           task.getWillWrites().size() != task.getOriginalWriteMemrefs().size() ||
-          resultIndex >= task.getWillWrites().size() ||
-          stripMemrefCasts(task.getWillWrites()[resultIndex]) != rootBase ||
-          stripMemrefCasts(task.getOriginalWriteMemrefs()[resultIndex]) !=
-              rootBase ||
-          !task.getDoneReads().empty() || !task.getValueOutputs().empty() ||
+          resultIndex >= task.getWillWrites().size())
+        return reject("completion join state has an incomplete output ABI");
+      FailureOr<Value> taskOutputRoot =
+          resolveTaskflowMemoryRoot(task.getOriginalWriteMemrefs()[resultIndex]);
+      FailureOr<Value> joinOutputRoot = resolveTaskflowMemoryRoot(rootBase);
+      if (stripMemrefCasts(task.getWillWrites()[resultIndex]) != rootBase ||
+          failed(taskOutputRoot) || failed(joinOutputRoot) ||
+          *taskOutputRoot != *joinOutputRoot ||
+          !hasVerifiedReadCompletionFanIn(task, current) ||
+          !task.getValueOutputs().empty() ||
           !visitedLeaves.insert(task.getOperation()).second)
         return reject("completion join state is not a unique output task");
       if (replicaJoin) {
@@ -393,8 +414,10 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
     for (const TaskEdge *edge : incomingEdges) {
       std::string encoded =
           (leaf.task.getTaskName() + "|producer_consumer|tensor_wide").str();
-      if (incomingEdges.size() > 1)
-        encoded += "|" + stringifyTaskEdgeKind(edge->kind).str();
+      // A linked read-completion join can add a WAR edge from the same
+      // producer to this consumer. Qualify the done-write edge even when it
+      // is the only edge in this completion tree's local result segment.
+      encoded += "|" + stringifyTaskEdgeKind(edge->kind).str();
       auto annotation = builder.getStringAttr(encoded);
       if (!llvm::is_contained(incoming, annotation))
         incoming.push_back(annotation);
@@ -688,6 +711,17 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
               .str()));
   }
   if (preserveOtherProducerEdges) {
+    std::string graphError;
+    auto function = consumer->getParentOfType<func::FuncOp>();
+    FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
+        function, TaskEdgeGraphOptions{/*require_payload=*/false,
+                                       /*read_control_predecessors=*/true},
+        graphError);
+    if (failed(graph)) {
+      consumer.emitError("cannot prove preserved replica consumer edges: " +
+                         Twine(graphError));
+      return failure();
+    }
     auto namesJoinedValue = [&](Value value) {
       if (value == joined)
         return true;
@@ -703,13 +737,8 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
       if (namesJoinedValue(input))
         continue;
       auto producer = input.getDefiningOp<TaskflowTaskOp>();
-      if (producer) {
-        auto annotation = builder.getStringAttr(
-            (producer.getTaskName() + "|producer_consumer|tensor_wide").str());
-        if (!llvm::is_contained(incoming, annotation))
-          incoming.push_back(annotation);
+      if (producer)
         continue;
-      }
       Value joinInput = input;
       while (auto cast = joinInput.getDefiningOp<memref::CastOp>())
         joinInput = cast.getSource();
@@ -730,6 +759,28 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
         return failure();
       }
     }
+    // Annotation coverage is a contract for every actual Taskflow edge, not
+    // just data inputs. Independent done-read tokens in will_writes retain
+    // WAR order even when their producers provide no will_reads operand.
+    SmallVector<Attribute> completeIncoming;
+    SmallVector<std::pair<Operation *, TaskEdgeKind>, 8> annotatedPairs;
+    for (const TaskEdge &edge : graph->getEdges()) {
+      if (edge.origin != TaskEdgeOrigin::Taskflow || edge.consumer != consumer)
+        continue;
+      auto producer = edge.producer;
+      auto pair = std::make_pair(producer.getOperation(), edge.kind);
+      if (llvm::is_contained(annotatedPairs, pair)) {
+        consumer.emitError("preserved replica consumer has multiple "
+                           "Taskflow edges with the same producer and kind");
+        return failure();
+      }
+      annotatedPairs.push_back(pair);
+      completeIncoming.push_back(builder.getStringAttr(
+          (producer.getTaskName() + "|producer_consumer|" +
+           stringifyTaskEdgeScope(edge.scope) + "|" +
+           stringifyTaskEdgeKind(edge.kind)).str()));
+    }
+    incoming = std::move(completeIncoming);
   }
   consumer->setAttr(kSemanticIncomingEdgesAttr,
                     builder.getArrayAttr(incoming));
@@ -778,6 +829,82 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
                     builder.getArrayAttr(newUppers));
   consumer->setAttr(kTilingInputRegionReasonsAttr,
                     builder.getArrayAttr(newReasons));
+  return success();
+}
+
+// A source done-read may feed downstream writers. Replacing it with a typed
+// read-completion join must retain one WAR edge from every replica to each
+// writer, with annotations checked against the derived TaskEdgeGraph.
+static LogicalResult makeReadCompletionConsumerEdges(
+    TaskflowTaskOp consumer, Value joined, StringRef parent,
+    OpBuilder &builder) {
+  auto reject = [&](const Twine &reason) {
+    consumer.emitError(reason);
+    return failure();
+  };
+  auto join = joined.getDefiningOp<TaskflowReadCompletionJoinOp>();
+  if (!join || join.getJoined() != joined || failed(verify(join.getOperation())))
+    return reject("replica writer has an unverified read-completion join");
+  auto joinedWrite = llvm::find(consumer.getWillWrites(), joined);
+  if (joinedWrite == consumer.getWillWrites().end() ||
+      llvm::count(consumer.getWillWrites(), joined) != 1)
+    return reject("replica writer must consume one read-completion token");
+  unsigned writeIndex =
+      static_cast<unsigned>(joinedWrite - consumer.getWillWrites().begin());
+  auto function = consumer->getParentOfType<func::FuncOp>();
+  if (!function || function != join->getParentOfType<func::FuncOp>())
+    return reject("read-completion join and writer are in different functions");
+  std::string graphError;
+  FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
+      function, TaskEdgeGraphOptions{/*require_payload=*/false,
+                                     /*read_control_predecessors=*/true},
+      graphError);
+  if (failed(graph))
+    return reject("cannot prove read-completion WAR edges: " +
+                  Twine(graphError));
+
+  SmallVector<Attribute> incoming;
+  if (auto previous = consumer->getAttrOfType<ArrayAttr>(
+          kSemanticIncomingEdgesAttr)) {
+    for (Attribute entry : previous) {
+      auto text = dyn_cast<StringAttr>(entry);
+      if (!text)
+        return reject("replica writer has a non-string semantic edge");
+      if (!text.getValue().starts_with((Twine(parent) + "|").str()))
+        incoming.push_back(entry);
+    }
+  }
+
+  DenseSet<Operation *> leaves;
+  for (Value state : join.getTileStates()) {
+    auto producer = state.getDefiningOp<TaskflowTaskOp>();
+    if (!producer)
+      return reject("read-completion join contains an unclassified replica leaf");
+    auto result = llvm::find(producer.getDoneReads(), state);
+    if (result == producer.getDoneReads().end() ||
+        !leaves.insert(producer.getOperation()).second)
+      return reject("read-completion join contains a duplicate or non-read result");
+    unsigned resultIndex =
+        static_cast<unsigned>(result - producer.getDoneReads().begin());
+    SmallVector<const TaskEdge *, 2> matchingEdges;
+    for (const TaskEdge &edge : graph->getEdges())
+      if (edge.origin == TaskEdgeOrigin::Taskflow &&
+          edge.producer == producer && edge.consumer == consumer &&
+          edge.producer_segment == TaskResultSegment::DoneReads &&
+          edge.producer_index == resultIndex && edge.kind == TaskEdgeKind::War &&
+          edge.consumer_segment == TaskOperandSegment::WillWrites &&
+          edge.consumer_index == writeIndex &&
+          edge.scope == TaskEdgeScope::TensorWide)
+        matchingEdges.push_back(&edge);
+    if (matchingEdges.size() != 1)
+      return reject("read-completion leaf lacks one typed tensor-wide WAR edge");
+    incoming.push_back(builder.getStringAttr(
+        (producer.getTaskName() +
+         "|producer_consumer|tensor_wide|war")
+            .str()));
+  }
+  consumer->setAttr(kSemanticIncomingEdgesAttr,
+                    builder.getArrayAttr(incoming));
   return success();
 }
 
@@ -2576,6 +2703,32 @@ static bool isLlamaInternalDFGOp(Operation *operation) {
          name == "neura.return_value";
 }
 
+// DataMovOp is a routing wrapper in a Neura kernel, but it has no memory-effect
+// interface.  Treat it as an internal forwarding operation only for the exact
+// well-typed, attribute-free form emitted by the canonical kernel conversion.
+// Requiring the definition and use to stay in the kernel's single body block
+// keeps this special case from forwarding values across region/control edges.
+static bool isLlamaIdentityDataMove(Operation *operation,
+                                    Block &kernelBody) {
+  if (!isa<neura::DataMovOp>(operation) ||
+      operation->getBlock() != &kernelBody ||
+      operation->getNumOperands() != 1 || operation->getNumResults() != 1 ||
+      operation->getNumRegions() != 0 || !operation->getAttrs().empty())
+    return false;
+
+  Value input = operation->getOperand(0);
+  Type inputType = input.getType();
+  auto dataType = dyn_cast<neura::PredicatedValue>(inputType);
+  if (!dataType || inputType != operation->getResult(0).getType() ||
+      !dataType.getPredicateType().isInteger(1))
+    return false;
+
+  if (auto argument = dyn_cast<BlockArgument>(input))
+    return argument.getOwner() == &kernelBody;
+  Operation *definition = input.getDefiningOp();
+  return definition && definition->getBlock() == &kernelBody;
+}
+
 // A completion join relies on disjoint output cells, not just on different
 // counter bounds. Predication forwards its first value; both alternatives of
 // an index phi must retain the same coordinate. Arithmetic and opaque chains
@@ -2954,6 +3107,11 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
         unsafeMemory = true;
       return;
     }
+    if (isa<neura::DataMovOp>(operation)) {
+      if (!isLlamaIdentityDataMove(operation, kernelBody))
+        unsafeMemory = true;
+      return;
+    }
     if (isa<scf::IfOp, scf::YieldOp, neura::YieldOp>(operation) ||
         isLlamaInternalDFGOp(operation))
       return;
@@ -2972,6 +3130,11 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
             neura::YieldOp>(operation) ||
         isLlamaInternalDFGOp(operation))
       return;
+    if (isa<neura::DataMovOp>(operation)) {
+      if (!isLlamaIdentityDataMove(operation, kernelBody))
+        unsafeMemory = true;
+      return;
+    }
     if (!isMemoryEffectFree(operation)) {
       unsafeMemory = true;
     }
@@ -2979,8 +3142,10 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   if (stores == 0 || !loadedRead0 || !loadedRead1 || unsafeMemory)
     return rejectLlama(
         source,
-        "LLaMA Task_0 Neura DFG must store only the private output and load "
-        "both read-only inputs");
+        (Twine("LLaMA ") + source.getTaskName() +
+         " Neura DFG must store only the private output and load both "
+         "read-only inputs")
+            .str());
   if (unsafeOutputCoordinates)
     return rejectLlama(source,
         "replica output stores do not preserve independent M/N cell ownership");
@@ -3049,18 +3214,14 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
       else if (auto candidate = dyn_cast<neura::KernelOp>(&operation))
         clonedKernel = candidate;
     }
-    // The mapped LLaMA task carries a dead K Taskflow counter in addition to
-    // the complete K counter in the Neura DFG.  Erasing only this dead
-    // scaffold makes stateRegion rank two without changing the computation.
+    // Preserve the complete source counter scaffold. Completion regions are
+    // derived from the leading output counters; the trailing K counter still
+    // authenticates the full mapper firing count and source partition ledger.
     if (clonedCounters.size() != 3 || !clonedKernel ||
         !clonedCounters[2].getCounterIndex().use_empty())
       return rejectLlama(source,
                          "LLaMA Task_0 clone lost the proved dead K counter "
                          "or complete Neura kernel");
-    clonedCounters[2].erase();
-    clonedCounters.pop_back();
-    clonedCounters[1].setCounterHierarchyAttr(
-        builder.getStringAttr("leaf"));
 
     TaskflowCounterOp selectedCounter = clonedCounters[axis];
     OpBuilder counterBuilder(selectedCounter);
@@ -3132,12 +3293,15 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
       }
     }
 
-    // The last Taskflow K counter is only a dead scaffold, while the Neura
-    // kernel still executes its reduction.  Preserve the complete mapper trip
-    // contract explicitly after removing that scaffold.
+    // The Taskflow and Neura K domains both retain the complete reduction.
+    // Record all source work in the mapper firing contract for this shard.
     int64_t shardTripCount = (upper - lower) * otherExtent * reduction;
     replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
     replica->setAttr("amoeba.selected_trip_count",
+                     builder.getI64IntegerAttr(shardTripCount));
+    replica->setAttr("amoeba.replica.total_trip_count",
+                     builder.getI64IntegerAttr(seqLen * hidden * reduction));
+    replica->setAttr("amoeba.replica.shard_trip_count",
                      builder.getI64IntegerAttr(shardTripCount));
     states.push_back(replica.getDoneWrites().front());
   }
@@ -3310,10 +3474,13 @@ struct ReplicaNeuraInPlacePlan {
   SmallVector<int64_t> kernelUppers;
   SmallVector<int64_t> outputShape;
   SmallVector<unsigned> outputCounterAxes;
+  SmallVector<std::optional<int64_t>> outputConstantAxes;
+  SmallVector<int64_t> producedLowers;
   SmallVector<int64_t> producedShape;
   int64_t totalTripCount = 0;
   int64_t axis = -1;
   int64_t factor = 0;
+  unsigned outputReadIndex = 0;
 };
 
 static LogicalResult rejectReplicaNeura(TaskflowTaskOp task,
@@ -3324,6 +3491,14 @@ static LogicalResult rejectReplicaNeura(TaskflowTaskOp task,
 
 static std::optional<SmallVector<int64_t>>
 replicaCallerShape(Value value) {
+  if (value.getDefiningOp<memref::AllocOp>() ||
+      value.getDefiningOp<memref::AllocaOp>()) {
+    auto type = dyn_cast<MemRefType>(value.getType());
+    if (type && type.hasStaticShape() &&
+        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
+      return SmallVector<int64_t>(type.getShape().begin(), type.getShape().end());
+    return std::nullopt;
+  }
   auto argument = dyn_cast<BlockArgument>(value);
   if (!argument || !argument.getOwner())
     return std::nullopt;
@@ -3606,9 +3781,15 @@ static bool authenticateFoldedOutputAddress(
 
   auto authenticatedRoot =
       replicaKernelInputRoot(plan.kernel, plan.task, outputInput);
+  if (plan.task.getWillWrites().size() != 1)
+    return false;
+  FailureOr<Value> outputStateRoot =
+      resolveTaskflowMemoryRoot(plan.task.getWillWrites().front());
+  FailureOr<Value> originalOutputRoot =
+      resolveTaskflowMemoryRoot(outputRoot);
   if (!authenticatedRoot || *authenticatedRoot != outputRoot ||
-      plan.task.getWillWrites().size() != 1 ||
-      plan.task.getWillWrites().front() != outputRoot ||
+      failed(outputStateRoot) || failed(originalOutputRoot) ||
+      *outputStateRoot != *originalOutputRoot ||
       plan.task.getOriginalWriteMemrefs().size() != 1 ||
       plan.task.getOriginalWriteMemrefs().front() != outputRoot ||
       llvm::count(plan.task.getOriginalReadMemrefs(), outputRoot) != 1)
@@ -3631,9 +3812,10 @@ static LogicalResult
 proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
                                Value output) {
   auto outputType = dyn_cast<MemRefType>(output.getType());
-  if (!outputType || outputType.getRank() < 1 || outputType.getRank() > 2)
+  if (!outputType || outputType.getRank() < 1 || outputType.getRank() > 3)
     return rejectReplicaNeura(
-        plan.task, "in-place Neura replica requires a rank-1 or rank-2 output");
+        plan.task,
+        "in-place Neura replica requires a rank-1, rank-2, or rank-3 output");
   const unsigned rank = static_cast<unsigned>(outputType.getRank());
   if (plan.taskCounters.size() < rank || plan.kernelCounters.size() < rank)
     return rejectReplicaNeura(
@@ -3674,30 +3856,61 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
       return rejectReplicaNeura(
           plan.task, "in-place Neura replica requires complete output indices");
     SmallVector<unsigned> mapping;
+    SmallVector<std::optional<int64_t>> constants;
     llvm::SmallDenseSet<unsigned, 4> used;
     for (auto [dimension, index] : llvm::enumerate(indices)) {
       auto counter = replicaCounterIndex(index, plan.kernelCounters);
-      if (!counter) {
+      if (counter) {
+        if (!used.insert(*counter).second)
+          return rejectReplicaNeura(
+              plan.task, "in-place Neura replica output indices are not the "
+                         "restricted counter permutation");
+        mapping.push_back(*counter);
+        constants.push_back(std::nullopt);
+        continue;
+      }
+      auto constant =
+          mlir::amoeba::neura::joint_scheduling::detail::staticIndex(
+              index, plan.task, plan.kernel);
+      if (outputType.getRank() != 3 || !constant || *constant < 0 ||
+          static_cast<size_t>(dimension) >= plan.outputShape.size() ||
+          *constant >= plan.outputShape[dimension]) {
         plan.task.emitError()
             << "in-place Neura replica cannot resolve output index at "
             << dimension << " in " << operation->getName().getStringRef();
         return failure();
       }
-      if (!used.insert(*counter).second)
-        return rejectReplicaNeura(
-            plan.task, "in-place Neura replica output indices are not the "
-                       "restricted counter permutation");
-      mapping.push_back(*counter);
+      mapping.push_back(ReplicaOutputCoordinateProof::kConstantAxis);
+      constants.push_back(*constant);
     }
     if (plan.outputCounterAxes.empty()) {
       plan.outputCounterAxes = mapping;
-    } else if (plan.outputCounterAxes.size() != mapping.size() ||
-               plan.axis < 0 ||
-               plan.axis >= static_cast<int64_t>(mapping.size()) ||
-               plan.outputCounterAxes[plan.axis] != mapping[plan.axis])
+      plan.outputConstantAxes = constants;
+    } else {
+      bool coordinateMapMismatch =
+          plan.outputCounterAxes.size() != mapping.size() ||
+          plan.outputConstantAxes.size() != constants.size();
+      if (!coordinateMapMismatch && outputType.getRank() == 3)
+        coordinateMapMismatch =
+            !llvm::equal(plan.outputCounterAxes, mapping) ||
+            !llvm::equal(plan.outputConstantAxes, constants);
+      if (!coordinateMapMismatch)
+        coordinateMapMismatch =
+            plan.axis < 0 ||
+            plan.axis >= static_cast<int64_t>(mapping.size()) ||
+            plan.outputCounterAxes[plan.axis] != mapping[plan.axis];
+      if (coordinateMapMismatch)
+        return rejectReplicaNeura(
+            plan.task,
+            "in-place Neura replica output accesses do not preserve the "
+            "authenticated shard coordinate map");
+    }
+    if (plan.axis < 0 ||
+        plan.axis >= static_cast<int64_t>(mapping.size()) ||
+        mapping[plan.axis] == ReplicaOutputCoordinateProof::kConstantAxis)
       return rejectReplicaNeura(
-          plan.task, "in-place Neura replica output accesses cross the "
-                     "selected shard coordinate");
+          plan.task, "in-place Neura replica selected shard coordinate is not "
+                     "an authenticated counter");
     return success();
   };
   auto validateAuxiliaryInput = [&](std::optional<unsigned> input) {
@@ -3934,11 +4147,15 @@ createReplicaNeuraPart(OpBuilder &builder,
   SmallVector<Value> originalWrites(source.getOriginalWriteMemrefs());
   if (!outputStorage || writes.size() != 1 || originalWrites.size() != 1)
     return failure();
-  auto outputRead = llvm::find(reads, source.getWillWrites().front());
-  if (outputRead == reads.end() ||
-      llvm::count(reads, source.getWillWrites().front()) != 1)
+  if (plan.outputReadIndex >= reads.size() ||
+      source.getOriginalReadMemrefs()[plan.outputReadIndex] !=
+          source.getOriginalWriteMemrefs().front())
     return failure();
-  *outputRead = outputStorage;
+  // Preserve the source read-state version when it is distinct from the write
+  // state, even though both name the same storage root.  When they are the
+  // exact same SSA state, use the static output view for both task inputs.
+  if (reads[plan.outputReadIndex] == source.getWillWrites().front())
+    reads[plan.outputReadIndex] = outputStorage;
   writes.front() = outputStorage;
   SmallVector<Type> writeTypes;
   writeTypes.push_back(outputStorage.getType());
@@ -4019,6 +4236,8 @@ createReplicaNeuraPart(OpBuilder &builder,
   partTask->setAttr("amoeba.replica.count",
                     builder.getI64IntegerAttr(plan.factor));
   partTask->setAttr("amoeba.replica.shard_axis",
+                    builder.getI64IntegerAttr(counterAxis));
+  partTask->setAttr("amoeba.replica.output_shard_axis",
                     builder.getI64IntegerAttr(plan.axis));
   SmallVector<int64_t> outputCounterAxes;
   outputCounterAxes.reserve(plan.outputCounterAxes.size());
@@ -4029,6 +4248,17 @@ createReplicaNeuraPart(OpBuilder &builder,
   // facts extractor independently re-derive the mapping before accepting it.
   partTask->setAttr("amoeba.replica.output_counter_axes",
                     builder.getDenseI64ArrayAttr(outputCounterAxes));
+  SmallVector<int64_t> outputConstantAxes;
+  outputConstantAxes.reserve(plan.outputConstantAxes.size());
+  for (std::optional<int64_t> constant : plan.outputConstantAxes)
+    outputConstantAxes.push_back(
+        constant ? *constant : std::numeric_limits<int64_t>::min());
+  if (llvm::any_of(plan.outputConstantAxes,
+                   [](std::optional<int64_t> value) {
+                     return value.has_value();
+                   }))
+    partTask->setAttr("amoeba.replica.output_constant_axes",
+                      builder.getDenseI64ArrayAttr(outputConstantAxes));
   partTask->setAttr("amoeba.replica.shard_lower",
                     builder.getI64IntegerAttr(lower));
   partTask->setAttr("amoeba.replica.shard_upper",
@@ -4041,18 +4271,48 @@ createReplicaNeuraPart(OpBuilder &builder,
                     builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
   partTask->removeAttr(kSemanticIncomingEdgesAttr);
   partTask->removeAttr("amoeba.tiling.parent_task");
-  SmallVector<int64_t> regionLower(plan.outputShape.size(), 0);
+  SmallVector<int64_t> regionLower(plan.producedLowers.begin(),
+                                   plan.producedLowers.end());
   if (plan.producedShape.size() != plan.outputShape.size())
     return failure();
-  SmallVector<int64_t> regionUpper(plan.producedShape.begin(),
-                                   plan.producedShape.end());
+  if (regionLower.size() != plan.outputShape.size())
+    return failure();
+  SmallVector<int64_t> regionUpper(regionLower);
+  for (auto [dimension, extent] : llvm::enumerate(plan.producedShape)) {
+    if (extent <= 0 || regionLower[dimension] >
+                           std::numeric_limits<int64_t>::max() - extent)
+      return failure();
+    regionUpper[dimension] = regionLower[dimension] + extent;
+  }
   regionLower[plan.axis] = lower;
   regionUpper[plan.axis] = upper;
-  // The output proof constrains the written shard.  The recurrence reads both
-  // the output state and an auxiliary input; neither read is reduced to a
-  // one-entry tile descriptor here.  Leaving input-region metadata absent is
-  // the explicit tensor-wide contract, and avoids manufacturing a descriptor
-  // for only one of the two will_reads operands.
+  // The authenticated output-coordinate proof covers every load of the
+  // recurrence state as well as its stores.  That read stays inside this
+  // shard.  Describe every input: auxiliary inputs retain unknown regions
+  // and their tensor-wide transfer contract.  This lets the existing memory
+  // ordering analysis prove sibling recurrence states disjoint without
+  // dropping any unknown auxiliary dependency.
+  SmallVector<Attribute> inputLowers, inputUppers, inputReasons;
+  Value outputRoot = source.getOriginalWriteMemrefs().front();
+  for (Value root : source.getOriginalReadMemrefs()) {
+    if (root == outputRoot) {
+      inputLowers.push_back(builder.getDenseI64ArrayAttr(regionLower));
+      inputUppers.push_back(builder.getDenseI64ArrayAttr(regionUpper));
+      inputReasons.push_back(builder.getStringAttr(
+          "replica-authenticated-output-recurrence-shard"));
+    } else {
+      inputLowers.push_back(builder.getUnitAttr());
+      inputUppers.push_back(builder.getUnitAttr());
+      inputReasons.push_back(builder.getStringAttr(
+          "replica-auxiliary-input-region-unknown"));
+    }
+  }
+  partTask->setAttr(kTilingInputRegionLowersAttr,
+                    builder.getArrayAttr(inputLowers));
+  partTask->setAttr(kTilingInputRegionUppersAttr,
+                    builder.getArrayAttr(inputUppers));
+  partTask->setAttr(kTilingInputRegionReasonsAttr,
+                    builder.getArrayAttr(inputReasons));
   partTask->setAttr(
       kTilingOutputRegionLowersAttr,
       builder.getArrayAttr({builder.getDenseI64ArrayAttr(regionLower)}));
@@ -4062,31 +4322,69 @@ createReplicaNeuraPart(OpBuilder &builder,
   return partTask;
 }
 
+static FailureOr<unsigned>
+getReadInputIndexForResult(TaskflowTaskOp task, unsigned resultIndex) {
+  if (!task || !task.getBody().hasOneBlock() ||
+      resultIndex >= task.getDoneReads().size())
+    return failure();
+  auto yield = dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
+  if (!yield || resultIndex >= yield.getDoneReads().size())
+    return failure();
+  auto argument = dyn_cast<BlockArgument>(yield.getDoneReads()[resultIndex]);
+  if (!argument || argument.getOwner() != &task.getBody().front() ||
+      argument.getArgNumber() >= task.getWillReads().size() ||
+      task.getOriginalReadMemrefs().size() != task.getWillReads().size() ||
+      task.getWillReads()[argument.getArgNumber()].getType() !=
+          task.getDoneReads()[resultIndex].getType())
+    return failure();
+  return argument.getArgNumber();
+}
+
 static FailureOr<ReplicaNeuraInPlacePlan>
 analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
   if (!task || !task.getBody().hasOneBlock() ||
       task.getWillReads().empty() || task.getWillWrites().size() != 1 ||
       task.getOriginalReadMemrefs().size() != task.getWillReads().size() ||
       task.getOriginalWriteMemrefs().size() != 1 ||
-      task.getDoneWrites().size() != 1 || !task.getDoneReads().empty() ||
+      task.getDoneWrites().size() != 1 || task.getDoneReads().size() > 1 ||
       !task.getValueOutputs().empty())
     return rejectReplicaNeura(
-        task, "in-place Neura replica requires one terminal read/write state");
-  Value outputState = task.getWillWrites().front();
-  Value outputRoot = task.getOriginalWriteMemrefs().front();
-  if (llvm::count(task.getWillReads(), outputState) != 1 ||
-      llvm::count(task.getOriginalReadMemrefs(), outputRoot) != 1)
+        task, "in-place Neura replica requires one output and at most one "
+              "sparse read-completion result");
+  if (!task.getDoneReads().empty() &&
+      failed(getReadInputIndexForResult(task, 0)))
     return rejectReplicaNeura(
-        task, "in-place Neura replica requires one shared output state and "
-              "storage root");
-  for (Value root : task.getOriginalReadMemrefs()) {
-    if (root == outputRoot)
+        task, "in-place Neura read-completion result must preserve one exact "
+              "will_reads state");
+  Value outputRoot = task.getOriginalWriteMemrefs().front();
+  if (llvm::count(task.getOriginalReadMemrefs(), outputRoot) != 1)
+    return rejectReplicaNeura(
+        task, "in-place Neura replica requires one exact read/write storage root");
+  FailureOr<Value> outputRootIdentity = resolveTaskflowMemoryRoot(outputRoot);
+  bool foundOutputRead = false;
+  unsigned outputReadIndex = 0;
+  for (auto [index, root] : llvm::enumerate(task.getOriginalReadMemrefs())) {
+    if (root == outputRoot) {
+      FailureOr<Value> readRoot =
+          resolveTaskflowMemoryRoot(task.getWillReads()[index]);
+      if (failed(readRoot) || failed(outputRootIdentity) ||
+          *readRoot != *outputRootIdentity || foundOutputRead)
+        return rejectReplicaNeura(
+            task, "in-place Neura replica read state does not resolve to its "
+                  "matched output storage root");
+      outputReadIndex = static_cast<unsigned>(index);
+      foundOutputRead = true;
       continue;
+    }
     if (!provesDistinctTaskStorage(root, outputRoot))
       return rejectReplicaNeura(
           task, "in-place Neura replica auxiliary read may alias its output "
                 "root");
   }
+  if (!foundOutputRead)
+    return rejectReplicaNeura(
+        task, "in-place Neura replica has no matched input state for its "
+              "output storage root");
   if (axis < 0 || factor < 2 || !isSupportedReplicaCount(factor))
     return rejectReplicaNeura(
         task, "in-place Neura replica requires a supported factor and axis");
@@ -4110,6 +4408,7 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
   plan.task = task;
   plan.axis = axis;
   plan.factor = factor;
+  plan.outputReadIndex = outputReadIndex;
   for (Operation &operation : task.getBody().front()) {
     if (auto counter = dyn_cast<TaskflowCounterOp>(&operation)) {
       plan.taskCounters.push_back(counter);
@@ -4142,7 +4441,7 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
         task, "in-place Neura replica requires the exact logical transfer "
               "shape contract on its caller storage root");
   if (plan.outputShape.size() != static_cast<size_t>(outputType.getRank()) ||
-      plan.outputShape.size() < 1 || plan.outputShape.size() > 2 ||
+      plan.outputShape.size() < 1 || plan.outputShape.size() > 3 ||
       axis >= static_cast<int64_t>(plan.outputShape.size()))
     return rejectReplicaNeura(
         task, "in-place Neura replica selected axis is outside its output "
@@ -4213,13 +4512,26 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
   if (failed(proveReplicaNeuraInPlaceRegion(
           plan, task.getWillWrites().front())))
     return failure();
-  if (plan.outputCounterAxes.size() != plan.outputShape.size())
+  if (plan.outputCounterAxes.size() != plan.outputShape.size() ||
+      plan.outputConstantAxes.size() != plan.outputShape.size())
     return rejectReplicaNeura(
         task, "in-place Neura replica did not prove every output dimension "
-              "counter");
+              "as a counter or bounded constant");
   llvm::SmallDenseSet<unsigned, 4> mappedCounters;
+  plan.producedLowers.resize(plan.outputShape.size());
   plan.producedShape.resize(plan.outputShape.size());
   for (auto [dimension, counter] : llvm::enumerate(plan.outputCounterAxes)) {
+    if (counter == ReplicaOutputCoordinateProof::kConstantAxis) {
+      if (!plan.outputConstantAxes[dimension] ||
+          *plan.outputConstantAxes[dimension] < 0 ||
+          *plan.outputConstantAxes[dimension] >= plan.outputShape[dimension])
+        return rejectReplicaNeura(
+            task, "in-place Neura replica constant output dimension is out "
+                  "of bounds");
+      plan.producedLowers[dimension] = *plan.outputConstantAxes[dimension];
+      plan.producedShape[dimension] = 1;
+      continue;
+    }
     if (counter >= plan.taskUppers.size() ||
         !mappedCounters.insert(counter).second)
       return rejectReplicaNeura(
@@ -4230,15 +4542,21 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
       return rejectReplicaNeura(
           task, "in-place Neura replica produced region exceeds its caller "
                 "shape");
+    plan.producedLowers[dimension] = plan.taskLowers[counter];
     plan.producedShape[dimension] = extent;
   }
   if (!llvm::equal(sourceOutputProof.outputCounterAxes,
                    plan.outputCounterAxes) ||
+      !llvm::equal(sourceOutputProof.outputConstantAxes,
+                   plan.outputConstantAxes) ||
+      !llvm::equal(sourceOutputProof.producedLowers, plan.producedLowers) ||
       !llvm::equal(sourceOutputProof.producedShape, plan.producedShape))
     return rejectReplicaNeura(
         task, "in-place Neura replica plan disagrees with the source "
               "output-coordinate proof");
-  if (!hasBalancedShards(plan.producedShape[axis], factor))
+  if (plan.outputCounterAxes[axis] ==
+          ReplicaOutputCoordinateProof::kConstantAxis ||
+      !hasBalancedShards(plan.producedShape[axis], factor))
     return rejectReplicaNeura(
         task, "in-place Neura replica produced region is not divisible on "
               "its selected axis");
@@ -4264,6 +4582,7 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
   // RAW/WAW annotations must be rebuilt for each generated replica rather
   // than left pointing at the erased parent task.
   SmallVector<TaskflowTaskOp> consumers;
+  SmallVector<TaskflowTaskOp> readConsumers;
   Value sourceDone = source.getDoneWrites().front();
   for (OpOperand &use : sourceDone.getUses()) {
     auto consumer = dyn_cast<TaskflowTaskOp>(use.getOwner());
@@ -4273,6 +4592,25 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
           source, "in-place Neura replica has an unclassified done-write "
                   "consumer");
     consumers.push_back(consumer);
+  }
+  if (!source.getDoneReads().empty()) {
+    if (source.getDoneReads().size() != 1 ||
+        failed(getReadInputIndexForResult(source, 0)))
+      return rejectReplicaNeura(
+          source, "in-place Neura replica supports one passthrough done-read "
+                  "result");
+    Value sourceReadDone = source.getDoneReads().front();
+    for (OpOperand &use : sourceReadDone.getUses()) {
+      auto consumer = dyn_cast<TaskflowTaskOp>(use.getOwner());
+      if (!consumer || !llvm::is_contained(consumer.getWillWrites(),
+                                           sourceReadDone) ||
+          llvm::count(consumer.getWillWrites(), sourceReadDone) != 1)
+        return rejectReplicaNeura(
+            source, "in-place Neura done-read must feed a unique downstream "
+                    "writer operand");
+      if (!llvm::is_contained(readConsumers, consumer))
+        readConsumers.push_back(consumer);
+    }
   }
   for (int64_t part = 0; part < plan.factor; ++part) {
     std::string name =
@@ -4307,6 +4645,7 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
   int64_t base = extent / plan.factor;
   int64_t remainder = extent % plan.factor;
   int64_t cursor = plan.taskLowers[counterAxis];
+  SmallVector<TaskflowTaskOp> replicaTasks;
   for (int64_t part = 0; part < plan.factor; ++part) {
     int64_t width = base + (part < remainder ? 1 : 0);
     FailureOr<TaskflowTaskOp> replica = createReplicaNeuraPart(
@@ -4314,6 +4653,7 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
         source.getWillWrites().front());
     if (failed(replica))
       return failure();
+    replicaTasks.push_back(*replica);
     // Preserve the parent's mapper-visible task and kernel operand types.
     // The static view exists only outside the kernel for completion-region
     // verification; shard counters are the only body specialization.
@@ -4321,9 +4661,18 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
         source.getLoc(), staticType, replica->getDoneWrites().front()));
     cursor += width;
   }
-  SmallVector<int64_t> regionLower(plan.outputShape.size(), 0);
-  SmallVector<int64_t> regionUpper(plan.producedShape.begin(),
-                                   plan.producedShape.end());
+  SmallVector<int64_t> regionLower(plan.producedLowers.begin(),
+                                   plan.producedLowers.end());
+  if (regionLower.size() != plan.outputShape.size() ||
+      plan.producedShape.size() != plan.outputShape.size())
+    return failure();
+  SmallVector<int64_t> regionUpper(regionLower);
+  for (auto [dimension, extent] : llvm::enumerate(plan.producedShape)) {
+    if (extent <= 0 || regionLower[dimension] >
+                           std::numeric_limits<int64_t>::max() - extent)
+      return failure();
+    regionUpper[dimension] = regionLower[dimension] + extent;
+  }
   auto join = builder.create<TaskflowJoinOp>(
       source.getLoc(), staticType, states, outputStorage,
       builder.getI64IntegerAttr(plan.axis),
@@ -4331,6 +4680,36 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
       builder.getDenseI64ArrayAttr(regionUpper));
   join->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
   join->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
+  if (source.getDoneReads().size() == 1) {
+    FailureOr<unsigned> readInputIndex = getReadInputIndexForResult(source, 0);
+    if (failed(readInputIndex) || replicaTasks.size() != states.size())
+      return rejectReplicaNeura(
+          source, "in-place Neura replica lost its exact done-read input slot");
+    SmallVector<Value> readStates;
+    readStates.reserve(replicaTasks.size());
+    Value baseReadState = replicaTasks.front().getWillReads()[*readInputIndex];
+    Value originalReadRoot =
+        source.getOriginalReadMemrefs()[*readInputIndex];
+    for (TaskflowTaskOp replica : replicaTasks) {
+      if (replica.getWillReads()[*readInputIndex] != baseReadState ||
+          replica.getOriginalReadMemrefs()[*readInputIndex] != originalReadRoot ||
+          replica.getDoneReads().size() != 1)
+        return rejectReplicaNeura(
+            source, "in-place Neura replica read versions or roots diverged");
+      readStates.push_back(replica.getDoneReads().front());
+    }
+    auto readJoin = builder.create<TaskflowReadCompletionJoinOp>(
+        source.getLoc(), source.getDoneReads().front().getType(), readStates,
+        baseReadState, originalReadRoot, join.getJoined());
+    readJoin->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
+    readJoin->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
+    Value readReplacement = readJoin.getJoined();
+    source.getDoneReads().front().replaceAllUsesWith(readReplacement);
+    for (TaskflowTaskOp consumer : readConsumers)
+      if (failed(makeReadCompletionConsumerEdges(
+              consumer, readReplacement, sourceName, builder)))
+        return failure();
+  }
   Value replacement = builder.create<memref::CastOp>(
       source.getLoc(), source.getDoneWrites().front().getType(),
       join.getJoined());
@@ -5551,10 +5930,13 @@ struct MaterializeJointTaskReplicasPass
         source.getWillWrites().size() == 1 &&
         source.getOriginalReadMemrefs().size() == source.getWillReads().size() &&
         source.getOriginalWriteMemrefs().size() == 1 &&
-        llvm::count(source.getWillReads(), source.getWillWrites().front()) == 1 &&
         llvm::count(source.getOriginalReadMemrefs(),
                     source.getOriginalWriteMemrefs().front()) == 1;
     inPlaceNeuraCandidate |= multiReadInPlaceNeuraCandidate;
+    bool hasSupportedReplicaReadCompletion =
+        source.getDoneReads().empty() ||
+        (multiReadInPlaceNeuraCandidate &&
+         source.getDoneReads().size() == 1);
     // Fresh Radar Task_2/Task_3 are the intentionally narrow two-output
     // post-Neura ABI.  Dispatch before the historical one-output guard so the
     // validator can authenticate both output coordinates and downstream
@@ -5571,9 +5953,11 @@ struct MaterializeJointTaskReplicasPass
         source.getWillWrites().size() != 1 ||
         source.getOriginalWriteMemrefs().size() != 1 ||
         source.getDoneWrites().size() != 1 ||
-        !source.getDoneReads().empty() || !source.getValueOutputs().empty()) {
+        !hasSupportedReplicaReadCompletion ||
+        !source.getValueOutputs().empty()) {
       func.emitError("replica source must be one unsharded terminal "
-                     "elementwise consumer with a single output");
+                     "elementwise consumer with one output and a supported "
+                     "read-completion shape");
       return signalPassFailure();
     }
     auto taskKind =

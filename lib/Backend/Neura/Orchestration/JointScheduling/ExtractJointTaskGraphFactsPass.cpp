@@ -915,6 +915,11 @@ sourceTaskIndices(Value value, const DenseMap<Operation *, unsigned> &indices,
     sourceTaskIndices(channel.getSource(), indices, sources, visited);
     return;
   }
+  if (auto join = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+    for (Value state : join.getTileStates())
+      sourceTaskIndices(state, indices, sources, visited);
+    return;
+  }
   if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
     for (Value state : join.getTileStates())
       sourceTaskIndices(state, indices, sources, visited);
@@ -952,15 +957,35 @@ collectFactOnlyMetadata(func::FuncOp function, std::string &error) {
       error = "duplicate task name " + name;
       return WalkResult::interrupt();
     }
-    int64_t tripCount = 1;
-    if (auto attr = task->getAttrOfType<IntegerAttr>("trip_count")) {
-      if (attr.getInt() <= 0) {
-        error = "task " + name + " has non-positive trip_count";
-        return WalkResult::interrupt();
-      }
-      tripCount = attr.getInt();
+    TaskMetadata metadata;
+    metadata.op = task;
+    metadata.name = std::move(name);
+    std::string domainError;
+    FailureOr<TaskIterationDomainMetadata> domain =
+        resolveTaskIterationDomain(task, domainError);
+    if (succeeded(domain)) {
+      metadata.tripCount = domain->effectiveMapperFiringCount;
+      metadata.taskflowTripCount = domain->taskflowTripCount;
+      metadata.sourceIterationMultiplicity = domain->internalMultiplicity;
+      metadata.sourceIterationWorkCount = domain->sourceIterationWorkCount;
+      metadata.sourceIterationDomainCertified = domain->sourceCertified;
+      metadata.sourceIterationDomainComplete = domain->complete;
+      metadata.tripCountKnown = domain->countKnown;
+      metadata.sourceIterationDomainStatus = domain->status;
+      metadata.sourceIterationDomainReason = domain->reason;
+      metadata.expandedInternalExtents =
+          std::move(domain->expandedInternalExtents);
+    } else {
+      // Fact-only extraction preserves the diagnostic task record but never
+      // substitutes one for an unproved or stale source workload count.
+      metadata.tripCount = 0;
+      metadata.taskflowTripCount = 0;
+      metadata.sourceIterationWorkCount = 0;
+      metadata.tripCountKnown = false;
+      metadata.sourceIterationDomainStatus = "unsupported-or-unproven";
+      metadata.sourceIterationDomainReason = std::move(domainError);
     }
-    tasks.push_back({task, std::move(name), tripCount});
+    tasks.push_back(std::move(metadata));
     return WalkResult::advance();
   });
   if (tasks.empty() && error.empty())
@@ -2266,7 +2291,8 @@ struct ExtractJointTaskGraphFactsPass
     for (BlockArgument argument : selected->getArguments())
       externalValueIds[argument] = nextExternalValueId++;
     for (Operation &operation : selected->getBody().front()) {
-      if (isa<TaskflowTaskOp, TaskflowChannelOp, TaskflowJoinOp>(&operation))
+      if (isa<TaskflowTaskOp, TaskflowChannelOp, TaskflowJoinOp,
+              TaskflowReadCompletionJoinOp>(&operation))
         continue;
       for (Value result : operation.getResults())
         externalValueIds.try_emplace(result, nextExternalValueId++);
@@ -2311,15 +2337,69 @@ struct ExtractJointTaskGraphFactsPass
                               {"task_index", static_cast<int64_t>(index)},
                               {"cost_query_supported", !factOnly},
                               {"native_mapper_input_supported", !factOnly}};
+      taskRecord["source_iteration_domain_status"] =
+          task.sourceIterationDomainStatus;
+      taskRecord["source_iteration_domain_certified"] =
+          task.sourceIterationDomainCertified;
+      taskRecord["source_iteration_domain_complete"] =
+          task.sourceIterationDomainComplete;
+      taskRecord["trip_count_known"] = task.tripCountKnown;
+      taskRecord["taskflow_trip_count"] =
+          task.tripCountKnown ? json::Value(task.taskflowTripCount)
+                              : json::Value(nullptr);
+      taskRecord["expanded_internal_extents"] =
+          integerArray(task.expandedInternalExtents);
+      taskRecord["source_iteration_work_count"] =
+          task.tripCountKnown ? json::Value(task.sourceIterationWorkCount)
+                              : json::Value(nullptr);
+      taskRecord["effective_mapper_firing_count"] =
+          task.tripCountKnown ? json::Value(task.tripCount)
+                              : json::Value(nullptr);
+      if (!task.sourceIterationDomainReason.empty())
+        taskRecord["source_iteration_domain_reason"] =
+            task.sourceIterationDomainReason;
       bool hasNeuraKernel = false;
       task.op.walk([&](neura::KernelOp) { hasNeuraKernel = true; });
       if (hasNeuraKernel) {
         int64_t requestedAxis = -1;
-        if (auto axis = task.op->getAttrOfType<IntegerAttr>(
-                "amoeba.replica.shard_axis"))
-          requestedAxis = axis.getInt();
+        // Facts describe the output coordinate being sharded.  A rank-3
+        // output may map that dimension to a different Taskflow counter, and
+        // Radar's legacy shard_axis is explicitly a counter axis.
+        auto outputAxis = task.op->getAttrOfType<IntegerAttr>(
+            "amoeba.replica.output_shard_axis");
+        auto counterAxis = task.op->getAttrOfType<IntegerAttr>(
+            "amoeba.replica.shard_axis");
+        bool invalidAxisMetadata =
+            (task.op->hasAttr("amoeba.replica.output_shard_axis") &&
+             !outputAxis) ||
+            (task.op->hasAttr("amoeba.replica.shard_axis") &&
+             !counterAxis) ||
+            (outputAxis && !counterAxis);
+        if (outputAxis)
+          requestedAxis = outputAxis.getInt();
+        else if (counterAxis)
+          requestedAxis = counterAxis.getInt();
         ReplicaOutputCoordinateProof outputProof =
             analyzeReplicaOutputCoordinates(task.op, requestedAxis);
+        if (invalidAxisMetadata) {
+          outputProof.proven = false;
+          outputProof.selectedAxisIndependent = false;
+          outputProof.reason = "replica shard-axis metadata is incomplete";
+        }
+        if (outputProof.proven && outputAxis && counterAxis) {
+          if (requestedAxis < 0 ||
+              requestedAxis >= static_cast<int64_t>(
+                                   outputProof.outputCounterAxes.size()) ||
+              outputProof.outputCounterAxes[requestedAxis] ==
+                  ReplicaOutputCoordinateProof::kConstantAxis ||
+              outputProof.outputCounterAxes[requestedAxis] !=
+                  static_cast<unsigned>(counterAxis.getInt())) {
+            outputProof.proven = false;
+            outputProof.selectedAxisIndependent = false;
+            outputProof.reason =
+                "replica output shard axis does not map to its counter axis";
+          }
+        }
         if (outputProof.proven) {
           SmallVector<int64_t> mapping;
           for (unsigned counter : outputProof.outputCounterAxes)
@@ -2357,9 +2437,6 @@ struct ExtractJointTaskGraphFactsPass
           taskRecord["neura_output_coordinate_reason"] = outputProof.reason;
         }
       }
-      if (factOnly)
-        taskRecord["trip_count_known"] =
-            task.op->hasAttr("trip_count");
       if (auto role =
               task.op->getAttrOfType<StringAttr>("amoeba.semantic.task_role"))
         taskRecord["semantic_role"] = role.getValue().str();
@@ -2488,10 +2565,31 @@ struct ExtractJointTaskGraphFactsPass
           structuralDimensions.push_back(upper - lower);
       json::Object structuralNode{
           {"static_dims", std::move(structuralDimensions)},
-          {"trip_count", task.tripCount},
+          {"trip_count", task.tripCountKnown
+                              ? json::Value(task.tripCount)
+                              : json::Value(nullptr)},
           {"input_bindings", std::move(inputBindings)}};
-      if (factOnly)
-        structuralNode["trip_count_known"] = task.op->hasAttr("trip_count");
+      structuralNode["trip_count_known"] = task.tripCountKnown;
+      structuralNode["source_iteration_domain_status"] =
+          task.sourceIterationDomainStatus;
+      structuralNode["source_iteration_domain_certified"] =
+          task.sourceIterationDomainCertified;
+      structuralNode["source_iteration_domain_complete"] =
+          task.sourceIterationDomainComplete;
+      structuralNode["taskflow_trip_count"] =
+          task.tripCountKnown ? json::Value(task.taskflowTripCount)
+                              : json::Value(nullptr);
+      structuralNode["expanded_internal_extents"] =
+          integerArray(task.expandedInternalExtents);
+      structuralNode["source_iteration_work_count"] =
+          task.tripCountKnown ? json::Value(task.sourceIterationWorkCount)
+                              : json::Value(nullptr);
+      structuralNode["effective_mapper_firing_count"] =
+          task.tripCountKnown ? json::Value(task.tripCount)
+                              : json::Value(nullptr);
+      if (!task.sourceIterationDomainReason.empty())
+        structuralNode["source_iteration_domain_reason"] =
+            task.sourceIterationDomainReason;
       if (std::optional<json::Object> descriptor = tileDescriptor(task.op))
         structuralNode["tile"] = std::move(*descriptor);
       if (std::optional<json::Object> descriptor =
@@ -2758,8 +2856,10 @@ struct ExtractJointTaskGraphFactsPass
       structuralEdges.push_back(std::move(structuralEdge));
     }
     json::Array completionJoins;
+    DenseMap<Operation *, int64_t> completionJoinIndices;
     int64_t joinIndex = 0;
     selected->walk([&](TaskflowJoinOp join) {
+      completionJoinIndices[join.getOperation()] = joinIndex;
       completionJoins.push_back(json::Object{
           {"join_index", joinIndex++},
           {"axis", join.getAxis()},
@@ -2769,6 +2869,34 @@ struct ExtractJointTaskGraphFactsPass
           {"users",
            static_cast<int64_t>(std::distance(join.getJoined().use_begin(),
                                               join.getJoined().use_end()))}});
+    });
+    json::Array readCompletionJoins;
+    int64_t readJoinIndex = 0;
+    selected->walk([&](TaskflowReadCompletionJoinOp join) {
+      auto completion =
+          join.getWriteCompletion().getDefiningOp<TaskflowJoinOp>();
+      int64_t completionIndex = -1;
+      if (completion)
+        if (auto found = completionJoinIndices.find(completion.getOperation());
+            found != completionJoinIndices.end())
+          completionIndex = found->second;
+      auto task = join.getTileStates().front().getDefiningOp<TaskflowTaskOp>();
+      unsigned readResult = 0;
+      if (task) {
+        auto result = llvm::find(task.getDoneReads(),
+                                 join.getTileStates().front());
+        if (result != task.getDoneReads().end())
+          readResult = result - task.getDoneReads().begin();
+      }
+      readCompletionJoins.push_back(json::Object{
+          {"read_join_index", readJoinIndex++},
+          {"read_result_index", static_cast<int64_t>(readResult)},
+          {"replica_read_states",
+           static_cast<int64_t>(join.getTileStates().size())},
+          {"linked_output_completion_join", completionIndex},
+          {"users", static_cast<int64_t>(std::distance(
+                         join.getJoined().use_begin(),
+                         join.getJoined().use_end()))}});
     });
     json::Object root{
         {"schema", kFactsSchema},
@@ -2787,6 +2915,7 @@ struct ExtractJointTaskGraphFactsPass
         {"sibling_fusion_materialization_complete",
          siblingFusionMaterializationComplete},
         {"completion_joins", std::move(completionJoins)},
+        {"read_completion_joins", std::move(readCompletionJoins)},
         {"action_diagnostics", std::move(actionDiagnostics)},
         {"structural_key", json::Object{{"nodes", std::move(structuralNodes)},
                                         {"edges", std::move(structuralEdges)}}},

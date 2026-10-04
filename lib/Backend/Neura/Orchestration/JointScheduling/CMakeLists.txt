@@ -7,16 +7,25 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   AnalyzeRecResMiiPass.cpp
   AnalyticalMLPInference.cpp
   MapperFeatureExtractor.cpp
+  MapperCostAnalysis.cpp
+  BindSourceIterationDomainPass.cpp
   BindExactMemrefShapePass.cpp
   EnumerateAnalyticalTaskCandidatesPass.cpp
   EnumerateExactTaskSchedulesPass.cpp
   ExactScheduleSpace.cpp
   CommunicationExactScheduleSpace.cpp
   FixedScheduleVerifier.cpp
+  OriginalAmoebaFixedDecisionRetimer.cpp
+  OriginalAmoebaCtrlToDataFlowPass.cpp
+  OriginalAmoebaProfileCostAdapter.cpp
+  RetimingOriginalAmoebaFixedDecisionsPass.cpp
   ProductionFixedScheduleCommunication.cpp
   EnumerateJointSemanticRewritePass.cpp
   EnumerateJointGraphClosurePass.cpp
   JointNeighborhoodSearchPass.cpp
+  ReplayJointNeighborhoodActionsPass.cpp
+  PrepareJointDiagnosticCandidatePass.cpp
+  ProveStaticActiveTransferShapesPass.cpp
   JointNeighborhoodActions.cpp
   PruneJointGraphCandidatesPass.cpp
   EnumerateApplicationRewriteActionsPass.cpp
@@ -53,6 +62,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   MLIRAmoebaNeuraOrchestrationUtil
   MLIRArithDialect
   MLIRBytecodeWriter
+  MLIRDataLayoutInterfaces
   MLIRFuncDialect
   MLIRIR
   MLIRNeura

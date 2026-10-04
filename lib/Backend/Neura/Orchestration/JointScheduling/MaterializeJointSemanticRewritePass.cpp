@@ -1059,7 +1059,9 @@ static bool hasInterveningUses(TaskflowTaskOp producer,
     }
     if (&operation == consumer.getOperation())
       break;
-    if (inRange && !isa<TaskflowChannelOp, TaskflowJoinOp>(&operation))
+    if (inRange &&
+        !isa<TaskflowChannelOp, TaskflowJoinOp,
+             TaskflowReadCompletionJoinOp>(&operation))
       for (Value operand : operation.getOperands())
         if (results.contains(operand))
           return true;

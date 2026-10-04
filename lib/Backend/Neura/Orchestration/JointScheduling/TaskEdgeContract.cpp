@@ -7,9 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -130,6 +132,27 @@ collectProducerResults(Value value,
                                   requireTaskProducer, true, results, visited,
                                   error);
   }
+  if (auto readJoin = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+    if (readJoin.getJoined() != value) {
+      error = "taskflow.read_completion_join result does not match its value";
+      return failure();
+    }
+    if (failed(verify(readJoin.getOperation()))) {
+      error = "taskflow.read_completion_join failed its completion proof";
+      return failure();
+    }
+    for (Value state : readJoin.getTileStates()) {
+      if (state.getType() != value.getType()) {
+        error = "taskflow.read_completion_join state and result types do not match";
+        return failure();
+      }
+      if (failed(collectProducerResults(state, taskIds, requireTaskProducer,
+                                        crossedChannel, results, visited,
+                                        error)))
+        return failure();
+    }
+    return success();
+  }
   if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
     for (Value state : join.getTileStates()) {
       if (state.getType() != value.getType()) {
@@ -240,6 +263,11 @@ static FailureOr<Value> resolveOriginalMemrefRoot(Value value,
     return resolveOriginalMemrefRoot(cast.getSource(), visited);
   if (auto channel = value.getDefiningOp<TaskflowChannelOp>())
     return resolveOriginalMemrefRoot(channel.getSource(), visited);
+  if (auto readJoin = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+    if (failed(verify(readJoin.getOperation())))
+      return failure();
+    return resolveOriginalMemrefRoot(readJoin.getBaseState(), visited);
+  }
   if (auto join = value.getDefiningOp<TaskflowJoinOp>())
     return resolveOriginalMemrefRoot(join.getBase(), visited);
   auto task = value.getDefiningOp<TaskflowTaskOp>();
@@ -489,6 +517,7 @@ enum class PayloadSource : uint8_t {
   StaticType,
   ProvenTiledRegion,
   CallerMemrefShape,
+  ProvenActiveTransferShape,
   Explicit,
 };
 
@@ -675,6 +704,43 @@ PayloadFact getCallerMemrefShapePayload(ProducerResult producer,
             "bits";
     return {};
   }
+  // Active footprints are an explicit opt-in proof contract. Retain the
+  // original capacity validation above, then independently re-derive every
+  // access before accepting fewer transferred elements. Unproved arguments
+  // continue using their full caller capacity.
+  unsigned argumentIndex = argument.getArgNumber();
+  Attribute active = function.getArgAttr(argumentIndex,
+                                          "amoeba.active_transfer_shape");
+  Attribute hasProof = function.getArgAttr(argumentIndex,
+                                           "amoeba.active_transfer_proof");
+  if (active || hasProof) {
+    if (failed(verifyStaticActiveTransferShapeProof(function, argumentIndex,
+                                                   &error)))
+      return {};
+    if (active) {
+      auto extents = dyn_cast<DenseI64ArrayAttr>(active);
+      if (!extents || static_cast<size_t>(extents.size()) !=
+                          contract.extents.size()) {
+        error = "active transfer shape must match the caller capacity rank";
+        return {};
+      }
+      uint64_t activeElements = 1;
+      for (auto [index, extent] : llvm::enumerate(extents.asArrayRef())) {
+        if (extent <= 0 || extent > contract.extents[index] ||
+            activeElements > UINT64_MAX / static_cast<uint64_t>(extent)) {
+          error = "active transfer extent is outside the caller capacity";
+          return {};
+        }
+        activeElements *= static_cast<uint64_t>(extent);
+      }
+      if (activeElements > UINT64_MAX / *elementBits) {
+        error = "active transfer payload overflows unsigned 64-bit bits";
+        return {};
+      }
+      return {activeElements * *elementBits,
+              PayloadSource::ProvenActiveTransferShape};
+    }
+  }
   return {elements * *elementBits, PayloadSource::CallerMemrefShape};
 }
 
@@ -799,6 +865,11 @@ bool validateExplicitPayloadBits(TaskflowTaskOp consumer, std::string &error) {
 }
 
 } // namespace
+
+FailureOr<Value> resolveTaskflowMemoryRoot(Value state) {
+  DenseSet<Value> visited;
+  return resolveOriginalMemrefRoot(state, visited);
+}
 
 std::optional<uint64_t> getStaticPayloadBits(Type type) {
   return getTypePayloadBits(type);

@@ -640,6 +640,11 @@ static void collectTaskDependencies(
     collectTaskDependencies(channel.getSource(), taskIndices, dependencies);
     return;
   }
+  if (auto join = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+    for (Value state : join.getTileStates())
+      collectTaskDependencies(state, taskIndices, dependencies);
+    return;
+  }
   if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
     for (Value state : join.getTileStates())
       collectTaskDependencies(state, taskIndices, dependencies);
@@ -2642,8 +2647,12 @@ static LogicalResult lowerTask(TaskflowTaskOp task, unsigned ordinal,
 
 static LogicalResult eliminateAliases(func::FuncOp function) {
   SmallVector<TaskflowJoinOp> joins;
+  SmallVector<TaskflowReadCompletionJoinOp> readJoins;
   SmallVector<TaskflowChannelOp> channels;
   function.walk([&](TaskflowJoinOp join) { joins.push_back(join); });
+  function.walk([&](TaskflowReadCompletionJoinOp join) {
+    readJoins.push_back(join);
+  });
   function.walk(
       [&](TaskflowChannelOp channel) { channels.push_back(channel); });
 
@@ -2655,6 +2664,15 @@ static LogicalResult eliminateAliases(func::FuncOp function) {
       return reject(join,
                     "HOST_LOWERING_UNVERIFIED_JOIN: completion join proof "
                     "did not verify");
+  for (TaskflowReadCompletionJoinOp join : readJoins)
+    if (failed(verify(join.getOperation())))
+      return reject(join,
+                    "HOST_LOWERING_UNVERIFIED_READ_JOIN: read completion "
+                    "proof did not verify");
+  for (TaskflowReadCompletionJoinOp join : readJoins) {
+    join.getJoined().replaceAllUsesWith(join.getBaseState());
+    join.erase();
+  }
   for (TaskflowJoinOp join : joins) {
     join.getJoined().replaceAllUsesWith(join.getBase());
     join.erase();
@@ -2679,6 +2697,14 @@ static LogicalResult validateFunction(func::FuncOp function) {
     if (failed(verify(join.getOperation()))) {
       join.emitError() << kErrorPrefix << "HOST_LOWERING_UNVERIFIED_JOIN: "
                        << "completion join proof did not verify";
+      valid = false;
+    }
+  });
+  function.walk([&](TaskflowReadCompletionJoinOp join) {
+    if (failed(verify(join.getOperation()))) {
+      join.emitError() << kErrorPrefix
+                       << "HOST_LOWERING_UNVERIFIED_READ_JOIN: "
+                       << "read completion proof did not verify";
       valid = false;
     }
   });

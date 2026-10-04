@@ -31,14 +31,18 @@ struct NeighborhoodAction {
   int64_t shapeCols = 0;
   bool canonicalReset = false;
 };
+// The published v11 profile remains the default; the expanded profile passes
+// 8 and is still bounded by source-authenticated lineage.
 std::vector<NeighborhoodAction> enumerateNeighborhoodActions(
     ModuleOp module, llvm::StringRef function,
     llvm::ArrayRef<NeighborhoodShape> shapes, llvm::StringRef stage,
-    unsigned round);
+    unsigned round, unsigned maxPartitionFactor = 4);
+// Must match the cap used for enumeration when replaying an action.
 bool applyNeighborhoodAction(
     ModuleOp cloned, ModuleOp canonical, llvm::StringRef function,
     const NeighborhoodAction &action, std::vector<NeighborhoodShape> &shapes,
-    std::string &reason, std::string &diagnostic);
+    std::string &reason, std::string &diagnostic,
+    unsigned maxPartitionFactor = 4);
 } // namespace mlir::amoeba::neura::joint_scheduling
 
 #endif

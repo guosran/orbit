@@ -13,6 +13,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -26,6 +28,12 @@ namespace mlir::amoeba::neura::joint_scheduling {
 using namespace mlir::taskflow;
 
 struct ReplicaOutputCoordinateProof {
+  // A constant output dimension has no counter route.  Keep an explicit
+  // sentinel in the legacy counter-map vectors so existing callers can still
+  // compare the complete rank-sized map; outputConstantAxes carries the
+  // authenticated value for those sentinel entries.
+  static constexpr unsigned kConstantAxis = std::numeric_limits<unsigned>::max();
+
   bool proven = false;
   bool selectedAxisIndependent = false;
   bool sawOutputLoad = false;
@@ -33,11 +41,15 @@ struct ReplicaOutputCoordinateProof {
   unsigned outputInput = std::numeric_limits<unsigned>::max();
   SmallVector<unsigned> outputCounterAxes;
   SmallVector<SmallVector<unsigned>> outputAccessCounterAxes;
+  SmallVector<std::optional<int64_t>> outputConstantAxes;
+  SmallVector<SmallVector<std::optional<int64_t>>>
+      outputAccessConstantAxes;
   SmallVector<unsigned> auxiliaryInputIndices;
   SmallVector<int64_t> taskLowers;
   SmallVector<int64_t> taskUppers;
   SmallVector<int64_t> kernelLowers;
   SmallVector<int64_t> kernelUppers;
+  SmallVector<int64_t> producedLowers;
   SmallVector<int64_t> producedShape;
   SmallVector<int64_t> callerShape;
   std::string reason;
@@ -63,6 +75,136 @@ inline std::optional<unsigned> parseInputReference(mlir::Attribute attribute) {
   return value;
 }
 
+inline bool fitsSignedWidth(int64_t value, uint64_t width) {
+  if (width == 0 || width > 64)
+    return false;
+  if (width == 64)
+    return true;
+  int64_t maximum = (int64_t(1) << (width - 1)) - 1;
+  int64_t minimum = -maximum - 1;
+  return value >= minimum && value <= maximum;
+}
+
+inline bool fitsUnsignedWidth(int64_t value, uint64_t width) {
+  if (value < 0 || width == 0 || width > 64)
+    return false;
+  if (width == 64)
+    return true;
+  return static_cast<uint64_t>(value) <= ((uint64_t(1) << width) - 1);
+}
+
+inline std::optional<int64_t> integerAttributeValue(IntegerAttr attribute,
+                                                     Type type) {
+  const llvm::APInt &value = attribute.getValue();
+  if (isa<IndexType>(type)) {
+    if (!value.isSignedIntN(64))
+      return std::nullopt;
+    return value.getSExtValue();
+  }
+  auto integerType = dyn_cast<IntegerType>(type);
+  if (!integerType || value.getBitWidth() > 64)
+    return std::nullopt;
+  if (integerType.isSigned()) {
+    if (!value.isSignedIntN(64))
+      return std::nullopt;
+    return value.getSExtValue();
+  }
+  if (integerType.isUnsigned()) {
+    // This proof stores coordinates in int64, so larger unsigned literals
+    // cannot be represented without changing its domain.
+    if (!value.isIntN(63))
+      return std::nullopt;
+    return static_cast<int64_t>(value.getZExtValue());
+  }
+  // Keep the existing signed interpretation for signless literal attributes,
+  // but reject a value that does not fit the proof's int64 domain.
+  if (!value.isSignedIntN(64))
+    return std::nullopt;
+  return value.getSExtValue();
+}
+
+inline std::optional<int64_t>
+input0StaticIndexBound(mlir::func::FuncOp function,
+                       mlir::BlockArgument argument) {
+  using namespace mlir;
+  if (!function || argument.getOwner() != &function.getBody().front() ||
+      argument.getArgNumber() >= function.getNumArguments() ||
+      !isa<IndexType>(argument.getType()) ||
+      !function->getAttrOfType<UnitAttr>("amoeba.input0_caller_noalias_proven"))
+    return std::nullopt;
+
+  auto callerBound =
+      function->getAttrOfType<IntegerAttr>("amoeba.input0_caller_static_bound");
+  auto caller =
+      function->getAttrOfType<StringAttr>("amoeba.input0_caller_function");
+  auto evidence = function->getAttrOfType<StringAttr>(
+      "amoeba.input0_caller_evidence_path");
+  auto proofMode = function->getAttrOfType<StringAttr>(
+      "amoeba.input0_caller_noalias_proof_mode");
+  std::string boundName = "amoeba.static_bound.arg." +
+                          std::to_string(argument.getArgNumber());
+  auto sourceBound = function->getAttrOfType<IntegerAttr>(boundName);
+  if (!callerBound || !caller || caller.getValue().empty() || !evidence ||
+      evidence.getValue().empty() || !proofMode ||
+      (proofMode.getValue() != "in-module-caller" &&
+       proofMode.getValue() != "prepared-external-caller") ||
+      !sourceBound || callerBound.getInt() <= 0 ||
+      sourceBound.getInt() != callerBound.getInt())
+    return std::nullopt;
+
+  DataLayout layout = DataLayout::closest(function);
+  std::optional<uint64_t> width =
+      layout.getTypeIndexBitwidth(IndexType::get(function.getContext()));
+  if (!width || !fitsSignedWidth(callerBound.getInt(), *width))
+    return std::nullopt;
+  return callerBound.getInt();
+}
+
+inline std::optional<int64_t> checkedStaticIntegerBinary(
+    mlir::Operation *operation, int64_t lhs, int64_t rhs, bool subtract) {
+  using namespace mlir;
+  if (!operation || operation->getNumOperands() != 2 ||
+      operation->getNumResults() != 1)
+    return std::nullopt;
+  Type type = operation->getResult(0).getType();
+  if (operation->getOperand(0).getType() != type ||
+      operation->getOperand(1).getType() != type)
+    return std::nullopt;
+
+  uint64_t width = 0;
+  bool signedDomain = false;
+  if (isa<IndexType>(type)) {
+    DataLayout layout = DataLayout::closest(operation);
+    std::optional<uint64_t> indexWidth = layout.getTypeIndexBitwidth(type);
+    if (!indexWidth)
+      return std::nullopt;
+    width = *indexWidth;
+    signedDomain = true;
+  } else if (auto integerType = dyn_cast<IntegerType>(type)) {
+    width = integerType.getWidth();
+    if (integerType.isSigned())
+      signedDomain = true;
+    else if (!integerType.isUnsigned())
+      return std::nullopt;
+  } else {
+    return std::nullopt;
+  }
+
+  auto fits = [&](int64_t value) {
+    return signedDomain ? fitsSignedWidth(value, width)
+                        : fitsUnsignedWidth(value, width);
+  };
+  if (!fits(lhs) || !fits(rhs))
+    return std::nullopt;
+  int64_t result = 0;
+  if (subtract ? __builtin_sub_overflow(lhs, rhs, &result)
+               : __builtin_add_overflow(lhs, rhs, &result))
+    return std::nullopt;
+  if (!fits(result))
+    return std::nullopt;
+  return result;
+}
+
 inline std::optional<int64_t>
 staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
             mlir::neura::KernelOp kernel,
@@ -70,11 +212,20 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
   using namespace mlir;
   if (!value || !visiting.insert(value).second)
     return std::nullopt;
+  // Keep this set as an active recursion stack. A global visited set would
+  // reject valid repeated operands such as `%x + %x` after the lhs walk.
+  auto eraseActive = llvm::make_scope_exit([&] { visiting.erase(value); });
   if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
     return constant.value();
   if (auto constant = value.getDefiningOp<arith::ConstantOp>())
     if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      return integer.getInt();
+      return integerAttributeValue(integer, constant.getType());
+  if (auto constant = value.getDefiningOp<::mlir::neura::ConstantOp>())
+    if (auto integer = dyn_cast<IntegerAttr>(constant->getAttr("value"))) {
+      if (!integer.getValue().isSignedIntN(64))
+        return std::nullopt;
+      return integer.getValue().getSExtValue();
+    }
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *parent = argument.getOwner()->getParentOp();
     if (kernel && argument.getOwner() == &kernel.getBody().front() &&
@@ -88,10 +239,7 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
     if (auto function = dyn_cast_or_null<func::FuncOp>(parent)) {
       if (argument.getOwner() != &function.getBody().front())
         return std::nullopt;
-      std::string name = "amoeba.static_bound.arg." +
-                         std::to_string(argument.getArgNumber());
-      if (auto bound = function->getAttrOfType<IntegerAttr>(name))
-        return bound.getInt();
+      return input0StaticIndexBound(function, argument);
     }
     return std::nullopt;
   }
@@ -108,9 +256,49 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
       return std::nullopt;
     return staticIndex(cast.getIn(), task, kernel, visiting);
   }
-  // Arithmetic on a bound/index is not folded here.  Even checked int64
-  // arithmetic is insufficient to prove the source integer width and
-  // signedness semantics, so a non-constant arithmetic route stays unknown.
+  // Predicate/data forwarding preserves a literal coordinate.  Follow only
+  // the same transparent routes accepted for authenticated counter indices;
+  // arithmetic and opaque selects remain unknown.
+  StringRef name = definition->getName().getStringRef();
+  if ((name == "neura.data_mov" || name == "neura.grant_predicate") &&
+      definition->getNumOperands() >= 1)
+    return staticIndex(definition->getOperand(0), task, kernel, visiting);
+  if (name == "neura.phi" && definition->getNumOperands() > 0) {
+    // A phi has independent incoming paths.  Keep cycle detection local to
+    // each path so two alternatives that forward the same literal (through
+    // distinct grant_predicate operations) still authenticate as one value.
+    llvm::SmallDenseSet<Value, 16> firstVisiting = visiting;
+    auto first = staticIndex(definition->getOperand(0), task, kernel,
+                             firstVisiting);
+    if (!first)
+      return std::nullopt;
+    for (Value operand : definition->getOperands().drop_front()) {
+      llvm::SmallDenseSet<Value, 16> branchVisiting = visiting;
+      auto candidate = staticIndex(operand, task, kernel, branchVisiting);
+      if (!candidate || *candidate != *first)
+        return std::nullopt;
+    }
+    return first;
+  }
+  // Arithmetic is accepted only from two independently resolved SSA values
+  // with identical operation/result types. The operation's actual index
+  // width (or explicit signed/unsigned integer width) must represent both
+  // operands and the mathematical result, so modular wrap and narrow casts
+  // cannot enter this proof.
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    auto lhs = staticIndex(add.getLhs(), task, kernel, visiting);
+    auto rhs = staticIndex(add.getRhs(), task, kernel, visiting);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    return checkedStaticIntegerBinary(add, *lhs, *rhs, false);
+  }
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    auto lhs = staticIndex(sub.getLhs(), task, kernel, visiting);
+    auto rhs = staticIndex(sub.getRhs(), task, kernel, visiting);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    return checkedStaticIntegerBinary(sub, *lhs, *rhs, true);
+  }
   return std::nullopt;
 }
 
@@ -328,8 +516,70 @@ taskRootForKernelInput(unsigned input, mlir::neura::KernelOp kernel,
 }
 
 inline std::optional<llvm::SmallVector<int64_t>>
-callerShape(mlir::Value value) {
+callerShape(mlir::Value value, unsigned depth = 0) {
   using namespace mlir;
+  if (!value || depth >= 64)
+    return std::nullopt;
+  // Static views and verified completion-state forwarding preserve storage;
+  // obtain its capacity from the original allocation or function argument,
+  // never from a cast that merely asserts a static view of a dynamic value.
+  if (auto cast = value.getDefiningOp<memref::CastOp>())
+    return callerShape(cast.getSource(), depth + 1);
+  if (auto channel = value.getDefiningOp<taskflow::TaskflowChannelOp>())
+    return callerShape(channel.getSource(), depth + 1);
+  if (auto join = value.getDefiningOp<taskflow::TaskflowJoinOp>())
+    return callerShape(join.getBase(), depth + 1);
+  if (auto join = value.getDefiningOp<taskflow::TaskflowReadCompletionJoinOp>())
+    return callerShape(join.getBaseState(), depth + 1);
+  if (auto producer = value.getDefiningOp<taskflow::TaskflowTaskOp>()) {
+    if (!producer.getBody().hasOneBlock())
+      return std::nullopt;
+    auto yield = dyn_cast<taskflow::TaskflowYieldOp>(
+        producer.getBody().front().getTerminator());
+    if (!yield)
+      return std::nullopt;
+    Value forwarded;
+    auto read = llvm::find(producer.getDoneReads(), value);
+    auto write = llvm::find(producer.getDoneWrites(), value);
+    if (read != producer.getDoneReads().end()) {
+      unsigned index = read - producer.getDoneReads().begin();
+      if (index >= yield.getDoneReads().size())
+        return std::nullopt;
+      forwarded = yield.getDoneReads()[index];
+    } else if (write != producer.getDoneWrites().end()) {
+      unsigned index = write - producer.getDoneWrites().begin();
+      if (index >= yield.getDoneWrites().size())
+        return std::nullopt;
+      forwarded = yield.getDoneWrites()[index];
+    } else {
+      return std::nullopt;
+    }
+    auto argument = dyn_cast<BlockArgument>(forwarded);
+    if (!argument || argument.getOwner() != &producer.getBody().front() ||
+        argument.getArgNumber() >= producer->getNumOperands())
+      return std::nullopt;
+    if (read != producer.getDoneReads().end()) {
+      if (argument.getArgNumber() >= producer.getWillReads().size())
+        return std::nullopt;
+    } else if (argument.getArgNumber() !=
+               producer.getWillReads().size() +
+                   (write - producer.getDoneWrites().begin())) {
+      return std::nullopt;
+    }
+    return callerShape(producer->getOperand(argument.getArgNumber()), depth + 1);
+  }
+  // Private, statically allocated intermediates carry their storage extent
+  // directly in the allocation type. The current output rectangle is still
+  // derived from counters and indexed accesses and checked within that extent.
+  if (value.getDefiningOp<memref::AllocOp>() ||
+      value.getDefiningOp<memref::AllocaOp>()) {
+    auto type = dyn_cast<MemRefType>(value.getType());
+    if (type && type.hasStaticShape() &&
+        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
+      return llvm::SmallVector<int64_t>(type.getShape().begin(),
+                                       type.getShape().end());
+    return std::nullopt;
+  }
   auto argument = dyn_cast<BlockArgument>(value);
   if (!argument || !argument.getOwner())
     return std::nullopt;
@@ -338,6 +588,17 @@ callerShape(mlir::Value value) {
     return std::nullopt;
   Attribute attr = function.getArgAttr(argument.getArgNumber(),
                                       "amoeba.logical_transfer_shape");
+  // A fully static function-argument type independently fixes its storage
+  // capacity. Dynamic arguments still require the explicit caller contract;
+  // a malformed present contract must not fall back to the type.
+  if (!attr) {
+    auto type = dyn_cast<MemRefType>(argument.getType());
+    if (type && type.hasStaticShape() &&
+        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
+      return llvm::SmallVector<int64_t>(type.getShape().begin(),
+                                      type.getShape().end());
+    return std::nullopt;
+  }
   if (auto dense = dyn_cast_or_null<DenseI64ArrayAttr>(attr))
     return llvm::SmallVector<int64_t>(dense.asArrayRef().begin(),
                                       dense.asArrayRef().end());
@@ -400,7 +661,7 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
   auto outputType = dyn_cast<MemRefType>(outputState.getType());
   auto rootType = dyn_cast<MemRefType>(outputRoot.getType());
   if (!outputType || !rootType || outputType.getRank() != rootType.getRank() ||
-      outputType.getRank() < 1 || outputType.getRank() > 2) {
+      outputType.getRank() < 1 || outputType.getRank() > 3) {
     proofFail(proof, "output state/storage rank is not supported");
     return proof;
   }
@@ -602,31 +863,69 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       return;
     }
     SmallVector<unsigned> mapping;
+    SmallVector<std::optional<int64_t>> constants;
     llvm::SmallDenseSet<unsigned, 4> used;
-    for (Value index : indices) {
+    for (auto [dimension, index] : llvm::enumerate(indices)) {
       auto route = counterRoute(index, kernelCounters);
-      if (!route || !used.insert(*route).second) {
-        proofFail(proof, "output index route is not an authenticated counter");
+      if (route) {
+        if (!used.insert(*route).second) {
+          proofFail(proof,
+                    "output index routes are not distinct authenticated "
+                    "counters");
+          return;
+        }
+        mapping.push_back(*route);
+        constants.push_back(std::nullopt);
+        continue;
+      }
+      auto constant = staticIndex(index, task, kernel);
+      if (rank != 3 || !constant || *constant < 0 ||
+          static_cast<size_t>(dimension) >= proof.callerShape.size() ||
+          *constant >= proof.callerShape[dimension]) {
+        proofFail(proof,
+                  "output index is neither an authenticated counter nor a "
+                  "bounded constant");
         return;
       }
-      mapping.push_back(*route);
+      mapping.push_back(ReplicaOutputCoordinateProof::kConstantAxis);
+      constants.push_back(*constant);
     }
-    if (proof.outputCounterAxes.empty())
+    if (proof.outputCounterAxes.empty()) {
       proof.outputCounterAxes = mapping;
+      proof.outputConstantAxes = constants;
+    }
     proof.outputAccessCounterAxes.push_back(std::move(mapping));
+    proof.outputAccessConstantAxes.push_back(std::move(constants));
     SmallVector<unsigned> &current = proof.outputAccessCounterAxes.back();
-    if (current.size() != proof.outputCounterAxes.size()) {
+    SmallVector<std::optional<int64_t>> &currentConstants =
+        proof.outputAccessConstantAxes.back();
+    if (current.size() != proof.outputCounterAxes.size() ||
+        currentConstants.size() != proof.outputConstantAxes.size()) {
       proofFail(proof, "output access rank changes");
       return;
     }
+    if (rank == 3 &&
+        (!llvm::equal(current, proof.outputCounterAxes) ||
+         !llvm::equal(currentConstants, proof.outputConstantAxes))) {
+      proofFail(proof,
+                "rank-3 output accesses do not preserve the authenticated "
+                "coordinate map");
+      return;
+    }
     int64_t axis = requestedAxis;
-    if (axis < 0)
-      if (auto attr = operation->getParentOfType<TaskflowTaskOp>()
-                          ->getAttrOfType<IntegerAttr>(
-                              "amoeba.replica.shard_axis"))
-        axis = attr.getInt();
+    if (axis < 0) {
+      TaskflowTaskOp parentTask = operation->getParentOfType<TaskflowTaskOp>();
+      if (auto outputAxisAttr = parentTask->getAttrOfType<IntegerAttr>(
+              "amoeba.replica.output_shard_axis"))
+        axis = outputAxisAttr.getInt();
+      else if (auto legacyShardAxisAttr =
+                   parentTask->getAttrOfType<IntegerAttr>(
+                       "amoeba.replica.shard_axis"))
+        axis = legacyShardAxisAttr.getInt();
+    }
     if (axis >= 0 &&
         (axis >= static_cast<int64_t>(current.size()) ||
+         current[axis] == ReplicaOutputCoordinateProof::kConstantAxis ||
          current[axis] != proof.outputCounterAxes[axis]))
       proofFail(proof, "output access crosses the selected shard coordinate");
   };
@@ -689,18 +988,34 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     return proof;
   }
   llvm::SmallDenseSet<unsigned, 4> mapped;
+  proof.producedLowers.resize(rank);
   proof.producedShape.resize(rank);
   for (auto [dimension, counter] : llvm::enumerate(proof.outputCounterAxes)) {
+    if (counter == ReplicaOutputCoordinateProof::kConstantAxis) {
+      if (dimension >= proof.outputConstantAxes.size() ||
+          !proof.outputConstantAxes[dimension]) {
+        proofFail(proof, "constant output dimension lacks an authenticated value");
+        return proof;
+      }
+      proof.producedLowers[dimension] = *proof.outputConstantAxes[dimension];
+      proof.producedShape[dimension] = 1;
+      continue;
+    }
     if (counter >= proof.taskUppers.size() || !mapped.insert(counter).second) {
       proofFail(proof, "output counter map is not one-to-one");
       return proof;
     }
-    int64_t extent = proof.taskUppers[counter] - proof.taskLowers[counter];
-    if (extent <= 0 || extent > proof.callerShape[dimension]) {
+    int64_t lower = proof.taskLowers[counter];
+    int64_t upper = proof.taskUppers[counter];
+    if (lower < 0 || upper <= lower ||
+        upper > proof.callerShape[dimension]) {
       proofFail(proof, "produced output region exceeds caller shape");
       return proof;
     }
-    proof.producedShape[dimension] = extent;
+    // Bounds are now nonnegative and limited by the positive caller extent,
+    // so this subtraction cannot overflow signed int64.
+    proof.producedLowers[dimension] = lower;
+    proof.producedShape[dimension] = upper - lower;
   }
   if (auto attr = task->getAttr("amoeba.replica.output_counter_axes")) {
     auto declared = parseCounterMap(attr);
@@ -709,11 +1024,49 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       return proof;
     }
   }
+  if (Attribute attr = task->getAttr("amoeba.replica.output_constant_axes")) {
+    SmallVector<int64_t> declared;
+    if (auto dense = dyn_cast<DenseI64ArrayAttr>(attr)) {
+      declared.append(dense.asArrayRef().begin(), dense.asArrayRef().end());
+    } else if (auto array = dyn_cast<ArrayAttr>(attr)) {
+      for (Attribute element : array) {
+        auto integer = dyn_cast<IntegerAttr>(element);
+        if (!integer) {
+          proofFail(proof,
+                    "declared output constant map is not an integer array");
+          return proof;
+        }
+        declared.push_back(integer.getInt());
+      }
+    } else {
+      proofFail(proof, "declared output constant map has an unsupported type");
+      return proof;
+    }
+    if (declared.size() != proof.outputConstantAxes.size()) {
+      proofFail(proof, "declared output constant map has the wrong rank");
+      return proof;
+    }
+    for (auto [dimension, value] : llvm::enumerate(declared)) {
+      bool isUnmapped =
+          value == std::numeric_limits<int64_t>::min();
+      if (isUnmapped != !proof.outputConstantAxes[dimension] ||
+          (!isUnmapped &&
+           value != *proof.outputConstantAxes[dimension])) {
+        proofFail(proof,
+                  "declared output constant map does not match IR proof");
+        return proof;
+      }
+    }
+  }
   int64_t axis = requestedAxis;
-  if (axis < 0)
-    if (auto attr = task->getAttrOfType<IntegerAttr>(
-            "amoeba.replica.shard_axis"))
-      axis = attr.getInt();
+  if (axis < 0) {
+    if (auto outputAxisAttr = task->getAttrOfType<IntegerAttr>(
+            "amoeba.replica.output_shard_axis"))
+      axis = outputAxisAttr.getInt();
+    else if (auto legacyShardAxisAttr = task->getAttrOfType<IntegerAttr>(
+                 "amoeba.replica.shard_axis"))
+      axis = legacyShardAxisAttr.getInt();
+  }
   if (axis >= 0) {
     if (axis >= static_cast<int64_t>(rank)) {
       proofFail(proof, "selected shard axis is outside output rank");

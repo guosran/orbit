@@ -36,6 +36,16 @@ inline constexpr llvm::StringLiteral kFormalCheckpointSchema =
 inline constexpr llvm::StringLiteral kFormalShapeProtocolId =
     "amoeba-static-rectangles-up-to-four-cgras-formal";
 
+inline constexpr unsigned kPerCgra2x2MapperFeatureWidth = 148;
+inline constexpr llvm::StringLiteral kPerCgra2x2ModelNamespace =
+    "orbit-per-cgra-2x2-direct-4member-v1";
+inline constexpr llvm::StringLiteral kPerCgra2x2EnsembleSchema =
+    "orbit-cgra-ii-per-cgra-2x2-direct-ensemble-cpp-v1";
+inline constexpr llvm::StringLiteral kPerCgra2x2FeatureContractId =
+    "cgra-ii-pre-mapper-features-148-2x2-per-cgra-v1";
+inline constexpr llvm::StringLiteral kPerCgra2x2ShapeProtocolId =
+    "amoeba-static-rectangles-2x2-per-cgra-max4";
+
 struct MLPEnsemblePrediction {
   double predictedII = 0.0;
   double predictedIIStd = 0.0;
@@ -131,6 +141,59 @@ private:
   bool loaded = false;
 };
 
+struct DirectMapperIIPrediction {
+  double predictedII = 0.0;
+  // The direct ensemble members are kept as members; they are not assigned
+  // legacy baseline/large-operation meanings from the separate three-model
+  // max-four bundle.
+  std::vector<double> memberPredictions;
+};
+
+// Standalone runtime for the 2x2-PE-per-CGRA candidate bundle.  Its single
+// JSON contract contains four direct regressors, their per-member
+// normalization, selected feature indices, and exact architecture text.
+class PerCgra2x2DirectEnsemble {
+public:
+  bool load(llvm::StringRef ensemblePath,
+            llvm::StringRef expectedArchitectureText, std::string &error);
+
+  bool predict(llvm::ArrayRef<double> features, double recMii,
+               double resMii, double lowerBound,
+               DirectMapperIIPrediction &prediction,
+               std::string &error) const;
+
+  bool featureNamesMatch(llvm::ArrayRef<std::string> names) const;
+  llvm::StringRef getModelNamespace() const { return modelNamespace; }
+  llvm::StringRef getFeatureContractId() const { return featureContractId; }
+  llvm::StringRef getShapeProtocolId() const { return shapeProtocolId; }
+  llvm::StringRef getArchitectureText() const { return architectureText; }
+  bool isLoaded() const { return loaded; }
+
+private:
+  struct Member {
+    int64_t seed = 0;
+    std::vector<float> featureMean;
+    std::vector<float> featureScale;
+    std::vector<float> layer0Weight;
+    std::vector<float> layer0Bias;
+    std::vector<float> layer1Weight;
+    std::vector<float> layer1Bias;
+    std::vector<float> layer2Weight;
+    std::vector<float> layer2Bias;
+  };
+
+  std::string modelNamespace;
+  std::string featureContractId;
+  std::string shapeProtocolId;
+  std::string architectureText;
+  std::vector<std::string> featureNames;
+  std::vector<std::string> selectedFeatureNames;
+  std::vector<unsigned> selectedFeatureIndices;
+  std::vector<Member> members;
+  float mapperIICeiling = 0.0F;
+  bool loaded = false;
+};
+
 // A persistent cache is optional at the command-line boundary, but all
 // callers get an in-memory cache even when no file was requested.  Loading an
 // absent file is an empty-cache operation; malformed or mismatched files fail
@@ -165,6 +228,7 @@ private:
 };
 
 bool isFormalMax4MapperShape(int64_t rows, int64_t cols);
+bool isPerCgra2x2MapperShape(int64_t rows, int64_t cols);
 
 } // namespace joint_scheduling
 } // namespace neura

@@ -6,17 +6,23 @@
 
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
+#include "MapperCostAnalysis.h"
+#include "SpatialTaskCandidateSpace.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "MapperCounterBounds.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
+#include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 
 #include "NeuraDialect/NeuraAttributes.h"
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Parser/Parser.h"
@@ -41,6 +47,7 @@
 
 using namespace mlir;
 using namespace mlir::taskflow;
+namespace json = llvm::json;
 
 namespace {
 
@@ -59,6 +66,96 @@ public:
   bool valid() const { return fd >= 0; }
   ~MappingCacheLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
 };
+
+static bool hasAllUnitRewriteEvidence(func::FuncOp function,
+                                     std::string &error) {
+  bool foundEvidence = false;
+  function->walk([&](Operation *operation) {
+    for (NamedAttribute attribute : operation->getAttrs()) {
+      StringRef name = attribute.getName().strref();
+      if ((name == "joint_scheduling_graph_variant_id" ||
+           name == "amoeba.graph_variant_id") &&
+          operation == function.getOperation()) {
+        auto graphVariant = dyn_cast<StringAttr>(attribute.getValue());
+        // The source-owned shape enumerator labels its unchanged graph.
+        // Permit only that identity label; rewrite evidence below and the
+        // complete source-domain/shape checks remain mandatory.
+        if (graphVariant && graphVariant.getValue() == "identity")
+          continue;
+      }
+      if (name.starts_with("amoeba.replica.") ||
+          name.starts_with("amoeba.tiling.") ||
+          name.starts_with("amoeba.neura.tiling.") ||
+          name.starts_with("amoeba.neura.fusion.") ||
+          name.starts_with("amoeba.semantic.fusion_") ||
+          name.starts_with("amoeba.fission.") ||
+          name.starts_with("amoeba.fusion.") ||
+          name == ::mlir::amoeba::neura::joint_scheduling::
+                     kSourceIterationPartitionProofAttr ||
+          name == "joint_scheduling_graph_variant_id" ||
+          name == "amoeba.graph_variant_id") {
+        error = "all-unit baseline rejects candidate graph rewrite evidence "
+                "attribute " +
+                name.str();
+        foundEvidence = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return foundEvidence;
+}
+
+static bool deriveStructuralStartupCycles(func::FuncOp mapperWrapper,
+                                          double &startup,
+                                          std::string &error) {
+  // This is the same C++ mapper frontend used by the model cost catalogue.
+  // It builds structural graph facts only; no model or prediction is loaded.
+  OwningOpRef<ModuleOp> featureModule = ModuleOp::create(mapperWrapper.getLoc());
+  featureModule->getBody()->push_back(mapperWrapper->clone());
+  PassManager featureFrontend(mapperWrapper.getContext());
+  featureFrontend.addPass(::mlir::neura::createAssignAcceleratorPass());
+  featureFrontend.addPass(::mlir::neura::createInsertDataMovPass());
+  if (failed(featureFrontend.run(*featureModule))) {
+    error = "C++ structural-startup frontend failed for the mapper body";
+    return false;
+  }
+  if (failed(verify(*featureModule))) {
+    error = "C++ structural-startup frontend produced invalid mapper IR";
+    return false;
+  }
+  func::FuncOp featureWrapper =
+      featureModule->lookupSymbol<func::FuncOp>(mapperWrapper.getSymName());
+  if (!featureWrapper) {
+    error = "C++ structural-startup frontend removed the mapper wrapper";
+    return false;
+  }
+  std::string mapperText;
+  llvm::raw_string_ostream mapperStream(mapperText);
+  featureWrapper.print(mapperStream);
+  mapperStream.flush();
+
+  orbit::mapper_features::RouteExpandedGraph graph;
+  if (!orbit::mapper_features::parseRouteExpandedDFG(
+          mapperText, graph, error, /*requireExpanded=*/true)) {
+    error = "C++ structural-startup frontend did not produce a certified "
+            "route-expanded graph: " +
+            error;
+    return false;
+  }
+  json::Array nodeTypes;
+  for (int type : graph.nodeTypes)
+    nodeTypes.push_back(static_cast<int64_t>(type));
+  json::Array edges;
+  for (auto [source, target] : graph.edges)
+    edges.push_back(json::Array{static_cast<int64_t>(source),
+                                static_cast<int64_t>(target)});
+  json::Object featureOutput;
+  featureOutput["node_types"] = std::move(nodeTypes);
+  featureOutput["edges"] = std::move(edges);
+  return ::mlir::amoeba::neura::joint_scheduling::
+      deriveStartupCyclesFromCppFeatureOutput(featureOutput, startup, error);
+}
 
 struct MapJointSchedulingTasksPass
     : public PassWrapper<MapJointSchedulingTasksPass, OperationPass<ModuleOp>> {
@@ -85,6 +182,11 @@ struct MapJointSchedulingTasksPass
   Option<std::string> candidateId{*this, "candidate-id",
                                   llvm::cl::desc("Selected candidate ID."),
                                   llvm::cl::init("")};
+  Option<bool> allUnitBaseline{
+      *this, "all-unit-baseline",
+      llvm::cl::desc("Use source-certified all-1x1 mapper durations without "
+                     "ML costs."),
+      llvm::cl::init(false)};
   Option<std::string> expectedTraceSha256{
       *this, "expected-trace-sha256",
       llvm::cl::desc("Expected selected schedule trace identity."),
@@ -103,10 +205,29 @@ struct MapJointSchedulingTasksPass
   std::string materializedCandidateId;
   bool exactScores = false;
   bool productionScheduler = false;
+  std::string baselineArchitectureText;
+  llvm::StringMap<int64_t> baselineSourceWorkCounts;
   std::string productionDispatchPolicy;
   int64_t productionFixedPointIterations = 10;
 
   LogicalResult loadStartupCycles(ModuleOp module, StringRef function) {
+    if (allUnitBaseline.getValue()) {
+      if (!scoreFile.getValue().empty())
+        return module.emitError("all-unit baseline must not consume an ML "
+                                "score file");
+      if (candidateId.getValue() != "candidate-0")
+        return module.emitError("all-unit baseline requires shape-space "
+                                "candidate-0");
+      if (!expectedScoreSha256.getValue().empty())
+        return module.emitError("all-unit baseline has no score JSONL to "
+                                "bind with expected-score-sha256");
+      exactScores = false;
+      productionScheduler = true;
+      productionDispatchPolicy = "fixed";
+      productionFixedPointIterations = 10;
+      materializedCandidateId = candidateId.getValue();
+      return success();
+    }
     if (scoreFile.getValue().empty() || candidateId.getValue().empty())
       return module.emitError("per-task mapper replay requires scores and "
                               "candidate-id");
@@ -327,6 +448,24 @@ struct MapJointSchedulingTasksPass
     if (failed(::mlir::amoeba::neura::joint_scheduling::prepareMapperCounterBounds(wrapper)))
       return task.emitError("invalid counter metadata or unprepared mapper body");
 
+    if (allUnitBaseline.getValue()) {
+      auto currentArchitecture = llvm::MemoryBuffer::getFile(
+          ::mlir::amoeba::getNeuraArchitectureSpecFile());
+      if (!currentArchitecture ||
+          (*currentArchitecture)->getBuffer() != baselineArchitectureText)
+        return task.emitError("mapper architecture changed during all-unit "
+                              "baseline replay");
+      double startup = 0.0;
+      std::string startupError;
+      if (!deriveStructuralStartupCycles(wrapper, startup, startupError))
+        return task.emitError() << "cannot derive structural startup cycles: "
+                                << startupError;
+      if (!std::isfinite(startup) || startup <= 0.0 ||
+          !startupCycles.try_emplace(task.getTaskName(), startup).second)
+        return task.emitError("all-unit baseline structural startup is "
+                              "invalid or duplicated");
+    }
+
     std::string errorForCache;
     std::unique_ptr<MappingCacheLock> entryLock;
     std::string cacheEntry;
@@ -341,6 +480,10 @@ struct MapJointSchedulingTasksPass
       wrapper.print(keyStream, OpPrintingFlags().useLocalScope());
       auto architecture = llvm::MemoryBuffer::getFile(::mlir::amoeba::getNeuraArchitectureSpecFile());
       if (!architecture) return task.emitError("cannot read mapper cache architecture");
+      if (allUnitBaseline.getValue() &&
+          (*architecture)->getBuffer() != baselineArchitectureText)
+        return task.emitError("mapper architecture changed during all-unit "
+                              "baseline replay");
       keyStream << "\narchitecture:\n" << (*architecture)->getBuffer();
       keyStream.flush();
       {
@@ -445,6 +588,37 @@ struct MapJointSchedulingTasksPass
     SmallVector<NamedAttribute> profile;
     profile.push_back(builder.getNamedAttr(
         "duration", builder.getI64IntegerAttr(roundedDuration)));
+    if (allUnitBaseline.getValue()) {
+      auto sourceWork = baselineSourceWorkCounts.find(task.getTaskName());
+      if (sourceWork == baselineSourceWorkCounts.end() ||
+          sourceWork->second < tripCount.getInt())
+        return task.emitError("all-unit baseline has no validated source work "
+                              "count");
+      StringRef durationProvenance =
+          "source-owned-all-unit-mapped-duration";
+      profile.push_back(builder.getNamedAttr(
+          "duration_provenance", builder.getStringAttr(durationProvenance)));
+      profile.push_back(builder.getNamedAttr(
+          "structural_startup_cycles", builder.getF64FloatAttr(startup->second)));
+      profile.push_back(builder.getNamedAttr(
+          "actual_mapper_ii", builder.getI64IntegerAttr(compiled_ii.getInt())));
+      profile.push_back(builder.getNamedAttr(
+          "ml_predicted_ii", builder.getStringAttr("unknown")));
+      profile.push_back(builder.getNamedAttr(
+          "current_taskflow_firing_count",
+          builder.getI64IntegerAttr(tripCount.getInt())));
+      profile.push_back(builder.getNamedAttr(
+          "source_iteration_work_count",
+          builder.getI64IntegerAttr(sourceWork->second)));
+      task->setAttr("amoeba.mapper_duration_provenance",
+                    builder.getStringAttr(durationProvenance));
+      task->setAttr("amoeba.mapper_structural_startup_cycles",
+                    builder.getF64FloatAttr(startup->second));
+      task->setAttr("amoeba.mapper_actual_ii",
+                    builder.getI64IntegerAttr(compiled_ii.getInt()));
+      task->setAttr("amoeba.mapper_ml_prediction_status",
+                    builder.getStringAttr("unknown"));
+    }
     task->setAttr("profile_info", builder.getDictionaryAttr(profile));
     return success();
   }
@@ -472,6 +646,24 @@ struct MapJointSchedulingTasksPass
     }
     if (failed(loadStartupCycles(module, selectedFunction->getSymName())))
       return signalPassFailure();
+    if (allUnitBaseline.getValue()) {
+      auto candidate = (*selectedFunction)->getAttrOfType<StringAttr>(
+          "joint_scheduling_candidate_id");
+      auto scope = (*selectedFunction)->getAttrOfType<StringAttr>(
+          "joint_scheduling_candidate_scope");
+      if (!candidate || candidate.getValue() != "candidate-0" ||
+          !scope || scope.getValue() !=
+                        ::mlir::amoeba::neura::joint_scheduling::kSearchScope) {
+        selectedFunction->emitError(
+            "all-unit baseline requires shape-only static candidate-0");
+        return signalPassFailure();
+      }
+      std::string rewriteError;
+      if (hasAllUnitRewriteEvidence(*selectedFunction, rewriteError)) {
+        selectedFunction->emitError() << rewriteError;
+        return signalPassFailure();
+      }
+    }
     SmallVector<TaskflowTaskOp> tasks;
     selectedFunction->walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
     if (tasks.empty()) {
@@ -488,13 +680,91 @@ struct MapJointSchedulingTasksPass
         return signalPassFailure();
       }
     }
-    if (startupCycles.size() != tasks.size()) {
+    if (allUnitBaseline.getValue()) {
+      const auto &physicalArchitecture = ::mlir::neura::getArchitecture();
+      for (TaskflowTaskOp task : tasks) {
+        auto selectedCount = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_cgra_count");
+        auto mapperRows = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_mapper_tile_rows");
+        auto mapperCols = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_mapper_tile_cols");
+        auto shape = task->getAttrOfType<StringAttr>(
+            "amoeba.selected_cgra_shape");
+        auto cgraCount = task->getAttrOfType<IntegerAttr>("cgra_count");
+        auto cgraShape = task->getAttrOfType<StringAttr>("cgra_shape");
+        if (!selectedCount || selectedCount.getInt() != 1 || !mapperRows ||
+            mapperRows.getInt() != physicalArchitecture.getPerCgraRows() ||
+            !mapperCols ||
+            mapperCols.getInt() != physicalArchitecture.getPerCgraColumns() ||
+            !shape || shape.getValue() != "1x1" || !cgraCount ||
+            cgraCount.getInt() != 1 || !cgraShape ||
+            cgraShape.getValue() != "1x1" ||
+            !task->getAttrOfType<UnitAttr>(
+                "amoeba.joint_shape_orientation_fixed")) {
+          task.emitError("all-unit baseline requires the identity-only 1x1 "
+                         "fixed-orientation shape for every task");
+          return signalPassFailure();
+        }
+      }
+      std::string metadataError;
+      FailureOr<llvm::SmallVector<
+          ::mlir::amoeba::neura::joint_scheduling::TaskMetadata>> metadata =
+          ::mlir::amoeba::neura::joint_scheduling::collectAnalyticalTaskMetadata(
+              *selectedFunction, metadataError);
+      if (failed(metadata)) {
+        module.emitError() << "all-unit baseline requires a valid complete "
+                              "source-domain certificate: "
+                           << metadataError;
+        return signalPassFailure();
+      }
+      for (const auto &entry : *metadata) {
+        auto selectedTrip = entry.op->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_trip_count");
+        if (!entry.sourceIterationDomainCertified ||
+            !entry.sourceIterationDomainComplete || !entry.tripCountKnown ||
+            entry.tripCount <= 0 || entry.sourceIterationWorkCount < entry.tripCount) {
+          module.emitError() << "all-unit baseline requires a complete, "
+                                "source-owned iteration-domain certificate "
+                                "and proven current count for task "
+                             << entry.name;
+          return signalPassFailure();
+        }
+        if (!selectedTrip || selectedTrip.getInt() != entry.tripCount) {
+          module.emitError() << "all-unit baseline current Taskflow firing "
+                                "count does not match its selected candidate "
+                                "count for task "
+                             << entry.name;
+          return signalPassFailure();
+        }
+        baselineSourceWorkCounts[entry.name] = entry.sourceIterationWorkCount;
+      }
+      if (metadata->size() != tasks.size()) {
+        module.emitError("all-unit baseline source count coverage differs "
+                         "from the selected task set");
+        return signalPassFailure();
+      }
+      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> architecture =
+          llvm::MemoryBuffer::getFile(
+              ::mlir::amoeba::getNeuraArchitectureSpecFile());
+      if (!architecture || (*architecture)->getBuffer().empty()) {
+        module.emitError("all-unit baseline cannot read the current mapper "
+                         "architecture");
+        return signalPassFailure();
+      }
+      baselineArchitectureText = (*architecture)->getBuffer().str();
+    }
+    if (!allUnitBaseline.getValue() && startupCycles.size() != tasks.size()) {
       module.emitError("selected score task coverage does not match replay");
       return signalPassFailure();
     }
     for (TaskflowTaskOp task : tasks)
       if (failed(mapTask(task)))
         return signalPassFailure();
+    if (startupCycles.size() != tasks.size()) {
+      module.emitError("structural startup coverage does not match mapper replay");
+      return signalPassFailure();
+    }
     if (exactScores) {
       bool predictionEqual = true;
       for (TaskflowTaskOp task : tasks) {
@@ -532,6 +802,30 @@ struct MapJointSchedulingTasksPass
         (*selectedFunction)->setAttr("joint_scheduling_exact_dispatch_order", exactDispatch);
       (*selectedFunction)->setAttr("joint_scheduling_candidate_id", StringAttr::get(module.getContext(), candidateId));
       (*selectedFunction)->setAttr("joint_scheduling_prediction_mapper_equal", BoolAttr::get(module.getContext(), predictionEqual));
+    }
+    if (allUnitBaseline.getValue()) {
+      (*selectedFunction)->removeAttr("joint_scheduling_exact_dispatch_order");
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_scheduler_backend",
+          StringAttr::get(module.getContext(),
+                          "orchestrate-tasks-on-accelerators"));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_production_dispatch_policy",
+          StringAttr::get(module.getContext(), productionDispatchPolicy));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_fixed_point_max_iterations",
+          IntegerAttr::get(IntegerType::get(module.getContext(), 64),
+                           productionFixedPointIterations));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_mapper_duration_provenance",
+          StringAttr::get(module.getContext(),
+                          "source-owned-all-unit-mapped-duration"));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_ml_prediction_status",
+          StringAttr::get(module.getContext(), "unknown"));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_candidate_id",
+          StringAttr::get(module.getContext(), "candidate-0"));
     }
     (*selectedFunction)->setAttr("joint_scheduling_mapper_cache_hits", IntegerAttr::get(IntegerType::get(module.getContext(), 64), mappingCacheHits));
     (*selectedFunction)->setAttr("joint_scheduling_mapper_cache_misses", IntegerAttr::get(IntegerType::get(module.getContext(), 64), mappingCacheMisses));

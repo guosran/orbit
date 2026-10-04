@@ -5,6 +5,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCostCatalog.h"
+#include "AnalyticalMLPInference.h"
+
+#include "NeuraDialect/Architecture/Architecture.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -102,6 +105,38 @@ static bool isGitCommit(StringRef value) {
   });
 }
 
+static bool getModelDomainShapes(
+    bool directPerCgra2x2,
+    std::array<std::pair<int64_t, int64_t>, 8> &shapes,
+    std::string &error) {
+  if (!directPerCgra2x2) {
+    shapes = kFormalMax4CostShapes;
+    return true;
+  }
+
+  const ::mlir::neura::Architecture &architecture =
+      ::mlir::neura::getArchitecture();
+  const int64_t perCgraRows = architecture.getPerCgraRows();
+  const int64_t perCgraCols = architecture.getPerCgraColumns();
+  if (perCgraRows != 2 || perCgraCols != 2 ||
+      architecture.getMultiCgraRows() < 4 ||
+      architecture.getMultiCgraColumns() < 4) {
+    error = "direct 2x2-per-CGRA model requires the bound architecture to "
+            "provide a 2x2 PE core and at least a 4x4 CGRA grid";
+    return false;
+  }
+
+  // The direct model schema names a maximum of four physical CGRAs per task.
+  // Keep the protocol's oriented rectangle sequence in CGRA coordinates and
+  // derive mapper-tile dimensions from the actual loaded architecture.
+  constexpr std::array<std::pair<int64_t, int64_t>, 8> kMaxFourCgraShapes =
+      {{{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
+  for (auto [index, shape] : llvm::enumerate(kMaxFourCgraShapes))
+    shapes[index] = {shape.first * perCgraRows,
+                     shape.second * perCgraCols};
+  return true;
+}
+
 // Loads one complete external predictor catalogue and memoizes lookups by the
 // source task ID and oriented mapper shape. The catalogue is bound through
 // explicit Git, architecture, graph, task, and candidate identifiers; no
@@ -112,7 +147,9 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
                               StringRef expectedSourceCommit,
                               StringRef expectedArchitecturePath,
                               StringRef expectedGraphId,
-                              std::string &error) {
+                              std::string &error,
+                              bool allowModelDomainUnsupported,
+                              StringRef expectedCanonicalModuleWitness) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -145,6 +182,36 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     return false;
   }
 
+  const bool directPerCgra2x2 =
+      *modelNamespace == kPerCgra2x2ModelNamespace;
+  const std::optional<StringRef> catalogModelSchema =
+      metadata->getString("model_schema");
+  if (directPerCgra2x2 ||
+      (catalogModelSchema && *catalogModelSchema == kPerCgra2x2EnsembleSchema)) {
+    std::optional<StringRef> featureContractId =
+        metadata->getString("feature_contract_id");
+    std::optional<StringRef> shapeProtocolId =
+        metadata->getString("shape_protocol_id");
+    if (!directPerCgra2x2 || !catalogModelSchema ||
+        *catalogModelSchema != kPerCgra2x2EnsembleSchema ||
+        !featureContractId ||
+        *featureContractId != kPerCgra2x2FeatureContractId ||
+        !shapeProtocolId ||
+        *shapeProtocolId != kPerCgra2x2ShapeProtocolId ||
+        !metadata->getBoolean("candidate_only").value_or(false) ||
+        metadata->getBoolean("production_ready").value_or(true) ||
+        metadata->getBoolean("amoeba_benchmark_overlap_audit_complete")
+            .value_or(true) ||
+        metadata->getBoolean("old_4x4_labels_reused").value_or(true) ||
+        metadata->getBoolean("supports_whole_program_latency_or_throughput_claim")
+            .value_or(true)) {
+      error = "direct per-CGRA cost catalogue does not match its explicit "
+              "namespace, schema, feature contract, shape protocol, or "
+              "candidate-only status";
+      return false;
+    }
+  }
+
   auto provenanceSchema =
       requiredString(*metadata, "provenance_schema", error);
   auto sourceRepository =
@@ -167,6 +234,24 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
       !candidateIdScheme || !candidateCount || !sourceTaskIds ||
       !rankingPolicy)
     return false;
+
+  if (allowModelDomainUnsupported) {
+    std::optional<StringRef> witness =
+        metadata->getString("canonical_module_witness");
+    std::optional<StringRef> domainPolicy =
+        metadata->getString("unsupported_prediction_policy");
+    std::optional<double> intervalMax =
+        metadata->getNumber("model_interval_max_ii");
+    if (!witness || witness->empty() || expectedCanonicalModuleWitness.empty() ||
+        *witness != expectedCanonicalModuleWitness || !domainPolicy ||
+        *domainPolicy != "analytical-lower-bound-exceeds-model-ceiling-v1" ||
+        !intervalMax || !std::isfinite(*intervalMax) ||
+        *intervalMax != kFormalMax4ModelCeilingII) {
+      error = "cost catalogue model-domain proof is not bound to the exact "
+              "current canonical module and formal interval";
+      return false;
+    }
+  }
 
   if (*provenanceSchema != kCostProvenanceSchema ||
       sourceRepository->empty() || !isGitCommit(*sourceCommit) ||
@@ -284,14 +369,52 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         return false;
       }
       cost = {*ii, *startup, true};
+      cost.analyticalLowerBound = *lowerBound;
     } else if (*status != "unsupported") {
       error = "support_status must be supported or unsupported";
       return false;
-    } else if (entry->get("predicted_ii") || entry->get("startup_cycles") ||
-               entry->get("analytical_lower_bound")) {
-      error = "unsupported cost entries must be censored and contain no "
-              "numeric timing prediction";
-      return false;
+    } else {
+      if (entry->get("predicted_ii") || entry->get("startup_cycles") ||
+          entry->get("predicted_ii_std") || entry->get("ii_mean_source") ||
+          entry->get("model_status") || entry->get("production_ready") ||
+          entry->get("mapper_success_probability")) {
+        error = "unsupported cost entries must contain no numeric timing "
+                "prediction";
+        return false;
+      }
+      if (auto unsupportedStatus = entry->getString("status")) {
+        if (!allowModelDomainUnsupported ||
+            *unsupportedStatus != kModelDomainUnsupportedStatus) {
+          error = "unsupported model-domain row is not permitted by the "
+                  "active cost-catalog policy";
+          return false;
+        }
+        auto reason = requiredString(*entry, "unsupported_reason", error);
+        auto lowerBound = entry->getNumber("analytical_lower_bound");
+        auto intervalMax = entry->getNumber("model_interval_max_ii");
+        if (!reason || *reason != kModelDomainUnsupportedReason ||
+            !lowerBound || !std::isfinite(*lowerBound) || *lowerBound <= 0.0 ||
+            !intervalMax || !std::isfinite(*intervalMax) ||
+            *intervalMax != kFormalMax4ModelCeilingII ||
+            *lowerBound <= *intervalMax) {
+          error = "unsupported model-domain row lacks a valid analytical "
+                  "lower-bound proof above the model ceiling";
+          return false;
+        }
+        cost.supported = false;
+        cost.modelDomainUnsupported = true;
+        cost.analyticalLowerBound = *lowerBound;
+        cost.modelIntervalMaxII = *intervalMax;
+        cost.unsupportedReason = reason->str();
+      } else if (allowModelDomainUnsupported) {
+        error = "model-domain catalogue unsupported row lacks explicit "
+                "unsupported status";
+        return false;
+      } else if (entry->get("analytical_lower_bound")) {
+        error = "unsupported cost entries must not carry an untyped lower "
+                "bound";
+        return false;
+      }
     }
     CostQueryKey queryKey{task->str(), *mapperRows, *mapperCols};
     if (!catalog_.emplace(queryKey, cost).second) {
@@ -302,6 +425,42 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
   if (catalog_.empty()) {
     error = "cost catalogue contains no task-shape entries";
     return false;
+  }
+  if (allowModelDomainUnsupported || directPerCgra2x2) {
+    std::array<std::pair<int64_t, int64_t>, 8> expectedShapes;
+    if (!getModelDomainShapes(directPerCgra2x2, expectedShapes, error))
+      return false;
+    if (catalog_.size() != expectedTasks.size() * expectedShapes.size()) {
+      error = directPerCgra2x2
+                  ? "direct model-domain catalogue must explicitly cover "
+                    "every task and all eight mapper shapes"
+                  : "model-domain catalogue must explicitly cover every task "
+                    "and all eight formal max-four shapes";
+      return false;
+    }
+    bool sawSupported = false;
+    for (const TaskMetadata &task : expectedTasks) {
+      for (auto [rows, cols] : expectedShapes) {
+        auto found = catalog_.find(CostQueryKey{task.name, rows, cols});
+        if (found == catalog_.end()) {
+          error = directPerCgra2x2
+                      ? "direct model-domain catalogue is missing task=" +
+                            task.name + " shape=rect-" +
+                            std::to_string(rows) + "x" +
+                            std::to_string(cols)
+                      : "model-domain catalogue is missing task=" +
+                            task.name + " shape=rect-" +
+                            std::to_string(rows) + "x" +
+                            std::to_string(cols);
+          return false;
+        }
+        sawSupported |= found->second.supported;
+      }
+    }
+    if (!sawSupported) {
+      error = "model-domain catalogue contains no supported task-shape query";
+      return false;
+    }
   }
   return true;
 }

@@ -46,16 +46,18 @@ public:
                            llvm::SmallVectorImpl<Operation *> &predecessors,
                            std::string &error) const override;
   bool getTransferLowerBound(Operation *producer, Operation *consumer,
-                             int64_t &cycles, std::string &error) const override;
+                             int64_t &cycles,
+                             std::string &error) const override;
 
   // Returns a lower bound for this concrete source/destination endpoint pair.
   // A disconnected remote pair is reported as a successful zero lower bound:
   // endpoint legality remains the ready-cycle/replay check's responsibility,
   // and a missing route must never become an unjustified branch rejection.
-  bool getTransferLowerBoundForEndpoints(
-      Operation *producer, Operation *consumer, int source_row, int source_col,
-      int destination_row, int destination_col, int64_t &cycles,
-      std::string &error) const override;
+  bool getTransferLowerBoundForEndpoints(Operation *producer,
+                                         Operation *consumer, int source_row,
+                                         int source_col, int destination_row,
+                                         int destination_col, int64_t &cycles,
+                                         std::string &error) const override;
 
   void resetReservations() override;
   void beginTrial() override;
@@ -73,7 +75,8 @@ public:
       ::mlir::taskflow::TaskCommunicationReservationCheckpoint &checkpoint,
       std::string &error) const override;
   bool restoreReservationCheckpoint(
-      const ::mlir::taskflow::TaskCommunicationReservationCheckpoint &checkpoint,
+      const ::mlir::taskflow::TaskCommunicationReservationCheckpoint
+          &checkpoint,
       std::string &error) override;
   bool getTransferReadyCycle(Operation *producer, Operation *consumer,
                              int source_row, int source_col,
@@ -107,6 +110,7 @@ public:
   llvm::ArrayRef<TaskEdge> getTypedEdges() const {
     return edge_graph_.getEdges();
   }
+  const InterTaskNetworkSpec &getNetworkSpec() const { return network_; }
 
 private:
   // These caches belong to one immutable edge-graph/network model instance.
@@ -152,15 +156,15 @@ private:
     llvm::SmallVector<TransferRecord> trialTransfers;
   };
 
-  const TaskPairPayloadCache *getTaskPairPayloadCache(
-      Operation *producer, Operation *consumer) const;
+  const TaskPairPayloadCache *
+  getTaskPairPayloadCache(Operation *producer, Operation *consumer) const;
   bool getEndpointPathMetrics(int source_row, int source_col,
                               int destination_row, int destination_col,
                               EndpointPathMetrics &metrics) const;
-  bool getCachedEndpointLowerBound(
-      Operation *producer, Operation *consumer, int source_row, int source_col,
-      int destination_row, int destination_col, int64_t &cycles,
-      std::string &error) const;
+  bool getCachedEndpointLowerBound(Operation *producer, Operation *consumer,
+                                   int source_row, int source_col,
+                                   int destination_row, int destination_col,
+                                   int64_t &cycles, std::string &error) const;
 
   bool routeTransfer(Operation *producer, Operation *consumer,
                      TaskNetworkCoordinate source,
@@ -180,7 +184,8 @@ private:
   llvm::SmallVector<TransferRecord> committedTransfers_;
   llvm::SmallVector<TransferRecord> trialTransfers_;
   mutable llvm::SmallVector<EndpointPathMetrics> endpointPathCache_;
-  mutable llvm::DenseMap<Operation *, llvm::DenseMap<Operation *, TaskPairCache>>
+  mutable llvm::DenseMap<Operation *,
+                         llvm::DenseMap<Operation *, TaskPairCache>>
       taskPairCache_;
 };
 

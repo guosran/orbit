@@ -1,7 +1,8 @@
 //===- PredictAnalyticalTaskCostCatalogPass.cpp ----------------*- C++ -*-===//
 //
 // Predicts an exploratory task-shape II catalogue from a C++ feature query
-// file and the pinned no-SHA formal max-four JSON ensemble.  The current
+// file and either the pinned no-SHA formal max-four or direct per-CGRA 2x2
+// JSON ensemble.  The current
 // route-expanded Neura module is the authoritative mapper/DFG frontend. An
 // optional feature query file is checked against that body and is never
 // trusted as an independent task-name lookup. This pass performs no Python
@@ -14,7 +15,7 @@
 //   feature_extractor, shape_protocol_id
 //   entries = [{ task, body_structural_text, mapper_tile_rows,
 //                mapper_tile_cols, rec_mii, res_mii,
-//                analytical_lower_bound, startup_cycles, features[156] }]
+//                analytical_lower_bound, startup_cycles, features[156|148] }]
 // body_structural_text is the canonical mapper-visible body serialization
 // supplied by the C++ frontend.  It is not a digest and must not be empty.
 //
@@ -22,9 +23,12 @@
 
 #include "AnalyticalMLPInference.h"
 #include "AnalyticalTaskCandidateCommon.h"
+#include "AnalyticalTaskCostCatalog.h"
 #include "MapperCounterBounds.h"
+#include "MapperCostAnalysis.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
+#include "NeighborhoodReplaySelection.h"
 #include "Conversion/NeuraConversionPasses.h"
 #include "NeuraDialect/NeuraPasses.h"
 
@@ -86,6 +90,26 @@ constexpr llvm::StringLiteral kModelName = "formal-max4-nohash-v2";
 constexpr llvm::StringLiteral kModelStatus = "exploratory";
 constexpr llvm::StringLiteral kCacheArchitecturePrefix =
     "neura-architecture-v1:";
+constexpr std::array<std::pair<int64_t, int64_t>, 8> kPerCgra2x2Shapes = {{
+    {2, 2},
+    {2, 4},
+    {4, 2},
+    {2, 6},
+    {6, 2},
+    {2, 8},
+    {8, 2},
+    {4, 4},
+}};
+constexpr llvm::StringLiteral kDirectModelName =
+    "orbit-cgra-ii-per-cgra-2x2-direct-4member-v1";
+constexpr llvm::StringLiteral kDirectCandidateStatus =
+    "candidate_pending_amoeba_benchmark_overlap_audit";
+constexpr llvm::StringLiteral kDirectSourceRepository =
+    "https://github.com/guosran/cgra-ii-predictor";
+constexpr llvm::StringLiteral kDirectSourceBranch = "orbit-2x2-predictor";
+constexpr llvm::StringLiteral kDirectSourceCommit =
+    "3ade31806cb4c92e31888109f7c42b8a77e4cbce";
+constexpr std::array<int64_t, 4> kDirectMemberSeeds = {{17, 41, 113, 239}};
 
 struct FeatureQuery {
   std::string task;
@@ -96,6 +120,7 @@ struct FeatureQuery {
   double resMII = 0.0;
   double lowerBound = 0.0;
   double startupCycles = 0.0;
+  bool modelDomainUnsupported = false;
   std::vector<double> features;
 };
 
@@ -251,7 +276,7 @@ static bool readTextFile(llvm::StringRef path, std::string &text,
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
-    error = "cannot read architecture source " + path.str() + ": " +
+    error = "cannot read source text " + path.str() + ": " +
             buffer.getError().message();
     return false;
   }
@@ -260,6 +285,42 @@ static bool readTextFile(llvm::StringRef path, std::string &text,
     error = "architecture source is empty: " + path.str();
     return false;
   }
+  return true;
+}
+
+static bool readDirectSourceModel(llvm::StringRef path,
+                                  json::Object &sourceModel,
+                                  std::string &error) {
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(path);
+  if (!buffer) {
+    error = "cannot read direct-model provenance " + path.str() + ": " +
+            buffer.getError().message();
+    return false;
+  }
+  llvm::Expected<json::Value> parsed = json::parse((*buffer)->getBuffer());
+  if (!parsed) {
+    error = "cannot parse direct-model provenance: " +
+            llvm::toString(parsed.takeError());
+    return false;
+  }
+  const json::Object *root = parsed->getAsObject();
+  const json::Object *source = root ? root->getObject("source_model") : nullptr;
+  const json::Object *candidate =
+      source ? source->getObject("candidate_metadata") : nullptr;
+  auto matches = [&](llvm::StringRef key, llvm::StringRef expected) {
+    std::optional<llvm::StringRef> actual =
+        source ? source->getString(key) : std::nullopt;
+    return actual && *actual == expected;
+  };
+  if (!source || !candidate ||
+      !matches("repository", kDirectSourceRepository) ||
+      !matches("branch", kDirectSourceBranch) ||
+      !matches("commit", kDirectSourceCommit)) {
+    error = "direct model bundle lacks validated candidate provenance";
+    return false;
+  }
+  sourceModel = json::Object(*source);
   return true;
 }
 
@@ -399,11 +460,12 @@ static bool readArchitectureTransferEvidence(
   return true;
 }
 
-static bool parseFeatures(const json::Object &object,
+static bool parseFeatures(const json::Object &object, unsigned featureWidth,
                           std::vector<double> &features, std::string &error) {
   const json::Array *raw = object.getArray("features");
-  if (!raw || raw->size() != kFormalMapperFeatureWidth) {
-    error = "feature query must contain exactly 156 feature values";
+  if (!raw || raw->size() != featureWidth) {
+    error = "feature query must contain exactly " +
+            std::to_string(featureWidth) + " feature values";
     return false;
   }
   features.clear();
@@ -516,9 +578,6 @@ static json::Object graphJson(const RouteExpandedGraph &graph) {
   result["semantic_edges"] = graphEdges(graph.semanticEdges);
   return result;
 }
-
-static bool deriveStartupCyclesFromCppFeatureOutput(
-    const json::Object &entry, double &startup, std::string &error);
 
 static bool canonicalBodyFromGraph(const RouteExpandedGraph &graph,
                                    std::string &body, std::string &error) {
@@ -711,98 +770,12 @@ static bool collectCurrentTaskBodies(
   return true;
 }
 
-static bool computeCurrentAnalyticalFacts(
-    Region &region, int64_t rows, int64_t columns,
-    double &recMII, double &resMII, double &lowerBound, std::string &error) {
-  if (rows <= 0 || columns <= 0 ||
-      rows > std::numeric_limits<int64_t>::max() / columns ||
-      rows > std::numeric_limits<int>::max() ||
-      columns > std::numeric_limits<int>::max()) {
-    error = "current mapper shape has invalid dimensions";
-    return false;
-  }
-  const int64_t tileCount = rows * columns;
-  auto architecture = ::mlir::neura::getArchitecture().cloneWithNewDimensions(
-      static_cast<int>(rows), static_cast<int>(columns));
-  if (!architecture || architecture->getNumTiles() <= 0) {
-    error = "cannot construct the current mapper architecture shape";
-    return false;
-  }
-  const auto cycles = ::mlir::neura::collectRecurrenceCycles(region);
-  int rec = 1;
-  for (const auto &cycle : cycles)
-    rec = std::max(rec, cycle.length);
-  const int res = ::mlir::neura::calculateResMii(region, *architecture);
-  if (rec <= 0 || res <= 0 || tileCount != architecture->getNumTiles()) {
-    error = "current mapper analytical bounds are invalid";
-    return false;
-  }
-  recMII = static_cast<double>(rec);
-  resMII = static_cast<double>(res);
-  lowerBound = std::max(recMII, resMII);
-  return std::isfinite(recMII) && std::isfinite(resMII) &&
-         std::isfinite(lowerBound);
-}
-
-static bool deriveStartupCyclesFromCppFeatureOutput(const json::Object &entry,
-                                                    double &startup,
-                                                    std::string &error) {
-  const json::Array *rawTypes = entry.getArray("node_types");
-  const json::Array *rawEdges = entry.getArray("edges");
-  if (!rawTypes || !rawEdges || rawTypes->empty()) {
-    error = "C++ feature output cannot derive startup without node_types and "
-            "edges";
-    return false;
-  }
-  std::vector<int64_t> types;
-  types.reserve(rawTypes->size());
-  for (const json::Value &value : *rawTypes) {
-    std::optional<int64_t> type = value.getAsInteger();
-    if (!type || *type < 0) {
-      error = "C++ feature output node_types are invalid";
-      return false;
-    }
-    types.push_back(*type);
-  }
-  std::vector<int64_t> depth(types.size(), 1);
-  for (const json::Value &rawEdge : *rawEdges) {
-    const json::Array *edge = rawEdge.getAsArray();
-    if (!edge || edge->size() != 2 || !(*edge)[0].getAsInteger() ||
-        !(*edge)[1].getAsInteger()) {
-      error = "C++ feature output edges are invalid";
-      return false;
-    }
-    int64_t source = *(*edge)[0].getAsInteger();
-    int64_t target = *(*edge)[1].getAsInteger();
-    if (source < 0 || target < 0 || source >= static_cast<int64_t>(types.size()) ||
-        target >= static_cast<int64_t>(types.size())) {
-      error = "C++ feature output edge endpoint is out of range";
-      return false;
-    }
-    // Route-expanded DFGs are emitted in source order.  Feedback edges are
-    // deliberately excluded from the startup critical path, matching the
-    // pinned frontend's unit-latency semantic depth calculation.
-    if (source >= target)
-      continue;
-    int64_t increment = (types[target] == 40 || types[target] == 41 ||
-                         types[target] == 42 || types[target] == 43)
-                            ? 0
-                            : 1;
-    depth[target] = std::max(depth[target], depth[source] + increment);
-  }
-  startup = static_cast<double>(*std::max_element(depth.begin(), depth.end()));
-  if (!std::isfinite(startup) || startup <= 0.0) {
-    error = "C++ feature output derived a non-positive startup critical path";
-    return false;
-  }
-  return true;
-}
-
-static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
-                               llvm::StringRef architectureContract,
-                               const FormalMax4MLPEnsemble &model,
-                               std::vector<FeatureQuery> &queries,
-                               std::string &error) {
+static bool readFeatureQueries(
+    llvm::StringRef path, llvm::StringRef function,
+    llvm::StringRef architectureContract, llvm::StringRef featureContractId,
+    llvm::StringRef featureExtractor, llvm::StringRef shapeProtocolId,
+    ArrayRef<std::string> expectedNames, bool directModel,
+    std::vector<FeatureQuery> &queries, std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -829,12 +802,9 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
     return false;
   }
   if (!cppFeatureOutput &&
-      (!requireString(*root, "feature_contract_id",
-                      model.getFeatureContractId(), error) ||
-       !requireString(*root, "feature_extractor", model.getFeatureExtractor(),
-                      error) ||
-       !requireString(*root, "shape_protocol_id", model.getShapeProtocolId(),
-                      error) ||
+      (!requireString(*root, "feature_contract_id", featureContractId, error) ||
+       !requireString(*root, "feature_extractor", featureExtractor, error) ||
+       !requireString(*root, "shape_protocol_id", shapeProtocolId, error) ||
        !requireString(*root, "architecture_contract", architectureContract,
                       error) ||
        !requireString(*root, "function", function, error)))
@@ -842,9 +812,9 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
   if (cppFeatureOutput) {
     std::optional<int64_t> width = root->getInteger("feature_width");
     const json::Array *names = root->getArray("feature_names");
-    if (!width || *width != kFormalMapperFeatureWidth || !names ||
-        names->size() != kFormalMapperFeatureWidth) {
-      error = "C++ feature output does not enumerate 156 mapper features";
+    if (!width || *width != static_cast<int64_t>(expectedNames.size()) ||
+        !names || names->size() != expectedNames.size()) {
+      error = "C++ feature output width does not match the selected model";
       return false;
     }
     std::set<std::string> uniqueNames;
@@ -859,10 +829,19 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
       }
       actualNames.push_back(name->str());
     }
-    if (!model.featureNamesMatch(actualNames)) {
+    if (!std::equal(actualNames.begin(), actualNames.end(),
+                    expectedNames.begin(), expectedNames.end())) {
       error = "C++ feature output feature_names differ from the model contract";
       return false;
     }
+    if (directModel &&
+        (!requireString(*root, "feature_contract_id", featureContractId,
+                        error) ||
+         !requireString(*root, "feature_extractor", featureExtractor, error) ||
+         !requireString(*root, "shape_protocol_id", shapeProtocolId, error) ||
+         !requireString(*root, "architecture_contract", architectureContract,
+                        error)))
+      return false;
     if (std::optional<llvm::StringRef> actualFunction =
             root->getString("function")) {
       if (*actualFunction != function) {
@@ -901,7 +880,7 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
               ? getNumber(*object, "lower_bound", query.lowerBound, error)
               : getNumber(*object, "analytical_lower_bound", query.lowerBound,
                           error)) ||
-        !parseFeatures(*object, query.features, error))
+        !parseFeatures(*object, expectedNames.size(), query.features, error))
       return false;
     if (cppFeatureOutput) {
       if (const json::Value *startup = object->get("startup_cycles")) {
@@ -927,12 +906,16 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
                           error)) {
       return false;
     }
-    if (!isFormalMax4MapperShape(query.rows, query.cols)) {
-      error = "feature query contains an unsupported formal mapper shape";
+    if (!(directModel ? isPerCgra2x2MapperShape(query.rows, query.cols)
+                      : isFormalMax4MapperShape(query.rows, query.cols))) {
+      error = directModel
+                  ? "feature query contains a shape outside the direct "
+                    "per-CGRA 2x2 protocol"
+                  : "feature query contains an unsupported formal mapper shape";
       return false;
     }
-    if (query.recMII <= 0.0 || query.resMII <= 0.0 ||
-        query.lowerBound <= 0.0 || query.startupCycles <= 0.0 ||
+    if (query.recMII <= 0.0 || query.resMII <= 0.0 || query.lowerBound <= 0.0 ||
+        query.startupCycles <= 0.0 ||
         query.lowerBound != std::max(query.recMII, query.resMII)) {
       error = "feature query has invalid RecMII/ResMII/lower-bound/startup "
               "facts";
@@ -949,38 +932,25 @@ static bool readFeatureQueries(llvm::StringRef path, llvm::StringRef function,
 }
 
 static bool generateCurrentFeatureQueries(
-    std::vector<CurrentTaskBody> &bodies,
-    const FormalMax4MLPEnsemble &model,
-    std::vector<FeatureQuery> &queries, std::string &error) {
-  const auto &names = orbit::mapper_features::mapperFeatureNames();
-  if (!model.featureNamesMatch(ArrayRef<std::string>(names.data(),
-                                                     names.size()))) {
-    error = "current C++ feature frontend feature_names differ from the model "
-            "contract";
-    return false;
-  }
+    std::vector<CurrentTaskBody> &bodies, ArrayRef<std::string> names,
+    bool directModel, std::vector<FeatureQuery> &queries, std::string &error,
+    bool allowUnsupportedAboveModelCeiling) {
   queries.clear();
-  queries.reserve(bodies.size() * kFormalMax4Shapes.size());
+  ArrayRef<std::pair<int64_t, int64_t>> shapes =
+      directModel ? ArrayRef<std::pair<int64_t, int64_t>>(kPerCgra2x2Shapes)
+                  : ArrayRef<std::pair<int64_t, int64_t>>(kFormalMax4Shapes);
+  queries.reserve(bodies.size() * shapes.size());
   for (CurrentTaskBody &body : bodies) {
-    for (auto [rows, columns] : kFormalMax4Shapes) {
+    for (auto [rows, columns] : shapes) {
       double recMII = 0.0;
       double resMII = 0.0;
       double lowerBound = 0.0;
-      if (!computeCurrentAnalyticalFacts(body.mapperFunction.getBody(), rows,
+      if (!computeMapperAnalyticalFacts(body.mapperFunction.getBody(), rows,
                                          columns, recMII, resMII, lowerBound,
                                          error)) {
         error = "current task " + body.task + " shape rect-" +
                 std::to_string(rows) + "x" + std::to_string(columns) +
                 " has invalid analytical facts: " + error;
-        return false;
-      }
-      FeatureVector featureVector;
-      if (!orbit::mapper_features::computeMapperFeatures(
-              body.graph, static_cast<int>(rows), static_cast<int>(columns),
-              recMII, resMII, lowerBound, featureVector, error)) {
-        error = "current task " + body.task + " shape rect-" +
-                std::to_string(rows) + "x" + std::to_string(columns) +
-                " feature extraction failed: " + error;
         return false;
       }
       FeatureQuery query;
@@ -992,8 +962,44 @@ static bool generateCurrentFeatureQueries(
       query.resMII = resMII;
       query.lowerBound = lowerBound;
       query.startupCycles = body.startupCycles;
-      query.features.assign(featureVector.values.begin(),
-                            featureVector.values.end());
+      if (allowUnsupportedAboveModelCeiling &&
+          lowerBound > kFormalMax4ModelCeilingII) {
+        query.modelDomainUnsupported = true;
+        queries.push_back(std::move(query));
+        continue;
+      }
+      if (directModel && lowerBound > kFormalMax4ModelCeilingII) {
+        error = "current task " + body.task + " shape rect-" +
+                std::to_string(rows) + "x" + std::to_string(columns) +
+                " has an analytical lower bound above the direct-model II "
+                "ceiling of 20; enable explicit unsupported-domain records";
+        return false;
+      }
+      if (directModel) {
+        orbit::mapper_features::PerCgra2x2FeatureVector featureVector;
+        if (!orbit::mapper_features::computePerCgra2x2MapperFeatures(
+                body.graph, static_cast<int>(rows), static_cast<int>(columns),
+                recMII, resMII, lowerBound, featureVector, error)) {
+          error = "current task " + body.task + " shape rect-" +
+                  std::to_string(rows) + "x" + std::to_string(columns) +
+                  " direct feature extraction failed: " + error;
+          return false;
+        }
+        query.features.assign(featureVector.values.begin(),
+                              featureVector.values.end());
+      } else {
+        FeatureVector featureVector;
+        if (!orbit::mapper_features::computeMapperFeatures(
+                body.graph, static_cast<int>(rows), static_cast<int>(columns),
+                recMII, resMII, lowerBound, featureVector, error)) {
+          error = "current task " + body.task + " shape rect-" +
+                  std::to_string(rows) + "x" + std::to_string(columns) +
+                  " feature extraction failed: " + error;
+          return false;
+        }
+        query.features.assign(featureVector.values.begin(),
+                              featureVector.values.end());
+      }
       queries.push_back(std::move(query));
     }
   }
@@ -1059,9 +1065,10 @@ static bool verifyFeatureQueriesBoundToCurrentBodies(
 
 static bool writeCurrentFeatureOutput(
     llvm::StringRef outputPath, llvm::StringRef function,
-    llvm::StringRef architectureContract, const FormalMax4MLPEnsemble &model,
-    ArrayRef<CurrentTaskBody> bodies, ArrayRef<FeatureQuery> queries,
-    std::string &error) {
+    llvm::StringRef architectureContract, llvm::StringRef featureContractId,
+    llvm::StringRef featureExtractor, llvm::StringRef shapeProtocolId,
+    ArrayRef<std::string> featureNames, ArrayRef<CurrentTaskBody> bodies,
+    ArrayRef<FeatureQuery> queries, std::string &error) {
   std::map<std::string, const CurrentTaskBody *> bodyByTask;
   for (const CurrentTaskBody &body : bodies)
     bodyByTask.emplace(body.task, &body);
@@ -1072,12 +1079,12 @@ static bool writeCurrentFeatureOutput(
         root["schema"] = "cgra-ii-cpp-feature-output-v1";
         root["function"] = function.str();
         root["architecture_contract"] = architectureContract.str();
-        root["feature_contract_id"] = model.getFeatureContractId().str();
-        root["feature_extractor"] = model.getFeatureExtractor().str();
-        root["shape_protocol_id"] = model.getShapeProtocolId().str();
-        root["feature_width"] = static_cast<int64_t>(kFormalMapperFeatureWidth);
+        root["feature_contract_id"] = featureContractId.str();
+        root["feature_extractor"] = featureExtractor.str();
+        root["shape_protocol_id"] = shapeProtocolId.str();
+        root["feature_width"] = static_cast<int64_t>(featureNames.size());
         json::Array names;
-        for (const std::string &name : orbit::mapper_features::mapperFeatureNames())
+        for (const std::string &name : featureNames)
           names.push_back(name);
         root["feature_names"] = std::move(names);
         json::Array entries;
@@ -1106,20 +1113,22 @@ static bool writeCurrentFeatureOutput(
       error);
 }
 
-static bool writeCatalogue(llvm::raw_ostream &os, llvm::StringRef function,
-                           llvm::StringRef modelNamespace,
-                           llvm::StringRef sourceRepository,
-                           llvm::StringRef sourceCommit,
-                           llvm::StringRef architecturePath,
-                           llvm::StringRef architectureContract,
-                           llvm::StringRef graphVariantId,
-                           const FormalMax4MLPEnsemble &model,
-                           llvm::ArrayRef<TaskMetadata> taskMetadata,
-                           llvm::StringRef candidateCount,
-                           const std::vector<FeatureQuery> &queries,
-                           const std::vector<MLPEnsemblePrediction> &predictions,
-                           const PersistentMLCostCache &cache,
-                           std::optional<json::Object> architectureTransfer) {
+static bool writeCatalogue(
+    llvm::raw_ostream &os, llvm::StringRef function,
+    llvm::StringRef modelNamespace, llvm::StringRef sourceRepository,
+    llvm::StringRef sourceCommit, llvm::StringRef architecturePath,
+    llvm::StringRef architectureContract, llvm::StringRef graphVariantId,
+    llvm::StringRef modelSchema, llvm::StringRef featureContractId,
+    llvm::StringRef featureExtractor, llvm::StringRef shapeProtocolId,
+    bool directModel,
+    const std::vector<DirectMapperIIPrediction> &directPredictions,
+    const json::Object *directSourceModel,
+    llvm::ArrayRef<TaskMetadata> taskMetadata, llvm::StringRef candidateCount,
+    const std::vector<FeatureQuery> &queries,
+    const std::vector<MLPEnsemblePrediction> &predictions,
+    const PersistentMLCostCache &cache,
+    std::optional<json::Object> architectureTransfer,
+    bool allowUnsupportedAboveModelCeiling, StringRef canonicalModuleWitness) {
   json::Object root;
   root["schema"] = "amoeba-task-shape-cost";
   root["function"] = function.str();
@@ -1127,7 +1136,9 @@ static bool writeCatalogue(llvm::raw_ostream &os, llvm::StringRef function,
 
   json::Object metadata;
   metadata["provenance_schema"] = kCostProvenanceSchema.str();
-  metadata["predictor_source"] = "ml-ii-startup-predictor";
+  metadata["predictor_source"] =
+      directModel ? "per-cgra-2x2-direct-four-member-ii-predictor"
+                  : "ml-ii-startup-predictor";
   metadata["source_repository"] = sourceRepository.str();
   metadata["source_commit"] = sourceCommit.str();
   metadata["architecture_path"] = architecturePath.str();
@@ -1145,26 +1156,52 @@ static bool writeCatalogue(llvm::raw_ostream &os, llvm::StringRef function,
   for (const TaskMetadata &task : taskMetadata)
     sourceTaskIds.push_back(task.name);
   metadata["source_task_ids"] = std::move(sourceTaskIds);
-  metadata["model"] = kModelName.str();
-  metadata["model_schema"] = model.getModelSchema().str();
-  metadata["model_status"] = kModelStatus.str();
-  metadata["quality_status"] = kModelStatus.str();
+  metadata["model"] = directModel ? kDirectModelName.str() : kModelName.str();
+  metadata["model_schema"] = modelSchema.str();
+  metadata["model_status"] =
+      directModel ? kDirectCandidateStatus.str() : kModelStatus.str();
+  metadata["quality_status"] =
+      directModel ? kDirectCandidateStatus.str() : kModelStatus.str();
   metadata["production_ready"] = false;
-  metadata["feature_contract_id"] = model.getFeatureContractId().str();
-  metadata["feature_extractor"] = model.getFeatureExtractor().str();
-  metadata["feature_frontend"] = "c++-mlir-current-body-v2";
-  metadata["shape_protocol_id"] = model.getShapeProtocolId().str();
+  metadata["feature_contract_id"] = featureContractId.str();
+  metadata["feature_extractor"] = featureExtractor.str();
+  metadata["feature_frontend"] = directModel
+                                     ? "c++-mlir-current-body-direct-148-v1"
+                                     : "c++-mlir-current-body-v2";
+  metadata["shape_protocol_id"] = shapeProtocolId.str();
+  if (directModel) {
+    metadata["candidate_only"] = true;
+    metadata["amoeba_benchmark_overlap_audit_complete"] = false;
+    metadata["old_4x4_labels_reused"] = false;
+    metadata["supports_whole_program_latency_or_throughput_claim"] = false;
+    if (directSourceModel)
+      metadata["source_model"] = json::Value(json::Object(*directSourceModel));
+    json::Array memberSeeds;
+    for (int64_t seed : kDirectMemberSeeds)
+      memberSeeds.push_back(seed);
+    metadata["direct_ensemble"] =
+        json::Object{{"member_count", 4},
+                     {"member_seeds", std::move(memberSeeds)},
+                     {"reduction", "arithmetic_mean"},
+                     {"uncertainty", "population_standard_deviation"}};
+  }
   metadata["communication_latency"] = "scored_by_scheduler";
-  metadata["ranking_policy"] = json::Object{
-      {"objective", "predicted_scheduler_makespan"},
-      {"mapper_success_probability", "not_predicted"},
-      {"uses_mapper_success_probability", false}};
+  metadata["ranking_policy"] =
+      json::Object{{"objective", "predicted_scheduler_makespan"},
+                   {"mapper_success_probability", "not_predicted"},
+                   {"uses_mapper_success_probability", false}};
   metadata["ml_cache"] = json::Object{
       {"identity", "canonical-body-text-and-mapper-shape"},
       {"entries", static_cast<int64_t>(cache.size())},
       {"hits", static_cast<int64_t>(cache.getHitCount())},
       {"misses", static_cast<int64_t>(cache.getMissCount())},
       {"trip_count_in_identity", false}};
+  if (allowUnsupportedAboveModelCeiling) {
+    metadata["unsupported_prediction_policy"] =
+        "analytical-lower-bound-exceeds-model-ceiling-v1";
+    metadata["model_interval_max_ii"] = kFormalMax4ModelCeilingII;
+    metadata["canonical_module_witness"] = canonicalModuleWitness.str();
+  }
   if (architectureTransfer)
     metadata["architecture_transfer"] = std::move(*architectureTransfer);
   root["predictor_metadata"] = std::move(metadata);
@@ -1173,7 +1210,19 @@ static bool writeCatalogue(llvm::raw_ostream &os, llvm::StringRef function,
   for (size_t index = 0; index < queries.size(); ++index) {
     const FeatureQuery &query = queries[index];
     const MLPEnsemblePrediction &prediction = predictions[index];
-    entries.push_back(json::Object{
+    if (query.modelDomainUnsupported) {
+      entries.push_back(json::Object{
+          {"task", query.task},
+          {"mapper_tile_rows", query.rows},
+          {"mapper_tile_cols", query.cols},
+          {"support_status", "unsupported"},
+          {"status", kModelDomainUnsupportedStatus.str()},
+          {"unsupported_reason", kModelDomainUnsupportedReason.str()},
+          {"analytical_lower_bound", query.lowerBound},
+          {"model_interval_max_ii", kFormalMax4ModelCeilingII}});
+      continue;
+    }
+    json::Object entry{
         {"task", query.task},
         {"mapper_tile_rows", query.rows},
         {"mapper_tile_cols", query.cols},
@@ -1182,9 +1231,28 @@ static bool writeCatalogue(llvm::raw_ostream &os, llvm::StringRef function,
         {"startup_cycles", query.startupCycles},
         {"predicted_ii_std", prediction.predictedIIStd},
         {"analytical_lower_bound", query.lowerBound},
-        {"ii_mean_source", kModelName.str()},
-        {"model_status", kModelStatus.str()},
-        {"production_ready", false}});
+        {"ii_mean_source",
+         directModel ? "direct_four_member_arithmetic_mean" : kModelName.str()},
+        {"model_status",
+         directModel ? kDirectCandidateStatus.str() : kModelStatus.str()},
+        {"production_ready", false}};
+    if (directModel) {
+      if (directPredictions.size() != queries.size())
+        return false;
+      json::Array members;
+      for (size_t member = 0;
+           member < directPredictions[index].memberPredictions.size();
+           ++member) {
+        members.push_back(
+            json::Object{{"member_index", static_cast<int64_t>(member)},
+                         {"seed", kDirectMemberSeeds[member]},
+                         {"predicted_ii",
+                          directPredictions[index].memberPredictions[member]}});
+      }
+      entry["direct_ensemble_members"] = std::move(members);
+      entry["candidate_only"] = true;
+    }
+    entries.push_back(std::move(entry));
   }
   root["entries"] = std::move(entries);
   os << json::Value(std::move(root));
@@ -1206,12 +1274,12 @@ struct PredictAnalyticalTaskCostCatalogPass
     return "predict-analytical-task-cost-catalog";
   }
   StringRef getDescription() const override {
-    return "Predict an exploratory C++ formal max-four task-shape catalogue";
+    return "Predict an exploratory C++ mapper task-shape cost catalogue";
   }
 
-  Option<std::string> functionName{
-      *this, "function", llvm::cl::desc("Taskflow function name"),
-      llvm::cl::init("")};
+  Option<std::string> functionName{*this, "function",
+                                   llvm::cl::desc("Taskflow function name"),
+                                   llvm::cl::init("")};
   Option<std::string> featureFile{
       *this, "feature-file", llvm::cl::desc("C++ mapper feature query JSON"),
       llvm::cl::init("")};
@@ -1257,6 +1325,11 @@ struct PredictAnalyticalTaskCostCatalogPass
   Option<std::string> outputFile{
       *this, "output", llvm::cl::desc("Output task-shape catalogue"),
       llvm::cl::init("")};
+  Option<bool> allowUnsupportedAboveModelCeiling{
+      *this, "allow-unsupported-above-model-ceiling",
+      llvm::cl::desc("Record C++-proved mapper lower bounds above the model "
+                     "interval as explicit unsupported shapes"),
+      llvm::cl::init(false)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -1264,12 +1337,16 @@ struct PredictAnalyticalTaskCostCatalogPass
       module.emitError() << message;
       signalPassFailure();
     };
+    const bool directModelMode =
+        llvm::StringRef(modelNamespace) == kPerCgra2x2ModelNamespace;
     if (spaceFile.empty() || ensembleFile.empty() ||
-        checkpointDirectory.empty() || architectureContract.empty() ||
-        architecturePath.empty() || sourceRepository.empty() ||
-        sourceCommit.empty() || graphVariantId.empty() || outputFile.empty()) {
+        (!directModelMode && checkpointDirectory.empty()) ||
+        architectureContract.empty() || architecturePath.empty() ||
+        sourceRepository.empty() || sourceCommit.empty() ||
+        graphVariantId.empty() || outputFile.empty()) {
       fail("predict-analytical-task-cost-catalog requires space-file, "
-           "ensemble-file, checkpoint-dir, architecture-contract, "
+           "ensemble-file, (checkpoint-dir for formal-max4), "
+           "architecture-contract, "
            "architecture-path, source-git-repository, source-git-commit, "
            "graph-variant-id, and output");
       return;
@@ -1281,6 +1358,11 @@ struct PredictAnalyticalTaskCostCatalogPass
     }
     if (!llvm::sys::fs::exists(architecturePath)) {
       fail("architecture-path does not name an existing target architecture");
+      return;
+    }
+    if (directModelMode && !architectureTransferCatalog.empty()) {
+      fail("direct per-CGRA 2x2 predictions cannot consume the legacy "
+           "architecture-transfer catalogue");
       return;
     }
 
@@ -1301,32 +1383,77 @@ struct PredictAnalyticalTaskCostCatalogPass
     for (size_t index = 0; index < taskMetadata->size(); ++index)
       taskOrder.emplace((*taskMetadata)[index].name, index);
 
-    FormalMax4MLPEnsemble model;
-    if (!model.load(ensembleFile, checkpointDirectory, architectureContract,
-                   error)) {
-      fail(error);
-      return;
-    }
     std::string architectureText;
     if (!readTextFile(architecturePath, architectureText, error)) {
       fail(error);
       return;
     }
-    MLCostCacheResources cacheResources =
-        model.makeCacheResources(architectureText);
+    FormalMax4MLPEnsemble model;
+    PerCgra2x2DirectEnsemble directModel;
+    std::string featureContractId;
+    std::string featureExtractor;
+    std::string shapeProtocolId;
+    std::vector<std::string> featureNames;
+    std::string modelSchema;
+    MLCostCacheResources cacheResources;
+    json::Object directSourceModel;
+    if (directModelMode) {
+      // The direct bundle validates its embedded exact architecture YAML
+      // against the caller's byte-for-byte source before any cache access.
+      if (!directModel.load(ensembleFile, architectureText, error) ||
+          !readDirectSourceModel(ensembleFile, directSourceModel, error)) {
+        fail(error);
+        return;
+      }
+      const auto &names =
+          orbit::mapper_features::perCgra2x2MapperFeatureNames();
+      featureNames.assign(names.begin(), names.end());
+      if (!directModel.featureNamesMatch(featureNames)) {
+        fail("direct model feature names differ from the C++ 148-feature "
+             "frontend");
+        return;
+      }
+      featureContractId = kPerCgra2x2FeatureContractId.str();
+      featureExtractor = "cgra_ii_predictor.mapper_model:mapper_feature_vector";
+      shapeProtocolId = kPerCgra2x2ShapeProtocolId.str();
+      modelSchema = kPerCgra2x2EnsembleSchema.str();
+      cacheResources.architectureText = architectureText;
+      if (!readTextFile(ensembleFile, cacheResources.ensembleText, error)) {
+        fail(error);
+        return;
+      }
+    } else {
+      if (!model.load(ensembleFile, checkpointDirectory, architectureContract,
+                      error)) {
+        fail(error);
+        return;
+      }
+      const auto &names = orbit::mapper_features::mapperFeatureNames();
+      featureNames.assign(names.begin(), names.end());
+      if (!model.featureNamesMatch(featureNames)) {
+        fail("current C++ feature frontend feature_names differ from the model "
+             "contract");
+        return;
+      }
+      featureContractId = model.getFeatureContractId().str();
+      featureExtractor = model.getFeatureExtractor().str();
+      shapeProtocolId = model.getShapeProtocolId().str();
+      modelSchema = model.getModelSchema().str();
+      cacheResources = model.makeCacheResources(architectureText);
+    }
     std::optional<json::Object> architectureTransfer;
     if (!readArchitectureTransferEvidence(architectureTransferCatalog,
-                                           architecturePath,
-                                           architectureTransfer, error)) {
+                                          architecturePath,
+                                          architectureTransfer, error)) {
       fail(error);
       return;
     }
 
-    // Always derive the mapper-visible body and 156 features from this
-    // module. An optional feature-file is an oracle/debug input only: it must
-    // exactly agree with the current module before it can be accepted. This
-    // prevents stale or task-name-substituted records from driving costs for
-    // a rewritten graph.
+    // Always derive the mapper-visible body and model-contract features from
+    // this module. An optional feature-file is an oracle/debug input only: it
+    // must exactly agree with the current module before it can be accepted.
+    // This prevents stale or task-name-substituted records from driving costs
+    // for a rewritten graph.
     OwningOpRef<ModuleOp> mapperInput;
     std::vector<CurrentTaskBody> currentBodies;
     if (!collectCurrentTaskBodies(*selected, mapperInput, currentBodies,
@@ -1335,26 +1462,42 @@ struct PredictAnalyticalTaskCostCatalogPass
       return;
     }
     std::vector<FeatureQuery> generatedQueries;
-    if (!generateCurrentFeatureQueries(currentBodies, model, generatedQueries,
-                                       error)) {
+    if (!generateCurrentFeatureQueries(currentBodies, featureNames,
+                                       directModelMode, generatedQueries, error,
+                                       allowUnsupportedAboveModelCeiling)) {
       fail(error);
+      return;
+    }
+    if (llvm::any_of(generatedQueries, [](const FeatureQuery &query) {
+          return query.modelDomainUnsupported;
+        }) && (!featureFile.empty() || !featureOutputFile.empty())) {
+      fail("feature-file and feature-output do not support explicit "
+           "unsupported model-domain queries");
+      return;
+    }
+    if (!llvm::any_of(generatedQueries, [](const FeatureQuery &query) {
+          return !query.modelDomainUnsupported;
+        })) {
+      fail("all task-shape queries are outside the supported model interval");
       return;
     }
     if (!featureFile.empty()) {
       std::vector<FeatureQuery> suppliedQueries;
       if (!readFeatureQueries(featureFile, selected->getName(),
-                              architectureContract, model, suppliedQueries,
-                              error) ||
+                              architectureContract, featureContractId,
+                              featureExtractor, shapeProtocolId, featureNames,
+                              directModelMode, suppliedQueries, error) ||
           !verifyFeatureQueriesBoundToCurrentBodies(generatedQueries,
-                                                     suppliedQueries, error)) {
+                                                    suppliedQueries, error)) {
         fail(error);
         return;
       }
     }
     if (!featureOutputFile.empty() &&
-        !writeCurrentFeatureOutput(featureOutputFile, selected->getName(),
-                                   architectureContract, model, currentBodies,
-                                   generatedQueries, error)) {
+        !writeCurrentFeatureOutput(
+            featureOutputFile, selected->getName(), architectureContract,
+            featureContractId, featureExtractor, shapeProtocolId, featureNames,
+            currentBodies, generatedQueries, error)) {
       fail(error);
       return;
     }
@@ -1394,38 +1537,100 @@ struct PredictAnalyticalTaskCostCatalogPass
       return;
     }
     PersistentMLCostCache cache;
-    if (!cache.load(cacheFile, model.getModelSchema(),
-                    model.getFeatureContractId(), architectureContract,
-                    cacheResources, error)) {
+    if (!cache.load(cacheFile, modelSchema, featureContractId,
+                    architectureContract, cacheResources, error)) {
       fail(error);
       return;
     }
     std::vector<MLPEnsemblePrediction> predictions;
     predictions.reserve(queries.size());
-    for (const FeatureQuery &query : queries) {
+    std::vector<DirectMapperIIPrediction> directPredictions;
+    if (directModelMode)
+      directPredictions.resize(queries.size());
+    for (size_t queryIndex = 0; queryIndex < queries.size(); ++queryIndex) {
+      const FeatureQuery &query = queries[queryIndex];
+      if (query.modelDomainUnsupported) {
+        predictions.emplace_back();
+        continue;
+      }
       MLCostCacheKey key{query.bodyStructuralText, query.rows, query.cols};
       MLCostCacheFacts facts{query.recMII, query.resMII, query.lowerBound};
       MLPEnsemblePrediction prediction;
-      if (!cache.lookup(key, facts, prediction)) {
-        if (!model.predict(query.features, query.lowerBound, prediction, error)) {
+      if (directModelMode) {
+        DirectMapperIIPrediction directPrediction;
+        if (!directModel.predict(query.features, query.recMII, query.resMII,
+                                 query.lowerBound, directPrediction, error) ||
+            directPrediction.memberPredictions.size() !=
+                kDirectMemberSeeds.size()) {
+          if (error.empty())
+            error =
+                "direct model did not return exactly four member predictions";
           fail(error);
           return;
         }
-        cache.insert(key, facts, prediction);
-      }
-      if (!std::isfinite(prediction.predictedII) ||
-          prediction.predictedII < query.lowerBound ||
-          prediction.predictedII > 20.0 + 1.0e-6 ||
-          !std::isfinite(prediction.predictedIIStd) ||
-          prediction.predictedIIStd < 0.0) {
-        fail("model prediction violates finite/lower-bound/ceiling contract");
-        return;
+        double mean = 0.0;
+        for (double value : directPrediction.memberPredictions) {
+          if (!std::isfinite(value) || value < query.lowerBound ||
+              value > kFormalMax4ModelCeilingII + 1.0e-6) {
+            fail("direct member prediction violates finite/lower-bound/ceiling "
+                 "contract");
+            return;
+          }
+          mean += value;
+        }
+        mean /= static_cast<double>(directPrediction.memberPredictions.size());
+        double variance = 0.0;
+        for (double value : directPrediction.memberPredictions)
+          variance += (value - mean) * (value - mean);
+        variance /=
+            static_cast<double>(directPrediction.memberPredictions.size());
+        MLPEnsemblePrediction scalarPrediction;
+        scalarPrediction.predictedII = directPrediction.predictedII;
+        scalarPrediction.predictedIIStd = std::sqrt(variance);
+        if (std::abs(mean - scalarPrediction.predictedII) >
+            1.0e-6 * std::max(1.0, std::abs(mean))) {
+          fail("direct ensemble arithmetic mean disagrees with its declared "
+               "reduction");
+          return;
+        }
+        MLPEnsemblePrediction cachedPrediction;
+        if (cache.lookup(key, facts, cachedPrediction)) {
+          if (!sameFeatureNumber(cachedPrediction.predictedII,
+                                 scalarPrediction.predictedII) ||
+              !sameFeatureNumber(cachedPrediction.predictedIIStd,
+                                 scalarPrediction.predictedIIStd)) {
+            fail("persistent direct-model scalar cache disagrees with the "
+                 "loaded bundle");
+            return;
+          }
+          prediction = cachedPrediction;
+        } else {
+          prediction = scalarPrediction;
+          cache.insert(key, facts, prediction);
+        }
+        directPredictions[queryIndex] = std::move(directPrediction);
+      } else {
+        if (!cache.lookup(key, facts, prediction)) {
+          if (!model.predict(query.features, query.lowerBound, prediction,
+                             error)) {
+            fail(error);
+            return;
+          }
+          cache.insert(key, facts, prediction);
+        }
+        if (!std::isfinite(prediction.predictedII) ||
+            prediction.predictedII < query.lowerBound ||
+            prediction.predictedII > kFormalMax4ModelCeilingII + 1.0e-6 ||
+            !std::isfinite(prediction.predictedIIStd) ||
+            prediction.predictedIIStd < 0.0) {
+          fail("model prediction violates finite/lower-bound/ceiling contract");
+          return;
+        }
       }
       predictions.push_back(prediction);
     }
-    if (!cache.write(cacheFile, model.getModelSchema(),
-                     model.getFeatureContractId(), architectureContract,
-                     cacheResources, error)) {
+    if (!cache.write(cacheFile, modelSchema, featureContractId,
+                     architectureContract, cacheResources, error)) {
       fail(error);
       return;
     }
@@ -1435,8 +1640,14 @@ struct PredictAnalyticalTaskCostCatalogPass
               return writeCatalogue(
                   os, selected->getName(), modelNamespace, sourceRepository,
                   sourceCommit, architecturePath, architectureContract,
-                  graphVariantId, model, *taskMetadata, candidateCount, queries,
-                  predictions, cache, std::move(architectureTransfer));
+                  graphVariantId, modelSchema, featureContractId,
+                  featureExtractor, shapeProtocolId, directModelMode,
+                  directPredictions,
+                  directModelMode ? &directSourceModel : nullptr, *taskMetadata,
+                  candidateCount, queries, predictions, cache,
+                  std::move(architectureTransfer),
+                  allowUnsupportedAboveModelCeiling,
+                  neighborhoodReplaySourceText(module));
             },
             error)) {
       fail(error);
@@ -1450,6 +1661,214 @@ struct PredictAnalyticalTaskCostCatalogPass
 namespace mlir {
 namespace amoeba {
 namespace neura {
+
+bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
+                                         StringRef functionName,
+                                         StringRef catalogPath,
+                                         std::string &error) {
+  auto fail = [&](StringRef message) {
+    error = message.str();
+    return false;
+  };
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(catalogPath);
+  if (!buffer)
+    return fail("cannot read model-domain catalogue for source verification");
+  llvm::Expected<json::Value> parsed = json::parse((*buffer)->getBuffer());
+  if (!parsed) {
+    error = "invalid model-domain catalogue JSON: " +
+            llvm::toString(parsed.takeError());
+    return false;
+  }
+  json::Object *root = parsed->getAsObject();
+  json::Object *metadata = root ? root->getObject("predictor_metadata") : nullptr;
+  json::Array *entries = root ? root->getArray("entries") : nullptr;
+  if (!root || !metadata || !entries)
+    return fail("model-domain catalogue lacks root metadata or entries");
+  const auto namespaceValue = root->getString("namespace");
+  const bool directModel =
+      namespaceValue && *namespaceValue == kPerCgra2x2ModelNamespace;
+  ArrayRef<std::pair<int64_t, int64_t>> shapes =
+      directModel ? ArrayRef<std::pair<int64_t, int64_t>>(kPerCgra2x2Shapes)
+                  : ArrayRef<std::pair<int64_t, int64_t>>(kFormalMax4Shapes);
+  auto witness = metadata->getString("canonical_module_witness");
+  auto policy = metadata->getString("unsupported_prediction_policy");
+  auto ceiling = metadata->getNumber("model_interval_max_ii");
+  if (!witness || *witness != neighborhoodReplaySourceText(module) || !policy ||
+      *policy != "analytical-lower-bound-exceeds-model-ceiling-v1" ||
+      !ceiling || !std::isfinite(*ceiling) ||
+      *ceiling != kFormalMax4ModelCeilingII)
+    return fail("model-domain catalogue source binding or interval policy "
+                "does not match the exact current module");
+  if (directModel &&
+      (!requireString(*metadata, "model_schema", kPerCgra2x2EnsembleSchema,
+                      error) ||
+       !requireString(*metadata, "model_status", kDirectCandidateStatus,
+                      error) ||
+       !requireString(*metadata, "shape_protocol_id",
+                      kPerCgra2x2ShapeProtocolId, error) ||
+       !metadata->getBoolean("candidate_only").value_or(false) ||
+       metadata->getBoolean("amoeba_benchmark_overlap_audit_complete")
+           .value_or(true) ||
+       metadata->getBoolean("old_4x4_labels_reused").value_or(true) ||
+       metadata
+           ->getBoolean("supports_whole_program_latency_or_throughput_claim")
+           .value_or(true)))
+    return fail("direct model-domain catalogue lost its candidate-only "
+                "source contract");
+  if (directModel) {
+    const json::Object *sourceModel = metadata->getObject("source_model");
+    const json::Object *candidate =
+        sourceModel ? sourceModel->getObject("candidate_metadata") : nullptr;
+    if (!sourceModel || !candidate ||
+        !requireString(*sourceModel, "repository", kDirectSourceRepository,
+                       error) ||
+        !requireString(*sourceModel, "branch", kDirectSourceBranch, error) ||
+        !requireString(*sourceModel, "commit", kDirectSourceCommit, error) ||
+        !requireString(*candidate, "promotion_status", kDirectCandidateStatus,
+                       error) ||
+        !requireString(*candidate, "shape_protocol_id",
+                       kPerCgra2x2ShapeProtocolId, error) ||
+        !candidate->getBoolean("candidate_only").value_or(false) ||
+        candidate->getBoolean("amoeba_benchmark_overlap_audit_complete")
+            .value_or(true) ||
+        candidate->getBoolean("old_4x4_labels_reused").value_or(true) ||
+        candidate
+            ->getBoolean("supports_whole_program_latency_or_throughput_claim")
+            .value_or(true))
+      return fail("direct model-domain catalogue has invalid predictor source "
+                  "or candidate provenance");
+  }
+
+  FailureOr<func::FuncOp> selected =
+      selectTaskFunction(module, functionName, error);
+  if (failed(selected))
+    return false;
+  OwningOpRef<ModuleOp> mapperInput;
+  std::vector<CurrentTaskBody> bodies;
+  if (!collectCurrentTaskBodies(*selected, mapperInput, bodies, error))
+    return false;
+  using QueryKey = std::tuple<std::string, int64_t, int64_t>;
+  std::map<QueryKey, double> expectedBounds;
+  for (CurrentTaskBody &body : bodies) {
+    for (auto [rows, cols] : shapes) {
+      double recMII = 0.0, resMII = 0.0, lowerBound = 0.0;
+      if (!computeMapperAnalyticalFacts(body.mapperFunction.getBody(), rows,
+                                        cols, recMII, resMII, lowerBound,
+                                        error)) {
+        error = "source lower-bound recomputation failed for task=" +
+                body.task + " shape=rect-" + std::to_string(rows) + "x" +
+                std::to_string(cols) + ": " + error;
+        return false;
+      }
+      expectedBounds.emplace(QueryKey{body.task, rows, cols}, lowerBound);
+    }
+  }
+  if (entries->size() != expectedBounds.size())
+    return fail("model-domain catalogue does not cover every current task and "
+                "model-supported mapper shape exactly once");
+  std::set<QueryKey> seen;
+  for (llvm::json::Value &value : *entries) {
+    json::Object *entry = value.getAsObject();
+    if (!entry)
+      return fail("model-domain catalogue entry is not an object");
+    auto task = entry->getString("task");
+    auto rows = entry->getInteger("mapper_tile_rows");
+    auto cols = entry->getInteger("mapper_tile_cols");
+    auto supportStatus = entry->getString("support_status");
+    auto reportedBound = entry->getNumber("analytical_lower_bound");
+    if (!task || !rows || !cols || !supportStatus || !reportedBound ||
+        !std::isfinite(*reportedBound))
+      return fail("model-domain catalogue row lacks task, shape, status, or "
+                  "finite analytical lower bound");
+    QueryKey key{task->str(), *rows, *cols};
+    auto expected = expectedBounds.find(key);
+    if (expected == expectedBounds.end() || !seen.insert(key).second ||
+        !sameFeatureNumber(*reportedBound, expected->second))
+      return fail("catalogue analytical lower bound is stale or does not "
+                  "match the current C++ mapper body");
+    if (*supportStatus == "supported") {
+      if (entry->get("status") || entry->get("unsupported_reason"))
+        return fail("supported model-domain row carries unsupported status "
+                    "metadata");
+      auto predictedII = entry->getNumber("predicted_ii");
+      auto startup = entry->getNumber("startup_cycles");
+      const json::Array *members =
+          directModel ? entry->getArray("direct_ensemble_members") : nullptr;
+      if (!predictedII || !startup || !std::isfinite(*predictedII) ||
+          !std::isfinite(*startup) || *predictedII < expected->second ||
+          *predictedII > kFormalMax4ModelCeilingII + 1.0e-6 ||
+          *startup <= 0.0 ||
+          (directModel &&
+           (!members || members->size() != 4 || entry->get("baseline_ii") ||
+            entry->get("large_operation_ii") || entry->get("ranking_ii") ||
+            !entry->getBoolean("candidate_only").value_or(false) ||
+            entry->getBoolean("production_ready").value_or(true) ||
+            entry->getString("model_status") != kDirectCandidateStatus)))
+        return fail("supported model-domain row violates current lower-bound "
+                    "or model-interval facts");
+      if (directModel) {
+        std::array<double, 4> memberValues{};
+        double mean = 0.0;
+        for (size_t index = 0; index < members->size(); ++index) {
+          const json::Object *member = (*members)[index].getAsObject();
+          auto memberIndex =
+              member ? member->getInteger("member_index") : std::nullopt;
+          auto seed = member ? member->getInteger("seed") : std::nullopt;
+          auto value =
+              member ? member->getNumber("predicted_ii") : std::nullopt;
+          if (!memberIndex || *memberIndex != static_cast<int64_t>(index) ||
+              !seed || *seed != kDirectMemberSeeds[index] || !value ||
+              !std::isfinite(*value) || *value < expected->second ||
+              *value > kFormalMax4ModelCeilingII + 1.0e-6)
+            return fail(
+                "direct model-domain row has an invalid member prediction");
+          memberValues[index] = *value;
+          mean += *value;
+        }
+        mean /= memberValues.size();
+        double variance = 0.0;
+        for (double value : memberValues)
+          variance += (value - mean) * (value - mean);
+        variance /= memberValues.size();
+        auto reportedStd = entry->getNumber("predicted_ii_std");
+        auto meanSource = entry->getString("ii_mean_source");
+        if (std::abs(mean - *predictedII) >
+                1.0e-6 * std::max(1.0, std::abs(mean)) ||
+            !reportedStd ||
+            !sameFeatureNumber(std::sqrt(variance), *reportedStd) ||
+            !meanSource || *meanSource != "direct_four_member_arithmetic_mean")
+          return fail(
+              "direct model-domain aggregate disagrees with its four members");
+      }
+      continue;
+    }
+    auto status = entry->getString("status");
+    auto reason = entry->getString("unsupported_reason");
+    auto rowCeiling = entry->getNumber("model_interval_max_ii");
+    if (*supportStatus != "unsupported" || !status ||
+        *status != kModelDomainUnsupportedStatus || !reason ||
+        *reason != kModelDomainUnsupportedReason || !rowCeiling ||
+        !std::isfinite(*rowCeiling) ||
+        *rowCeiling != kFormalMax4ModelCeilingII ||
+        expected->second <= kFormalMax4ModelCeilingII ||
+        entry->get("predicted_ii") || entry->get("startup_cycles") ||
+        entry->get("predicted_ii_std") || entry->get("ii_mean_source") ||
+        entry->get("direct_ensemble_members") || entry->get("model_status") ||
+        entry->get("production_ready") ||
+        entry->get("mapper_success_probability"))
+      return fail("unsupported model-domain row is not justified by the "
+                  "current source lower bound");
+  }
+  if (seen.size() != expectedBounds.size())
+    return fail("model-domain catalogue omits a current task/shape query");
+  if (!llvm::any_of(*entries, [](const json::Value &value) {
+        const json::Object *entry = value.getAsObject();
+        return entry && entry->getString("support_status") == "supported";
+      }))
+    return fail("model-domain catalogue contains no supported query");
+  return true;
+}
 
 std::unique_ptr<Pass> createPredictAnalyticalTaskCostCatalogPass() {
   return std::make_unique<PredictAnalyticalTaskCostCatalogPass>();

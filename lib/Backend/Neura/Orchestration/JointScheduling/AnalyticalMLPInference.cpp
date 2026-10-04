@@ -3,6 +3,7 @@
 #include "AnalyticalMLPInference.h"
 
 #include "AnalyticalTaskCandidateCommon.h"
+#include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/JSON.h"
@@ -196,6 +197,63 @@ static bool appendTensorValues(const json::Value &value,
     return false;
   }
   values.push_back(static_cast<float>(*number));
+  return true;
+}
+
+static bool parseDirectFloatVector(const json::Value *raw, unsigned expected,
+                                   std::vector<float> &values,
+                                   std::string &error) {
+  const json::Array *array = raw ? raw->getAsArray() : nullptr;
+  if (!array || array->size() != expected) {
+    error = "direct-model vector has the wrong width";
+    return false;
+  }
+  values.clear();
+  if (!appendTensorValues(*raw, values, error))
+    return false;
+  return values.size() == expected;
+}
+
+static bool parseDirectFloatMatrix(const json::Value *raw, unsigned rows,
+                                   unsigned columns,
+                                   std::vector<float> &values,
+                                   std::string &error) {
+  const json::Array *matrix = raw ? raw->getAsArray() : nullptr;
+  if (!matrix || matrix->size() != rows) {
+    error = "direct-model matrix has the wrong row count";
+    return false;
+  }
+  for (const json::Value &rowValue : *matrix) {
+    const json::Array *row = rowValue.getAsArray();
+    if (!row || row->size() != columns) {
+      error = "direct-model matrix has the wrong column count";
+      return false;
+    }
+  }
+  values.clear();
+  if (!appendTensorValues(*raw, values, error))
+    return false;
+  return values.size() == static_cast<std::size_t>(rows) * columns;
+}
+
+static bool parseDirectStringArray(const json::Value *raw,
+                                   std::vector<std::string> &values,
+                                   std::string &error) {
+  const json::Array *array = raw ? raw->getAsArray() : nullptr;
+  if (!array) {
+    error = "direct-model feature names are missing";
+    return false;
+  }
+  values.clear();
+  std::set<std::string> unique;
+  for (const json::Value &entry : *array) {
+    std::optional<llvm::StringRef> value = entry.getAsString();
+    if (!value || value->empty() || !unique.insert(value->str()).second) {
+      error = "direct-model feature names are missing or duplicated";
+      return false;
+    }
+    values.push_back(value->str());
+  }
   return true;
 }
 
@@ -632,10 +690,363 @@ bool FormalMax4MLPEnsemble::predict(llvm::ArrayRef<double> features,
   return true;
 }
 
+bool PerCgra2x2DirectEnsemble::load(
+    llvm::StringRef ensemblePath, llvm::StringRef expectedArchitectureText,
+    std::string &error) {
+  loaded = false;
+  modelNamespace.clear();
+  featureContractId.clear();
+  shapeProtocolId.clear();
+  architectureText.clear();
+  featureNames.clear();
+  selectedFeatureNames.clear();
+  selectedFeatureIndices.clear();
+  members.clear();
+  mapperIICeiling = 0.0F;
+  if (ensemblePath.empty() || expectedArchitectureText.empty()) {
+    error = "direct ensemble path and expected architecture text are required";
+    return false;
+  }
+
+  json::Object root;
+  if (!readJsonObject(ensemblePath, root, error))
+    return false;
+  if (!requireExactString(root, "schema", kPerCgra2x2EnsembleSchema, error) ||
+      !requireExactString(root, "model_namespace",
+                          kPerCgra2x2ModelNamespace, error))
+    return false;
+
+  const json::Object *source = root.getObject("source_model");
+  if (!source ||
+      !requireExactString(*source, "repository",
+                          "https://github.com/guosran/cgra-ii-predictor",
+                          error) ||
+      !requireExactString(*source, "branch", "orbit-2x2-predictor", error) ||
+      !requireExactString(*source, "commit",
+                          "3ade31806cb4c92e31888109f7c42b8a77e4cbce", error))
+    return false;
+  const json::Object *candidate = source->getObject("candidate_metadata");
+  if (!candidate ||
+      !requireExactString(
+          *candidate, "promotion_status",
+          "candidate_pending_amoeba_benchmark_overlap_audit", error) ||
+      !requireExactString(*candidate, "shape_protocol_id",
+                          kPerCgra2x2ShapeProtocolId, error) ||
+      !requireExactBoolean(*candidate, "candidate_only", true, error) ||
+      !requireExactBoolean(*candidate,
+                           "amoeba_benchmark_overlap_audit_complete", false,
+                           error) ||
+      !requireExactBoolean(*candidate, "old_4x4_labels_reused", false, error) ||
+      !requireExactBoolean(
+          *candidate, "supports_whole_program_latency_or_throughput_claim",
+          false, error))
+    return false;
+  int64_t rawFeatureCount = 0;
+  int64_t selectedFeatureCount = 0;
+  int64_t memberCount = 0;
+  if (!getRequiredInteger(*candidate, "feature_count", rawFeatureCount,
+                          error) ||
+      !getRequiredInteger(*candidate, "effective_feature_count",
+                          selectedFeatureCount, error) ||
+      !getRequiredInteger(*candidate, "ensemble_member_count", memberCount,
+                          error) ||
+      rawFeatureCount != kPerCgra2x2MapperFeatureWidth ||
+      selectedFeatureCount != 61 || memberCount != 4) {
+    error = "candidate metadata does not match the 148/61/four-member model";
+    return false;
+  }
+
+  const json::Object *featureContract = root.getObject("feature_contract");
+  if (!featureContract ||
+      !requireExactString(*featureContract, "contract_id",
+                          kPerCgra2x2FeatureContractId, error) ||
+      !requireExactString(
+          *featureContract, "extractor",
+          "cgra_ii_predictor.mapper_model:mapper_feature_vector", error) ||
+      !requireExactString(*featureContract, "shape_protocol_id",
+                          kPerCgra2x2ShapeProtocolId, error))
+    return false;
+  int64_t featureWidth = 0;
+  if (!getRequiredInteger(*featureContract, "feature_width", featureWidth,
+                          error) ||
+      featureWidth != kPerCgra2x2MapperFeatureWidth ||
+      !parseDirectStringArray(featureContract->get("feature_names"),
+                              featureNames, error) ||
+      featureNames.size() != kPerCgra2x2MapperFeatureWidth)
+    return false;
+  const auto &expectedNames =
+      orbit::mapper_features::perCgra2x2MapperFeatureNames();
+  if (!std::equal(featureNames.begin(), featureNames.end(),
+                  expectedNames.begin(), expectedNames.end())) {
+    error = "direct ensemble feature names differ from the C++ frontend";
+    return false;
+  }
+
+  const json::Array *rawIndices =
+      featureContract->getArray("selected_feature_indices");
+  if (!rawIndices || rawIndices->size() != 61 ||
+      !parseDirectStringArray(featureContract->get("selected_feature_names"),
+                              selectedFeatureNames, error) ||
+      selectedFeatureNames.size() != 61) {
+    error = "direct ensemble selected feature contract must contain 61 entries";
+    return false;
+  }
+  unsigned previousIndex = 0;
+  for (unsigned position = 0; position < rawIndices->size(); ++position) {
+    std::optional<int64_t> parsedIndex = (*rawIndices)[position].getAsInteger();
+    if (!parsedIndex || *parsedIndex < 0 ||
+        *parsedIndex >= static_cast<int64_t>(featureNames.size()) ||
+        (position != 0 && static_cast<unsigned>(*parsedIndex) <= previousIndex)) {
+      error = "direct ensemble feature indices must be increasing and in range";
+      return false;
+    }
+    unsigned index = static_cast<unsigned>(*parsedIndex);
+    if (selectedFeatureNames[position] != featureNames[index]) {
+      error = "selected feature names do not match their ordered indices";
+      return false;
+    }
+    selectedFeatureIndices.push_back(index);
+    previousIndex = index;
+  }
+
+  const json::Object *shapeProtocol = root.getObject("shape_protocol");
+  if (!shapeProtocol ||
+      !requireExactString(*shapeProtocol, "protocol_id",
+                          kPerCgra2x2ShapeProtocolId, error) ||
+      !requireExactBoolean(*shapeProtocol, "orientation_equivalent", false,
+                           error))
+    return false;
+  int64_t maxPhysicalCgras = 0;
+  if (!getRequiredInteger(*shapeProtocol,
+                          "maximum_physical_cgras_per_task",
+                          maxPhysicalCgras, error) ||
+      maxPhysicalCgras != 4)
+    return false;
+  static constexpr std::pair<int64_t, int64_t> expectedShapes[] = {
+      {2, 2}, {2, 4}, {4, 2}, {2, 6},
+      {6, 2}, {2, 8}, {8, 2}, {4, 4},
+  };
+  const json::Array *shapeArray =
+      shapeProtocol->getArray("supported_mapper_tile_shapes");
+  if (!shapeArray || shapeArray->size() != std::size(expectedShapes)) {
+    error = "direct ensemble shape protocol must enumerate eight shapes";
+    return false;
+  }
+  for (unsigned index = 0; index < std::size(expectedShapes); ++index) {
+    const json::Object *shape = (*shapeArray)[index].getAsObject();
+    int64_t rows = 0;
+    int64_t columns = 0;
+    if (!shape || !getRequiredInteger(*shape, "rows", rows, error) ||
+        !getRequiredInteger(*shape, "cols", columns, error) ||
+        std::pair<int64_t, int64_t>{rows, columns} != expectedShapes[index]) {
+      error = "direct ensemble shape order differs from the pinned protocol";
+      return false;
+    }
+  }
+
+  const json::Object *architecture = root.getObject("architecture");
+  if (!architecture ||
+      !requireExactString(*architecture, "name",
+                          "AMOEBA_4x4_CGRA_2x2_Tiles", error) ||
+      !requireExactString(*architecture, "exact_yaml_text",
+                          expectedArchitectureText, error)) {
+    error = "direct ensemble architecture text does not exactly match target";
+    return false;
+  }
+
+  const json::Object *network = root.getObject("network");
+  if (!network ||
+      !requireExactString(*network, "activation", "gelu_erf", error) ||
+      !requireExactString(*network, "residual_activation", "softplus", error) ||
+      !requireExactString(*network, "lower_bound_rule",
+                          "max(rec_mii,res_mii)", error) ||
+      !requireExactString(
+          *network, "output_rule",
+          "min(lower_bound + softplus(logit), mapper_ii_ceiling)", error) ||
+      !requireExactString(*network, "ensemble_reduction", "arithmetic_mean",
+                          error))
+    return false;
+  int64_t networkInputWidth = 0;
+  int64_t selectedInputWidth = 0;
+  double ceiling = 0.0;
+  if (!getRequiredInteger(*network, "input_width", networkInputWidth, error) ||
+      !getRequiredInteger(*network, "selected_input_width", selectedInputWidth,
+                          error) ||
+      !getRequiredNumber(*network, "mapper_ii_ceiling", ceiling, error) ||
+      networkInputWidth != 148 || selectedInputWidth != 61 || ceiling != 20.0) {
+    error = "direct ensemble network dimensions or II ceiling are invalid";
+    return false;
+  }
+  const json::Array *hidden = network->getArray("hidden_dimensions");
+  if (!hidden || hidden->size() != 2 || !(*hidden)[0].getAsInteger() ||
+      *(*hidden)[0].getAsInteger() != 64 ||
+      !(*hidden)[1].getAsInteger() || *(*hidden)[1].getAsInteger() != 32) {
+    error = "direct ensemble hidden dimensions are not [64, 32]";
+    return false;
+  }
+
+  const json::Array *rawMembers = root.getArray("members");
+  if (!rawMembers || rawMembers->size() != 4) {
+    error = "direct ensemble must contain exactly four members";
+    return false;
+  }
+  static constexpr int64_t expectedSeeds[] = {17, 41, 113, 239};
+  std::vector<Member> parsedMembers;
+  parsedMembers.reserve(4);
+  for (unsigned memberIndex = 0; memberIndex < 4; ++memberIndex) {
+    const json::Object *rawMember = (*rawMembers)[memberIndex].getAsObject();
+    if (!rawMember) {
+      error = "direct ensemble member is not an object";
+      return false;
+    }
+    int64_t actualIndex = -1;
+    int64_t seed = -1;
+    if (!getRequiredInteger(*rawMember, "member_index", actualIndex, error) ||
+        !getRequiredInteger(*rawMember, "seed", seed, error) ||
+        actualIndex != static_cast<int64_t>(memberIndex) ||
+        seed != expectedSeeds[memberIndex]) {
+      error = "direct ensemble member order or seed changed";
+      return false;
+    }
+    Member member;
+    member.seed = seed;
+    if (!parseDirectFloatVector(rawMember->get("feature_mean"), 148,
+                                member.featureMean, error) ||
+        !parseDirectFloatVector(rawMember->get("feature_scale"), 148,
+                                member.featureScale, error))
+      return false;
+    for (float scale : member.featureScale) {
+      if (!std::isfinite(scale) || scale <= 0.0F) {
+        error = "direct ensemble feature scales must be positive";
+        return false;
+      }
+    }
+    const json::Array *layers = rawMember->getArray("layers");
+    if (!layers || layers->size() != 3) {
+      error = "direct ensemble member must contain three linear layers";
+      return false;
+    }
+    std::vector<float> *weights[] = {
+        &member.layer0Weight, &member.layer1Weight, &member.layer2Weight};
+    std::vector<float> *biases[] = {
+        &member.layer0Bias, &member.layer1Bias, &member.layer2Bias};
+    static constexpr unsigned inputWidths[] = {61, 64, 32};
+    static constexpr unsigned outputWidths[] = {64, 32, 1};
+    for (unsigned layerIndex = 0; layerIndex < 3; ++layerIndex) {
+      const json::Object *layer = (*layers)[layerIndex].getAsObject();
+      int64_t inputWidth = 0;
+      int64_t outputWidth = 0;
+      if (!layer ||
+          !getRequiredInteger(*layer, "input_width", inputWidth, error) ||
+          !getRequiredInteger(*layer, "output_width", outputWidth, error) ||
+          inputWidth != inputWidths[layerIndex] ||
+          outputWidth != outputWidths[layerIndex] ||
+          !parseDirectFloatMatrix(layer->get("weights"), outputWidths[layerIndex],
+                                  inputWidths[layerIndex], *weights[layerIndex],
+                                  error) ||
+          !parseDirectFloatVector(layer->get("bias"), outputWidths[layerIndex],
+                                  *biases[layerIndex], error)) {
+        error = "direct ensemble member layer has invalid dimensions or values";
+        return false;
+      }
+    }
+    parsedMembers.push_back(std::move(member));
+  }
+
+  modelNamespace = kPerCgra2x2ModelNamespace.str();
+  featureContractId = kPerCgra2x2FeatureContractId.str();
+  shapeProtocolId = kPerCgra2x2ShapeProtocolId.str();
+  architectureText = expectedArchitectureText.str();
+  members = std::move(parsedMembers);
+  mapperIICeiling = static_cast<float>(ceiling);
+  loaded = true;
+  return true;
+}
+
+bool PerCgra2x2DirectEnsemble::featureNamesMatch(
+    llvm::ArrayRef<std::string> names) const {
+  return names.size() == featureNames.size() &&
+         std::equal(names.begin(), names.end(), featureNames.begin());
+}
+
+bool PerCgra2x2DirectEnsemble::predict(
+    llvm::ArrayRef<double> features, double recMii, double resMii,
+    double lowerBound, DirectMapperIIPrediction &prediction,
+    std::string &error) const {
+  if (!loaded) {
+    error = "per-CGRA 2x2 direct ensemble is not loaded";
+    return false;
+  }
+  if (features.size() != kPerCgra2x2MapperFeatureWidth) {
+    error = "per-CGRA 2x2 feature vector width is not 148";
+    return false;
+  }
+  if (!finiteNumber(recMii) || !finiteNumber(resMii) ||
+      !finiteNumber(lowerBound) || recMii < 0.0 || resMii < 0.0 ||
+      lowerBound != std::max(recMii, resMii) ||
+      lowerBound > mapperIICeiling) {
+    error = "direct-model lower bound must equal max(RecMII, ResMII) in [0, 20]";
+    return false;
+  }
+  SmallVector<float, kPerCgra2x2MapperFeatureWidth> input;
+  input.reserve(kPerCgra2x2MapperFeatureWidth);
+  for (double feature : features) {
+    if (!finiteNumber(feature) || feature > std::numeric_limits<float>::max() ||
+        feature < -std::numeric_limits<float>::max()) {
+      error = "direct-model feature vector contains a non-finite or out-of-range value";
+      return false;
+    }
+    input.push_back(static_cast<float>(feature));
+  }
+
+  std::vector<double> outputs;
+  outputs.reserve(members.size());
+  float lower = static_cast<float>(lowerBound);
+  float sum = 0.0F;
+  for (const Member &member : members) {
+    SmallVector<float, 61> normalized;
+    normalized.reserve(61);
+    for (unsigned index : selectedFeatureIndices)
+      normalized.push_back((input[index] - member.featureMean[index]) /
+                           member.featureScale[index]);
+    SmallVector<float, 64> hidden0;
+    hidden0.reserve(64);
+    for (unsigned index = 0; index < 64; ++index)
+      hidden0.push_back(gelu(linear(member.layer0Weight, member.layer0Bias,
+                                    normalized, index, 61)));
+    SmallVector<float, 32> hidden1;
+    hidden1.reserve(32);
+    for (unsigned index = 0; index < 32; ++index)
+      hidden1.push_back(gelu(linear(member.layer1Weight, member.layer1Bias,
+                                    hidden0, index, 64)));
+    float raw = linear(member.layer2Weight, member.layer2Bias, hidden1, 0, 32);
+    float value = std::min(lower + softplus(raw), mapperIICeiling);
+    if (!std::isfinite(value) || value < lower) {
+      error = "direct ensemble produced an invalid prediction";
+      return false;
+    }
+    outputs.push_back(static_cast<double>(value));
+    sum += value;
+  }
+  prediction.predictedII = static_cast<double>(sum / 4.0F);
+  prediction.memberPredictions = std::move(outputs);
+  return std::isfinite(prediction.predictedII);
+}
+
 bool mlir::amoeba::neura::joint_scheduling::isFormalMax4MapperShape(
     int64_t rows, int64_t cols) {
   static constexpr std::pair<int64_t, int64_t> shapes[] = {
       {4, 4}, {4, 8}, {8, 4}, {4, 12}, {12, 4}, {4, 16}, {8, 8}, {16, 4}};
+  return std::find(std::begin(shapes), std::end(shapes),
+                   std::pair<int64_t, int64_t>{rows, cols}) !=
+         std::end(shapes);
+}
+
+bool mlir::amoeba::neura::joint_scheduling::isPerCgra2x2MapperShape(
+    int64_t rows, int64_t cols) {
+  static constexpr std::pair<int64_t, int64_t> shapes[] = {
+      {2, 2}, {2, 4}, {4, 2}, {2, 6},
+      {6, 2}, {2, 8}, {8, 2}, {4, 4}};
   return std::find(std::begin(shapes), std::end(shapes),
                    std::pair<int64_t, int64_t>{rows, cols}) !=
          std::end(shapes);
@@ -734,20 +1145,32 @@ bool PersistentMLCostCache::load(llvm::StringRef path,
         !getRequiredNumber(*object, "predicted_ii",
                            entry.prediction.predictedII, error) ||
         !getRequiredNumber(*object, "predicted_ii_std",
-                           entry.prediction.predictedIIStd, error) ||
-        !getRequiredNumber(*object, "baseline_ii", entry.prediction.baselineII,
-                           error) ||
-        !getRequiredNumber(*object, "large_operation_ii",
-                           entry.prediction.largeOperationII, error) ||
-        !getRequiredNumber(*object, "ranking_ii", entry.prediction.rankingII,
-                           error))
+                           entry.prediction.predictedIIStd, error))
       return false;
-    if (entry.key.bodyStructuralText.empty() ||
-        !isFormalMax4MapperShape(entry.key.mapperTileRows,
-                                 entry.key.mapperTileCols) ||
+    const bool directModel = modelSchema == kPerCgra2x2EnsembleSchema;
+    if (!directModel &&
+        (!getRequiredNumber(*object, "baseline_ii", entry.prediction.baselineII,
+                            error) ||
+         !getRequiredNumber(*object, "large_operation_ii",
+                            entry.prediction.largeOperationII, error) ||
+         !getRequiredNumber(*object, "ranking_ii", entry.prediction.rankingII,
+                            error)))
+      return false;
+    if (directModel &&
+        (object->get("baseline_ii") || object->get("large_operation_ii") ||
+         object->get("ranking_ii"))) {
+      error = "direct-model cache entry must not carry legacy member labels";
+      return false;
+    }
+    const bool shapeAllowed =
+        directModel ? isPerCgra2x2MapperShape(entry.key.mapperTileRows,
+                                              entry.key.mapperTileCols)
+                    : isFormalMax4MapperShape(entry.key.mapperTileRows,
+                                              entry.key.mapperTileCols);
+    if (entry.key.bodyStructuralText.empty() || !shapeAllowed ||
         entry.facts.recMII <= 0.0 || entry.facts.resMII <= 0.0 ||
-        entry.facts.lowerBound <= 0.0 || entry.prediction.predictedII <
-            entry.facts.lowerBound ||
+        entry.facts.lowerBound <= 0.0 ||
+        entry.prediction.predictedII < entry.facts.lowerBound ||
         entry.prediction.predictedII > kMapperIICeiling + kFactsTolerance ||
         entry.prediction.predictedIIStd < 0.0) {
       error = "ML cache contains an invalid entry";
@@ -822,13 +1245,13 @@ bool PersistentMLCostCache::write(llvm::StringRef path,
           rawCheckpointTexts.push_back(json::Object{
               {"name", checkpoint.first}, {"text", checkpoint.second}});
         }
-        root["resource_contract"] = json::Object{
-            {"architecture_text", resources.architectureText},
-            {"ensemble_text", resources.ensembleText},
-            {"checkpoint_texts", std::move(rawCheckpointTexts)}};
+        root["resource_contract"] =
+            json::Object{{"architecture_text", resources.architectureText},
+                         {"ensemble_text", resources.ensembleText},
+                         {"checkpoint_texts", std::move(rawCheckpointTexts)}};
         json::Array rawEntries;
         for (const MLCostCacheEntry &entry : entries) {
-          rawEntries.push_back(json::Object{
+          json::Object rawEntry{
               {"body_structural_text", entry.key.bodyStructuralText},
               {"mapper_tile_rows", entry.key.mapperTileRows},
               {"mapper_tile_cols", entry.key.mapperTileCols},
@@ -836,10 +1259,13 @@ bool PersistentMLCostCache::write(llvm::StringRef path,
               {"res_mii", entry.facts.resMII},
               {"lower_bound", entry.facts.lowerBound},
               {"predicted_ii", entry.prediction.predictedII},
-              {"predicted_ii_std", entry.prediction.predictedIIStd},
-              {"baseline_ii", entry.prediction.baselineII},
-              {"large_operation_ii", entry.prediction.largeOperationII},
-              {"ranking_ii", entry.prediction.rankingII}});
+              {"predicted_ii_std", entry.prediction.predictedIIStd}};
+          if (modelSchema != kPerCgra2x2EnsembleSchema) {
+            rawEntry["baseline_ii"] = entry.prediction.baselineII;
+            rawEntry["large_operation_ii"] = entry.prediction.largeOperationII;
+            rawEntry["ranking_ii"] = entry.prediction.rankingII;
+          }
+          rawEntries.push_back(std::move(rawEntry));
         }
         root["entries"] = std::move(rawEntries);
         os << json::Value(std::move(root));

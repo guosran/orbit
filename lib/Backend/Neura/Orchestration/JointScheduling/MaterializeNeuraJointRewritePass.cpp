@@ -1715,6 +1715,46 @@ createPart(OpBuilder &builder, const NeuraTilePlan &plan, int64_t partIndex,
   bodyBuilder.clone(*sourceTerminator, mapping);
 
   copyTaskAttributes(source, part, name, builder);
+  // Current work is derived from every retained Taskflow counter after the
+  // selected M/N interval is changed. This includes an unchanged trailing K
+  // reduction counter; historical replica total/shard attributes remain
+  // attached to their earlier ledger step and are not rewritten here.
+  auto counterVolume = [](ArrayRef<int64_t> lowers,
+                          ArrayRef<int64_t> uppers)
+      -> std::optional<int64_t> {
+    if (lowers.empty() || lowers.size() != uppers.size())
+      return std::nullopt;
+    __int128 product = 1;
+    for (auto [lower, upper] : llvm::zip(lowers, uppers)) {
+      if (lower < 0 || upper <= lower)
+        return std::nullopt;
+      product *= static_cast<__int128>(upper - lower);
+      if (product <= 0 ||
+          product > static_cast<__int128>(std::numeric_limits<int64_t>::max()))
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(product);
+  };
+  auto parentWork = counterVolume(plan.taskCounterLowers,
+                                  plan.taskCounterUppers);
+  auto childWork = counterVolume(taskLowers, taskUppers);
+  if (!parentWork || !childWork)
+    return reject(source, "post-Neura tiling cannot derive an overflow-safe "
+                         "current M/N[/K] work volume");
+  auto updateCurrentWork = [&](StringRef attribute) -> LogicalResult {
+    Attribute raw = source->getAttr(attribute);
+    if (!raw)
+      return success();
+    auto count = dyn_cast<IntegerAttr>(raw);
+    if (!count || count.getInt() != *parentWork)
+      return reject(source, "post-Neura tiling current trip-count metadata "
+                           "does not match its actual Taskflow counter volume");
+    part->setAttr(attribute, builder.getI64IntegerAttr(*childWork));
+    return success();
+  };
+  if (failed(updateCurrentWork("trip_count")) ||
+      failed(updateCurrentWork("amoeba.selected_trip_count")))
+    return failure();
   part->setAttr(kParentTaskAttr, builder.getStringAttr(source.getTaskName()));
   part->setAttr(kAxisAttr, builder.getI64IntegerAttr(plan.axis));
   part->setAttr(kFactorAttr, builder.getI64IntegerAttr(plan.factor));
@@ -1724,9 +1764,13 @@ createPart(OpBuilder &builder, const NeuraTilePlan &plan, int64_t partIndex,
   part->setAttr(kDerivedRangeAttr,
                 builder.getDenseI64ArrayAttr({partLower, partUpper}));
   part->setAttr(kRewriteAttr, builder.getStringAttr("post-neura-mn-tiling"));
-  if (!plan.inPlaceSelectedIndex &&
+  auto outputType =
+      dyn_cast<MemRefType>(part.getWillWrites().front().getType());
+  bool publishRankOneInPlaceRegion =
+      plan.inPlaceSelectedIndex && outputType && outputType.getRank() == 1;
+  if ((!plan.inPlaceSelectedIndex || publishRankOneInPlaceRegion) &&
       failed(setProvenOutputRegionAttrs(builder, part, plan, partLower,
-                                         partUpper)))
+                                        partUpper)))
     return failure();
   return part;
 }
@@ -2295,9 +2339,35 @@ analyzePostNeuraSiblingFusion(ModuleOp module, StringRef firstName,
   return plan;
 }
 
+static std::optional<Value> peelIdentityDataMov(Value value,
+                                                Block *accessBlock) {
+  while (auto move = value.getDefiningOp<neura::DataMovOp>()) {
+    Operation *operation = move.getOperation();
+    if (operation->getBlock() != accessBlock ||
+        operation->getNumOperands() != 1 ||
+        operation->getNumResults() != 1 || operation->getNumRegions() != 0 ||
+        operation->getNumSuccessors() != 0 ||
+        !operation->getAttrs().empty() || operation->getResult(0) != value ||
+        operation->getOperand(0).getType() != operation->getResult(0).getType())
+      return std::nullopt;
+    // A DataMov may be peeled only when it preserves both payload and the
+    // Neura validity type, and is in the same guarded block as the access.
+    value = operation->getOperand(0);
+  }
+  return value;
+}
+
 static bool equivalentCounterIndex(Value lhs, Value rhs,
                                    ArrayRef<neura::CounterOp> lhsCounters,
-                                   ArrayRef<neura::CounterOp> rhsCounters) {
+                                   ArrayRef<neura::CounterOp> rhsCounters,
+                                   Block *lhsAccessBlock,
+                                   Block *rhsAccessBlock) {
+  auto peeledLhs = peelIdentityDataMov(lhs, lhsAccessBlock);
+  auto peeledRhs = peelIdentityDataMov(rhs, rhsAccessBlock);
+  if (!peeledLhs || !peeledRhs)
+    return false;
+  lhs = *peeledLhs;
+  rhs = *peeledRhs;
   if (lhs == rhs)
     return true;
   for (size_t index = 0; index < lhsCounters.size(); ++index) {
@@ -2314,11 +2384,14 @@ static bool equivalentCounterIndex(Value lhs, Value rhs,
 
 static bool equivalentAccessIndices(ValueRange lhs, ValueRange rhs,
                                     ArrayRef<neura::CounterOp> lhsCounters,
-                                    ArrayRef<neura::CounterOp> rhsCounters) {
+                                    ArrayRef<neura::CounterOp> rhsCounters,
+                                    Block *lhsAccessBlock,
+                                    Block *rhsAccessBlock) {
   if (lhs.size() != rhs.size())
     return false;
   for (auto [left, right] : llvm::zip(lhs, rhs))
-    if (!equivalentCounterIndex(left, right, lhsCounters, rhsCounters))
+    if (!equivalentCounterIndex(left, right, lhsCounters, rhsCounters,
+                                lhsAccessBlock, rhsAccessBlock))
       return false;
   return true;
 }
@@ -2637,7 +2710,9 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
     if (!equivalentAccessIndices(producerIndexedStore.getIndices(),
                                  consumerIndexedLoad.getIndices(),
                                  producerKernelCounters,
-                                 consumerKernelCounters))
+                                 consumerKernelCounters,
+                                 producerIndexedStore->getBlock(),
+                                 consumerIndexedLoad->getBlock()))
       return reject(consumer, "post-Neura indexed fusion rejects mismatched "
                               "producer-store/consumer-load indices");
 
@@ -2696,7 +2771,9 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
     if (!equivalentAccessIndices(producerStore.getIndices(),
                                  consumerLoad.getIndices(),
                                  producerKernelCounters,
-                                 consumerKernelCounters))
+                                 consumerKernelCounters,
+                                 producerStore->getBlock(),
+                                 consumerLoad->getBlock()))
       return reject(consumer, "post-Neura fusion rejects mismatched "
                               "producer-store/consumer-load indices");
   }

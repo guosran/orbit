@@ -171,6 +171,40 @@ def TaskflowJoinOp
   let hasVerifier = 1;
 }
 
+// Joins the read-completion tokens from every replica of a source task. This
+// barrier is distinct from TaskflowJoinOp: it does not merge storage regions
+// and does not represent a numeric reduction. The verifier binds every read
+// token to the same exact will_reads operand and original storage root, and
+// requires the same complete task set as the separately verified output
+// completion join. Dependency walkers expand the read tokens into WAR edges.
+def TaskflowReadCompletionJoinOp
+    : TaskflowOpBase<"read_completion_join", [Pure]> {
+  let summary = "Completion barrier for all replica reads of one state";
+  let description = [{
+    Combines read-completion states returned by every replica of one source
+    task. It preserves the read-state version and storage identity, and is
+    linked to the disjoint output completion join for that same complete
+    replica set. The operation performs no computation or memory update. Its
+    consumers are scheduled only after every replica has finished the read.
+  }];
+
+  let arguments = (ins Variadic<AnyMemRef>:$tile_states,
+                       AnyMemRef:$base_state,
+                       AnyMemRef:$original_root,
+                       AnyMemRef:$write_completion);
+  let results = (outs AnyMemRef:$joined);
+
+  let assemblyFormat = [{
+    `states` `(` $tile_states `:` type($tile_states) `)`
+    `base` `(` $base_state `:` type($base_state) `)`
+    `root` `(` $original_root `:` type($original_root) `)`
+    `completion` `(` $write_completion `:` type($write_completion) `)`
+    attr-dict `:` type($joined)
+  }];
+
+  let hasVerifier = 1;
+}
+
 //----------------------------------------------------------------------
 // Intra-Task Operations.
 //----------------------------------------------------------------------

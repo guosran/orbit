@@ -183,6 +183,11 @@ AnalyticalBasedTaskOrchestration::computeRoutingCriticalPathPriority(
         self(self, channel.getSource());
         return;
       }
+      if (auto join = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+        for (Value state : join.getTileStates())
+          self(self, state);
+        return;
+      }
       if (auto join = value.getDefiningOp<TaskflowJoinOp>()) {
         for (Value state : join.getTileStates())
           self(self, state);

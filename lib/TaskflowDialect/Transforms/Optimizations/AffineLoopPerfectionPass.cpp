@@ -123,6 +123,18 @@ static bool hasResultUsedByOperation(Operation *producer, Operation *user) {
   });
 }
 
+static bool canBuildEpilogueCondition(affine::AffineForOp loop) {
+  if (!loop.getStepAsInt()) {
+    return false;
+  }
+
+  if (loop.hasConstantUpperBound()) {
+    return true;
+  }
+
+  return loop.getUpperBoundMap().getNumResults() == 1;
+}
+
 static LogicalResult checkLoopBandSupported(AffineLoopBand &loop_band) {
   for (size_t i = loop_band.size() - 1; i > 0; i--) {
     affine::AffineForOp loop = loop_band[i - 1];
@@ -189,9 +201,9 @@ static LogicalResult checkLoopBandSupported(AffineLoopBand &loop_band) {
 
     if (has_epilogue_side_effect) {
       for (affine::AffineForOp inner_loop : inner_loops) {
-        if (!inner_loop.getStepAsInt() || !inner_loop.hasConstantUpperBound()) {
+        if (!canBuildEpilogueCondition(inner_loop)) {
           llvm::errs() << "[LoopPerfection] Skipping unsupported loop band: "
-                          "non-constant upper bound or step.\n";
+                          "unsupported upper bound or step.\n";
           return failure();
         }
       }
@@ -283,6 +295,24 @@ createPrologueCondition(OpBuilder &builder, Location loc,
   return condition;
 }
 
+static Value buildLoopUpperBoundValue(OpBuilder &builder, Location loc,
+                                      affine::AffineForOp loop) {
+  if (loop.hasConstantUpperBound()) {
+    return builder.create<arith::ConstantIndexOp>(loc,
+                                                  loop.getConstantUpperBound());
+  }
+
+  AffineMap upper_bound_map = loop.getUpperBoundMap();
+  if (upper_bound_map.getNumResults() != 1) {
+    llvm::errs()
+        << "[LoopPerfection] Multi-result upper bound not supported.\n";
+    return nullptr;
+  }
+
+  return builder.create<affine::AffineApplyOp>(
+      loc, upper_bound_map, loop.getUpperBoundOperands());
+}
+
 // Creates a condition checking if all inner loop indices are at their upper
 // bounds. Used for epilogue condition.
 static Value
@@ -310,12 +340,13 @@ createEpilogueCondition(OpBuilder &builder, Location loc,
     Value step = builder.create<arith::ConstantIndexOp>(loc, step_val);
     next_idx = builder.create<arith::AddIOp>(loc, idx, step);
 
-    if (loop.hasConstantUpperBound()) {
-      ub = builder.create<arith::ConstantIndexOp>(loc,
-                                                  loop.getConstantUpperBound());
-    } else {
-      llvm::errs()
-          << "[LoopPerfection] Non-constant upper bound not supported.\n";
+    // For epilogue sinking, a side-effecting op originally after the child
+    // loop must run exactly once, at the child's final iteration.  Symbol-bound
+    // loops such as "to %node_count" are valid here: materialize the affine
+    // upper bound and check whether the next induction value would leave the
+    // loop.
+    ub = buildLoopUpperBoundValue(builder, loc, loop);
+    if (!ub) {
       return nullptr;
     }
 

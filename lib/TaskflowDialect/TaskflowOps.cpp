@@ -6,10 +6,14 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <optional>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::taskflow;
@@ -20,6 +24,163 @@ static std::optional<int64_t> constantIndex(Value value) {
   if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
     return constant.value();
   return std::nullopt;
+}
+
+static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
+regionFromOutputProof(const mlir::amoeba::neura::joint_scheduling::
+                          ReplicaOutputCoordinateProof &proof,
+                      MemRefType baseType) {
+  if (!baseType || !baseType.hasStaticShape() ||
+      proof.producedLowers.size() != static_cast<size_t>(baseType.getRank()) ||
+      proof.producedShape.size() != proof.producedLowers.size())
+    return failure();
+
+  SmallVector<int64_t> lower(proof.producedLowers.begin(),
+                             proof.producedLowers.end());
+  SmallVector<int64_t> upper(lower);
+  for (auto [dimension, extent] : llvm::enumerate(proof.producedShape)) {
+    if (extent <= 0 || lower[dimension] < 0 ||
+        lower[dimension] > std::numeric_limits<int64_t>::max() - extent)
+      return failure();
+    upper[dimension] = lower[dimension] + extent;
+    if (upper[dimension] > baseType.getShape()[dimension])
+      return failure();
+  }
+  return std::make_pair(std::move(lower), std::move(upper));
+}
+
+static LogicalResult verifyReplicaShardMetadata(
+    TaskflowTaskOp task,
+    const mlir::amoeba::neura::joint_scheduling::
+        ReplicaOutputCoordinateProof &proof,
+    int64_t selectedAxis) {
+  if (selectedAxis < 0 ||
+      selectedAxis >= static_cast<int64_t>(proof.outputCounterAxes.size()))
+    return failure();
+  auto outputAxis = task->getAttrOfType<IntegerAttr>(
+      "amoeba.replica.output_shard_axis");
+  auto shardAxis = task->getAttrOfType<IntegerAttr>(
+      "amoeba.replica.shard_axis");
+  if ((outputAxis && outputAxis.getInt() != selectedAxis) ||
+      (!outputAxis && (!shardAxis || shardAxis.getInt() != selectedAxis)))
+    return failure();
+
+  unsigned shardCounter = proof.outputCounterAxes[selectedAxis];
+  if (shardCounter ==
+          mlir::amoeba::neura::joint_scheduling::
+              ReplicaOutputCoordinateProof::kConstantAxis ||
+      shardCounter >= proof.taskLowers.size() ||
+      shardCounter >= proof.taskUppers.size() || !shardAxis ||
+      (outputAxis &&
+       shardAxis.getInt() != static_cast<int64_t>(shardCounter)))
+    return failure();
+  auto shardLower = task->getAttrOfType<IntegerAttr>(
+      "amoeba.replica.shard_lower");
+  auto shardUpper = task->getAttrOfType<IntegerAttr>(
+      "amoeba.replica.shard_upper");
+  if (!shardLower || !shardUpper ||
+      shardLower.getInt() != proof.taskLowers[shardCounter] ||
+      shardUpper.getInt() != proof.taskUppers[shardCounter])
+    return failure();
+  return success();
+}
+
+static Value stripTaskflowMemrefCasts(Value value) {
+  while (auto cast = value.getDefiningOp<memref::CastOp>())
+    value = cast.getSource();
+  return value;
+}
+
+// Resolve a Taskflow dependence state to the exact storage value it forwards.
+// Unsupported body aliases deliberately fail closed; this is used by the read
+// completion barrier to ensure that its base state and original-root witness
+// name the same memory object.
+static FailureOr<Value> resolveTaskflowStorageRoot(Value value,
+                                                   DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return failure();
+  if (auto cast = value.getDefiningOp<memref::CastOp>())
+    return resolveTaskflowStorageRoot(cast.getSource(), visited);
+  if (auto channel = value.getDefiningOp<TaskflowChannelOp>())
+    return resolveTaskflowStorageRoot(channel.getSource(), visited);
+  if (auto join = value.getDefiningOp<TaskflowJoinOp>())
+    return resolveTaskflowStorageRoot(join.getBase(), visited);
+  if (auto join = value.getDefiningOp<TaskflowReadCompletionJoinOp>()) {
+    if (failed(verify(join.getOperation())))
+      return failure();
+    return resolveTaskflowStorageRoot(join.getBaseState(), visited);
+  }
+
+  auto task = value.getDefiningOp<TaskflowTaskOp>();
+  if (!task)
+    return value;
+  auto yield =
+      dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
+  if (!yield)
+    return failure();
+  unsigned bodyArgument = task.getBody().front().getNumArguments();
+  auto read = llvm::find(task.getDoneReads(), value);
+  if (read != task.getDoneReads().end()) {
+    size_t resultIndex = read - task.getDoneReads().begin();
+    if (resultIndex >= yield.getDoneReads().size())
+      return failure();
+    auto argument = dyn_cast<BlockArgument>(yield.getDoneReads()[resultIndex]);
+    if (!argument || argument.getOwner() != &task.getBody().front() ||
+        argument.getArgNumber() >= task.getWillReads().size())
+      return failure();
+    bodyArgument = argument.getArgNumber();
+  } else {
+    auto write = llvm::find(task.getDoneWrites(), value);
+    if (write == task.getDoneWrites().end())
+      return failure();
+    size_t resultIndex = write - task.getDoneWrites().begin();
+    if (resultIndex >= yield.getDoneWrites().size())
+      return failure();
+    auto argument = dyn_cast<BlockArgument>(yield.getDoneWrites()[resultIndex]);
+    if (!argument || argument.getOwner() != &task.getBody().front() ||
+        argument.getArgNumber() < task.getWillReads().size() ||
+        argument.getArgNumber() >=
+            task.getWillReads().size() + task.getWillWrites().size())
+      return failure();
+    bodyArgument = argument.getArgNumber();
+  }
+  if (bodyArgument >= task->getNumOperands())
+    return failure();
+  return resolveTaskflowStorageRoot(task->getOperand(bodyArgument), visited);
+}
+
+static bool taskReadResultInput(TaskflowTaskOp task, Value state,
+                                unsigned &resultIndex, unsigned &inputIndex) {
+  if (!task || !task.getBody().hasOneBlock())
+    return false;
+  auto result = llvm::find(task.getDoneReads(), state);
+  auto yield =
+      dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
+  if (result == task.getDoneReads().end() || !yield)
+    return false;
+  resultIndex = static_cast<unsigned>(result - task.getDoneReads().begin());
+  if (resultIndex >= yield.getDoneReads().size())
+    return false;
+  auto argument = dyn_cast<BlockArgument>(yield.getDoneReads()[resultIndex]);
+  if (!argument || argument.getOwner() != &task.getBody().front() ||
+      argument.getArgNumber() >= task.getWillReads().size() ||
+      task.getOriginalReadMemrefs().size() != task.getWillReads().size())
+    return false;
+  inputIndex = argument.getArgNumber();
+  return task.getWillReads()[inputIndex].getType() == state.getType();
+}
+
+static bool hasOnlyJoinUseThroughCasts(Value state, TaskflowJoinOp join) {
+  Operation *expectedOwner = join.getOperation();
+  while (auto cast = state.getDefiningOp<memref::CastOp>()) {
+    if (!llvm::hasSingleElement(state.getUses()) ||
+        state.use_begin()->getOwner() != expectedOwner)
+      return false;
+    expectedOwner = cast.getOperation();
+    state = cast.getSource();
+  }
+  return llvm::hasSingleElement(state.getUses()) &&
+         state.use_begin()->getOwner() == expectedOwner;
 }
 
 static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
@@ -39,6 +200,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
     return std::make_pair(SmallVector<int64_t>(join.getRegionLower()),
                           SmallVector<int64_t>(join.getRegionUpper()));
   }
+  auto baseType = dyn_cast<MemRefType>(expectedBase.getType());
   auto task = state.getDefiningOp<TaskflowTaskOp>();
   if (!task || !llvm::is_contained(task.getDoneWrites(), state) ||
       task.getDoneWrites().size() != task.getWillWrites().size() ||
@@ -48,8 +210,17 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
   if (stateIt == task.getDoneWrites().end())
     return failure();
   const size_t writeIndex = stateIt - task.getDoneWrites().begin();
-  if (stripCasts(task.getWillWrites()[writeIndex]) != originalBase ||
-      stripCasts(task.getOriginalWriteMemrefs()[writeIndex]) != originalBase)
+  if (stripCasts(task.getWillWrites()[writeIndex]) != originalBase)
+    return failure();
+  // The write dependence state can be a prior task's completion token while
+  // the original-write operand remains its storage root. Preserve the exact
+  // state-version check above and independently authenticate that root.
+  DenseSet<Value> baseVisited, writeVisited;
+  FailureOr<Value> baseRoot =
+      resolveTaskflowStorageRoot(originalBase, baseVisited);
+  FailureOr<Value> writeRoot = resolveTaskflowStorageRoot(
+      task.getOriginalWriteMemrefs()[writeIndex], writeVisited);
+  if (failed(baseRoot) || failed(writeRoot) || *baseRoot != *writeRoot)
     return failure();
 
   // Multi-output post-Neura tasks carry one exact rectangle per completion
@@ -69,17 +240,13 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
                        << proof.reason;
       return failure();
     }
-    if (proof.outputCounterAxes.size() !=
-        static_cast<size_t>(proof.taskLowers.size()))
+    if (selectedAxis >= 0 &&
+        task->hasAttr("amoeba.replica.output_counter_axes") &&
+        failed(verifyReplicaShardMetadata(task, proof, selectedAxis)))
       return failure();
-    SmallVector<int64_t> actualLower;
-    SmallVector<int64_t> actualUpper;
-    for (unsigned counter : proof.outputCounterAxes) {
-      if (counter >= proof.taskLowers.size())
-        return failure();
-      actualLower.push_back(proof.taskLowers[counter]);
-      actualUpper.push_back(proof.taskUppers[counter]);
-    }
+    auto actual = regionFromOutputProof(proof, baseType);
+    if (failed(actual))
+      return failure();
     if (lowers || uppers) {
       if (!lowers || !uppers ||
           lowers.size() != task.getWillWrites().size() ||
@@ -88,13 +255,13 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
       auto lower = dyn_cast<DenseI64ArrayAttr>(lowers[writeIndex]);
       auto upper = dyn_cast<DenseI64ArrayAttr>(uppers[writeIndex]);
       if (!lower || !upper ||
-          static_cast<size_t>(lower.size()) != actualLower.size() ||
-          static_cast<size_t>(upper.size()) != actualUpper.size() ||
-          !llvm::equal(lower.asArrayRef(), actualLower) ||
-          !llvm::equal(upper.asArrayRef(), actualUpper))
+          static_cast<size_t>(lower.size()) != actual->first.size() ||
+          static_cast<size_t>(upper.size()) != actual->second.size() ||
+          !llvm::equal(lower.asArrayRef(), actual->first) ||
+          !llvm::equal(upper.asArrayRef(), actual->second))
         return failure();
     }
-    return std::make_pair(std::move(actualLower), std::move(actualUpper));
+    return std::move(*actual);
   }
 
   if (task.getWillWrites().size() != 1)
@@ -105,8 +272,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
   // by itself would let a forged permutation make a non-disjoint join look
   // legal.
   if (task->hasAttr("amoeba.replica.output_counter_axes")) {
-    auto expectedType = dyn_cast<MemRefType>(expectedBase.getType());
-    if (!expectedType)
+    if (!baseType)
       return failure();
     auto proof =
         mlir::amoeba::neura::joint_scheduling::analyzeReplicaOutputCoordinates(
@@ -116,30 +282,18 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
                        << proof.reason;
       return failure();
     }
-    if (
-        proof.outputCounterAxes.size() !=
-            static_cast<size_t>(expectedType.getRank()))
+    if (proof.outputCounterAxes.size() !=
+        static_cast<size_t>(baseType.getRank()))
       return failure();
-    if (selectedAxis >= 0)
-      if (auto declaredAxis = task->getAttrOfType<IntegerAttr>(
-              "amoeba.replica.shard_axis");
-          !declaredAxis || declaredAxis.getInt() != selectedAxis)
-        return failure();
-    SmallVector<int64_t> lower;
-    SmallVector<int64_t> upper;
-    for (unsigned counter : proof.outputCounterAxes) {
-      if (counter >= proof.taskLowers.size())
-        return failure();
-      lower.push_back(proof.taskLowers[counter]);
-      upper.push_back(proof.taskUppers[counter]);
-    }
-    if (lower.size() != static_cast<size_t>(expectedType.getRank()))
+    if (failed(verifyReplicaShardMetadata(task, proof, selectedAxis)))
       return failure();
-    for (size_t dimension = 0; dimension < lower.size(); ++dimension)
-      if (lower[dimension] < 0 || upper[dimension] <= lower[dimension] ||
-          upper[dimension] > expectedType.getShape()[dimension])
+    auto actual = regionFromOutputProof(proof, baseType);
+    if (failed(actual))
+      return failure();
+    for (size_t dimension = 0; dimension < actual->first.size(); ++dimension)
+      if (actual->second[dimension] <= actual->first[dimension])
         return failure();
-    return std::make_pair(std::move(lower), std::move(upper));
+    return std::move(*actual);
 }
   SmallVector<int64_t> lower;
   SmallVector<int64_t> upper;
@@ -147,7 +301,6 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
   for (Operation &operation : task.getBody().front())
     if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
       counters.push_back(counter);
-  auto baseType = dyn_cast<MemRefType>(expectedBase.getType());
   size_t outputRank = baseType ? static_cast<size_t>(baseType.getRank()) : 0;
   if (!baseType || counters.size() < outputRank)
     return failure();
@@ -243,6 +396,113 @@ LogicalResult TaskflowJoinOp::verify() {
   }
   if (cursor != parentUpper[axis])
     return emitOpError("tile regions do not exactly cover the parent region");
+  return success();
+}
+
+LogicalResult TaskflowReadCompletionJoinOp::verify() {
+  if (getTileStates().size() < 2)
+    return emitOpError("requires every state from at least two replicas");
+  auto baseType = dyn_cast<MemRefType>(getBaseState().getType());
+  auto rootType = dyn_cast<MemRefType>(getOriginalRoot().getType());
+  if (!baseType || !rootType || getJoined().getType() != baseType ||
+      rootType.getRank() != baseType.getRank() ||
+      rootType.getElementType() != baseType.getElementType())
+    return emitOpError("requires a compatible read-state, root, and result");
+  if (!getOperation()->hasAttr("amoeba.semantic.completion_only") ||
+      !getOperation()->hasAttr("amoeba.replica.completion_only"))
+    return emitOpError("requires completion-only replica markers");
+
+  auto writeJoin = getWriteCompletion().getDefiningOp<TaskflowJoinOp>();
+  if (!writeJoin || writeJoin.getJoined() != getWriteCompletion() ||
+      !writeJoin->hasAttr("amoeba.semantic.completion_only") ||
+      !writeJoin->hasAttr("amoeba.replica.completion_only") ||
+      failed(mlir::verify(writeJoin.getOperation())) ||
+      writeJoin->getParentRegion() != getOperation()->getParentRegion() ||
+      writeJoin.getTileStates().size() != getTileStates().size())
+    return emitOpError(
+        "must reference the verified output join for the same replica group");
+
+  DenseMap<Operation *, std::pair<int64_t, int64_t>> outputReplicas;
+  for (Value state : writeJoin.getTileStates()) {
+    if (!hasOnlyJoinUseThroughCasts(state, writeJoin))
+      return emitOpError("output completion state has an unexpected SSA user");
+    TaskflowTaskOp task =
+        stripTaskflowMemrefCasts(state).getDefiningOp<TaskflowTaskOp>();
+    if (!task ||
+        !llvm::is_contained(task.getDoneWrites(),
+                            stripTaskflowMemrefCasts(state)) ||
+        task->getParentRegion() != getOperation()->getParentRegion())
+      return emitOpError("output join must contain direct replica done-writes");
+    auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+    auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+    auto parent = task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+    if (!id || !count || !parent || parent.getValue().empty() ||
+        id.getInt() < 0 || id.getInt() >= count.getInt() ||
+        count.getInt() != static_cast<int64_t>(getTileStates().size()) ||
+        !outputReplicas
+             .insert(
+                 std::make_pair(task.getOperation(),
+                                std::make_pair(id.getInt(), count.getInt())))
+             .second)
+      return emitOpError("output join has incomplete replica identity");
+  }
+
+  DenseSet<Operation *> readReplicas;
+  DenseSet<int64_t> readIds;
+  std::optional<unsigned> commonResultIndex;
+  std::optional<unsigned> commonInputIndex;
+  std::optional<std::string> commonParent;
+  DenseSet<int64_t> readCounts;
+  for (Value state : getTileStates()) {
+    if (state.getType() != baseType ||
+        !llvm::hasSingleElement(state.getUses()) ||
+        state.use_begin()->getOwner() != getOperation())
+      return emitOpError("requires unique direct read-completion states");
+    TaskflowTaskOp task = state.getDefiningOp<TaskflowTaskOp>();
+    unsigned resultIndex = 0, inputIndex = 0;
+    if (!task || task->getParentRegion() != getOperation()->getParentRegion() ||
+        !taskReadResultInput(task, state, resultIndex, inputIndex) ||
+        task.getDoneReads().size() != 1 || resultIndex != 0 ||
+        task.getWillReads()[inputIndex] != getBaseState() ||
+        task.getOriginalReadMemrefs()[inputIndex] != getOriginalRoot() ||
+        !readReplicas.insert(task.getOperation()).second)
+      return emitOpError(
+          "read state does not preserve one exact will_reads version and root");
+    auto output = outputReplicas.find(task.getOperation());
+    auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+    auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+    auto parent = task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+    if (output == outputReplicas.end() || !id || !count || !parent ||
+        output->second.first != id.getInt() ||
+        output->second.second != count.getInt() ||
+        !readIds.insert(id.getInt()).second)
+      return emitOpError(
+          "read completion and output joins contain different replica tasks");
+    if (!commonResultIndex)
+      commonResultIndex = resultIndex;
+    if (!commonInputIndex)
+      commonInputIndex = inputIndex;
+    if (!commonParent)
+      commonParent = parent.getValue().str();
+    if (*commonResultIndex != resultIndex || *commonInputIndex != inputIndex ||
+        *commonParent != parent.getValue().str())
+      return emitOpError(
+          "replicas disagree on read-result slot, input slot, or parent");
+    readCounts.insert(static_cast<int64_t>(task.getDoneReads().size()));
+  }
+  if (readReplicas.size() != outputReplicas.size() ||
+      readIds.size() != getTileStates().size() || readCounts.size() != 1)
+    return emitOpError(
+        "read completion does not cover the complete output replica set");
+
+  DenseSet<Value> baseVisited, rootVisited;
+  FailureOr<Value> baseRoot =
+      resolveTaskflowStorageRoot(getBaseState(), baseVisited);
+  FailureOr<Value> originalRoot =
+      resolveTaskflowStorageRoot(getOriginalRoot(), rootVisited);
+  if (failed(baseRoot) || failed(originalRoot) || *baseRoot != *originalRoot)
+    return emitOpError(
+        "base read state and original storage root do not resolve identically");
   return success();
 }
 

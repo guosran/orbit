@@ -168,6 +168,10 @@ FailureOr<TaskEdgeGraph> buildTaskEdgeGraph(func::FuncOp func,
                                             const TaskEdgeGraphOptions &options,
                                             std::string &error);
 
+// Resolves a Taskflow read/write state through verified state forwarding
+// operations to its exact underlying storage value. Unsupported aliases fail.
+FailureOr<Value> resolveTaskflowMemoryRoot(Value state);
+
 // Returns the statically known number of bits represented by a value type.
 // Dynamic shapes, index values, and types without a fixed bit width return
 // std::nullopt. A memory edge therefore needs an explicit runtime payload fact

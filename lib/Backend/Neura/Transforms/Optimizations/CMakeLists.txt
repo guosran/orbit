@@ -3,6 +3,7 @@ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 add_mlir_library(MLIRAmoebaNeuraOptimizations
   FuseTaskPass.cpp
   FissionTaskPass.cpp
+  FissionRayCarriedReductionPass.cpp
   ResourceAwareTaskOptimizationPass.cpp
   TileTaskPass.cpp
 

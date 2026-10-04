@@ -36,11 +36,56 @@ inline constexpr llvm::StringLiteral kCandidateSchema =
 struct TaskMetadata {
   taskflow::TaskflowTaskOp op;
   std::string name;
+  // Number of scheduled mapper firings. This intentionally excludes internal
+  // loops that the source-owned certificate proves fully expanded into each
+  // firing; their source work is reported separately below.
   int64_t tripCount = 1;
+  int64_t taskflowTripCount = 1;
+  int64_t sourceIterationMultiplicity = 1;
+  int64_t sourceIterationWorkCount = 1;
+  bool sourceIterationDomainCertified = false;
+  bool sourceIterationDomainComplete = false;
+  bool tripCountKnown = true;
+  std::string sourceIterationDomainStatus = "legacy-unproved";
+  std::string sourceIterationDomainReason;
+  SmallVector<int64_t> expandedInternalExtents;
 };
+
+struct TaskIterationDomainMetadata {
+  bool sourceCertified = false;
+  bool complete = false;
+  bool countKnown = false;
+  int64_t taskflowTripCount = 1;
+  int64_t internalMultiplicity = 1;
+  int64_t sourceIterationWorkCount = 1;
+  int64_t effectiveMapperFiringCount = 1;
+  std::string status;
+  std::string reason;
+  SmallVector<int64_t> expandedInternalExtents;
+};
+
+// Recomputes current Taskflow extents and validates the source-domain
+// certificate/binding. A certified task reports both total source work and
+// mapper firings after proven internal full expansion.
+FailureOr<TaskIterationDomainMetadata>
+resolveTaskIterationDomain(taskflow::TaskflowTaskOp task,
+                           std::string &error);
+
+// Internal metadata view for the replica-partition proof. It validates the
+// source certificate and current counter arithmetic while allowing the
+// current body binding to be stale until the complete child group has been
+// compared with its canonical source. Ordinary scoring must use the strict
+// overload above.
+FailureOr<TaskIterationDomainMetadata>
+resolveTaskIterationDomainForSourcePartitionProof(
+    taskflow::TaskflowTaskOp task, std::string &error);
 
 FailureOr<llvm::SmallVector<TaskMetadata>>
 collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error);
+
+FailureOr<llvm::SmallVector<TaskMetadata>>
+collectAnalyticalTaskMetadataForSourcePartitionProof(func::FuncOp func,
+                                                     std::string &error);
 
 
 FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module,

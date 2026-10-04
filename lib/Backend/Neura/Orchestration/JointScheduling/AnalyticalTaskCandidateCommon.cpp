@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCandidateCommon.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -238,29 +239,325 @@ inferStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
   return std::optional<int64_t>{total};
 }
 
-// Resolves any compile-time trip count stored with each task. An explicit
-// `trip_count` is authoritative; otherwise, constant Taskflow counter chains
-// supply the count. Dynamic or invalid bounds fail instead of inventing a
-// numeric value. A task without a counter represents one execution.
-static FailureOr<int64_t> resolveAnalyticalTripCount(TaskflowTaskOp task,
-                                                     std::string &error) {
-  if (auto attr = task->getAttrOfType<IntegerAttr>("trip_count")) {
-    if (attr.getInt() <= 0) {
-      error =
-          "task " + task.getTaskName().str() + " has non-positive trip_count";
-      return failure();
-    }
-    return attr.getInt();
+static bool validateTaskflowCounterAxisChain(TaskflowTaskOp task,
+                                              unsigned expectedAxes,
+                                              std::string &error) {
+  SmallVector<TaskflowCounterOp> counters;
+  SmallVector<TaskflowCounterOp> roots;
+  llvm::DenseMap<Value, SmallVector<TaskflowCounterOp>> children;
+  task.walk([&](TaskflowCounterOp counter) {
+    counters.push_back(counter);
+    if (Value parent = counter.getParentIndex())
+      children[parent].push_back(counter);
+    else
+      roots.push_back(counter);
+  });
+  if (counters.size() != expectedAxes) {
+    error = "task " + task.getTaskName().str() + " has " +
+            std::to_string(counters.size()) +
+            " current Taskflow counters for " + std::to_string(expectedAxes) +
+            " source-represented axes";
+    return false;
   }
+  if (expectedAxes == 0)
+    return counters.empty();
+  if (roots.size() != 1) {
+    error = "task " + task.getTaskName().str() +
+            " source-represented counters do not form one chain";
+    return false;
+  }
+  llvm::DenseSet<Operation *> visited;
+  TaskflowCounterOp current = roots.front();
+  while (current) {
+    if (!visited.insert(current.getOperation()).second) {
+      error = "task " + task.getTaskName().str() +
+              " has a cyclic source-represented counter chain";
+      return false;
+    }
+    auto found = children.find(current.getCounterIndex());
+    if (found == children.end())
+      break;
+    if (found->second.size() != 1) {
+      error = "task " + task.getTaskName().str() +
+              " source-represented counters branch into multiple axes";
+      return false;
+    }
+    current = found->second.front();
+  }
+  if (visited.size() != expectedAxes) {
+    error = "task " + task.getTaskName().str() +
+            " has disconnected source-represented counter axes";
+    return false;
+  }
+  return true;
+}
 
-  FailureOr<std::optional<int64_t>> inferred =
-      inferStaticTaskTripCount(task, error);
-  if (failed(inferred)) {
-    error += "; add an explicit positive trip_count or resolve the counter "
-             "bounds first";
+static bool hasUncertifiedSequentialControl(TaskflowTaskOp task) {
+  bool found = false;
+  task.walk([&](affine::AffineForOp) { found = true; });
+  task.walk([&](scf::ForOp) { found = true; });
+  task.walk([&](scf::WhileOp) { found = true; });
+  task.walk([&](Operation *operation) {
+    StringRef name = operation->getName().getStringRef();
+    if (name == "neura.phi" || name == "neura.counter" || name == "cf.br" ||
+        name == "cf.cond_br" || name == "cf.switch")
+      found = true;
+  });
+  return found;
+}
+
+static bool hasRetainedSequentialLoop(TaskflowTaskOp task) {
+  bool found = false;
+  task.walk([&](affine::AffineForOp) { found = true; });
+  task.walk([&](scf::ForOp) { found = true; });
+  task.walk([&](scf::WhileOp) { found = true; });
+  return found;
+}
+
+static bool validateExplicitMapperFiringCount(
+    TaskflowTaskOp task, int64_t expected, std::string &error,
+    bool validateReplicaShardTripCount = true) {
+  auto validateAttribute = [&](StringRef attribute) {
+    if (!task->hasAttr(attribute))
+      return true;
+    auto count = task->getAttrOfType<IntegerAttr>(attribute);
+    if (count && count.getInt() > 0 && count.getInt() == expected)
+      return true;
+    error = "task " + task.getTaskName().str() + " has " + attribute.str() +
+            "=" + (count ? std::to_string(count.getInt()) : "<malformed>") +
+            " but its current effective mapper-firing count is " +
+            std::to_string(expected);
+    return false;
+  };
+  if (!validateAttribute("trip_count") ||
+      !validateAttribute("amoeba.selected_trip_count"))
+    return false;
+  // Replica shard counts describe the historical replica step. Source-owned
+  // partition candidates validate that value against the authenticated ledger
+  // volume after the latest replica step; it need not equal a later tiled
+  // child's current mapper-firing count.
+  return !validateReplicaShardTripCount ||
+         validateAttribute("amoeba.replica.shard_trip_count");
+}
+
+static FailureOr<TaskIterationDomainMetadata>
+resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
+                               bool sourcePartitionCandidate) {
+  TaskIterationDomainMetadata result;
+  auto sourceAttr = task->getAttrOfType<DictionaryAttr>(
+      kSourceIterationDomainAttr);
+  if (task->hasAttr(kSourceIterationDomainAttr) && !sourceAttr) {
+    error = "task " + task.getTaskName().str() +
+            " has a malformed source-owned iteration-domain attribute";
     return failure();
   }
-  return inferred->value_or(1);
+  if (!sourceAttr) {
+    SmallVector<TaskflowCounterOp> counters;
+    task.walk([&](TaskflowCounterOp counter) { counters.push_back(counter); });
+    if (sourcePartitionCandidate) {
+      if (hasRetainedSequentialLoop(task)) {
+        error = "task " + task.getTaskName().str() +
+                " retains a sequential loop outside source-domain coverage";
+        return failure();
+      }
+      FailureOr<std::optional<int64_t>> inferred =
+          inferStaticTaskTripCount(task, error);
+      if (failed(inferred))
+        return failure();
+      int64_t currentCount = inferred->has_value() ? **inferred : 1;
+      // The current trip-count fields are checked here. A replica shard
+      // count may describe an earlier ledger step, so the enclosing complete
+      // partition proof checks it against that step's authenticated volume.
+      if (!validateExplicitMapperFiringCount(
+              task, currentCount, error,
+              /*validateReplicaShardTripCount=*/false))
+        return failure();
+      result.complete = false;
+      result.countKnown = true;
+      result.status = "source-partition-proof-candidate";
+      result.taskflowTripCount = currentCount;
+      result.effectiveMapperFiringCount = currentCount;
+      result.sourceIterationWorkCount = currentCount;
+      return result;
+    }
+    // Compatibility for uncertified historical inputs and small mapper fixtures.
+    // These counts are diagnostic; certified searches reject such inputs at
+    // their canonical boundary. Never substitute one for an unknown axis.
+    if (hasRetainedSequentialLoop(task)) {
+      error = "task " + task.getTaskName().str() +
+              " has retained sequential control without source-domain coverage";
+      return failure();
+    }
+    FailureOr<std::optional<int64_t>> inferred = inferStaticTaskTripCount(task, error);
+    if (failed(inferred)) return failure();
+    std::optional<int64_t> known = *inferred;
+    if (!known) {
+      if (auto explicitCount = task->getAttrOfType<IntegerAttr>("trip_count"))
+        known = explicitCount.getInt();
+      else if (!hasUncertifiedSequentialControl(task))
+        known = 1;
+    }
+    if (!known || *known <= 0 ||
+        !validateExplicitMapperFiringCount(task, *known, error)) {
+      if (error.empty()) error = "task " + task.getTaskName().str() +
+          " has no known mapper-firing count or source-domain proof";
+      return failure();
+    }
+    result.complete = false;
+    result.countKnown = true;
+    result.status = "legacy-uncertified-diagnostic";
+    result.taskflowTripCount = *known;
+    result.effectiveMapperFiringCount = *known;
+    result.sourceIterationWorkCount = *known;
+    return result;
+  }
+
+  std::string parseError;
+  FailureOr<SourceIterationDomainInfo> parsed =
+      parseSourceIterationDomain(task, parseError);
+  if (failed(parsed)) {
+    error = std::move(parseError);
+    return failure();
+  }
+  if (hasRetainedSequentialLoop(task)) {
+    error = "task " + task.getTaskName().str() +
+            " retains a sequential loop outside its complete source-domain "
+            "certificate";
+    return failure();
+  }
+  result.sourceCertified = true;
+  result.complete = true;
+  result.internalMultiplicity = parsed->internalMultiplicity;
+  result.status = "certified-complete";
+  for (const SourceIterationAxis &axis : parsed->axes)
+    if (!axis.representedByTaskflow)
+      result.expandedInternalExtents.push_back(axis.extent);
+
+  unsigned representedAxes = llvm::count_if(
+      parsed->axes, [](const SourceIterationAxis &axis) {
+        return axis.representedByTaskflow;
+      });
+  if (!validateTaskflowCounterAxisChain(task, representedAxes, error))
+    return failure();
+  FailureOr<std::optional<int64_t>> inferred =
+      inferStaticTaskTripCount(task, error);
+  if (failed(inferred))
+    return failure();
+  if (representedAxes == 0) {
+    result.taskflowTripCount = 1;
+  } else {
+    if (!inferred->has_value()) {
+      error = "task " + task.getTaskName().str() +
+              " has certified axes but no static current Taskflow extent";
+      return failure();
+    }
+    result.taskflowTripCount = **inferred;
+  }
+  result.effectiveMapperFiringCount = result.taskflowTripCount;
+  // The certificate records the original source-axis product, while the
+  // counters above are the current mapper firing domain. They must agree for
+  // a standalone task. A smaller product is valid only after a complete
+  // source-owned shard-group proof establishes coverage of the original
+  // domain; per-task lineage/count attributes cannot establish that proof.
+  // Keep this resolver fail-closed until the enclosing C++ materialization
+  // path has validated that complete group.
+  const bool changedMapperDomain =
+      result.taskflowTripCount != parsed->representedMultiplicity;
+  if (changedMapperDomain && !sourcePartitionCandidate) {
+    auto partitionProof = task->getAttrOfType<StringAttr>(
+        kSourceIterationPartitionProofAttr);
+    if (!partitionProof ||
+        partitionProof.getValue() !=
+            sourceIterationDomainCanonicalWitness(*parsed)) {
+      error = "task " + task.getTaskName().str() +
+              " has current Taskflow extent " +
+              std::to_string(result.taskflowTripCount) +
+              " but its source-owned represented domain is " +
+              std::to_string(parsed->representedMultiplicity) +
+              "; no complete source-owned partition proof is available";
+      return failure();
+    }
+    result.status = "certified-source-partition";
+  } else if (changedMapperDomain) {
+    result.status = "source-partition-proof-candidate";
+  }
+  if (!changedMapperDomain && !sourcePartitionCandidate) {
+    auto partitionProof = task->getAttrOfType<StringAttr>(
+        kSourceIterationPartitionProofAttr);
+    if (partitionProof &&
+        partitionProof.getValue() !=
+            sourceIterationDomainCanonicalWitness(*parsed)) {
+      error = "task " + task.getTaskName().str() +
+              " has a stale source iteration partition proof";
+      return failure();
+    }
+    if (partitionProof)
+      result.status = "certified-source-partition";
+  }
+  if (!checkedMultiply(result.taskflowTripCount,
+                       result.internalMultiplicity,
+                       result.sourceIterationWorkCount)) {
+    error = "task " + task.getTaskName().str() +
+            " source iteration work count exceeds int64";
+    return failure();
+  }
+  if (!validateExplicitMapperFiringCount(
+          task, result.effectiveMapperFiringCount, error))
+    return failure();
+
+  if (task->hasAttr(kSourceIterationCapturePendingAttr)) {
+    error = "task " + task.getTaskName().str() +
+            " source-domain certificate still needs trusted control binding";
+    return failure();
+  }
+  auto binding = task->getAttrOfType<StringAttr>(
+      kSourceIterationControlBindingAttr);
+  auto sourceBinding = task->getAttrOfType<StringAttr>(
+      kSourceIterationSourceControlBindingAttr);
+  if (!binding || binding.getValue().empty() || !sourceBinding ||
+      sourceBinding.getValue().empty()) {
+    error = "task " + task.getTaskName().str() +
+            " source-domain certificate has no current/source control binding";
+    return failure();
+  }
+  if (!sourcePartitionCandidate) {
+    std::string expectedBinding = currentSourceIterationControlBinding(
+        task, sourceIterationDomainCanonicalWitness(*parsed));
+    if (expectedBinding.empty() || binding.getValue() != expectedBinding) {
+      size_t mismatch = 0;
+      StringRef stored = binding.getValue();
+      while (mismatch < stored.size() && mismatch < expectedBinding.size() &&
+             stored[mismatch] == expectedBinding[mismatch]) ++mismatch;
+      error = "task " + task.getTaskName().str() +
+              " source-domain control binding is stale or forged at byte " +
+              std::to_string(mismatch) + "; stored=" +
+              stored.substr(mismatch, 180).str() + "; current=" +
+              expectedBinding.substr(mismatch, 180);
+      return failure();
+    }
+    if (!task->hasAttr(kSourceIterationPartitionProofAttr) &&
+        sourceBinding.getValue() != expectedBinding) {
+      error = "task " + task.getTaskName().str() +
+              " source-origin control binding is stale without a verified "
+              "partition rewrite";
+      return failure();
+    }
+  }
+  result.countKnown = true;
+  return result;
+}
+
+FailureOr<TaskIterationDomainMetadata>
+resolveTaskIterationDomain(TaskflowTaskOp task, std::string &error) {
+  return resolveTaskIterationDomainImpl(task, error,
+                                        /*sourcePartitionCandidate=*/false);
+}
+
+FailureOr<TaskIterationDomainMetadata>
+resolveTaskIterationDomainForSourcePartitionProof(TaskflowTaskOp task,
+                                                  std::string &error) {
+  return resolveTaskIterationDomainImpl(task, error,
+                                        /*sourcePartitionCandidate=*/true);
 }
 
 // Task names are the stable source task IDs in the candidate contract.
@@ -270,8 +567,9 @@ static FailureOr<int64_t> resolveAnalyticalTripCount(TaskflowTaskOp task,
 // walk order.
 // The order is the task axis used by a spatial shape tuple, so duplicate names
 // are rejected before they can make candidate records ambiguous.
-FailureOr<SmallVector<TaskMetadata>>
-collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error) {
+static FailureOr<SmallVector<TaskMetadata>>
+collectAnalyticalTaskMetadataImpl(func::FuncOp func, std::string &error,
+                                  bool sourcePartitionCandidate) {
   SmallVector<TaskMetadata> tasks;
   llvm::StringSet<> names;
   WalkResult walkResult = func.walk([&](TaskflowTaskOp task) {
@@ -280,10 +578,31 @@ collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error) {
       error = "duplicate task name " + name;
       return WalkResult::interrupt();
     }
-    FailureOr<int64_t> tripCount = resolveAnalyticalTripCount(task, error);
-    if (failed(tripCount))
+    std::string domainError;
+    FailureOr<TaskIterationDomainMetadata> domain =
+        sourcePartitionCandidate
+            ? resolveTaskIterationDomainForSourcePartitionProof(task,
+                                                                domainError)
+            : resolveTaskIterationDomain(task, domainError);
+    if (failed(domain)) {
+      error = std::move(domainError);
       return WalkResult::interrupt();
-    tasks.push_back({task, std::move(name), *tripCount});
+    }
+    TaskMetadata metadata;
+    metadata.op = task;
+    metadata.name = std::move(name);
+    metadata.tripCount = domain->effectiveMapperFiringCount;
+    metadata.taskflowTripCount = domain->taskflowTripCount;
+    metadata.sourceIterationMultiplicity = domain->internalMultiplicity;
+    metadata.sourceIterationWorkCount = domain->sourceIterationWorkCount;
+    metadata.sourceIterationDomainCertified = domain->sourceCertified;
+    metadata.sourceIterationDomainComplete = domain->complete;
+    metadata.tripCountKnown = domain->countKnown;
+    metadata.sourceIterationDomainStatus = domain->status;
+    metadata.sourceIterationDomainReason = domain->reason;
+    metadata.expandedInternalExtents =
+        std::move(domain->expandedInternalExtents);
+    tasks.push_back(std::move(metadata));
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
@@ -293,6 +612,19 @@ collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error) {
     return failure();
   }
   return tasks;
+}
+
+FailureOr<SmallVector<TaskMetadata>>
+collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error) {
+  return collectAnalyticalTaskMetadataImpl(
+      func, error, /*sourcePartitionCandidate=*/false);
+}
+
+FailureOr<SmallVector<TaskMetadata>>
+collectAnalyticalTaskMetadataForSourcePartitionProof(func::FuncOp func,
+                                                     std::string &error) {
+  return collectAnalyticalTaskMetadataImpl(
+      func, error, /*sourcePartitionCandidate=*/true);
 }
 
 std::string makeSequentialCandidateId(uint64_t index) {

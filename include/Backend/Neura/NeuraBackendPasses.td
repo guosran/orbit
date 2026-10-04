@@ -99,6 +99,29 @@ def ConstructHyperblockFromTask
       "::mlir::amoeba::neura::createConstructHyperblockFromTaskPass()";
 }
 
+def BindSourceIterationDomain
+    : Pass<"bind-source-iteration-domain", "ModuleOp"> {
+  let summary = "Bind a captured source iteration domain to its current Neura control body";
+  let description = [{
+    Consumes the one-shot capture marker emitted by construct-hyperblock-from-task
+    after source affine-loop bounds, carried state, and full expansion have been
+    proved. The pass binds the certificate to the current canonical Neura kernel
+    bodies. It never creates or refreshes a missing binding on imported IR.
+    Incomplete source domains are retained as unsupported facts.
+  }];
+  let constructor =
+      "::mlir::amoeba::neura::createBindSourceIterationDomainPass()";
+  let dependentDialects = ["mlir::taskflow::TaskflowDialect",
+                           "mlir::neura::NeuraDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
+def VerifySourceIterationDomainPartitions
+    : Pass<"verify-source-iteration-domain-partitions", "ModuleOp"> {
+  let summary = "Re-prove an imported task graph against immutable source domains";
+  let constructor = "::mlir::amoeba::neura::createVerifySourceIterationDomainPartitionsPass()";
+}
+
 def ClassifyTaskAndCounter : Pass<"classify-task-and-counter", "ModuleOp"> {
   let summary = "Classify tasks and counters for Neura runtime management";
   let description = [{
@@ -335,6 +358,11 @@ def MapJointSchedulingTasks
     materialized task. The selected per-task mapper rows and columns configure
     each invocation. Mapping failure, missing kernels, or a mismatched result
     fails closed. Successfully mapped operations are moved back into the task.
+    The opt-in all-unit-baseline mode accepts only shape-space candidate-0
+    with a complete source-owned iteration-domain certificate and an identity
+    1x1 shape for every task. It derives structural startup from the C++ mapper
+    feature graph and combines it with actual mapped II without reading an ML
+    score file.
   }];
   let constructor =
       "::mlir::amoeba::neura::createMapJointSchedulingTasksPass()";
@@ -345,6 +373,9 @@ def MapJointSchedulingTasks
            "Validated score JSONL used to bind startup cycles.">,
     Option<"candidateId", "candidate-id", "std::string",
            /*default=*/"\"\"", "Selected candidate ID.">,
+    Option<"allUnitBaseline", "all-unit-baseline", "bool",
+           /*default=*/"false",
+           "Use source-certified all-1x1 mapper durations without ML scores.">,
     Option<"expectedTraceSha256", "expected-trace-sha256", "std::string",
            /*default=*/"\"\"", "Expected selected schedule trace identity.">,
     Option<"expectedScoreSha256", "expected-score-sha256", "std::string",
@@ -396,10 +427,96 @@ def ScoreAnalyticalTaskCandidates
 
 def SearchJointNeighborhood : Pass<"search-joint-neighborhood", "ModuleOp"> {
   let summary = "Budgeted cost-guided complete-program neighborhood search";
+  let options = [
+    Option<"scoringWorkers", "scoring-workers", "int64_t",
+           /*default=*/"1",
+           "Number of private production-scheduler workers; one preserves serial semantics.">,
+    Option<"maxPartitionFactor", "max-partition-factor", "int64_t",
+           /*default=*/"4",
+           "Independent authenticated cumulative tiling/replica cap: 4 or 8.">,
+    Option<"historicalNativeWinner", "historical-native-winner", "std::string",
+           /*default=*/"\"\"",
+           "Optional source-owned historical native control selection JSONL.">
+  ];
   let constructor = "::mlir::amoeba::neura::createSearchJointNeighborhoodPass()";
   let dependentDialects = ["mlir::func::FuncDialect",
                            "mlir::taskflow::TaskflowDialect"];
 }
+
+def ReplayJointNeighborhoodActions
+    : Pass<"replay-joint-neighborhood-actions", "ModuleOp"> {
+  let summary = "Replay a typed neighborhood action path with source-domain proofs";
+  let description = [{
+    Replays only the supplied exact action sequence through the existing C++
+    neighborhood enumerator and source-owned materializers. Every predecessor
+    and resulting candidate is checked against the immutable source iteration
+    domain. It emits the complete replayed module and source facts, without
+    reading a cost catalogue, predicting, mapping, or ranking candidates.
+  }];
+  let options = [
+    Option<"actionFile", "action-file", "std::string", /*default=*/"\"\"",
+           "Exact typed action JSON file.">,
+    Option<"canonicalInput", "canonical-input", "std::string", /*default=*/"\"\"",
+           "Exact immutable source-certified canonical module path.">,
+    Option<"candidateInput", "candidate-input", "std::string", /*default=*/"\"\"",
+           "Exact current predecessor module path.">,
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process.">,
+    Option<"stage", "stage", "std::string", /*default=*/"\"full-joint\"",
+           "Cumulative neighborhood stage enabled for supplied actions.">,
+    Option<"maxPartitionFactor", "max-partition-factor", "int64_t",
+           /*default=*/"8", "Authenticated cumulative partition cap: 1, 2, 4, or 8.">,
+    Option<"outputDir", "output-dir", "std::string", /*default=*/"\"\"",
+           "New directory for the complete candidate, facts, and exact inputs.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createReplayJointNeighborhoodActionsPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
+def ProveStaticActiveTransferShapes
+    : Pass<"prove-static-active-transfer-shapes", "ModuleOp"> {
+  let summary = "Prove opt-in active transfer boxes without changing physical memory";
+  let constructor =
+      "::mlir::amoeba::neura::joint_scheduling::createProveStaticActiveTransferShapesPass()";
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::taskflow::TaskflowDialect",
+                           "mlir::neura::NeuraDialect"];
+}
+
+def PrepareJointDiagnosticCandidate
+    : Pass<"prepare-joint-diagnostic-candidate", "ModuleOp"> {
+  let summary = "Emit one source-bound explicit joint scheduling diagnostic candidate";
+  let constructor =
+      "::mlir::amoeba::neura::createPrepareJointDiagnosticCandidatePass()";
+  let options = [
+    Option<"functionName", "function", "std::string", /*default=*/"\"\"",
+           "Taskflow function to process; inferred only when explicitly supplied.">,
+    Option<"parentCostFile", "parent-cost-file", "std::string", /*default=*/"\"\"",
+           "Provenance-bound parent task-shape ML cost catalogue.">,
+    Option<"sourceRepository", "source-repository", "std::string", /*default=*/"\"\"",
+           "Source repository bound by the parent catalogue.">,
+    Option<"sourceCommit", "source-commit", "std::string", /*default=*/"\"\"",
+           "Source commit bound by the parent catalogue.">,
+    Option<"architecturePath", "architecture-path", "std::string", /*default=*/"\"\"",
+           "Architecture specification bound by the parent catalogue.">,
+    Option<"candidateId", "candidate-id", "std::string", /*default=*/"\"\"",
+           "Explicit diagnostic candidate identity.">,
+    Option<"outputDir", "output-dir", "std::string", /*default=*/"\"\"",
+           "Directory for the candidate, selection, and score artifacts.">,
+    Option<"dispatchPolicy", "dispatch-policy", "std::string",
+           /*default=*/"\"fixed\"",
+           "Production dispatch policy: fixed or critical-path.">,
+    Option<"taskShapes", "task-shapes", "std::string", /*default=*/"\"\"",
+           "Optional semicolon-separated TaskName:RxC overrides; unspecified tasks use 1x1.">
+  ];
+  let dependentDialects = ["mlir::func::FuncDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 
 def ScoreExactJointTaskCandidates
     : Pass<"score-exact-joint-task-candidates", "ModuleOp"> {
@@ -812,6 +929,33 @@ def FissionTask : Pass<"fission-task", "func::FuncOp"> {
                            "mlir::taskflow::TaskflowDialect"];
 }
 
+def FissionRayCarriedReduction
+    : Pass<"fission-ray-carried-reduction", "func::FuncOp"> {
+  let summary = "Split the exact Ray carried reduction across an affine lane interval";
+  let description = [{
+    Materializes a source-owned two-stage split of the Ray Task_13 reduction.
+    It recognizes only the original scalar-seeded, two-result min/index loop,
+    requires caller-proved disjoint inputs and outputs, and partitions the
+    complete static lane range into prefix and suffix tasks connected by
+    explicit scratch state. Unsupported bodies fail closed. Run after
+    convert-affine-to-taskflow and before construct-hyperblock-from-task.
+  }];
+  let options = [
+    Option<"taskName", "task-name", "std::string", /*default=*/"\"Task_13\"",
+           "Exact source task name to split.">,
+    Option<"splitAt", "split-at", "int64_t", /*default=*/"4",
+           "Exclusive lane bound for the first reduction stage.">
+  ];
+  let constructor =
+      "::mlir::amoeba::neura::createFissionRayCarriedReductionPass()";
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::memref::MemRefDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::taskflow::TaskflowDialect"];
+}
+
 def TileTask : Pass<"tile-task", "func::FuncOp"> {
   let summary = "Split a static tensor task into k parts along one axis";
   let constructor = "::mlir::amoeba::neura::createTileTaskPass()";
@@ -887,7 +1031,12 @@ def PredictAnalyticalTaskCostCatalog
     Option<"cacheFile", "cache", "std::string", /*default=*/"\"\"",
            "Persistent structural ML cache.">,
     Option<"outputFile", "output", "std::string", /*default=*/"\"\"",
-           "Output task-shape catalogue.">
+           "Output task-shape catalogue.">,
+    Option<"allowUnsupportedAboveModelCeiling",
+           "allow-unsupported-above-model-ceiling", "bool",
+           /*default=*/"false",
+           "Record source-proved lower bounds above the model interval as "
+           "explicit unsupported task-shape rows.">
   ];
   let constructor =
       "::mlir::amoeba::neura::createPredictAnalyticalTaskCostCatalogPass()";
@@ -1006,4 +1155,15 @@ def GlobalStageRanker : Pass<"select-global-stage-top-five", "ModuleOp"> {
            "Maximum uncertified diagnostic selections for incomplete inputs.">
   ];
   let constructor = "::mlir::amoeba::neura::createGlobalStageRankerPass()";
+}
+
+// Original decisions are held fixed; this pass performs no orchestration search.
+def OriginalAmoebaProfileCostAdapter : Pass<"adapt-original-amoeba-profile-costs", "ModuleOp"> {
+  let summary = "Bind original AMOEBA mapper profiles to exact current kernel bodies";
+  let constructor = "mlir::amoeba::neura::createOriginalAmoebaProfileCostAdapterPass()";
+}
+
+def RetimingOriginalAmoebaFixedDecisions : Pass<"retime-original-amoeba-fixed-decisions", "ModuleOp"> {
+  let summary = "Retime captured original AMOEBA decisions with explicit communication";
+  let constructor = "mlir::amoeba::neura::createRetimingOriginalAmoebaFixedDecisionsPass()";
 }

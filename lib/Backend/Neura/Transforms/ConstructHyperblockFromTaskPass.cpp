@@ -7,6 +7,7 @@
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -20,10 +21,14 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include <cstddef>
+#include <utility>
 using namespace mlir;
 using namespace mlir::taskflow;
+using namespace mlir::amoeba::neura::joint_scheduling;
 
 namespace {
 
@@ -460,6 +465,174 @@ createHyperblockFromInnermostLoop(OpBuilder &builder, Location loc,
 //============================================================================
 // Task Transformation.
 //===========================================================================
+static void writeSourceIterationDomain(TaskflowTaskOp task,
+                                       SourceIterationDomainInfo info,
+                                       bool capturePending) {
+  OpBuilder builder(task.getContext());
+  task->setAttr(kSourceIterationDomainAttr,
+                makeSourceIterationDomainAttr(builder, info));
+  if (capturePending)
+    task->setAttr(kSourceIterationCapturePendingAttr, builder.getUnitAttr());
+}
+
+static void markSourceDomainUnsupported(SourceIterationDomainInfo &info,
+                                        StringRef reason) {
+  info.complete = false;
+  info.reason = reason.str();
+}
+
+/// affine::loopUnrollFull may promote a single-iteration affine loop by
+/// replacing its IV with an arith.constant inserted at the containing
+/// function entry. That insertion point is outside TaskflowTaskOp's isolated
+/// region, so uses in the task would become illegal captures. Re-materialize
+/// only those leaked index constants in the task; reject any other leaked
+/// value instead of silently weakening region isolation.
+static LogicalResult localizeUnrolledLoopConstants(TaskflowTaskOp task) {
+  auto isInsideTask = [&](Operation *operation) {
+    for (Operation *parent = operation; parent;
+         parent = parent->getParentOp()) {
+      if (parent == task.getOperation())
+        return true;
+    }
+    return false;
+  };
+
+  SmallVector<Value> escapedConstants;
+  LogicalResult result = success();
+  task.walk([&](Operation *operation) {
+    if (operation == task.getOperation())
+      return;
+    for (Value operand : operation->getOperands()) {
+      Operation *definition = operand.getDefiningOp();
+      if (!definition) {
+        auto argument = dyn_cast<BlockArgument>(operand);
+        if (argument && !isInsideTask(argument.getOwner()->getParentOp())) {
+          operation->emitError("internal-loop unrolling introduced an external block argument");
+          result = failure();
+        }
+        continue;
+      }
+      if (isInsideTask(definition)) continue;
+      if (isa<arith::ConstantIndexOp>(definition)) {
+        escapedConstants.push_back(operand);
+        continue;
+      }
+      operation->emitError(
+          "internal-loop unrolling introduced a non-constant value outside "
+          "the isolated task region");
+      result = failure();
+    }
+  });
+  if (failed(result))
+    return failure();
+
+  if (escapedConstants.empty())
+    return success();
+
+  Block &taskBody = task.getBody().front();
+  OpBuilder builder(&taskBody, taskBody.begin());
+  DenseMap<Value, Value> localized;
+  for (Value escaped : escapedConstants) {
+    auto constant = cast<arith::ConstantIndexOp>(escaped.getDefiningOp());
+    Value local = localized.lookup(escaped);
+    if (!local) {
+      local = builder.create<arith::ConstantIndexOp>(constant.getLoc(),
+                                                      constant.value());
+      localized.try_emplace(escaped, local);
+    }
+    escaped.replaceUsesWithIf(local, [&](OpOperand &use) {
+      return use.getOwner() != task.getOperation() &&
+             isInsideTask(use.getOwner());
+    });
+  }
+  return success();
+}
+
+static LogicalResult captureAndExpandSourceIterationDomain(
+    TaskflowTaskOp task, const PerfectLoopBand &band) {
+  if (task->hasAttr(kSourceIterationDomainAttr)) {
+    bool hasAffineLoop = false;
+    task.walk([&](affine::AffineForOp) { hasAffineLoop = true; });
+    if (hasAffineLoop) {
+      task.emitError("refusing to replace an imported source iteration-domain "
+                     "certificate while source loops remain");
+      return failure();
+    }
+    return success();
+  }
+
+  SourceIterationDomainInfo info =
+      certifySourceIterationDomain(task, band.loops);
+  if (!info.complete) {
+    writeSourceIterationDomain(task, std::move(info),
+                               /*capturePending=*/false);
+    return success();
+  }
+
+  // An explicit legacy count is valid only when it describes the source axes
+  // that are about to become the current Taskflow counter chain. Internal
+  // carried axes are expanded inside one mapper firing and therefore do not
+  // increase this count.
+  for (StringRef attribute : {StringRef("trip_count"),
+                              StringRef("amoeba.selected_trip_count")}) {
+    if (!task->hasAttr(attribute))
+      continue;
+    auto count = task->getAttrOfType<IntegerAttr>(attribute);
+    if (!count || count.getInt() != info.representedMultiplicity) {
+      markSourceDomainUnsupported(
+          info, "explicit mapper-firing count disagrees with source Taskflow axes");
+      writeSourceIterationDomain(task, std::move(info),
+                                 /*capturePending=*/false);
+      return success();
+    }
+  }
+
+  auto internalAxis = llvm::find_if(info.axes, [](const auto &axis) {
+    return !axis.representedByTaskflow;
+  });
+  if (internalAxis != info.axes.end()) {
+    // Persist the source-derived bounds/carry contract before the loop is
+    // rewritten. This incomplete snapshot cannot be consumed for cost; it is
+    // replaced only in this invocation after loopUnrollFull succeeds.
+    SourceIterationDomainInfo pending = info;
+    pending.complete = false;
+    pending.reason = "source proof captured; internal expansion is pending";
+    writeSourceIterationDomain(task, std::move(pending),
+                               /*capturePending=*/false);
+    if (internalAxis->extent > 8) {
+      markSourceDomainUnsupported(
+          info, "internal source loop exceeds the supported full-unroll bound");
+      writeSourceIterationDomain(task, std::move(info),
+                                 /*capturePending=*/false);
+      return success();
+    }
+
+    SmallVector<affine::AffineForOp> internalLoops;
+    llvm::DenseSet<Operation *> represented;
+    for (affine::AffineForOp loop : band.loops)
+      represented.insert(loop.getOperation());
+    task.walk([&](affine::AffineForOp loop) {
+      if (!represented.contains(loop.getOperation()))
+        internalLoops.push_back(loop);
+    });
+    if (internalLoops.size() != 1 ||
+        failed(affine::loopUnrollFull(internalLoops.front()))) {
+      markSourceDomainUnsupported(
+          info, "internal carried source loop could not be fully unrolled");
+      writeSourceIterationDomain(task, std::move(info),
+                                 /*capturePending=*/false);
+      return success();
+    }
+    if (failed(localizeUnrolledLoopConstants(task)))
+      return failure();
+    internalAxis->expandedInsideMapperFiring = true;
+  }
+
+  writeSourceIterationDomain(task, std::move(info),
+                             /*capturePending=*/true);
+  return success();
+}
+
 static LogicalResult transformTaskWithCounter(TaskflowTaskOp task_op) {
   Location loc = task_op.getLoc();
   Block &task_body = task_op.getBody().front();
@@ -473,13 +646,38 @@ static LogicalResult transformTaskWithCounter(TaskflowTaskOp task_op) {
   }
 
   if (top_level_loops.empty()) {
-    // llvm::errs() << "No loops found in task " << task_op.getTaskName() <<
-    // "\n";
+    if (task_op->hasAttr(kSourceIterationDomainAttr))
+      return success();
+    SourceIterationDomainInfo info =
+        certifySourceIterationDomain(task_op, {});
+    bool complete = info.complete;
+    writeSourceIterationDomain(task_op, std::move(info), complete);
     return success();
   }
 
-  assert(top_level_loops.size() == 1 &&
-         "Expected exactly one top-level loop in each task.");
+  if (task_op->hasAttr(kSourceIterationDomainAttr)) {
+    task_op.emitError("refusing to recertify source iteration domain while "
+                      "affine loops remain");
+    return failure();
+  }
+  if (top_level_loops.size() != 1) {
+    SourceIterationDomainInfo info =
+        certifySourceIterationDomain(task_op, {});
+    markSourceDomainUnsupported(info,
+                                "task has multiple top-level affine loops");
+    writeSourceIterationDomain(task_op, std::move(info),
+                               /*capturePending=*/false);
+    return success();
+  }
+
+  PerfectLoopBand sourceBand = detectPerfectLoopBand(top_level_loops.front());
+  if (failed(captureAndExpandSourceIterationDomain(task_op, sourceBand)))
+    return failure();
+  auto domain = task_op->getAttrOfType<DictionaryAttr>(
+      kSourceIterationDomainAttr);
+  auto complete = domain ? domain.getAs<BoolAttr>("complete") : BoolAttr{};
+  if (!complete || !complete.getValue())
+    return success();
 
   OpBuilder builder(&task_body, task_body.begin());
 
@@ -490,7 +688,8 @@ static LogicalResult transformTaskWithCounter(TaskflowTaskOp task_op) {
   for (affine::AffineForOp top_loop : top_level_loops) {
     llvm::errs() << "\n[ConstructHyperblock] Processing top-level loop\n";
 
-    // Step 1: Detects maximal perfect loop band.
+    // Step 1: Re-detects the maximal band after any supported carried-loop
+    // expansion. The source domain was captured before the expansion above.
     PerfectLoopBand band = detectPerfectLoopBand(top_loop);
     llvm::errs() << "  Detected perfect loop band of depth " << band.getDepth()
                  << "\n";
@@ -537,6 +736,23 @@ static LogicalResult transformTaskWithCounter(TaskflowTaskOp task_op) {
 }
 
 static LogicalResult transformTaskWithoutCounter(TaskflowTaskOp task_op) {
+  if (!task_op->hasAttr(kSourceIterationDomainAttr)) {
+    SourceIterationDomainInfo info =
+        certifySourceIterationDomain(task_op, {});
+    if (!info.axes.empty() || !info.complete)
+      markSourceDomainUnsupported(
+          info, "source loops are not represented by Taskflow counters");
+    bool complete = info.complete;
+    writeSourceIterationDomain(task_op, std::move(info), complete);
+  }
+
+  auto existingDomain = task_op->getAttrOfType<DictionaryAttr>(
+      kSourceIterationDomainAttr);
+  auto existingComplete =
+      existingDomain ? existingDomain.getAs<BoolAttr>("complete") : BoolAttr{};
+  if (!existingComplete || !existingComplete.getValue())
+    return success();
+
   Location loc = task_op.getLoc();
 
   llvm::errs()

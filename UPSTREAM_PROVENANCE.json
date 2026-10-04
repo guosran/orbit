@@ -1,6 +1,5 @@
 {
   "schema": "orbit-published-source-provenance-v1",
-  "collected_source_version": "v11-neighborhood",
   "upstream": {
     "amoeba": {
       "repository": "https://github.com/guosran/amoeba",
@@ -18,11 +17,38 @@
       "base_commit": "ed00ea6d960ca086f071fa4f815c4a3b21526163",
       "vendored": false,
       "modified": true,
-      "usage": "Serialized weights in the companion artifact; source-owned C++ inference is part of ORBIT."
+      "usage": "Legacy formal-max-four serialized weights in the companion artifact; preserved for historical diagnostics."
+    },
+    "predictor_2x2": {
+      "repository": "https://github.com/guosran/cgra-ii-predictor",
+      "branch": "orbit-2x2-predictor",
+      "base_commit": "3ade31806cb4c92e31888109f7c42b8a77e4cbce",
+      "vendored": false,
+      "weights_modified": false,
+      "usage": "Four-member direct ensemble exported without training; 148 raw / 61 selected features and source-owned C++ inference.",
+      "model_namespace": "orbit-per-cgra-2x2-direct-4member-v1",
+      "status": "candidate_pending_amoeba_benchmark_overlap_audit"
     }
   },
   "llvm_mlir_commit": "6146a88f60492b520a36f8f8f3231e15f3cc6082",
   "binding_policy": "exact source/model payload comparison; no SHA-256",
-  "source_payloads_checked": 102,
-  "publication_revision": "Repository Git HEAD"
+  "source_payloads_checked": 131,
+  "publication_revision": "Repository Git HEAD",
+  "initial_publication_source_version": "v11-neighborhood",
+  "paper_experiment": {
+    "scripts_repository": "https://github.com/ShangkunLi/AMOEBA-Test",
+    "scripts_commit": "fc49b578d807a137ec3c38481be0271d176aa56b",
+    "architecture": "Evaluation/arch_spec/architecture_4x4_cgra_2x2.yaml",
+    "original_compiler_repository": "https://github.com/ShangkunLi/neura",
+    "original_compiler_branch": "hpca-eval",
+    "original_compiler_commit": "f45a0c5f4cc3163a016250fee865c19ec56f0fa0",
+    "fabric_cgras": [
+      4,
+      4
+    ],
+    "per_cgra_pes": [
+      2,
+      2
+    ]
+  }
 }
