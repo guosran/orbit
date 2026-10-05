@@ -2,6 +2,7 @@
 #include "FixedScheduleVerifier.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <utility>
@@ -51,16 +52,19 @@ FixedScheduleScore verifyAndScoreFixedSchedule(
     int gridRows, int gridCols, const std::vector<ExactScheduleTask> &tasks,
     const std::vector<ExactSchedulePlacement> &placements,
     const std::vector<unsigned> &taskOrder,
-    FixedScheduleCommunication &communication) {
+    FixedScheduleCommunication &communication,
+    const FixedScheduleOccupiedCellInventory *occupiedCells) {
   if (gridRows != 4 || gridCols != 4 || tasks.empty() ||
       placements.size() != tasks.size() || taskOrder.size() != tasks.size())
     return reject("fixed schedule requires a complete 4x4 task inventory");
+  if (occupiedCells && occupiedCells->size() != tasks.size())
+    return reject("captured occupied-cell inventory omits or adds a task");
   std::vector<const ExactSchedulePlacement *> byTask(tasks.size(), nullptr);
   std::set<std::string> names;
   for (unsigned i = 0; i < tasks.size(); ++i) {
     const auto &task = tasks[i];
-    if (task.name.empty() || !names.insert(task.name).second ||
-        task.rows < 1 || task.cols < 1 || task.rows > 4 || task.cols > 4 ||
+    if (task.name.empty() || !names.insert(task.name).second || task.rows < 1 ||
+        task.cols < 1 || task.rows > 4 || task.cols > 4 ||
         task.rows * task.cols > 4 || task.duration < 1)
       return reject("invalid fixed task shape, name or predicted duration");
     std::set<unsigned> predecessors;
@@ -78,20 +82,56 @@ FixedScheduleScore verifyAndScoreFixedSchedule(
         placement.col + task.cols > gridCols || placement.start < 0 ||
         placement.start > std::numeric_limits<int64_t>::max() - task.duration ||
         placement.end != placement.start + task.duration)
-      return reject("schedule rectangle, interval or predicted duration is invalid");
+      return reject(
+          "schedule rectangle, interval or predicted duration is invalid");
     byTask[placement.task] = &placement;
   }
   for (const auto *placement : byTask)
     if (!placement)
       return reject("schedule omits a task");
+
+  FixedScheduleOccupiedCellInventory cellInventory(tasks.size());
+  std::vector<std::set<FixedScheduleOccupiedCell>> cellSets(tasks.size());
+  for (unsigned task = 0; task < tasks.size(); ++task) {
+    const ExactSchedulePlacement &placement = *byTask[task];
+    const ExactScheduleTask &shape = tasks[task];
+    auto &cells = cellInventory[task];
+    if (occupiedCells) {
+      cells = (*occupiedCells)[task];
+      if (cells.empty())
+        return reject("captured task occupancy contains no CGRA cells");
+      for (const FixedScheduleOccupiedCell &cell : cells)
+        if (cell.first < 0 || cell.first >= gridRows || cell.second < 0 ||
+            cell.second >= gridCols || !cellSets[task].insert(cell).second)
+          return reject("captured task occupancy has an out-of-bounds or "
+                        "duplicate CGRA cell");
+      for (int row = placement.row; row < placement.row + shape.rows; ++row)
+        for (int col = placement.col; col < placement.col + shape.cols; ++col)
+          if (!cellSets[task].count({row, col}))
+            return reject("captured task occupancy omits a primary-rectangle "
+                          "CGRA cell");
+      std::sort(cells.begin(), cells.end());
+    } else {
+      for (int row = placement.row; row < placement.row + shape.rows; ++row)
+        for (int col = placement.col; col < placement.col + shape.cols; ++col) {
+          cells.emplace_back(row, col);
+          cellSets[task].emplace(row, col);
+        }
+    }
+  }
+
   for (unsigned i = 0; i < placements.size(); ++i)
     for (unsigned j = i + 1; j < placements.size(); ++j) {
       const auto &a = placements[i], &b = placements[j];
-      const auto &aShape = tasks[a.task], &bShape = tasks[b.task];
-      if (overlaps(a.start, a.end, b.start, b.end) &&
-          a.row < b.row + bShape.rows && b.row < a.row + aShape.rows &&
-          a.col < b.col + bShape.cols && b.col < a.col + aShape.cols)
-        return reject("simultaneous task rectangles overlap on the 4x4 grid");
+      if (!overlaps(a.start, a.end, b.start, b.end))
+        continue;
+      std::vector<FixedScheduleOccupiedCell> commonCells;
+      std::set_intersection(
+          cellInventory[a.task].begin(), cellInventory[a.task].end(),
+          cellInventory[b.task].begin(), cellInventory[b.task].end(),
+          std::back_inserter(commonCells));
+      if (!commonCells.empty())
+        return reject("simultaneous tasks overlap on captured CGRA cells");
     }
   std::vector<bool> visited(tasks.size(), false);
   for (unsigned index : taskOrder) {
@@ -125,54 +165,51 @@ FixedScheduleScore verifyAndScoreFixedSchedule(
     communication.beginTrial();
     for (unsigned predecessor : modelPredecessors) {
       const auto &source = *byTask[predecessor];
-      const auto &destination = *byTask[index];
-      const auto &sourceShape = tasks[predecessor];
-      const auto &destinationShape = tasks[index];
       int64_t bestReady = std::numeric_limits<int64_t>::max();
       int bestSourceRow = -1, bestSourceCol = -1;
       int bestDestinationRow = -1, bestDestinationCol = -1;
-      for (int sourceRow = source.row;
-           sourceRow < source.row + sourceShape.rows; ++sourceRow)
-        for (int sourceCol = source.col;
-             sourceCol < source.col + sourceShape.cols; ++sourceCol)
-          for (int destinationRow = destination.row;
-               destinationRow < destination.row + destinationShape.rows;
-               ++destinationRow)
-            for (int destinationCol = destination.col;
-                 destinationCol < destination.col + destinationShape.cols;
-                 ++destinationCol) {
-              int64_t endpointReady = 0;
-              if (!communication.getTransferReadyCycle(
-                      predecessor, index, sourceRow, sourceCol,
-                      destinationRow, destinationCol, source.end, false,
-                      endpointReady, error)) {
-                communication.finishTrial(false);
-                return reject(error.empty() ? "communication transfer query failed"
-                                            : std::move(error));
-              }
-              if (endpointReady < source.end) {
-                communication.finishTrial(false);
-                return reject("communication model returns a cycle before producer finish");
-              }
-              if (endpointReady < bestReady) {
-                bestReady = endpointReady;
-                bestSourceRow = sourceRow;
-                bestSourceCol = sourceCol;
-                bestDestinationRow = destinationRow;
-                bestDestinationCol = destinationCol;
-              }
-            }
+      for (const FixedScheduleOccupiedCell &sourceCell :
+           cellInventory[predecessor]) {
+        for (const FixedScheduleOccupiedCell &destinationCell :
+             cellInventory[index]) {
+          const int sourceRow = sourceCell.first;
+          const int sourceCol = sourceCell.second;
+          const int destinationRow = destinationCell.first;
+          const int destinationCol = destinationCell.second;
+          int64_t endpointReady = 0;
+          if (!communication.getTransferReadyCycle(
+                  predecessor, index, sourceRow, sourceCol, destinationRow,
+                  destinationCol, source.end, false, endpointReady, error)) {
+            communication.finishTrial(false);
+            return reject(error.empty() ? "communication transfer query failed"
+                                        : std::move(error));
+          }
+          if (endpointReady < source.end) {
+            communication.finishTrial(false);
+            return reject(
+                "communication model returns a cycle before producer finish");
+          }
+          if (endpointReady < bestReady) {
+            bestReady = endpointReady;
+            bestSourceRow = sourceRow;
+            bestSourceCol = sourceCol;
+            bestDestinationRow = destinationRow;
+            bestDestinationCol = destinationCol;
+          }
+        }
+      }
       if (bestSourceRow < 0) {
         communication.finishTrial(false);
-        return reject("communication transfer has no rectangle endpoint");
+        return reject("communication transfer has no occupied-cell endpoint");
       }
       if (!communication.getTransferReadyCycle(
               predecessor, index, bestSourceRow, bestSourceCol,
               bestDestinationRow, bestDestinationCol, source.end, true,
               bestReady, error)) {
         communication.finishTrial(false);
-        return reject(error.empty() ? "communication transfer reservation failed"
-                                    : std::move(error));
+        return reject(error.empty()
+                          ? "communication transfer reservation failed"
+                          : std::move(error));
       }
       if (bestReady < source.end) {
         communication.finishTrial(false);

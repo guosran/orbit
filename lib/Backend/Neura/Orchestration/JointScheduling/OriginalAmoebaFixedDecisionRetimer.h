@@ -22,11 +22,11 @@ struct OriginalAmoebaOccupiedCell {
   unsigned replicaId = 0;
 };
 
-// Geometry read from one original TaskScheduler replica. `selectedRows` and
+// Geometry read from the original TaskScheduler trace. `selectedRows` and
 // `selectedCols` retain the throughput-guided profile orientation; `rows`,
-// `cols`, `row` and `col` describe the exact orientation and origin actually
-// placed by TaskScheduler. `occupiedCells` is the captured cell inventory as
-// (row, column) pairs and must exactly fill that rectangle.
+// `cols`, `row` and `col` describe replica 0's exact orientation and origin.
+// `occupiedCells` preserves every captured (row, column, replica ID) tuple in
+// source order; the retimer validates each replica's rectangle independently.
 struct OriginalAmoebaFixedPlacement {
   unsigned task = 0;
   int row = 0;
@@ -41,6 +41,9 @@ struct OriginalAmoebaFixedPlacement {
 
 struct OriginalAmoebaFixedDecisionResult {
   bool valid = false;
+  // True only when the caller explicitly selected the legacy F45 replica
+  // duration estimate. This records the estimate mode, not child measurements.
+  bool usesOriginalF45ReplicaScalingEstimate = false;
   std::string rejection;
   std::vector<ExactScheduleTask> tasks;
   std::vector<ExactSchedulePlacement> placements;
@@ -53,7 +56,9 @@ struct OriginalAmoebaFixedDecisionResult {
 
 // Re-time captured AMOEBA decisions without choosing a new shape, origin or
 // dispatch order. Durations are indexed by task and must be mapped latency
-// cycles. TaskScheduler's scaled internal timestamps are intentionally not an
+// cycles. With explicit F45 scaling, inputs are full-parent mapped cycles and
+// the helper applies ceil(duration / activeReplicas) once. Otherwise inputs
+// already describe each mapped task. Scaled internal timestamps are not an
 // input. `occupiedCells` and `activeReplicas` must come from the actual old
 // scheduler trace so unsupported replica layouts fail closed.
 bool retimeOriginalAmoebaFixedDecisions(
@@ -63,7 +68,8 @@ bool retimeOriginalAmoebaFixedDecisions(
     const std::vector<OriginalAmoebaFixedPlacement> &originalPlacements,
     const std::vector<unsigned> &originalDispatchOrder,
     FixedScheduleCommunication &communication,
-    OriginalAmoebaFixedDecisionResult &result);
+    OriginalAmoebaFixedDecisionResult &result,
+    bool allowOriginalF45ReplicaScaling = false);
 
 } // namespace mlir::amoeba::neura::joint_scheduling
 #endif // AMOEBA_ORIGINAL_AMOEBA_FIXED_DECISION_RETIMER_H

@@ -54,6 +54,7 @@ struct TaskShapeCost {
   bool modelDomainUnsupported = false;
   double analyticalLowerBound = 0.0;
   double modelIntervalMaxII = 0.0;
+  double runtimeIICeiling = kFormalMax4ModelCeilingII;
   std::string unsupportedReason;
 };
 
@@ -110,6 +111,8 @@ public:
   llvm::StringRef mapperSuccessProbabilityRole() const {
     return mapperSuccessProbabilityRole_;
   }
+  double runtimeIICeiling() const { return runtimeIICeiling_; }
+  bool hasDiagnosticOverride() const { return diagnosticOverride_; }
   uint64_t hits() const { return hits_; }
   uint64_t misses() const { return misses_; }
   uint64_t cachedPredictions() const { return predictionCache_.size(); }
@@ -128,6 +131,8 @@ private:
   bool candidateCountFitsInt64_ = false;
   uint64_t candidateCount_ = 0;
   std::string mapperSuccessProbabilityRole_;
+  double runtimeIICeiling_ = kFormalMax4ModelCeilingII;
+  bool diagnosticOverride_ = false;
   // Current-IR task IDs. This set is populated only after the catalogue's
   // source_task_ids have been checked against the IR.
   std::set<std::string> taskIds_;

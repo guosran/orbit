@@ -608,6 +608,7 @@ static bool computeMapperFeaturesForProtocol(
     llvm::ArrayRef<std::pair<int, int>> supportedShapes, double maxRows,
     double maxColumns, double maxTiles, double maxDirectedLinks,
     double maxBisectionLinks, double mapperIICeiling,
+    double lowerBoundSearchCeiling,
     std::array<double, Width> &features, std::string &error) {
   auto validShape = [&] {
     return std::find(supportedShapes.begin(), supportedShapes.end(),
@@ -627,7 +628,7 @@ static bool computeMapperFeaturesForProtocol(
     error = "lower_bound must equal max(rec_mii, res_mii)";
     return false;
   }
-  if (lowerBound < 0.0 || lowerBound > mapperIICeiling) {
+  if (lowerBound < 0.0 || lowerBound > lowerBoundSearchCeiling) {
     error = "lower_bound is outside the mapper search interval";
     return false;
   }
@@ -870,17 +871,29 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
                            std::string &error) {
   return computeMapperFeaturesForProtocol(
       graph, rows, columns, recMii, resMii, lowerBound, kMapperShapes, 16.0,
-      16.0, 256.0, 224.0, 16.0, 20.0, features.values, error);
+      16.0, 256.0, 224.0, 16.0, 20.0, 20.0, features.values, error);
 }
 
 bool computePerCgra2x2MapperFeatures(
     const RouteExpandedGraph &graph, int rows, int columns, double recMii,
     double resMii, double lowerBound, PerCgra2x2FeatureVector &features,
-    std::string &error) {
+    std::string &error, PerCgra2x2MapperFeatureInterval interval) {
+  double lowerBoundSearchCeiling = 20.0;
+  switch (interval) {
+  case PerCgra2x2MapperFeatureInterval::Training20:
+    break;
+  case PerCgra2x2MapperFeatureInterval::Diagnostic23:
+    lowerBoundSearchCeiling = 23.0;
+    break;
+  default:
+    error = "direct-model feature interval must be training II=20 or "
+            "diagnostic II=23";
+    return false;
+  }
   return computeMapperFeaturesForProtocol(
       graph, rows, columns, recMii, resMii, lowerBound,
       kPerCgra2x2MapperShapes, 8.0, 8.0, 16.0, 48.0, 8.0, 20.0,
-      features.values, error);
+      lowerBoundSearchCeiling, features.values, error);
 }
 
 } // namespace mapper_features

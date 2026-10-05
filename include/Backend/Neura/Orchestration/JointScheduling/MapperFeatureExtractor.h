@@ -38,6 +38,11 @@ struct PerCgra2x2FeatureVector {
   std::array<double, kPerCgra2x2FeatureWidth> values{};
 };
 
+enum class PerCgra2x2MapperFeatureInterval {
+  Training20,
+  Diagnostic23,
+};
+
 // The returned names are in the exact order consumed by the 156-input model.
 const std::array<std::string, kFeatureWidth> &mapperFeatureNames();
 
@@ -63,10 +68,14 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
                            double lowerBound, FeatureVector &features,
                            std::string &error);
 
+// Diagnostic23 widens only the accepted lower-bound interval. The MII
+// feature normalization remains at the model's training ceiling of 20.
 bool computePerCgra2x2MapperFeatures(
     const RouteExpandedGraph &graph, int rows, int columns, double recMii,
     double resMii, double lowerBound, PerCgra2x2FeatureVector &features,
-    std::string &error);
+    std::string &error,
+    PerCgra2x2MapperFeatureInterval interval =
+        PerCgra2x2MapperFeatureInterval::Training20);
 
 } // namespace mapper_features
 } // namespace orbit

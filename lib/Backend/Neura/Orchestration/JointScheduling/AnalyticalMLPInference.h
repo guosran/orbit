@@ -13,6 +13,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/JSON.h"
 
 #include <cstdint>
 #include <string>
@@ -45,6 +46,31 @@ inline constexpr llvm::StringLiteral kPerCgra2x2FeatureContractId =
     "cgra-ii-pre-mapper-features-148-2x2-per-cgra-v1";
 inline constexpr llvm::StringLiteral kPerCgra2x2ShapeProtocolId =
     "amoeba-static-rectangles-2x2-per-cgra-max4";
+inline constexpr double kPerCgra2x2TrainingIICeiling = 20.0;
+inline constexpr double kPerCgra2x2DiagnosticIICeiling = 23.0;
+inline constexpr llvm::StringLiteral kPerCgra2x2DiagnosticSchema =
+    "per-cgra-2x2-ii-extrapolation-v1";
+inline constexpr llvm::StringLiteral kPerCgra2x2DiagnosticOutputRule =
+    "min(lower_bound + softplus(logit), diagnostic_runtime_ii_ceiling)";
+
+// Validates the runtime contract against the training architecture.  The
+// diagnostic contract permits only an exact ctrl_mem_items: 20 -> 23 text
+// substitution; ordinary inference requires byte-for-byte architecture
+// identity.
+bool validatePerCgra2x2RuntimeContract(
+    double runtimeIICeiling, llvm::StringRef trainingArchitectureText,
+    llvm::StringRef runtimeArchitectureText, std::string &error);
+
+// Produces and validates the shared diagnostic metadata contract.  The
+// validator accepts the complete predictor_metadata object and binds its
+// embedded runtime YAML to the caller's current architecture bytes.
+bool makePerCgra2x2DiagnosticOverrideMetadata(
+    llvm::StringRef trainingArchitectureText,
+    llvm::StringRef runtimeArchitectureText,
+    llvm::json::Object &overrideMetadata, std::string &error);
+bool validatePerCgra2x2DiagnosticMetadata(
+    const llvm::json::Object &predictorMetadata,
+    llvm::StringRef currentRuntimeArchitectureText, std::string &error);
 
 struct MLPEnsemblePrediction {
   double predictedII = 0.0;
@@ -156,6 +182,9 @@ class PerCgra2x2DirectEnsemble {
 public:
   bool load(llvm::StringRef ensemblePath,
             llvm::StringRef expectedArchitectureText, std::string &error);
+  bool load(llvm::StringRef ensemblePath,
+            llvm::StringRef runtimeArchitectureText, double runtimeIICeiling,
+            std::string &error);
 
   bool predict(llvm::ArrayRef<double> features, double recMii,
                double resMii, double lowerBound,
@@ -167,6 +196,17 @@ public:
   llvm::StringRef getFeatureContractId() const { return featureContractId; }
   llvm::StringRef getShapeProtocolId() const { return shapeProtocolId; }
   llvm::StringRef getArchitectureText() const { return architectureText; }
+  llvm::StringRef getTrainingArchitectureText() const {
+    return architectureText;
+  }
+  llvm::StringRef getRuntimeArchitectureText() const {
+    return runtimeArchitectureText;
+  }
+  double getTrainingIICeiling() const { return mapperIICeiling; }
+  double getRuntimeIICeiling() const { return runtimeIICeiling; }
+  bool hasDiagnosticOverride() const {
+    return runtimeIICeiling > mapperIICeiling;
+  }
   bool isLoaded() const { return loaded; }
 
 private:
@@ -186,11 +226,13 @@ private:
   std::string featureContractId;
   std::string shapeProtocolId;
   std::string architectureText;
+  std::string runtimeArchitectureText;
   std::vector<std::string> featureNames;
   std::vector<std::string> selectedFeatureNames;
   std::vector<unsigned> selectedFeatureIndices;
   std::vector<Member> members;
   float mapperIICeiling = 0.0F;
+  float runtimeIICeiling = 0.0F;
   bool loaded = false;
 };
 

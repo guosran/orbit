@@ -9,13 +9,17 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskGraphRewriteLegality.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraTypes.h"
 
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -34,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -83,6 +88,25 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
       return integer.getInt();
   if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
     return compileTimeIndex(cast.getIn(), task, kernel);
+  if (auto apply = value.getDefiningOp<affine::AffineApplyOp>()) {
+    SmallVector<Attribute> constants;
+    constants.reserve(apply->getNumOperands());
+    for (Value operand : apply->getOperands()) {
+      auto constant = compileTimeIndex(operand, task, kernel);
+      if (!constant)
+        return std::nullopt;
+      constants.push_back(IntegerAttr::get(IndexType::get(value.getContext()),
+                                           *constant));
+    }
+    SmallVector<Attribute> folded;
+    if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
+        folded.size() != 1)
+      return std::nullopt;
+    auto integer = dyn_cast<IntegerAttr>(folded.front());
+    if (!integer || !integer.getValue().isSignedIntN(64))
+      return std::nullopt;
+    return integer.getValue().getSExtValue();
+  }
 
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     if (kernel && argument.getOwner() == &kernel.getBody().front()) {
@@ -101,6 +125,10 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
         return std::nullopt;
       return compileTimeIndex(task.getValueInputs()[index], task);
     }
+    if (auto function = dyn_cast_or_null<func::FuncOp>(
+            argument.getOwner()->getParentOp()))
+      return mlir::amoeba::neura::joint_scheduling::detail::
+          input0StaticIndexBound(function, argument);
   }
   return std::nullopt;
 }
@@ -179,6 +207,282 @@ static Value stripMemrefCasts(Value value);
 // a no-op by the pass driver below.
 static bool isSupportedReplicaCount(int64_t count) {
   return count == 1 || count == 2 || count == 4 || count == 8;
+}
+
+struct ActiveTransferRewriteSnapshot {
+  unsigned argument = 0;
+  Attribute logicalShape;
+  Attribute capacityShape;
+  Attribute activeShape;
+  Attribute noAlias;
+};
+
+static LogicalResult captureActiveTransferRewriteFacts(
+    func::FuncOp function,
+    SmallVectorImpl<ActiveTransferRewriteSnapshot> &facts,
+    SmallVectorImpl<std::pair<std::string, Attribute>> &callerFacts) {
+  for (NamedAttribute attribute : function->getAttrs()) {
+    StringRef name = attribute.getName().strref();
+    if (name.starts_with("amoeba.input0_caller_") ||
+        name.starts_with("amoeba.static_bound.arg."))
+      callerFacts.emplace_back(name.str(), attribute.getValue());
+  }
+  for (unsigned argument = 0; argument < function.getNumArguments();
+       ++argument) {
+    if (!hasStaticActiveTransferShapeFacts(function, argument))
+      continue;
+    std::string error;
+    if (failed(
+            verifyStaticActiveTransferShapeProof(function, argument, &error))) {
+      function.emitError() << "cannot enter source replica rewrite with an "
+                              "invalid active-transfer proof on argument "
+                           << argument << ": " << error;
+      return failure();
+    }
+    StaticActiveTransferShapeProof proof =
+        analyzeStaticActiveTransferShape(function, argument);
+    if (llvm::any_of(proof.accesses, [](const ActiveTransferAccessRecord &access) {
+          return !access.proven;
+        })) {
+      function.emitError()
+          << "cannot enter source replica rewrite with an unproved memory "
+             "access on argument "
+          << argument;
+      return failure();
+    }
+    facts.push_back(
+        {argument,
+         function.getArgAttr(argument, "amoeba.logical_transfer_shape"),
+         function.getArgAttr(argument, "amoeba.active_transfer_capacity_shape"),
+         function.getArgAttr(argument, "amoeba.active_transfer_shape"),
+         function.getArgAttr(argument, "amoeba.noalias")});
+  }
+  return success();
+}
+
+static LogicalResult refreshActiveTransferProofsAfterSourceRewrite(
+    func::FuncOp function, ArrayRef<ActiveTransferRewriteSnapshot> facts,
+    ArrayRef<std::pair<std::string, Attribute>> callerFacts) {
+  for (const ActiveTransferRewriteSnapshot &fact : facts) {
+    std::string error;
+    if (failed(rederiveAndStoreStaticActiveTransferShapeProof(
+            function, fact.argument, &error))) {
+      function.emitError() << "trusted source rewrite could not re-prove "
+                              "active-transfer facts for argument "
+                           << fact.argument << ": " << error;
+      return failure();
+    }
+    StaticActiveTransferShapeProof proof =
+        analyzeStaticActiveTransferShape(function, fact.argument);
+    if (llvm::any_of(proof.accesses, [](const ActiveTransferAccessRecord &access) {
+          return !access.proven;
+        })) {
+      function.emitError()
+          << "trusted source rewrite left an unproved memory access on "
+             "argument "
+          << fact.argument;
+      return failure();
+    }
+    if (function.getArgAttr(fact.argument, "amoeba.logical_transfer_shape") !=
+            fact.logicalShape ||
+        function.getArgAttr(fact.argument,
+                            "amoeba.active_transfer_capacity_shape") !=
+            fact.capacityShape ||
+        function.getArgAttr(fact.argument, "amoeba.active_transfer_shape") !=
+            fact.activeShape ||
+        function.getArgAttr(fact.argument, "amoeba.noalias") != fact.noAlias) {
+      function.emitError()
+          << "source replica rewrite changed caller capacity, active access "
+             "shape, logical footprint, or no-alias root for argument "
+          << fact.argument;
+      return failure();
+    }
+    if (failed(verifyStaticActiveTransferShapeProof(function, fact.argument,
+                                                    &error))) {
+      function.emitError() << "refreshed active-transfer proof is not "
+                              "self-consistent for argument "
+                           << fact.argument << ": " << error;
+      return failure();
+    }
+  }
+  SmallVector<std::pair<std::string, Attribute>> refreshedCallerFacts;
+  for (NamedAttribute attribute : function->getAttrs()) {
+    StringRef name = attribute.getName().strref();
+    if (name.starts_with("amoeba.input0_caller_") ||
+        name.starts_with("amoeba.static_bound.arg."))
+      refreshedCallerFacts.emplace_back(name.str(), attribute.getValue());
+  }
+  llvm::sort(refreshedCallerFacts, [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+  SmallVector<std::pair<std::string, Attribute>> sortedCallerFacts(
+      callerFacts.begin(), callerFacts.end());
+  llvm::sort(sortedCallerFacts, [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+  if (!llvm::equal(refreshedCallerFacts, sortedCallerFacts)) {
+    function.emitError(
+        "source replica rewrite changed caller-bound static evidence");
+    return failure();
+  }
+  return success();
+}
+
+static constexpr StringLiteral kOriginalAmoebaDecisionModeAttr =
+    "amoeba.original_amoeba.fixed_decision_materialization";
+static constexpr StringLiteral kOriginalAmoebaReplicaDecisionAttr =
+    "amoeba.original_amoeba.replica_decision";
+static constexpr StringLiteral kOriginalAmoebaReplicaPlacementsAttr =
+    "amoeba.original_amoeba.replica_placements";
+static constexpr StringLiteral kOriginalAmoebaPartitionRealizationAttr =
+    "amoeba.original_amoeba.source_partition_realization";
+static constexpr StringLiteral kOriginalAmoebaFixedDecisionFlag =
+    "original-amoeba-fixed-decision";
+
+static bool isOriginalAmoebaFixedDecisionTask(func::FuncOp function,
+                                              TaskflowTaskOp task) {
+  if (!function || !task)
+    return false;
+  StringRef symbol = function.getSymName();
+  StringRef name = task.getTaskName();
+  // Keep the baseline scope guard at the stable Itanium symbol prefix. Exact
+  // f45 schedule records and all source/no-alias/partition proofs remain the
+  // authority for whether an individual task can be materialized.
+  return (symbol.starts_with("_Z8gcn_funci") &&
+          (name == "Task_16" || name == "Task_17")) ||
+         (symbol.starts_with("_Z11harris_funci") &&
+          (name == "Task_19" || name == "Task_21")) ||
+         (symbol.starts_with("_Z7lu_funci") && name == "Task_6");
+}
+
+static bool isOriginalAmoebaFixedDecisionMode(TaskflowTaskOp task) {
+  auto mode = task ? task->getAttrOfType<BoolAttr>(
+                         kOriginalAmoebaDecisionModeAttr)
+                   : BoolAttr();
+  return mode && mode.getValue();
+}
+
+static bool supportsTaskReplicaCount(TaskflowTaskOp task, int64_t count) {
+  return isSupportedReplicaCount(count) ||
+         (isOriginalAmoebaFixedDecisionMode(task) && count == 3);
+}
+
+static std::optional<int64_t> integerField(DictionaryAttr dictionary,
+                                           StringRef name) {
+  auto value = dictionary ? dictionary.getAs<IntegerAttr>(name) : IntegerAttr();
+  if (!value)
+    return std::nullopt;
+  return value.getInt();
+}
+
+static std::optional<StringRef> stringField(DictionaryAttr dictionary,
+                                            StringRef name) {
+  auto value = dictionary ? dictionary.getAs<StringAttr>(name) : StringAttr();
+  if (!value)
+    return std::nullopt;
+  return value.getValue();
+}
+
+static std::optional<std::pair<int64_t, int64_t>> parseCgraShape(
+    StringRef shape) {
+  auto parts = shape.split('x');
+  int64_t rows = 0;
+  int64_t cols = 0;
+  if (parts.first.empty() || parts.second.empty() || parts.second.contains('x') ||
+      parts.first.getAsInteger(10, rows) ||
+      parts.second.getAsInteger(10, cols) || rows < 1 || cols < 1 ||
+      rows > 4 || cols > 4 || rows * cols > 4)
+    return std::nullopt;
+  return std::make_pair(rows, cols);
+}
+
+// Read a fixed active-replica decision only from the original TaskScheduler
+// record.  The profile's composed shape remains a separate field: each replica
+// gets the exact placed orientation recorded in replica_shapes.
+static LogicalResult readOriginalAmoebaReplicaDecision(
+    TaskflowTaskOp task, int64_t &replicaCount,
+    SmallVectorImpl<DictionaryAttr> &replicaShapes) {
+  auto fail = [&](StringRef reason) {
+    task.emitError() << "original AMOEBA fixed-decision materialization: "
+                     << reason;
+    return failure();
+  };
+  auto active = task->getAttrOfType<IntegerAttr>("active_replicas");
+  auto info = task->getAttrOfType<DictionaryAttr>(
+      "amoeba.task_scheduler_schedule_info");
+  auto infoActive = integerField(info, "active_replicas");
+  auto infoTask = stringField(info, "task_name");
+  auto shapes = info ? info.getAs<ArrayAttr>("replica_shapes") : ArrayAttr();
+  auto placements = info ? info.getAs<ArrayAttr>("placements") : ArrayAttr();
+  if (!active || !info || !infoActive || !infoTask || !shapes || !placements ||
+      *infoActive != active.getInt() || *infoTask != task.getTaskName() ||
+      active.getInt() < 2 || active.getInt() > 4 ||
+      shapes.size() != static_cast<size_t>(active.getInt()) || placements.empty())
+    return fail("trace does not bind a valid 2-4 replica inventory");
+
+  auto composed = task->getAttrOfType<StringAttr>("composed_cgra_shape");
+  auto composedCount = task->getAttrOfType<IntegerAttr>("composed_cgra_count");
+  auto parsedComposed = composed ? parseCgraShape(composed.getValue())
+                                 : std::nullopt;
+  if (!composed || !composedCount || !parsedComposed ||
+      composedCount.getInt() != parsedComposed->first * parsedComposed->second)
+    return fail("selected composed shape/count is invalid");
+
+  SmallVector<DictionaryAttr> byId(active.getInt());
+  std::vector<unsigned> cellCounts(active.getInt(), 0);
+  std::set<std::pair<int64_t, int64_t>> uniqueCells;
+  for (Attribute attribute : shapes) {
+    auto shape = dyn_cast<DictionaryAttr>(attribute);
+    auto id = integerField(shape, "replica_id");
+    auto count = integerField(shape, "cgra_count");
+    auto row = integerField(shape, "row");
+    auto col = integerField(shape, "col");
+    auto rows = integerField(shape, "placement_rows");
+    auto cols = integerField(shape, "placement_cols");
+    auto shapeText = stringField(shape, "shape");
+    auto parsed = shapeText ? parseCgraShape(*shapeText) : std::nullopt;
+    if (!shape || !id || !count || !row || !col || !rows || !cols ||
+        !shapeText || !parsed || *id < 0 || *id >= active.getInt() ||
+        byId[*id] || *count != *rows * *cols || *rows != parsed->first ||
+        *cols != parsed->second || *count != composedCount.getInt() ||
+        ((*rows != parsedComposed->first || *cols != parsedComposed->second) &&
+         (*rows != parsedComposed->second || *cols != parsedComposed->first)) ||
+        *row < 0 || *col < 0 || *row + *rows > 4 || *col + *cols > 4)
+      return fail("replica shape disagrees with the selected area or placement");
+    byId[*id] = shape;
+  }
+  for (Attribute attribute : placements) {
+    auto cell = dyn_cast<DictionaryAttr>(attribute);
+    auto id = integerField(cell, "replica_id");
+    auto row = integerField(cell, "row");
+    auto col = integerField(cell, "col");
+    auto context = integerField(cell, "context_id");
+    auto start = integerField(cell, "scheduler_start_time");
+    auto end = integerField(cell, "scheduler_end_time");
+    auto duration = integerField(cell, "scheduler_duration");
+    if (!cell || !id || !row || !col || !context || !start || !end ||
+        !duration || *id < 0 || *id >= active.getInt() || *row < 0 ||
+        *row >= 4 || *col < 0 || *col >= 4 || *context < 0 || *start < 0 ||
+        *end <= *start || *duration != *end - *start ||
+        !uniqueCells.emplace(*row, *col).second || !byId[*id])
+      return fail("placement cell lacks a valid original replica binding");
+    auto baseRow = integerField(byId[*id], "row");
+    auto baseCol = integerField(byId[*id], "col");
+    auto rows = integerField(byId[*id], "placement_rows");
+    auto cols = integerField(byId[*id], "placement_cols");
+    if (!baseRow || !baseCol || !rows || !cols || *row < *baseRow ||
+        *row >= *baseRow + *rows || *col < *baseCol || *col >= *baseCol + *cols)
+      return fail("placed cell lies outside its recorded replica rectangle");
+    ++cellCounts[*id];
+  }
+  for (int64_t id = 0; id < active.getInt(); ++id) {
+    auto count = integerField(byId[id], "cgra_count");
+    if (!count || cellCounts[id] != static_cast<unsigned>(*count))
+      return fail("replica placement does not cover its recorded CGRA shape");
+    replicaShapes.push_back(byId[id]);
+  }
+  replicaCount = active.getInt();
+  return success();
 }
 
 // A completion-only join forwards each state producer to every consumer of
@@ -3808,6 +4112,149 @@ static bool authenticateFoldedOutputAddress(
       rank, visited, indexedUses);
 }
 
+// Accept only the counter-zero guard used to initialize independent source
+// cells.  The conditional itself is not treated as effect-free: its regions
+// remain in the kernel walk below, where every memory operation is checked
+// against the authenticated root and coordinate map and every unknown effect
+// remains rejected.
+static bool
+isVerifiedReplicaCounterZeroIf(scf::IfOp ifOp, ReplicaNeuraInPlacePlan &plan,
+                               unsigned selectedCounter,
+                               StringRef *rejectionReason = nullptr) {
+  auto reject = [&](StringRef reason) {
+    if (rejectionReason)
+      *rejectionReason = reason;
+    return false;
+  };
+  if (!ifOp)
+    return reject("operation is not scf.if");
+  if (ifOp.getNumResults() != 0)
+    return reject("scf.if has results");
+  if (!ifOp.getCondition().getType().isInteger(1))
+    return reject("scf.if condition is not i1");
+  if (selectedCounter >= plan.kernelCounters.size())
+    return reject("selected output axis has no authenticated kernel counter");
+  auto condition = ifOp.getCondition().getDefiningOp<arith::CmpIOp>();
+  if (!condition)
+    return reject("scf.if condition is not arith.cmpi");
+  if (condition.getPredicate() != arith::CmpIPredicate::eq)
+    return reject("scf.if comparison predicate is not equal");
+
+  auto exactCounterThroughRepresentableCast =
+      [&](auto &&self, Value value, unsigned depth) -> std::optional<unsigned> {
+    if (depth > 8)
+      return std::nullopt;
+    if (auto direct = replicaCounterIndex(value, plan.kernelCounters))
+      return direct;
+    Operation *definition = value.getDefiningOp();
+    if (!definition || definition->getNumOperands() != 1 ||
+        definition->getNumResults() != 1 ||
+        (!isa<arith::IndexCastOp, arith::IndexCastUIOp>(definition)))
+      return std::nullopt;
+    auto counter = self(self, definition->getOperand(0), depth + 1);
+    if (!counter || *counter >= plan.kernelLowers.size() ||
+        *counter >= plan.kernelUppers.size() ||
+        plan.kernelLowers[*counter] < 0 ||
+        plan.kernelUppers[*counter] <= plan.kernelLowers[*counter])
+      return std::nullopt;
+    auto destination =
+        dyn_cast<IntegerType>(definition->getResult(0).getType());
+    if (!destination)
+      return definition->getResult(0).getType().isIndex() ? counter
+                                                          : std::nullopt;
+    unsigned width = destination.getWidth();
+    if (width == 0 || width > 64)
+      return std::nullopt;
+    bool unsignedCast = isa<arith::IndexCastUIOp>(definition);
+    uint64_t maxValue = 0;
+    if (unsignedCast) {
+      maxValue = width == 64 ? std::numeric_limits<uint64_t>::max()
+                             : (uint64_t{1} << width) - 1;
+    } else {
+      maxValue =
+          width == 64
+              ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+              : (uint64_t{1} << (width - 1)) - 1;
+    }
+    if (static_cast<uint64_t>(plan.kernelUppers[*counter] - 1) > maxValue)
+      return std::nullopt;
+    return counter;
+  };
+  auto lhsCounter = exactCounterThroughRepresentableCast(
+      exactCounterThroughRepresentableCast, condition.getLhs(), 0);
+  auto rhsCounter = exactCounterThroughRepresentableCast(
+      exactCounterThroughRepresentableCast, condition.getRhs(), 0);
+  auto lhsConstant = mlir::amoeba::neura::joint_scheduling::detail::staticIndex(
+      condition.getLhs(), plan.task, plan.kernel);
+  auto rhsConstant = mlir::amoeba::neura::joint_scheduling::detail::staticIndex(
+      condition.getRhs(), plan.task, plan.kernel);
+  std::optional<unsigned> guardCounter;
+  if (lhsCounter && rhsConstant && *rhsConstant == 0 && !rhsCounter)
+    guardCounter = lhsCounter;
+  else if (rhsCounter && lhsConstant && *lhsConstant == 0 && !lhsCounter)
+    guardCounter = rhsCounter;
+  if (!guardCounter)
+    return reject("scf.if equality does not compare one representable kernel "
+                  "counter with literal zero");
+  if (*guardCounter == selectedCounter)
+    return reject("zero-initialization guard uses the selected shard counter");
+  if (*guardCounter >= plan.kernelLowers.size() ||
+      *guardCounter >= plan.kernelUppers.size())
+    return reject("zero-initialization guard counter has no proved bounds");
+  if (plan.kernelLowers[*guardCounter] != 0)
+    return reject("zero-initialization guard counter does not start at zero");
+  if (plan.kernelUppers[*guardCounter] <= 0)
+    return reject("zero-initialization guard counter has an empty range");
+
+  auto validateYieldRegion = [](Region &region, bool allowEmpty, StringRef arm,
+                                StringRef &reason) {
+    if (region.empty()) {
+      if (allowEmpty)
+        return true;
+      reason = "then initialization region is empty";
+      return false;
+    }
+    if (!llvm::hasSingleElement(region)) {
+      reason = arm == "then" ? "then initialization region has multiple blocks"
+                             : "else region has multiple blocks";
+      return false;
+    }
+    Block &block = region.front();
+    if (block.getNumArguments() != 0) {
+      reason = arm == "then" ? "then initialization region has block arguments"
+                             : "else region has block arguments";
+      return false;
+    }
+    auto yield = dyn_cast<scf::YieldOp>(block.getTerminator());
+    if (!yield || yield.getNumOperands() != 0) {
+      reason = arm == "then" ? "then initialization region lacks an empty yield"
+                             : "else region lacks an empty yield";
+      return false;
+    }
+    if (allowEmpty && block.getOperations().size() != 1) {
+      reason = "else region is not empty";
+      return false;
+    }
+    if (!allowEmpty && block.getOperations().size() <= 1) {
+      reason = "then initialization region has no initialization operation";
+      return false;
+    }
+    return true;
+  };
+  // The initialization arm may contain memory operations.  They are not
+  // trusted by this structural check: the enclosing kernel walk below still
+  // proves every nested load/store against the selected output root and exact
+  // counter-coordinate map, and rejects every other effect.
+  StringRef regionRejection;
+  if (!validateYieldRegion(ifOp.getThenRegion(), /*allowEmpty=*/false, "then",
+                           regionRejection))
+    return reject(regionRejection);
+  if (!validateYieldRegion(ifOp.getElseRegion(), /*allowEmpty=*/true, "else",
+                           regionRejection))
+    return reject(regionRejection);
+  return true;
+}
+
 static LogicalResult
 proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
                                Value output) {
@@ -4027,11 +4474,36 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
             plan.task, "in-place Neura replica rejects an unknown output alias");
         return;
       }
-    if (!replicaKnownPureNeuraOp(operation) &&
-        (!isPure(operation) || !isMemoryEffectFree(operation)))
-      result = rejectReplicaNeura(
-          plan.task, "in-place Neura replica contains an unclassified kernel "
-                     "operation");
+    auto conditional = dyn_cast<scf::IfOp>(operation);
+    unsigned selectedCounter =
+        plan.axis >= 0 &&
+                plan.axis < static_cast<int64_t>(plan.outputCounterAxes.size())
+            ? plan.outputCounterAxes[plan.axis]
+            : std::numeric_limits<unsigned>::max();
+    StringRef guardRejection;
+    bool verifiedInitializationGuard = false;
+    if (conditional) {
+      if (selectedCounter == ReplicaOutputCoordinateProof::kConstantAxis) {
+        guardRejection =
+            "selected output axis has no authenticated kernel counter";
+      } else {
+        verifiedInitializationGuard = isVerifiedReplicaCounterZeroIf(
+            conditional, plan, selectedCounter, &guardRejection);
+      }
+    }
+    if (!replicaKnownPureNeuraOp(operation) && !verifiedInitializationGuard &&
+        (!isPure(operation) || !isMemoryEffectFree(operation))) {
+      std::string reason =
+          "in-place Neura replica contains unclassified kernel operation " +
+          operation->getName().getStringRef().str();
+      if (conditional) {
+        reason += "; zero-initialization guard rejected: ";
+        reason += guardRejection.empty()
+                      ? "guard did not satisfy the counter-zero proof"
+                      : guardRejection.str();
+      }
+      result = rejectReplicaNeura(plan.task, reason);
+    }
   });
   if (failed(result))
     return failure();
@@ -4385,7 +4857,7 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
     return rejectReplicaNeura(
         task, "in-place Neura replica has no matched input state for its "
               "output storage root");
-  if (axis < 0 || factor < 2 || !isSupportedReplicaCount(factor))
+  if (axis < 0 || factor < 2 || !supportsTaskReplicaCount(task, factor))
     return rejectReplicaNeura(
         task, "in-place Neura replica requires a supported factor and axis");
 
@@ -4420,6 +4892,15 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
                                   "in-place Neura replica requires one kernel");
       plan.kernel = kernel;
       continue;
+    }
+    if (isa<affine::AffineApplyOp, arith::AddIOp, arith::SubIOp>(&operation)) {
+      if (operation.getNumResults() == 1 &&
+          operation.getResult(0).getType().isIndex() &&
+          compileTimeIndex(operation.getResult(0), task))
+        continue;
+      return rejectReplicaNeura(
+          task, "in-place Neura replica has an unresolved task-level index "
+                "expression");
     }
     if (!isa<arith::ConstantOp, arith::ConstantIndexOp, TaskflowYieldOp>(
             &operation))
@@ -4463,11 +4944,11 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
             ? static_cast<bool>(counter.getParentIndex())
             : counter.getParentIndex() !=
                   plan.taskCounters[index - 1].getCounterIndex();
-    if (!lower || !upper || !step || *lower != 0 || *upper <= *lower ||
+    if (!lower || !upper || !step || *lower < 0 || *upper <= *lower ||
         *step != 1 || parentMismatch)
       return rejectReplicaNeura(
           task, "in-place Neura replica Taskflow counter domains are not "
-                "static unit-step ranges");
+                "nonnegative static unit-step ranges");
     plan.taskLowers.push_back(*lower);
     plan.taskUppers.push_back(*upper);
   }
@@ -4509,6 +4990,8 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
     plan.kernelLowers.push_back(*lower);
     plan.kernelUppers.push_back(*upper);
   }
+  plan.outputCounterAxes = sourceOutputProof.outputCounterAxes;
+  plan.outputConstantAxes = sourceOutputProof.outputConstantAxes;
   if (failed(proveReplicaNeuraInPlaceRegion(
           plan, task.getWillWrites().front())))
     return failure();
@@ -4576,6 +5059,11 @@ static LogicalResult
 materializeReplicaNeuraInPlace(func::FuncOp function,
                                ReplicaNeuraInPlacePlan &plan) {
   TaskflowTaskOp source = plan.task;
+  SmallVector<ActiveTransferRewriteSnapshot> activeTransferFacts;
+  SmallVector<std::pair<std::string, Attribute>> callerFacts;
+  if (failed(captureActiveTransferRewriteFacts(function, activeTransferFacts,
+                                               callerFacts)))
+    return failure();
   std::string sourceName = source.getTaskName().str();
   // Capture every downstream Taskflow consumer before replacing the source
   // done-write.  The completion join is a typed dependency, so its incoming
@@ -4602,8 +5090,8 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
     Value sourceReadDone = source.getDoneReads().front();
     for (OpOperand &use : sourceReadDone.getUses()) {
       auto consumer = dyn_cast<TaskflowTaskOp>(use.getOwner());
-      if (!consumer || !llvm::is_contained(consumer.getWillWrites(),
-                                           sourceReadDone) ||
+      if (!consumer ||
+          !llvm::is_contained(consumer.getWillWrites(), sourceReadDone) ||
           llvm::count(consumer.getWillWrites(), sourceReadDone) != 1)
         return rejectReplicaNeura(
             source, "in-place Neura done-read must feed a unique downstream "
@@ -4613,8 +5101,7 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
     }
   }
   for (int64_t part = 0; part < plan.factor; ++part) {
-    std::string name =
-        (Twine(sourceName) + ".replica." + Twine(part)).str();
+    std::string name = (Twine(sourceName) + ".replica." + Twine(part)).str();
     bool collision = false;
     function.walk([&](TaskflowTaskOp task) {
       collision |= task != source && task.getTaskName() == name;
@@ -4623,12 +5110,14 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
       return rejectReplicaNeura(
           source, "in-place Neura replica name collides with an existing task");
   }
-  auto originalType = dyn_cast<MemRefType>(source.getWillWrites().front().getType());
+  auto originalType =
+      dyn_cast<MemRefType>(source.getWillWrites().front().getType());
   if (!originalType)
-    return rejectReplicaNeura(source, "in-place Neura replica output is not a memref");
-  auto staticType = MemRefType::get(
-      plan.outputShape, originalType.getElementType(), originalType.getLayout(),
-      originalType.getMemorySpace());
+    return rejectReplicaNeura(source,
+                              "in-place Neura replica output is not a memref");
+  auto staticType =
+      MemRefType::get(plan.outputShape, originalType.getElementType(),
+                      originalType.getLayout(), originalType.getMemorySpace());
   OpBuilder builder(source);
   Value outputStorage = builder.create<memref::CastOp>(
       source.getLoc(), staticType, source.getWillWrites().front());
@@ -4648,9 +5137,9 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
   SmallVector<TaskflowTaskOp> replicaTasks;
   for (int64_t part = 0; part < plan.factor; ++part) {
     int64_t width = base + (part < remainder ? 1 : 0);
-    FailureOr<TaskflowTaskOp> replica = createReplicaNeuraPart(
-        builder, plan, part, cursor, cursor + width,
-        source.getWillWrites().front());
+    FailureOr<TaskflowTaskOp> replica =
+        createReplicaNeuraPart(builder, plan, part, cursor, cursor + width,
+                               source.getWillWrites().front());
     if (failed(replica))
       return failure();
     replicaTasks.push_back(*replica);
@@ -4668,8 +5157,8 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
     return failure();
   SmallVector<int64_t> regionUpper(regionLower);
   for (auto [dimension, extent] : llvm::enumerate(plan.producedShape)) {
-    if (extent <= 0 || regionLower[dimension] >
-                           std::numeric_limits<int64_t>::max() - extent)
+    if (extent <= 0 ||
+        regionLower[dimension] > std::numeric_limits<int64_t>::max() - extent)
       return failure();
     regionUpper[dimension] = regionLower[dimension] + extent;
   }
@@ -4680,6 +5169,7 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
       builder.getDenseI64ArrayAttr(regionUpper));
   join->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
   join->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
+  Value readReplacement;
   if (source.getDoneReads().size() == 1) {
     FailureOr<unsigned> readInputIndex = getReadInputIndexForResult(source, 0);
     if (failed(readInputIndex) || replicaTasks.size() != states.size())
@@ -4688,11 +5178,11 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
     SmallVector<Value> readStates;
     readStates.reserve(replicaTasks.size());
     Value baseReadState = replicaTasks.front().getWillReads()[*readInputIndex];
-    Value originalReadRoot =
-        source.getOriginalReadMemrefs()[*readInputIndex];
+    Value originalReadRoot = source.getOriginalReadMemrefs()[*readInputIndex];
     for (TaskflowTaskOp replica : replicaTasks) {
       if (replica.getWillReads()[*readInputIndex] != baseReadState ||
-          replica.getOriginalReadMemrefs()[*readInputIndex] != originalReadRoot ||
+          replica.getOriginalReadMemrefs()[*readInputIndex] !=
+              originalReadRoot ||
           replica.getDoneReads().size() != 1)
         return rejectReplicaNeura(
             source, "in-place Neura replica read versions or roots diverged");
@@ -4703,21 +5193,13 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
         baseReadState, originalReadRoot, join.getJoined());
     readJoin->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
     readJoin->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
-    Value readReplacement = readJoin.getJoined();
+    readReplacement = readJoin.getJoined();
     source.getDoneReads().front().replaceAllUsesWith(readReplacement);
-    for (TaskflowTaskOp consumer : readConsumers)
-      if (failed(makeReadCompletionConsumerEdges(
-              consumer, readReplacement, sourceName, builder)))
-        return failure();
   }
   Value replacement = builder.create<memref::CastOp>(
       source.getLoc(), source.getDoneWrites().front().getType(),
       join.getJoined());
   source.getDoneWrites().front().replaceAllUsesWith(replacement);
-  for (TaskflowTaskOp consumer : consumers)
-    if (failed(makeConsumerTensorWideForReplicas(
-            consumer, replacement, sourceName, builder, plan.factor, true)))
-      return failure();
   source.erase();
   function->setAttr("amoeba.replica.materialized_task",
                     builder.getStringAttr(sourceName));
@@ -4727,8 +5209,27 @@ materializeReplicaNeuraInPlace(func::FuncOp function,
                     builder.getI64IntegerAttr(plan.axis));
   function->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(plan.totalTripCount));
-  function->setAttr("amoeba.replica.shard_trip_count",
-                    builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
+  function->setAttr(
+      "amoeba.replica.shard_trip_count",
+      builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
+  // The function-wide active-transfer record binds all observed accesses, so
+  // cloning a task makes only that detailed access witness stale. Re-derive
+  // the complete proof after the graph reaches its final task/join/SSA shape,
+  // while requiring every source caller fact and both transfer boxes to stay
+  // bit-for-bit fixed. The subsequent TaskEdgeGraph checks then consume the
+  // refreshed, source-equivalent record rather than a stale proof.
+  if (failed(refreshActiveTransferProofsAfterSourceRewrite(
+          function, activeTransferFacts, callerFacts)))
+    return failure();
+  if (readReplacement)
+    for (TaskflowTaskOp consumer : readConsumers)
+      if (failed(makeReadCompletionConsumerEdges(consumer, readReplacement,
+                                                 sourceName, builder)))
+        return failure();
+  for (TaskflowTaskOp consumer : consumers)
+    if (failed(makeConsumerTensorWideForReplicas(
+            consumer, replacement, sourceName, builder, plan.factor, true)))
+      return failure();
   return success();
 }
 
@@ -5173,10 +5674,23 @@ static LogicalResult convertNeuraTilesToReplicas(
   // Keep the child tile shells structurally comparable with their canonical
   // dynamic-output task.  The completion join continues to consume static
   // cast states, so its half-open region and coverage proof remain unchanged.
-  for (TaskflowTaskOp tile : tiles)
+  for (TaskflowTaskOp tile : tiles) {
     if (failed(restoreDynamicReplicaOutputShell(tile, completionJoin,
                                                 diagnostic)))
       return failure();
+    // The source tiler can leave an identity memref.cast on an output base.
+    // Fold only casts whose source/result types are identical; the shared
+    // output proof then authenticates the same base input and every index.
+    SmallVector<memref::CastOp> identityCasts;
+    tile.walk([&](memref::CastOp cast) {
+      if (cast.getSource().getType() == cast.getType())
+        identityCasts.push_back(cast);
+    });
+    for (memref::CastOp cast : identityCasts) {
+      cast.getResult().replaceAllUsesWith(cast.getSource());
+      cast.erase();
+    }
+  }
 
   OpBuilder builder(function.getContext());
   SmallVector<int64_t> childTripCounts;
@@ -5242,7 +5756,12 @@ static LogicalResult convertNeuraTilesToReplicas(
                   builder.getStringAttr(sourceName));
     tile->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(id));
     tile->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(factor));
-    tile->setAttr("amoeba.replica.shard_axis",
+    tile->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(axis));
+    // For this legacy tiler, the selected tile axis is both the source
+    // counter ordinal and output dimension.  Record both meanings explicitly
+    // so source-partition validation never has to infer them from task names
+    // or scheduler metadata.
+    tile->setAttr("amoeba.replica.output_shard_axis",
                   builder.getI64IntegerAttr(axis));
     // The source tiler metadata was removed above, so recover the selected
     // counter interval directly from the cloned body.  This is the same
@@ -5356,6 +5875,488 @@ static LogicalResult materializeGenericNeuraReplica(
   if (failed(verify(originalModule.getOperation()))) {
     originalModule.emitError(
         "source-owned post-Neura replica commit failed verification");
+    return failure();
+  }
+  return success();
+}
+
+static bool isInPlaceNeuraReplicaCandidate(TaskflowTaskOp source) {
+  bool hasKernel = false;
+  source.walk([&](neura::KernelOp) { hasKernel = true; });
+  return hasKernel && !source.getWillReads().empty() &&
+         source.getWillWrites().size() == 1 &&
+         source.getOriginalReadMemrefs().size() == source.getWillReads().size() &&
+         source.getOriginalWriteMemrefs().size() == 1 &&
+         llvm::count(source.getOriginalReadMemrefs(),
+                     source.getOriginalWriteMemrefs().front()) == 1;
+}
+
+// The original TaskScheduler specifies how many replicas run, their shapes,
+// placement cells, dispatch ordering, and timing.  It does not specify which
+// source counter each replica computes.  Choose that partition here, after
+// authenticating the exact output-coordinate map and requiring one exact,
+// evenly divisible counter interval.  Candidate source tiling is performed
+// on private clones so a failed axis cannot partially rewrite the module.
+static LogicalResult chooseOriginalAmoebaAxis(
+    func::FuncOp function, TaskflowTaskOp source, int64_t factor,
+    int64_t &outputAxis, ReplicaOutputCoordinateProof &selectedProof,
+    std::string &error) {
+  bool inPlace = isInPlaceNeuraReplicaCandidate(source);
+  ModuleOp module = function->getParentOfType<ModuleOp>();
+  if (!module) {
+    error = "original AMOEBA realization has no parent module";
+    return failure();
+  }
+
+  SmallVector<std::pair<int64_t, ReplicaOutputCoordinateProof>, 1> candidates;
+  SmallVector<std::string, 3> rejectedAxes;
+  auto recordAxisRejection = [&](int64_t axis, StringRef reason) {
+    std::string detail = reason.str();
+    constexpr size_t kMaxAxisDiagnosticLength = 240;
+    if (detail.size() > kMaxAxisDiagnosticLength)
+      detail.resize(kMaxAxisDiagnosticLength);
+    rejectedAxes.push_back(
+        (Twine("axis ") + Twine(axis) + ": " + detail).str());
+  };
+  for (int64_t axis = 0; axis < 3; ++axis) {
+    ReplicaOutputCoordinateProof proof =
+        analyzeReplicaOutputCoordinates(source, axis);
+    if (!proof.proven) {
+      if (proof.reason.empty())
+        recordAxisRejection(axis, "output-coordinate proof failed");
+      else
+        recordAxisRejection(axis, proof.reason);
+      continue;
+    }
+    if (!proof.selectedAxisIndependent) {
+      recordAxisRejection(axis,
+                          "selected output coordinate is not axis-independent");
+      continue;
+    }
+    if (axis >= static_cast<int64_t>(proof.outputCounterAxes.size())) {
+      recordAxisRejection(axis, "output-coordinate proof has no selected axis");
+      continue;
+    }
+    unsigned counter = proof.outputCounterAxes[axis];
+    if (counter == ReplicaOutputCoordinateProof::kConstantAxis ||
+        counter >= proof.taskLowers.size() ||
+        counter >= proof.taskUppers.size() ||
+        !hasBalancedShards(
+            proof.taskUppers[counter] - proof.taskLowers[counter], factor)) {
+      recordAxisRejection(
+          axis, "selected counter has no exact balanced source partition");
+      continue;
+    }
+
+    bool materializable = false;
+    std::string ignoredDiagnostic;
+    SmallVector<std::string, 2> capturedDiagnostics;
+    auto captureDiagnostic = [&](Diagnostic &diagnostic) {
+      std::string detail;
+      for (const DiagnosticArgument &argument : diagnostic.getArguments()) {
+        // Keep only textual reasons. Operation and attribute arguments can
+        // print the full rejected IR, which is not useful in this summary.
+        if (argument.getKind() !=
+            DiagnosticArgument::DiagnosticArgumentKind::String)
+          continue;
+        StringRef text = argument.getAsString();
+        if (text.empty())
+          continue;
+        if (!detail.empty())
+          detail += ' ';
+        detail.append(text.data(), text.size());
+        if (detail.size() >= 240) {
+          detail.resize(240);
+          break;
+        }
+      }
+      if (!detail.empty())
+        capturedDiagnostics.push_back(std::move(detail));
+      return success();
+    };
+    if (inPlace) {
+      func::FuncOp clonedFunction = cast<func::FuncOp>(function->clone());
+      OwningOpRef<func::FuncOp> ownedFunction(clonedFunction);
+      TaskflowTaskOp clonedTask;
+      clonedFunction.walk([&](TaskflowTaskOp task) {
+        if (task.getTaskName() == source.getTaskName())
+          clonedTask = task;
+      });
+      if (clonedTask) {
+        ScopedDiagnosticHandler capture(function.getContext(),
+                                        captureDiagnostic);
+        materializable =
+            succeeded(analyzeReplicaNeuraInPlace(clonedTask, axis, factor));
+      }
+    } else {
+      OwningOpRef<ModuleOp> trial;
+      ScopedDiagnosticHandler capture(function.getContext(), captureDiagnostic);
+      materializable =
+          succeeded(runSourceNeuraTiler(module, source.getTaskName(), axis,
+                                        factor, trial, ignoredDiagnostic)) &&
+          succeeded(convertNeuraTilesToReplicas(
+              function.getName(), source.getTaskName(), axis, factor, trial,
+              ignoredDiagnostic));
+    }
+    if (materializable)
+      candidates.emplace_back(axis, std::move(proof));
+    else if (!ignoredDiagnostic.empty())
+      recordAxisRejection(axis, ignoredDiagnostic);
+    else if (!capturedDiagnostics.empty())
+      recordAxisRejection(axis, capturedDiagnostics.front());
+    else
+      recordAxisRejection(axis, "source replica materialization was rejected");
+  }
+  if (candidates.size() != 1) {
+    error = candidates.empty()
+                ? "no output axis has a source-proved exact partition and a "
+                  "legal replica materialization"
+                : "more than one output axis has a legal fixed-decision "
+                  "source partition; refusing an ambiguous realization";
+    if (candidates.empty() && !rejectedAxes.empty()) {
+      error += "; axis diagnostics: ";
+      llvm::interleave(
+          rejectedAxes, [&](const std::string &reason) { error += reason; },
+          [&] { error += "; "; });
+    }
+    return failure();
+  }
+  outputAxis = candidates.front().first;
+  selectedProof = std::move(candidates.front().second);
+  return success();
+}
+
+static std::optional<int64_t> positiveSourceInternalMultiplicity(
+    TaskflowTaskOp task) {
+  auto domain = task->getAttrOfType<DictionaryAttr>(
+      kSourceIterationDomainAttr);
+  auto complete = domain ? domain.getAs<BoolAttr>("complete") : BoolAttr();
+  auto multiplicity =
+      domain ? domain.getAs<IntegerAttr>("internal_multiplicity")
+             : IntegerAttr();
+  if (!complete || !complete.getValue() || !multiplicity ||
+      multiplicity.getInt() <= 0)
+    return std::nullopt;
+  return multiplicity.getInt();
+}
+
+static LogicalResult attachOriginalAmoebaRealization(
+    func::FuncOp function, StringRef parentName, int64_t factor,
+    int64_t outputAxis, const ReplicaOutputCoordinateProof &sourceProof,
+    ArrayRef<DictionaryAttr> replicaShapes, DictionaryAttr schedulerRecord,
+    TaskflowTaskOp canonicalSource) {
+  auto fail = [&](StringRef reason) {
+    function.emitError() << "original AMOEBA source realization: " << reason;
+    return failure();
+  };
+  if (!function || !schedulerRecord ||
+      replicaShapes.size() != static_cast<size_t>(factor) ||
+      outputAxis < 0 ||
+      outputAxis >= static_cast<int64_t>(sourceProof.outputCounterAxes.size()))
+    return fail("decision and output-coordinate bindings are incomplete");
+  unsigned selectedCounter = sourceProof.outputCounterAxes[outputAxis];
+  if (selectedCounter == ReplicaOutputCoordinateProof::kConstantAxis ||
+      selectedCounter >= sourceProof.taskLowers.size() ||
+      selectedCounter >= sourceProof.taskUppers.size())
+    return fail("selected output axis has no authenticated source counter");
+  std::optional<int64_t> internalMultiplicity =
+      positiveSourceInternalMultiplicity(canonicalSource);
+  if (!internalMultiplicity)
+    return fail("canonical task lacks a complete source-domain witness");
+
+  OpBuilder builder(function.getContext());
+  SmallVector<NamedAttribute> domainFields;
+  domainFields.push_back(builder.getNamedAttr(
+      "schema", builder.getStringAttr("amoeba-source-domain-v1")));
+  SmallVector<Attribute> originalAxes;
+  for (auto [ordinal, lower] : llvm::enumerate(sourceProof.taskLowers)) {
+    int64_t upper = sourceProof.taskUppers[ordinal];
+    if (upper <= lower)
+      return fail("source task has an invalid counter interval");
+    originalAxes.push_back(builder.getDictionaryAttr({
+        builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+        builder.getNamedAttr("lower", builder.getI64IntegerAttr(lower)),
+        builder.getNamedAttr("upper", builder.getI64IntegerAttr(upper)),
+        builder.getNamedAttr("step", builder.getI64IntegerAttr(1))}));
+  }
+
+  SmallVector<TaskflowTaskOp> children;
+  function.walk([&](TaskflowTaskOp task) {
+    auto parent = task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+    if (parent && parent.getValue() == parentName)
+      children.push_back(task);
+  });
+  if (children.size() != static_cast<size_t>(factor))
+    return fail("expanded task count differs from the original replica count");
+  SmallVector<TaskflowTaskOp> byId(factor);
+  for (TaskflowTaskOp child : children) {
+    auto id = child->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+    auto count = child->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+    if (!id || !count || id.getInt() < 0 || id.getInt() >= factor ||
+        count.getInt() != factor || byId[id.getInt()])
+      return fail("expanded task ids are duplicate or disagree with f45 count");
+    byId[id.getInt()] = child;
+  }
+
+  SmallVector<Attribute> replicaManifest;
+  SmallVector<Attribute> allPlacementRecords;
+  if (auto placements = schedulerRecord.getAs<ArrayAttr>("placements"))
+    allPlacementRecords.append(placements.begin(), placements.end());
+  else
+    return fail("original decision has no physical placements");
+
+  for (int64_t replicaId = 0; replicaId < factor; ++replicaId) {
+    TaskflowTaskOp child = byId[replicaId];
+    if (!child)
+      return fail("expanded task group is missing an original replica id");
+    SmallVector<int64_t> childLowers;
+    SmallVector<int64_t> childUppers;
+    SmallVector<TaskflowCounterOp> counters;
+    for (Operation &operation : child.getBody().front())
+      if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
+        counters.push_back(counter);
+    llvm::sort(counters, [](TaskflowCounterOp lhs, TaskflowCounterOp rhs) {
+      auto left = lhs->getAttrOfType<IntegerAttr>("counter_id");
+      auto right = rhs->getAttrOfType<IntegerAttr>("counter_id");
+      return left && right && left.getInt() < right.getInt();
+    });
+    if (counters.size() != sourceProof.taskLowers.size())
+      return fail("expanded shard changed the number of source counters");
+    int64_t sourceWork = *internalMultiplicity;
+    SmallVector<Attribute> partitionAxes;
+    for (auto [ordinal, counter] : llvm::enumerate(counters)) {
+      auto lower = compileTimeIndex(counter.getLowerBound(), child);
+      auto upper = compileTimeIndex(counter.getUpperBound(), child);
+      auto step = compileTimeIndex(counter.getStep(), child);
+      if (!lower || !upper || !step || *step != 1 || *upper <= *lower)
+        return fail("expanded shard has an unresolved source counter interval");
+      childLowers.push_back(*lower);
+      childUppers.push_back(*upper);
+      int64_t extent = *upper - *lower;
+      if (sourceWork > std::numeric_limits<int64_t>::max() / extent)
+        return fail("expanded shard source-work count overflows");
+      sourceWork *= extent;
+      partitionAxes.push_back(builder.getDictionaryAttr({
+          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+          builder.getNamedAttr("lower", builder.getI64IntegerAttr(*lower)),
+          builder.getNamedAttr("upper", builder.getI64IntegerAttr(*upper)),
+          builder.getNamedAttr("step", builder.getI64IntegerAttr(*step))}));
+    }
+    for (unsigned ordinal = 0; ordinal < childLowers.size(); ++ordinal) {
+      if (ordinal == selectedCounter)
+        continue;
+      if (childLowers[ordinal] != sourceProof.taskLowers[ordinal] ||
+          childUppers[ordinal] != sourceProof.taskUppers[ordinal])
+        return fail("materializer changed a nonselected source counter");
+    }
+    int64_t expectedWidth =
+        (sourceProof.taskUppers[selectedCounter] -
+         sourceProof.taskLowers[selectedCounter]) /
+        factor;
+    int64_t expectedLower =
+        sourceProof.taskLowers[selectedCounter] + replicaId * expectedWidth;
+    if (childLowers[selectedCounter] != expectedLower ||
+        childUppers[selectedCounter] != expectedLower + expectedWidth)
+      return fail("expanded intervals do not preserve ordered equal shards");
+
+    SmallVector<Attribute> placements;
+    for (Attribute attribute : allPlacementRecords) {
+      auto placement = dyn_cast<DictionaryAttr>(attribute);
+      auto id = placement ? placement.getAs<IntegerAttr>("replica_id")
+                          : IntegerAttr();
+      if (!id)
+        return fail("original placement has no replica id");
+      if (id.getInt() == replicaId)
+        placements.push_back(attribute);
+    }
+    if (placements.empty())
+      return fail("original replica has no placement cells");
+    replicaManifest.push_back(builder.getDictionaryAttr({
+        builder.getNamedAttr("replica_id", builder.getI64IntegerAttr(replicaId)),
+        builder.getNamedAttr("task_name", builder.getStringAttr(
+                                               child.getTaskName())),
+        builder.getNamedAttr("replica_shape", replicaShapes[replicaId]),
+        builder.getNamedAttr("placements", builder.getArrayAttr(placements)),
+        builder.getNamedAttr("partition_bounds",
+                             builder.getArrayAttr(partitionAxes)),
+        builder.getNamedAttr("source_work_count",
+                             builder.getI64IntegerAttr(sourceWork))}));
+
+    SmallVector<NamedAttribute> replicaDecisionFields;
+    replicaDecisionFields.push_back(builder.getNamedAttr(
+        "scheduler_record", schedulerRecord));
+    replicaDecisionFields.push_back(builder.getNamedAttr(
+        "replica_shape", replicaShapes[replicaId]));
+    replicaDecisionFields.push_back(builder.getNamedAttr(
+        "placements", builder.getArrayAttr(placements)));
+    child->setAttr(kOriginalAmoebaReplicaDecisionAttr,
+                   builder.getDictionaryAttr(replicaDecisionFields));
+    child->setAttr(kOriginalAmoebaReplicaPlacementsAttr,
+                   builder.getArrayAttr(placements));
+
+    SmallVector<NamedAttribute> realizationFields;
+    realizationFields.push_back(builder.getNamedAttr(
+        "schema", builder.getStringAttr(
+                      "amoeba-source-certified-replica-realization-v1")));
+    realizationFields.push_back(builder.getNamedAttr(
+        "status", builder.getStringAttr(
+                      "verified-source-certified-realization-v1")));
+    realizationFields.push_back(builder.getNamedAttr(
+        "origin", builder.getStringAttr(
+                      "orbit-native-materializer-selected-counter-axis-after-f45")));
+    realizationFields.push_back(builder.getNamedAttr(
+        "f45_axis_and_bounds_present", builder.getBoolAttr(false)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "selected_output_axis", builder.getI64IntegerAttr(outputAxis)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "selected_counter_ordinal",
+        builder.getI64IntegerAttr(selectedCounter)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "original_replica_count", builder.getI64IntegerAttr(factor)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "replica_id", builder.getI64IntegerAttr(replicaId)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "original_domain", builder.getArrayAttr(originalAxes)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "partition_bounds", builder.getArrayAttr(partitionAxes)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "source_work_count", builder.getI64IntegerAttr(sourceWork)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "internal_multiplicity",
+        builder.getI64IntegerAttr(*internalMultiplicity)));
+    realizationFields.push_back(builder.getNamedAttr(
+        "decision_binding", builder.getStringAttr(
+                                "amoeba.task_scheduler_schedule_info")));
+    child->setAttr(kOriginalAmoebaPartitionRealizationAttr,
+                   builder.getDictionaryAttr(realizationFields));
+
+    // These are parent-firing costs, not the current shard mapper result.
+    // Drop them so no consumer can accidentally treat a full-task profile as
+    // a per-replica measurement. The fresh profile evidence is imported only
+    // by the fixed-decision cost adapter.
+    child->removeAttr("profile_info");
+    child->removeAttr("task_orchestration_info");
+  }
+
+  constexpr StringLiteral kDecisionManifestAttr =
+      "amoeba.original_amoeba.materialized_decisions";
+  SmallVector<Attribute> decisions;
+  if (auto existing = function->getAttrOfType<ArrayAttr>(kDecisionManifestAttr))
+    decisions.append(existing.begin(), existing.end());
+  if (llvm::any_of(decisions, [&](Attribute attribute) {
+        auto decision = dyn_cast<DictionaryAttr>(attribute);
+        auto parent = decision ? decision.getAs<StringAttr>("parent_task")
+                               : StringAttr();
+        return parent && parent.getValue() == parentName;
+      }))
+    return fail("parent decision was already recorded in the function manifest");
+  decisions.push_back(builder.getDictionaryAttr({
+      builder.getNamedAttr("schema", builder.getStringAttr(
+                                         "amoeba-original-fixed-decision-realization-v1")),
+      builder.getNamedAttr("parent_task", builder.getStringAttr(parentName)),
+      builder.getNamedAttr("original_replica_count",
+                           builder.getI64IntegerAttr(factor)),
+      builder.getNamedAttr("selected_output_axis",
+                           builder.getI64IntegerAttr(outputAxis)),
+      builder.getNamedAttr("selected_counter_ordinal",
+                           builder.getI64IntegerAttr(selectedCounter)),
+      builder.getNamedAttr("original_domain", builder.getArrayAttr(originalAxes)),
+      builder.getNamedAttr("scheduler_record", schedulerRecord),
+      builder.getNamedAttr("replicas", builder.getArrayAttr(replicaManifest))}));
+  function->setAttr(kDecisionManifestAttr, builder.getArrayAttr(decisions));
+  // Keep the legacy scalar summary for existing tooling. The append-only
+  // per-parent manifest above preserves all groups in a multi-task function.
+  function->setAttr("amoeba.original_amoeba.materialized_parent_task",
+                    builder.getStringAttr(parentName));
+  function->setAttr("amoeba.original_amoeba.materialized_count",
+                    builder.getI64IntegerAttr(factor));
+  function->setAttr("amoeba.original_amoeba.selected_output_axis",
+                    builder.getI64IntegerAttr(outputAxis));
+  function->setAttr("amoeba.original_amoeba.selected_counter_ordinal",
+                    builder.getI64IntegerAttr(selectedCounter));
+  return success();
+}
+
+static LogicalResult materializeOriginalAmoebaFixedDecision(
+    ModuleOp module, func::FuncOp function, func::FuncOp canonicalFunction,
+    TaskflowTaskOp source) {
+  auto reject = [&](StringRef reason) {
+    source.emitError() << "original AMOEBA fixed-decision materialization: "
+                       << reason;
+    return failure();
+  };
+  if (!isOriginalAmoebaFixedDecisionTask(function, source))
+    return reject("only the pinned GCN Task_16/Task_17, Harris "
+                  "Task_19/Task_21, and LU Task_6 baseline tasks are "
+                  "supported");
+  const std::string functionSymbol = function.getSymName().str();
+  const std::string parentName = source.getTaskName().str();
+
+  int64_t factor = 0;
+  SmallVector<DictionaryAttr> replicaShapes;
+  if (failed(readOriginalAmoebaReplicaDecision(source, factor,
+                                                replicaShapes)))
+    return failure();
+  if (factor < 2 || factor > 4)
+    return reject("original fixed replica count must be between two and four");
+  auto schedulerRecord = source->getAttrOfType<DictionaryAttr>(
+      "amoeba.task_scheduler_schedule_info");
+  if (!schedulerRecord)
+    return reject("original TaskScheduler decision record is missing");
+
+  TaskflowTaskOp canonicalSource;
+  canonicalFunction.walk([&](TaskflowTaskOp task) {
+    if (task.getTaskName() == parentName)
+      canonicalSource = task;
+  });
+  if (!canonicalSource)
+    return reject("cannot retain an immutable canonical source task");
+
+  OpBuilder builder(source.getContext());
+  source->setAttr(kOriginalAmoebaDecisionModeAttr, builder.getBoolAttr(true));
+  int64_t outputAxis = -1;
+  ReplicaOutputCoordinateProof sourceProof;
+  std::string error;
+  if (failed(chooseOriginalAmoebaAxis(function, source, factor, outputAxis,
+                                      sourceProof, error)))
+    return reject(error);
+
+  if (isInPlaceNeuraReplicaCandidate(source)) {
+    FailureOr<ReplicaNeuraInPlacePlan> plan =
+        analyzeReplicaNeuraInPlace(source, outputAxis, factor);
+    if (failed(plan) || failed(materializeReplicaNeuraInPlace(function, *plan)))
+      return failure();
+  } else {
+    if (hasUnprovedGenericReplicaFeedback(source))
+      return reject("source tiler cannot authenticate kernel feedback state");
+    if (failed(materializeGenericNeuraReplica(function, source, outputAxis,
+                                               factor)))
+      return failure();
+  }
+
+  FailureOr<func::FuncOp> materializedFunction = selectTaskFunction(
+      module, functionSymbol, error);
+  if (failed(materializedFunction))
+    return reject("cannot reselect the expanded function after materialization");
+  func::FuncOp currentFunction = *materializedFunction;
+  if (failed(attachOriginalAmoebaRealization(
+          currentFunction, parentName, factor, outputAxis,
+          sourceProof, replicaShapes, schedulerRecord, canonicalSource)))
+    return failure();
+  // Include the source-certified realization metadata in the final exact task
+  // control binding.  The full graph proof still rechecks every existing and
+  // newly materialized replica group before refreshing any binding.
+  if (failed(proveAndRefreshSourceIterationDomainPartition(
+          canonicalFunction, currentFunction, error))) {
+    currentFunction.emitError()
+        << "expanded source partition is not authenticated: " << error;
+    return failure();
+  }
+  currentFunction->setAttr(kOriginalAmoebaDecisionModeAttr,
+                           builder.getBoolAttr(true));
+  if (failed(verify(module.getOperation()))) {
+    currentFunction.emitError(
+        "fixed-decision source-certified realization failed module verification");
     return failure();
   }
   return success();
@@ -5876,6 +6877,11 @@ struct MaterializeJointTaskReplicasPass
   Option<std::string> taskName{*this, "task", llvm::cl::init("consumer")};
   Option<int64_t> replicaCount{*this, "replicas", llvm::cl::init(2)};
   Option<int64_t> shardAxis{*this, "axis", llvm::cl::init(0)};
+  Option<bool> originalAmoebaFixedDecision{
+      *this, kOriginalAmoebaFixedDecisionFlag,
+      llvm::cl::desc("realize only the replica count and geometry already "
+                     "recorded by the original AMOEBA scheduler"),
+      llvm::cl::init(false)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -5887,7 +6893,8 @@ struct MaterializeJointTaskReplicasPass
       return signalPassFailure();
     }
     func::FuncOp func = *selected;
-    if (!isSupportedReplicaCount(replicaCount.getValue())) {
+    if (!originalAmoebaFixedDecision &&
+        !isSupportedReplicaCount(replicaCount.getValue())) {
       func.emitError("replicas must be one of the proved factors {1, 2, 4, 8}");
       return signalPassFailure();
     }
@@ -5903,6 +6910,92 @@ struct MaterializeJointTaskReplicasPass
     if (!source || duplicate) {
       func.emitError("replica task name must identify exactly one task");
       return signalPassFailure();
+    }
+    if (originalAmoebaFixedDecision) {
+      if (!isOriginalAmoebaFixedDecisionTask(func, source)) {
+        source.emitError("selected seed task is outside the pinned original "
+                         "AMOEBA fixed-decision baseline scope");
+        return signalPassFailure();
+      }
+
+      const std::string functionSymbol = func.getSymName().str();
+      const std::string seedName = source.getTaskName().str();
+      func::FuncOp canonicalFunction = cast<func::FuncOp>(func->clone());
+      OwningOpRef<func::FuncOp> canonicalOwner(canonicalFunction);
+      SmallVector<std::string> decisionTasks;
+      std::set<std::string> seenDecisionNames;
+      bool unsupportedDecision = false;
+      func.walk([&](TaskflowTaskOp task) {
+        auto active = task->getAttrOfType<IntegerAttr>("active_replicas");
+        auto scheduler = task->getAttrOfType<DictionaryAttr>(
+            "amoeba.task_scheduler_schedule_info");
+        auto schedulerActive = integerField(scheduler, "active_replicas");
+        bool activeAboveOne = active && active.getInt() > 1;
+        bool schedulerAboveOne = schedulerActive && *schedulerActive > 1;
+        if (!activeAboveOne && !schedulerAboveOne)
+          return;
+        if (!active || !schedulerActive ||
+            active.getInt() != *schedulerActive) {
+          task.emitError("original AMOEBA multi-replica decision has "
+                         "unbound active_replicas fields");
+          unsupportedDecision = true;
+          return;
+        }
+        if (!isOriginalAmoebaFixedDecisionTask(func, task)) {
+          task.emitError("original AMOEBA fixed-decision materialization found "
+                         "an unsupported task with active_replicas > 1");
+          unsupportedDecision = true;
+          return;
+        }
+        std::string name = task.getTaskName().str();
+        if (!seenDecisionNames.insert(name).second) {
+          task.emitError("original AMOEBA fixed-decision task name is "
+                         "ambiguous in the selected function");
+          unsupportedDecision = true;
+          return;
+        }
+        decisionTasks.push_back(std::move(name));
+      });
+      if (unsupportedDecision)
+        return signalPassFailure();
+      if (!llvm::is_contained(decisionTasks, seedName)) {
+        source.emitError("selected seed task is not an original active replica "
+                         "decision");
+        return signalPassFailure();
+      }
+      if (decisionTasks.empty()) {
+        func.emitError("original AMOEBA fixed-decision function has no active "
+                       "multi-replica tasks");
+        return signalPassFailure();
+      }
+
+      for (const std::string &decisionTaskName : decisionTasks) {
+        FailureOr<func::FuncOp> current =
+            selectTaskFunction(module, functionSymbol, error);
+        if (failed(current)) {
+          module.emitError() << error;
+          return signalPassFailure();
+        }
+        TaskflowTaskOp currentSource;
+        bool duplicateCurrentSource = false;
+        current->walk([&](TaskflowTaskOp task) {
+          if (task.getTaskName() != decisionTaskName)
+            return;
+          if (currentSource)
+            duplicateCurrentSource = true;
+          currentSource = task;
+        });
+        if (!currentSource || duplicateCurrentSource) {
+          current->emitError() << "fixed-decision source task "
+                               << decisionTaskName
+                               << " disappeared or became ambiguous";
+          return signalPassFailure();
+        }
+        if (failed(materializeOriginalAmoebaFixedDecision(
+                module, *current, canonicalFunction, currentSource)))
+          return signalPassFailure();
+      }
+      return;
     }
     if (replicaCount.getValue() == 1)
       return;

@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskGraphRewriteLegality.h"
 #include "NeuraDialect/NeuraDialect.h"
@@ -25,6 +26,7 @@
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -500,6 +502,26 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
   if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
     return compileTimeIndex(cast.getIn(), task, kernel);
 
+  if (auto apply = value.getDefiningOp<affine::AffineApplyOp>()) {
+    SmallVector<Attribute> constants;
+    constants.reserve(apply->getNumOperands());
+    for (Value operand : apply->getOperands()) {
+      auto constant = compileTimeIndex(operand, task, kernel);
+      if (!constant)
+        return std::nullopt;
+      constants.push_back(IntegerAttr::get(IndexType::get(value.getContext()),
+                                           *constant));
+    }
+    SmallVector<Attribute> folded;
+    if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
+        folded.size() != 1)
+      return std::nullopt;
+    auto integer = dyn_cast<IntegerAttr>(folded.front());
+    if (!integer || !integer.getValue().isSignedIntN(64))
+      return std::nullopt;
+    return integer.getValue().getSExtValue();
+  }
+
   // Application frontends sometimes materialize a static bound as an
   // arith.addi of a task value input and a literal (Radar uses 64 + (-2)).
   // Fold only when both operands are already proven constants by the paths
@@ -553,6 +575,10 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
         return std::nullopt;
       return compileTimeIndex(task.getValueInputs()[index], task);
     }
+    if (auto function = dyn_cast_or_null<func::FuncOp>(
+            argument.getOwner()->getParentOp()))
+      return mlir::amoeba::neura::joint_scheduling::detail::
+          input0StaticIndexBound(function, argument);
   }
   return std::nullopt;
 }
@@ -1256,8 +1282,10 @@ analyzeTask(TaskflowTaskOp task, int64_t axis, int64_t factor) {
     // (e.g. Harris height - 1). The whole source expression is cloned; only
     // the independently checked counter interval is changed. An unresolved
     // input, non-index arithmetic, or signed overflow remains unsupported.
-    if (auto add = dyn_cast<arith::AddIOp>(&operation))
-      if (add.getType().isIndex() && compileTimeIndex(add.getResult(), task))
+    if (isa<affine::AffineApplyOp, arith::AddIOp, arith::SubIOp>(&operation))
+      if (operation.getNumResults() == 1 &&
+          operation.getResult(0).getType().isIndex() &&
+          compileTimeIndex(operation.getResult(0), task))
         continue;
     return reject(task, "post-Neura tiling accepts only constants, a static "
                         "counter chain, one neura.kernel, and taskflow.yield");

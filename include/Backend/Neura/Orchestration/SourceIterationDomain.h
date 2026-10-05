@@ -630,6 +630,86 @@ parseSourceIterationDomain(taskflow::TaskflowTaskOp task,
   return info;
 }
 
+inline std::string
+normalizeFalseDefaultMemoryHintsInBinding(StringRef binding) {
+  std::string normalized = binding.str();
+  constexpr llvm::StringLiteral operationNames[] = {"\"memref.load\"",
+                                              "\"memref.store\""};
+  constexpr llvm::StringLiteral defaultField = "nontemporal = false";
+  for (StringRef operationName : operationNames) {
+    size_t searchFrom = 0;
+    while (true) {
+      size_t operation = normalized.find(operationName.str(), searchFrom);
+      if (operation == std::string::npos)
+        break;
+      // Do not interpret an escaped operation-looking string inside an
+      // unrelated attribute as generic assembly syntax.
+      size_t backslashes = 0;
+      for (size_t index = operation; index > 0 && normalized[index - 1] == '\\';
+           --index)
+        ++backslashes;
+      if (backslashes % 2 != 0) {
+        searchFrom = operation + operationName.size();
+        continue;
+      }
+
+      size_t typeSeparator =
+          normalized.find(" : ", operation + operationName.size());
+      if (typeSeparator == std::string::npos)
+        break;
+      size_t attributeOpen = normalized.rfind("<{", typeSeparator);
+      if (attributeOpen == std::string::npos ||
+          attributeOpen < operation + operationName.size()) {
+        searchFrom = typeSeparator + 3;
+        continue;
+      }
+      size_t attributeClose = normalized.find("}>", attributeOpen + 2);
+      if (attributeClose == std::string::npos ||
+          attributeClose + 2 > typeSeparator) {
+        searchFrom = typeSeparator + 3;
+        continue;
+      }
+
+      StringRef fields(normalized.data() + attributeOpen + 2,
+                       attributeClose - attributeOpen - 2);
+      size_t field = fields.find(defaultField);
+      if (field == StringRef::npos ||
+          fields.find("nontemporal", field + defaultField.size()) !=
+              StringRef::npos) {
+        searchFrom = typeSeparator + 3;
+        continue;
+      }
+      const bool hasLeadingSeparator =
+          field >= 2 && fields.substr(field - 2, 2) == ", ";
+      size_t fieldEnd = field + defaultField.size();
+      const bool hasTrailingSeparator =
+          fields.substr(fieldEnd).starts_with(", ");
+      if ((field != 0 && !hasLeadingSeparator) ||
+          (fieldEnd != fields.size() && !hasTrailingSeparator)) {
+        searchFrom = typeSeparator + 3;
+        continue;
+      }
+
+      if (field == 0 && fieldEnd == fields.size()) {
+        size_t eraseStart = attributeOpen;
+        if (eraseStart > 0 && normalized[eraseStart - 1] == ' ')
+          --eraseStart;
+        normalized.erase(eraseStart, attributeClose + 2 - eraseStart);
+        searchFrom = eraseStart + operationName.size();
+        continue;
+      }
+
+      size_t fieldStart = hasLeadingSeparator ? field - 2 : field;
+      size_t eraseEnd = !hasLeadingSeparator && hasTrailingSeparator
+                            ? fieldEnd + 2
+                            : fieldEnd;
+      normalized.erase(attributeOpen + 2 + fieldStart, eraseEnd - fieldStart);
+      searchFrom = attributeOpen + 2 + fieldStart;
+    }
+  }
+  return normalized;
+}
+
 inline std::string currentSourceIterationControlBinding(
     taskflow::TaskflowTaskOp task, StringRef domainWitness) {
   std::string text;
@@ -677,11 +757,28 @@ inline std::string currentSourceIterationControlBinding(
         name == "est_latency") derived.push_back(attr.getName());
   }
   for (StringAttr name : derived) copy->removeAttr(name);
+  // Generic MLIR round-trips may materialize the default `nontemporal =
+  // false` on loads or stores. Treat only that BoolAttr spelling as the same
+  // canonical witness; true, malformed, and all other attributes remain
+  // covered by the exact body binding.
+  copy->walk([&](Operation *operation) {
+    if (!isa<memref::LoadOp, memref::StoreOp>(operation))
+      return;
+    auto nontemporal = operation->getAttrOfType<BoolAttr>("nontemporal");
+    if (nontemporal && !nontemporal.getValue())
+      operation->removeAttr("nontemporal");
+  });
   OpBuilder builder(task.getContext());
   builder.setInsertionPointToEnd(entry);
   builder.create<func::ReturnOp>(task.getLoc());
   wrapper.print(stream, OpPrintingFlags().printGenericOpForm().useLocalScope());
   wrapper->destroy();
+  if (auto stored = task->getAttrOfType<StringAttr>(
+          kSourceIterationControlBindingAttr)) {
+    if (normalizeFalseDefaultMemoryHintsInBinding(stored.getValue()) ==
+        normalizeFalseDefaultMemoryHintsInBinding(text))
+      return stored.getValue().str();
+  }
   return text;
 }
 

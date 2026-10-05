@@ -16,6 +16,8 @@
 #include "llvm/Support/Path.h"
 
 #include <cmath>
+#include <array>
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -104,6 +106,14 @@ static bool isGitCommit(StringRef value) {
            (character >= 'A' && character <= 'F');
   });
 }
+
+static bool closeModelValue(double lhs, double rhs) {
+  return std::isfinite(lhs) && std::isfinite(rhs) &&
+         std::abs(lhs - rhs) <= 1.0e-6 * std::max(1.0, std::abs(lhs));
+}
+
+static constexpr std::array<int64_t, 4> kDirectModelMemberSeeds = {
+    {17, 41, 113, 239}};
 
 static bool getModelDomainShapes(
     bool directPerCgra2x2,
@@ -235,6 +245,34 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
       !rankingPolicy)
     return false;
 
+  const llvm::json::Object *diagnostic =
+      metadata->getObject("diagnostic_override");
+  const bool diagnosticOverride = diagnostic != nullptr;
+  double runtimeIICeiling = kFormalMax4ModelCeilingII;
+  if (diagnosticOverride) {
+    std::string architectureError;
+    auto runtimeArchitectureFile = llvm::MemoryBuffer::getFile(*architecturePath);
+    if (!directPerCgra2x2 || !runtimeArchitectureFile ||
+        !validatePerCgra2x2DiagnosticMetadata(
+            *metadata, (*runtimeArchitectureFile)->getBuffer(),
+            architectureError)) {
+      error = architectureError.empty()
+                  ? "direct diagnostic override metadata is missing, forged, "
+                    "or differs from the exact runtime architecture file"
+                  : architectureError;
+      return false;
+    }
+    runtimeIICeiling = kPerCgra2x2DiagnosticIICeiling;
+  } else if (metadata->get("diagnostic_only") || metadata->get("formal")) {
+    error = "diagnostic direct-model metadata is missing its override proof";
+    return false;
+  }
+  if (diagnosticOverride && !allowModelDomainUnsupported) {
+    error = "diagnostic direct-model catalog requires explicit model-domain "
+            "row validation";
+    return false;
+  }
+
   if (allowModelDomainUnsupported) {
     std::optional<StringRef> witness =
         metadata->getString("canonical_module_witness");
@@ -242,9 +280,13 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         metadata->getString("unsupported_prediction_policy");
     std::optional<double> intervalMax =
         metadata->getNumber("model_interval_max_ii");
+    const StringRef requiredPolicy =
+        diagnosticOverride
+            ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling-v1")
+            : StringRef("analytical-lower-bound-exceeds-model-ceiling-v1");
     if (!witness || witness->empty() || expectedCanonicalModuleWitness.empty() ||
         *witness != expectedCanonicalModuleWitness || !domainPolicy ||
-        *domainPolicy != "analytical-lower-bound-exceeds-model-ceiling-v1" ||
+        *domainPolicy != requiredPolicy ||
         !intervalMax || !std::isfinite(*intervalMax) ||
         *intervalMax != kFormalMax4ModelCeilingII) {
       error = "cost catalogue model-domain proof is not bound to the exact "
@@ -322,6 +364,8 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
   coveredQueries_.clear();
   hits_ = 0;
   misses_ = 0;
+  diagnosticOverride_ = diagnosticOverride;
+  runtimeIICeiling_ = runtimeIICeiling;
 
   for (llvm::json::Value &value : *entries) {
     llvm::json::Object *entry = value.getAsObject();
@@ -362,7 +406,7 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
       if (!ii || !startup || !lowerBound || !std::isfinite(*ii) ||
           !std::isfinite(*startup) || !std::isfinite(*lowerBound) ||
           *ii <= 0.0 || *startup <= 0.0 || *lowerBound <= 0.0 ||
-          *ii < *lowerBound) {
+          *ii < *lowerBound || *ii > runtimeIICeiling + 1.0e-6) {
         error = "supported cost requires positive finite predicted_ii and "
                 "startup_cycles and analytical_lower_bound, and "
                 "predicted_ii >= analytical_lower_bound";
@@ -370,6 +414,71 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
       }
       cost = {*ii, *startup, true};
       cost.analyticalLowerBound = *lowerBound;
+      cost.runtimeIICeiling = runtimeIICeiling;
+      if (diagnosticOverride) {
+        auto trainingCeiling = entry->getNumber("training_ceiling_ii");
+        auto rowRuntimeCeiling = entry->getNumber("runtime_ceiling_ii");
+        auto extrapolationStatus = entry->getString("extrapolation_status");
+        auto reportedStd = entry->getNumber("predicted_ii_std");
+        auto meanSource = entry->getString("ii_mean_source");
+        const llvm::json::Array *members =
+            entry->getArray("direct_ensemble_members");
+        if (!directPerCgra2x2 || !trainingCeiling ||
+            *trainingCeiling != kPerCgra2x2TrainingIICeiling ||
+            !rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
+            !reportedStd || !std::isfinite(*reportedStd) ||
+            *reportedStd < 0.0 || !meanSource ||
+            *meanSource != "direct_four_member_arithmetic_mean" || !members ||
+            members->size() != kDirectModelMemberSeeds.size()) {
+          error = "supported diagnostic cost lacks its exact ceiling and "
+                  "four-member metadata";
+          return false;
+        }
+        std::array<double, 4> memberValues{};
+        double memberMean = 0.0;
+        bool extrapolated = *lowerBound > kPerCgra2x2TrainingIICeiling;
+        for (size_t index = 0; index < members->size(); ++index) {
+          const llvm::json::Object *member = (*members)[index].getAsObject();
+          auto memberIndex = member ? member->getInteger("member_index")
+                                    : std::nullopt;
+          auto seed = member ? member->getInteger("seed") : std::nullopt;
+          auto value = member ? member->getNumber("predicted_ii")
+                              : std::nullopt;
+          if (!memberIndex || *memberIndex != static_cast<int64_t>(index) ||
+              !seed || *seed != kDirectModelMemberSeeds[index] || !value ||
+              !std::isfinite(*value) || *value < *lowerBound ||
+              *value > runtimeIICeiling + 1.0e-6) {
+            error = "diagnostic direct ensemble member is outside its "
+                    "validated runtime interval";
+            return false;
+          }
+          memberValues[index] = *value;
+          memberMean += *value;
+          extrapolated |= *value > kPerCgra2x2TrainingIICeiling;
+        }
+        memberMean /= memberValues.size();
+        double variance = 0.0;
+        for (double value : memberValues) {
+          double delta = value - memberMean;
+          variance += delta * delta;
+        }
+        variance /= memberValues.size();
+        if (!closeModelValue(memberMean, *ii) ||
+            !closeModelValue(std::sqrt(variance), *reportedStd) ||
+            !extrapolationStatus ||
+            *extrapolationStatus !=
+                (extrapolated ? "out-of-training-ceiling"
+                              : "within-training-ceiling")) {
+          error = "diagnostic direct ensemble aggregate or extrapolation "
+                  "status disagrees with its four members";
+          return false;
+        }
+      } else if (entry->get("training_ceiling_ii") ||
+                 entry->get("runtime_ceiling_ii") ||
+                 entry->get("extrapolation_status")) {
+        error = "ordinary model cost carries unbound diagnostic metadata";
+        return false;
+      }
     } else if (*status != "unsupported") {
       error = "support_status must be supported or unsupported";
       return false;
@@ -392,11 +501,27 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         auto reason = requiredString(*entry, "unsupported_reason", error);
         auto lowerBound = entry->getNumber("analytical_lower_bound");
         auto intervalMax = entry->getNumber("model_interval_max_ii");
-        if (!reason || *reason != kModelDomainUnsupportedReason ||
+        auto rowRuntimeCeiling = entry->getNumber("runtime_ceiling_ii");
+        auto rowTrainingCeiling = entry->getNumber("training_ceiling_ii");
+        auto extrapolationStatus = entry->getString("extrapolation_status");
+        const StringRef expectedReason =
+            diagnosticOverride
+                ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling")
+                : StringRef(kModelDomainUnsupportedReason);
+        if (!reason || *reason != expectedReason ||
             !lowerBound || !std::isfinite(*lowerBound) || *lowerBound <= 0.0 ||
             !intervalMax || !std::isfinite(*intervalMax) ||
             *intervalMax != kFormalMax4ModelCeilingII ||
-            *lowerBound <= *intervalMax) {
+            *lowerBound <= runtimeIICeiling ||
+            (diagnosticOverride &&
+             (!rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
+              !rowTrainingCeiling ||
+              *rowTrainingCeiling != kPerCgra2x2TrainingIICeiling ||
+              !extrapolationStatus ||
+              *extrapolationStatus != "outside-diagnostic-runtime-domain")) ||
+            (!diagnosticOverride &&
+             (rowRuntimeCeiling || rowTrainingCeiling ||
+              extrapolationStatus))) {
           error = "unsupported model-domain row lacks a valid analytical "
                   "lower-bound proof above the model ceiling";
           return false;
@@ -405,6 +530,7 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         cost.modelDomainUnsupported = true;
         cost.analyticalLowerBound = *lowerBound;
         cost.modelIntervalMaxII = *intervalMax;
+        cost.runtimeIICeiling = runtimeIICeiling;
         cost.unsupportedReason = reason->str();
       } else if (allowModelDomainUnsupported) {
         error = "model-domain catalogue unsupported row lacks explicit "

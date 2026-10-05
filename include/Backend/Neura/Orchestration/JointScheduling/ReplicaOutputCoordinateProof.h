@@ -8,6 +8,7 @@
 
 #include "NeuraDialect/NeuraOps.h"
 #include "TaskflowDialect/TaskflowOps.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -299,6 +300,25 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
       return std::nullopt;
     return checkedStaticIntegerBinary(sub, *lhs, *rhs, true);
   }
+  if (auto apply = value.getDefiningOp<affine::AffineApplyOp>()) {
+    SmallVector<Attribute> constants;
+    constants.reserve(apply->getNumOperands());
+    for (Value operand : apply->getOperands()) {
+      auto constant = staticIndex(operand, task, kernel, visiting);
+      if (!constant)
+        return std::nullopt;
+      constants.push_back(IntegerAttr::get(IndexType::get(value.getContext()),
+                                           *constant));
+    }
+    SmallVector<Attribute> folded;
+    if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
+        folded.size() != 1)
+      return std::nullopt;
+    auto integer = dyn_cast<IntegerAttr>(folded.front());
+    if (!integer || !integer.getValue().isSignedIntN(64))
+      return std::nullopt;
+    return integer.getValue().getSExtValue();
+  }
   return std::nullopt;
 }
 
@@ -376,6 +396,8 @@ accessInput(mlir::Operation *operation, mlir::Value base,
             mlir::neura::KernelOp kernel) {
   bool isLoad = isa<::mlir::neura::LoadIndexedOp>(operation);
   bool isStore = isa<::mlir::neura::StoreIndexedOp>(operation);
+  if (isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(operation))
+    return resolveKernelInput(base, kernel);
   if (!isLoad && !isStore)
     return std::nullopt;
 
@@ -972,9 +994,47 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       proof.sawOutputStore = proof.reason.empty();
       return;
     }
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      auto input = accessInput(operation, load.getMemRef(), kernel);
+      if (!input) {
+        proofFail(proof, "memref load base is not an authenticated input");
+        return;
+      }
+      if (*input == proof.outputInput) {
+        checkOutputIndices(operation, load.getIndices());
+        proof.sawOutputLoad = proof.reason.empty();
+      } else {
+        if (outputInputIndices.contains(*input)) {
+          proofFail(proof, "output slot load crosses another output storage");
+          return;
+        }
+        if (!checkAuxiliary(*input)) {
+          proofFail(proof, "auxiliary memref load may alias output storage");
+          return;
+        }
+        if (!llvm::is_contained(proof.auxiliaryInputIndices, *input))
+          proof.auxiliaryInputIndices.push_back(*input);
+      }
+      return;
+    }
+    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      auto input = accessInput(operation, store.getMemRef(), kernel);
+      if (!input) {
+        proofFail(proof, "memref store base is not an authenticated input");
+        return;
+      }
+      if (*input != proof.outputInput) {
+        if (outputInputIndices.contains(*input))
+          return;
+        proofFail(proof, "auxiliary memref store is outside the read-only contract");
+        return;
+      }
+      checkOutputIndices(operation, store.getIndices());
+      proof.sawOutputStore = proof.reason.empty();
+      return;
+    }
     StringRef name = operation->getName().getStringRef();
-    if (name == "neura.load" || name == "neura.store" ||
-        name == "memref.load" || name == "memref.store") {
+    if (name == "neura.load" || name == "neura.store") {
       proofFail(proof, "unclassified memory operation in Neura output proof");
       sawUnknownMemory = true;
       return;

@@ -19,6 +19,13 @@ namespace amoeba::neura::joint_scheduling {
 
 inline constexpr llvm::StringLiteral kOriginalAmoebaProfileBindingSchema =
     "amoeba-original-profile-body-binding-v1";
+inline constexpr llvm::StringLiteral
+    kOriginalAmoebaSourceDomainCoverageStatus =
+        "verified-unsharded-source-domain-v1";
+inline constexpr llvm::StringLiteral kOriginalAmoebaStaticInternalCoverageStatus =
+    "verified-original-static-internal-source-domain-v1";
+
+struct TaskMetadata;
 
 struct OriginalAmoebaProfileBodyEvidence {
   std::string task;
@@ -40,6 +47,16 @@ bool readOriginalAmoebaProfileBodyExport(
     llvm::StringRef path, llvm::StringRef expectedFunction,
     llvm::ArrayRef<std::string> expectedTasks,
     OriginalAmoebaProfileBodyExport &result, std::string &error);
+
+// Verifies exact complete source-domain certificates for the unsharded
+// original task graph consumed by the original AMOEBA profile adapter.
+bool verifyOriginalAmoebaSourceDomainCoverage(
+    llvm::ArrayRef<TaskMetadata> tasks, std::string &error,
+    bool allowStaticInternalExpansion = false,
+    bool allowScheduledReplicaInventory = false);
+
+llvm::StringRef originalAmoebaSourceDomainCoverageStatus(
+    llvm::ArrayRef<TaskMetadata> tasks);
 
 // Rebuilds the exact pre-mapper wrapper used by the original TaskProfiler from
 // a current task's neura.kernel and returns the locally-scoped printed

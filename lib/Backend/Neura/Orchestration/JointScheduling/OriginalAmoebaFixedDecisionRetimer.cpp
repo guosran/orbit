@@ -23,10 +23,89 @@ bool isValidRectangle(const OriginalAmoebaFixedPlacement &placement) {
           placement.cols == placement.selectedRows);
 }
 
-bool overlapsSpatially(const OriginalAmoebaFixedPlacement &lhs,
-                       const OriginalAmoebaFixedPlacement &rhs) {
-  return lhs.row < rhs.row + rhs.rows && rhs.row < lhs.row + lhs.rows &&
-         lhs.col < rhs.col + rhs.cols && rhs.col < lhs.col + lhs.cols;
+bool validateCapturedReplicaCells(
+    const OriginalAmoebaFixedPlacement &placement, int gridRows, int gridCols,
+    bool allowOriginalF45ReplicaScaling,
+    std::vector<FixedScheduleOccupiedCell> &sortedCells,
+    std::string &rejection) {
+  const unsigned replicas = placement.activeReplicas;
+  if (replicas < 1 || replicas > 4) {
+    rejection = "captured active_replicas must be in the range 1..4";
+    return false;
+  }
+  if (replicas != 1 && !allowOriginalF45ReplicaScaling) {
+    rejection = "captured active_replicas requires the explicit original F45 "
+                "replica scaling estimate mode";
+    return false;
+  }
+
+  const size_t cellsPerReplica =
+      static_cast<size_t>(placement.selectedRows * placement.selectedCols);
+  if (placement.occupiedCells.size() !=
+      cellsPerReplica * static_cast<size_t>(replicas)) {
+    rejection = "captured occupancy does not contain exactly the selected "
+                "CGRA area for every replica";
+    return false;
+  }
+
+  std::vector<std::set<FixedScheduleOccupiedCell>> replicaCells(replicas);
+  std::set<FixedScheduleOccupiedCell> allCells;
+  for (const OriginalAmoebaOccupiedCell &cell : placement.occupiedCells) {
+    const FixedScheduleOccupiedCell coordinate{cell.row, cell.col};
+    if (cell.replicaId >= replicas || cell.row < 0 || cell.row >= gridRows ||
+        cell.col < 0 || cell.col >= gridCols) {
+      rejection = "captured occupancy has an out-of-range replica ID or a "
+                  "CGRA cell outside the grid";
+      return false;
+    }
+    if (!replicaCells[cell.replicaId].insert(coordinate).second ||
+        !allCells.insert(coordinate).second) {
+      rejection = "captured replica occupancy duplicates or overlaps a CGRA "
+                  "cell";
+      return false;
+    }
+  }
+
+  for (unsigned replica = 0; replica < replicas; ++replica) {
+    const auto &cells = replicaCells[replica];
+    if (cells.size() != cellsPerReplica) {
+      rejection = "captured occupancy omits cells for a replica ID";
+      return false;
+    }
+    int minRow = gridRows, maxRow = -1, minCol = gridCols, maxCol = -1;
+    for (const FixedScheduleOccupiedCell &cell : cells) {
+      minRow = std::min(minRow, cell.first);
+      maxRow = std::max(maxRow, cell.first);
+      minCol = std::min(minCol, cell.second);
+      maxCol = std::max(maxCol, cell.second);
+    }
+    const int rows = maxRow - minRow + 1;
+    const int cols = maxCol - minCol + 1;
+    if (static_cast<size_t>(rows * cols) != cellsPerReplica ||
+        !((rows == placement.selectedRows && cols == placement.selectedCols) ||
+          (rows == placement.selectedCols && cols == placement.selectedRows))) {
+      rejection = "captured replica cells do not form the selected shape or "
+                  "its rotation";
+      return false;
+    }
+    if (replica == 0 && (minRow != placement.row || minCol != placement.col ||
+                         rows != placement.rows || cols != placement.cols)) {
+      rejection = "replica 0 captured geometry disagrees with the primary "
+                  "placement";
+      return false;
+    }
+  }
+
+  sortedCells.assign(allCells.begin(), allCells.end());
+  return true;
+}
+
+bool shareCapturedCell(const std::vector<FixedScheduleOccupiedCell> &lhs,
+                       const std::vector<FixedScheduleOccupiedCell> &rhs) {
+  for (const FixedScheduleOccupiedCell &cell : lhs)
+    if (std::binary_search(rhs.begin(), rhs.end(), cell))
+      return true;
+  return false;
 }
 
 bool checkedEnd(int64_t start, int64_t duration, int64_t &end) {
@@ -46,7 +125,8 @@ bool retimeOriginalAmoebaFixedDecisions(
     const std::vector<OriginalAmoebaFixedPlacement> &originalPlacements,
     const std::vector<unsigned> &originalDispatchOrder,
     FixedScheduleCommunication &communication,
-    OriginalAmoebaFixedDecisionResult &result) {
+    OriginalAmoebaFixedDecisionResult &result,
+    bool allowOriginalF45ReplicaScaling) {
   result = {};
   communication.resetReservations();
   auto reject = [&](std::string message, bool trialActive = false) {
@@ -68,6 +148,7 @@ bool retimeOriginalAmoebaFixedDecisions(
 
   std::vector<const OriginalAmoebaFixedPlacement *> placementByTask(
       tasks.size(), nullptr);
+  FixedScheduleOccupiedCellInventory cellsByTask(tasks.size());
   std::set<std::string> taskNames;
   for (unsigned task = 0; task < tasks.size(); ++task) {
     if (tasks[task].name.empty() ||
@@ -86,9 +167,6 @@ bool retimeOriginalAmoebaFixedDecisions(
     if (placement.task >= tasks.size() || placementByTask[placement.task])
       return reject(
           "original placement duplicates or references an unknown task");
-    if (placement.activeReplicas != 1)
-      return reject("original placement has unsupported active_replicas; "
-                    "replicas are not materialized shards");
     if (!isValidRectangle(placement))
       return reject("selected and placed CGRA rectangles are invalid or have "
                     "different area");
@@ -98,22 +176,11 @@ bool retimeOriginalAmoebaFixedDecisions(
         placement.cols > gridCols - placement.col)
       return reject("original placement rectangle is outside the 4x4 grid");
 
-    const size_t expectedCells =
-        static_cast<size_t>(placement.rows * placement.cols);
-    if (placement.occupiedCells.size() != expectedCells)
-      return reject(
-          "captured active occupancy does not fill the original rectangle");
-    std::set<std::pair<int, int>> uniqueCells;
-    for (const OriginalAmoebaOccupiedCell &cell : placement.occupiedCells) {
-      if (cell.replicaId != 0 || cell.row < placement.row ||
-          cell.row >= placement.row + placement.rows ||
-          cell.col < placement.col ||
-          cell.col >= placement.col + placement.cols ||
-          !uniqueCells.emplace(cell.row, cell.col).second)
-        return reject(
-            "captured occupancy has an unsupported replica ID, "
-            "duplicates a cell, or lies outside its original rectangle");
-    }
+    std::string occupancyRejection;
+    if (!validateCapturedReplicaCells(
+            placement, gridRows, gridCols, allowOriginalF45ReplicaScaling,
+            cellsByTask[placement.task], occupancyRejection))
+      return reject(std::move(occupancyRejection));
     placementByTask[placement.task] = &placement;
   }
   for (const OriginalAmoebaFixedPlacement *placement : placementByTask)
@@ -156,6 +223,8 @@ bool retimeOriginalAmoebaFixedDecisions(
     return reject("original dispatch order omits a task");
 
   OriginalAmoebaFixedDecisionResult candidate;
+  candidate.usesOriginalF45ReplicaScalingEstimate =
+      allowOriginalF45ReplicaScaling;
   candidate.dispatchOrder = originalDispatchOrder;
   candidate.preservedDecisions = originalPlacements;
   candidate.tasks.reserve(tasks.size());
@@ -165,7 +234,11 @@ bool retimeOriginalAmoebaFixedDecisions(
     exactTask.name = tasks[task].name;
     exactTask.rows = placement.rows;
     exactTask.cols = placement.cols;
+    const unsigned activeReplicas = placement.activeReplicas;
     exactTask.duration = durations[task];
+    if (allowOriginalF45ReplicaScaling && activeReplicas > 1)
+      exactTask.duration = durations[task] / activeReplicas +
+                           (durations[task] % activeReplicas != 0 ? 1 : 0);
     exactTask.predecessors = tasks[task].predecessors;
     candidate.tasks.push_back(std::move(exactTask));
   }
@@ -174,13 +247,12 @@ bool retimeOriginalAmoebaFixedDecisions(
 
   for (unsigned task : originalDispatchOrder) {
     const OriginalAmoebaFixedPlacement &destination = *placementByTask[task];
+    const int64_t duration = candidate.tasks[task].duration;
     int64_t dependencyReady = 0;
     std::string error;
     communication.beginTrial();
 
     for (unsigned predecessor : modelPredecessorOrder[task]) {
-      const OriginalAmoebaFixedPlacement &source =
-          *placementByTask[predecessor];
       const ExactSchedulePlacement &sourceSchedule =
           candidate.placements[predecessor];
       int64_t bestReady = std::numeric_limits<int64_t>::max();
@@ -188,41 +260,40 @@ bool retimeOriginalAmoebaFixedDecisions(
       int bestSourceCol = -1;
       int bestDestinationRow = -1;
       int bestDestinationCol = -1;
-      for (int sourceRow = source.row; sourceRow < source.row + source.rows;
-           ++sourceRow)
-        for (int sourceCol = source.col; sourceCol < source.col + source.cols;
-             ++sourceCol)
-          for (int destinationRow = destination.row;
-               destinationRow < destination.row + destination.rows;
-               ++destinationRow)
-            for (int destinationCol = destination.col;
-                 destinationCol < destination.col + destination.cols;
-                 ++destinationCol) {
-              int64_t endpointReady = 0;
-              error.clear();
-              if (!communication.getTransferReadyCycle(
-                      predecessor, task, sourceRow, sourceCol, destinationRow,
-                      destinationCol, sourceSchedule.end, false, endpointReady,
-                      error))
-                return reject(error.empty()
-                                  ? "communication endpoint query failed"
-                                  : std::move(error),
-                              true);
-              if (endpointReady < sourceSchedule.end)
-                return reject(
-                    "communication ready cycle precedes producer finish", true);
-              // Match verifyAndScoreFixedSchedule: endpoint iteration order is
-              // row-major and an equal ready time retains the first endpoint.
-              if (endpointReady < bestReady) {
-                bestReady = endpointReady;
-                bestSourceRow = sourceRow;
-                bestSourceCol = sourceCol;
-                bestDestinationRow = destinationRow;
-                bestDestinationCol = destinationCol;
-              }
-            }
+      for (const FixedScheduleOccupiedCell &sourceCell :
+           cellsByTask[predecessor]) {
+        for (const FixedScheduleOccupiedCell &destinationCell :
+             cellsByTask[task]) {
+          const int sourceRow = sourceCell.first;
+          const int sourceCol = sourceCell.second;
+          const int destinationRow = destinationCell.first;
+          const int destinationCol = destinationCell.second;
+          int64_t endpointReady = 0;
+          error.clear();
+          if (!communication.getTransferReadyCycle(
+                  predecessor, task, sourceRow, sourceCol, destinationRow,
+                  destinationCol, sourceSchedule.end, false, endpointReady,
+                  error))
+            return reject(error.empty() ? "communication endpoint query failed"
+                                        : std::move(error),
+                          true);
+          if (endpointReady < sourceSchedule.end)
+            return reject("communication ready cycle precedes producer finish",
+                          true);
+          // Match verifyAndScoreFixedSchedule: endpoint iteration order is
+          // row-major and an equal ready time retains the first endpoint.
+          if (endpointReady < bestReady) {
+            bestReady = endpointReady;
+            bestSourceRow = sourceRow;
+            bestSourceCol = sourceCol;
+            bestDestinationRow = destinationRow;
+            bestDestinationCol = destinationCol;
+          }
+        }
+      }
       if (bestSourceRow < 0)
-        return reject("communication transfer has no rectangle endpoint", true);
+        return reject("communication transfer has no occupied-cell endpoint",
+                      true);
 
       int64_t reservedReady = 0;
       error.clear();
@@ -243,12 +314,12 @@ bool retimeOriginalAmoebaFixedDecisions(
     int64_t start = dependencyReady;
     int64_t end = 0;
     for (;;) {
-      if (!checkedEnd(start, durations[task], end))
+      if (!checkedEnd(start, duration, end))
         return reject("fixed-decision replay time overflows int64", true);
       bool advanced = false;
       for (unsigned prior : originalDispatchOrder) {
         if (!scheduled[prior] ||
-            !overlapsSpatially(destination, *placementByTask[prior]))
+            !shareCapturedCell(cellsByTask[task], cellsByTask[prior]))
           continue;
         const ExactSchedulePlacement &priorSchedule =
             candidate.placements[prior];
@@ -277,7 +348,7 @@ bool retimeOriginalAmoebaFixedDecisions(
 
   candidate.replay = verifyAndScoreFixedSchedule(
       gridRows, gridCols, candidate.tasks, candidate.placements,
-      candidate.dispatchOrder, communication);
+      candidate.dispatchOrder, communication, &cellsByTask);
   if (!candidate.replay.valid)
     return reject(candidate.replay.rejection.empty()
                       ? "fixed-decision replay failed final verification"

@@ -40,6 +40,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -634,6 +635,9 @@ static bool isIgnoredTaskAttr(StringRef name) {
          name == "amoeba.tiling.output_region_uppers" ||
          name.starts_with("amoeba.tiling.input_region_");
 }
+
+static constexpr StringLiteral kOriginalAmoebaDecisionModeAttr =
+    "amoeba.original_amoeba.fixed_decision_materialization";
 
 // The nested composition path keeps the source-owned M/N tiling contract on
 // the sibling tile and keeps the output rectangle on both that tile and its
@@ -2830,32 +2834,75 @@ static bool isSourceOwnedTilingAttr(StringRef name) {
          name == kNeighborhoodPartitionLineageAttr;
 }
 
-static bool attrsEquivalent(Operation *lhs, Operation *rhs, bool taskAttrs,
-                            bool counterAttrs, bool sequentialK = false,
-                            bool sourceOwnedTiling = false) {
+static bool
+attrsEquivalent(Operation *lhs, Operation *rhs, bool taskAttrs,
+                bool counterAttrs, bool sequentialK = false,
+                bool sourceOwnedTiling = false,
+                bool verifiedOriginalAmoebaRealization = false,
+                SmallVectorImpl<std::string> *mismatchedAttrs = nullptr) {
+  auto recordMismatch = [&](StringRef name) {
+    if (mismatchedAttrs && !llvm::is_contained(*mismatchedAttrs, name.str()))
+      mismatchedAttrs->push_back(name.str());
+  };
+  auto isVerifiedDerivedMetadata = [&](StringRef name) {
+    if (!verifiedOriginalAmoebaRealization)
+      return false;
+    if (name == kOriginalAmoebaDecisionModeAttr ||
+        name == "amoeba.original_amoeba.replica_decision" ||
+        name == "amoeba.original_amoeba.replica_placements" ||
+        name == "amoeba.original_amoeba.source_partition_realization")
+      return true;
+    // The native materializer removes these parent-firing summaries from
+    // verified children so they cannot masquerade as per-shard profile data.
+    // Permit only that validated parent-present/child-absent relationship;
+    // changed or child-invented summaries still compare exactly.
+    return (name == "profile_info" || name == "task_orchestration_info") &&
+           lhs->hasAttr(name) && !rhs->hasAttr(name);
+  };
   for (NamedAttribute left : lhs->getAttrs()) {
     StringRef name = left.getName().getValue();
     if ((taskAttrs && isIgnoredTaskAttr(name)) ||
         (counterAttrs && isIgnoredCounterAttr(name)) ||
         (sequentialK && isSequentialKDerivedTaskAttr(name)) ||
-        (sourceOwnedTiling && isSourceOwnedTilingAttr(name)))
+        (sourceOwnedTiling && isSourceOwnedTilingAttr(name)) ||
+        isVerifiedDerivedMetadata(name))
       continue;
     Attribute right = rhs->getAttr(name);
-    if (!right || right != left.getValue())
+    if (!right || right != left.getValue()) {
+      recordMismatch(name);
       return false;
+    }
   }
   for (NamedAttribute right : rhs->getAttrs()) {
     StringRef name = right.getName().getValue();
     if ((taskAttrs && isIgnoredTaskAttr(name)) ||
         (counterAttrs && isIgnoredCounterAttr(name)) ||
         (sequentialK && isSequentialKDerivedTaskAttr(name)) ||
-        (sourceOwnedTiling && isSourceOwnedTilingAttr(name)))
+        (sourceOwnedTiling && isSourceOwnedTilingAttr(name)) ||
+        isVerifiedDerivedMetadata(name))
       continue;
     Attribute left = lhs->getAttr(name);
-    if (!left || left != right.getValue())
+    if (!left || left != right.getValue()) {
+      recordMismatch(name);
       return false;
+    }
   }
   return true;
+}
+
+static std::string conciseAttributeText(Attribute attribute) {
+  if (!attribute)
+    return "<absent>";
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  attribute.print(stream);
+  stream.flush();
+  constexpr size_t kMaxAttributeTextLength = 160;
+  if (text.size() > kMaxAttributeTextLength) {
+    text.resize(kMaxAttributeTextLength);
+    text += "...";
+  }
+  return text;
 }
 
 static bool sourceOwnedTypesCompatible(Type lhs, Type rhs,
@@ -2968,8 +3015,27 @@ static bool compareOperation(Operation *lhs, Operation *rhs,
     reason = "Neura counter operation changed";
     return false;
   }
-  if (!attrsEquivalent(lhs, rhs, /*taskAttrs=*/false, counter)) {
-    reason = "Neura body semantic attributes changed";
+  SmallVector<std::string, 4> mismatchedAttrs;
+  if (!attrsEquivalent(lhs, rhs, /*taskAttrs=*/false, counter,
+                       /*sequentialK=*/false,
+                       /*sourceOwnedTiling=*/false,
+                       /*verifiedOriginalAmoebaRealization=*/false,
+                       &mismatchedAttrs)) {
+    reason = "Neura body semantic attributes changed on " +
+             lhs->getName().getStringRef().str();
+    constexpr size_t kMaxReportedAttributeDifferences = 8;
+    for (auto [index, name] : llvm::enumerate(mismatchedAttrs)) {
+      if (index == kMaxReportedAttributeDifferences) {
+        reason += "; additional attribute differences omitted";
+        break;
+      }
+      reason += "; ";
+      reason += name;
+      reason += " source=";
+      reason += conciseAttributeText(lhs->getAttr(name));
+      reason += " child=";
+      reason += conciseAttributeText(rhs->getAttr(name));
+    }
     return false;
   }
   if (counter) {
@@ -3116,12 +3182,14 @@ static bool compareKernel(neura::KernelOp lhs, neura::KernelOp rhs,
 static bool proveTaskBody(TaskflowTaskOp parent, TaskflowTaskOp child,
                           BodyProof &proof, std::string &error,
                           bool sequentialK = false,
-                          bool sourceOwnedTiling = false) {
+                          bool sourceOwnedTiling = false,
+                          bool verifiedOriginalAmoebaRealization = false) {
   if (parent->getNumOperands() != child->getNumOperands() ||
       parent->getNumResults() != child->getNumResults() ||
       !attrsEquivalent(parent, child, /*taskAttrs=*/true,
                        /*counterAttrs=*/false, sequentialK,
-                       sourceOwnedTiling)) {
+                       sourceOwnedTiling,
+                       verifiedOriginalAmoebaRealization)) {
     error = "task shell inputs, outputs, or semantic attributes changed";
     return false;
   }
@@ -3954,6 +4022,396 @@ static bool collectReplicaLayout(
   return true;
 }
 
+static std::optional<int64_t> originalAmoebaInteger(DictionaryAttr dictionary,
+                                                    StringRef name) {
+  auto value = dictionary ? dictionary.getAs<IntegerAttr>(name) : IntegerAttr();
+  if (!value)
+    return std::nullopt;
+  return value.getInt();
+}
+
+static std::optional<StringRef> originalAmoebaString(DictionaryAttr dictionary,
+                                                     StringRef name) {
+  auto value = dictionary ? dictionary.getAs<StringAttr>(name) : StringAttr();
+  if (!value)
+    return std::nullopt;
+  return value.getValue();
+}
+
+static bool buildOriginalAmoebaCounterBounds(
+    TaskflowTaskOp task, SmallVectorImpl<CounterBounds> &bounds,
+    std::string &error) {
+  SmallVector<int64_t> ids;
+  if (!collectCounterIds(task, ids, error))
+    return false;
+  bounds.reserve(ids.size());
+  for (int64_t id : ids) {
+    CounterBounds current;
+    if (!findTaskflowCounterBounds(task, id, current, error))
+      return false;
+    bounds.push_back(current);
+  }
+  return true;
+}
+
+static ArrayAttr originalAmoebaBoundsAttr(MLIRContext *context,
+                                          ArrayRef<CounterBounds> bounds) {
+  OpBuilder builder(context);
+  SmallVector<Attribute> axes;
+  axes.reserve(bounds.size());
+  for (auto [ordinal, bound] : llvm::enumerate(bounds))
+    axes.push_back(builder.getDictionaryAttr(
+        {builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+         builder.getNamedAttr("lower", builder.getI64IntegerAttr(bound.lower)),
+         builder.getNamedAttr("upper", builder.getI64IntegerAttr(bound.upper)),
+         builder.getNamedAttr("step", builder.getI64IntegerAttr(bound.step))}));
+  return builder.getArrayAttr(axes);
+}
+
+// The original f45 scheduler owns only replica count, selected/composed
+// shape, and ordered placements.  The native realization's selected output
+// axis and source intervals are a separate proof.  Check their explicit
+// binding before allowing the three derived attributes through canonical
+// task-shell comparison.
+static bool validateOriginalAmoebaRealizationMetadata(
+    func::FuncOp function, const std::map<std::string, TaskMetadata> &parents,
+    const std::map<std::string, TaskMetadata> &children,
+    const std::map<std::string, std::vector<ReplicaRecord>> &replicas,
+    std::set<std::string> &verifiedChildren, std::string &error) {
+  constexpr StringLiteral kDecisionManifestAttr =
+      "amoeba.original_amoeba.materialized_decisions";
+  constexpr StringLiteral kReplicaDecisionAttr =
+      "amoeba.original_amoeba.replica_decision";
+  constexpr StringLiteral kReplicaPlacementsAttr =
+      "amoeba.original_amoeba.replica_placements";
+  constexpr StringLiteral kPartitionRealizationAttr =
+      "amoeba.original_amoeba.source_partition_realization";
+  auto reject = [&](StringRef reason) {
+    error = "original AMOEBA source-realization metadata is invalid: " +
+            reason.str();
+    return false;
+  };
+
+  std::map<std::string, DictionaryAttr> manifests;
+  ArrayAttr decisionManifest =
+      function->getAttrOfType<ArrayAttr>(kDecisionManifestAttr);
+  if (decisionManifest) {
+    for (Attribute attribute : decisionManifest) {
+      auto decision = dyn_cast<DictionaryAttr>(attribute);
+      auto parentName = originalAmoebaString(decision, "parent_task");
+      auto schema = originalAmoebaString(decision, "schema");
+      if (!decision || decision.size() != 8 || !parentName || !schema ||
+          *schema != "amoeba-original-fixed-decision-realization-v1" ||
+          !manifests.emplace(parentName->str(), decision).second)
+        return reject("function decision manifest has an invalid schema or "
+                      "duplicate parent");
+    }
+  }
+
+  bool foundDerivedMetadata = false;
+  for (const auto &entry : children) {
+    TaskflowTaskOp child = entry.second.op;
+    bool hasDecision = child->hasAttr(kReplicaDecisionAttr);
+    bool hasPlacements = child->hasAttr(kReplicaPlacementsAttr);
+    bool hasRealization = child->hasAttr(kPartitionRealizationAttr);
+    if (!hasDecision && !hasPlacements && !hasRealization)
+      continue;
+    foundDerivedMetadata = true;
+    if (!hasDecision || !hasPlacements || !hasRealization)
+      return reject("replica child has only a partial derived-attribute set");
+  }
+  if (foundDerivedMetadata && !decisionManifest)
+    return reject("replica child metadata has no function-level decision "
+                  "manifest");
+  if (!decisionManifest)
+    return true;
+
+  std::set<std::string> verifiedParents;
+  for (const auto &manifestEntry : manifests) {
+    const std::string &parentName = manifestEntry.first;
+    DictionaryAttr manifest = manifestEntry.second;
+    auto parent = parents.find(parentName);
+    auto group = replicas.find(parentName);
+    if (parent == parents.end() || group == replicas.end() ||
+        group->second.empty())
+      return reject("manifest names a missing canonical parent or replica "
+                    "group");
+    TaskflowTaskOp canonical = parent->second.op;
+    DictionaryAttr scheduler = canonical->getAttrOfType<DictionaryAttr>(
+        "amoeba.task_scheduler_schedule_info");
+    auto canonicalActive =
+        canonical->getAttrOfType<IntegerAttr>("active_replicas");
+    auto schedulerActive = originalAmoebaInteger(scheduler, "active_replicas");
+    auto schedulerTask = originalAmoebaString(scheduler, "task_name");
+    auto schedulerShapes =
+        scheduler ? scheduler.getAs<ArrayAttr>("replica_shapes") : ArrayAttr();
+    auto schedulerPlacements =
+        scheduler ? scheduler.getAs<ArrayAttr>("placements") : ArrayAttr();
+    auto schedulerComposedShape =
+        originalAmoebaString(scheduler, "composed_cgra_shape");
+    auto schedulerComposedCount =
+        originalAmoebaInteger(scheduler, "composed_cgra_count");
+    auto composedShape =
+        canonical->getAttrOfType<StringAttr>("composed_cgra_shape");
+    auto composedCount =
+        canonical->getAttrOfType<IntegerAttr>("composed_cgra_count");
+    auto manifestCount =
+        originalAmoebaInteger(manifest, "original_replica_count");
+    auto manifestOutputAxis =
+        originalAmoebaInteger(manifest, "selected_output_axis");
+    auto manifestCounter =
+        originalAmoebaInteger(manifest, "selected_counter_ordinal");
+    auto manifestScheduler = manifest.getAs<DictionaryAttr>("scheduler_record");
+    ArrayAttr manifestDomain = manifest.getAs<ArrayAttr>("original_domain");
+    ArrayAttr manifestReplicas = manifest.getAs<ArrayAttr>("replicas");
+    int64_t composedRows = 0;
+    int64_t composedCols = 0;
+    bool validComposedShape = false;
+    if (composedShape) {
+      auto dimensions = composedShape.getValue().split('x');
+      validComposedShape =
+          !dimensions.first.empty() && !dimensions.second.empty() &&
+          !dimensions.second.contains('x') &&
+          !dimensions.first.getAsInteger(10, composedRows) &&
+          !dimensions.second.getAsInteger(10, composedCols) &&
+          composedRows > 0 && composedRows <= 4 && composedCols > 0 &&
+          composedCols <= 4 && composedRows * composedCols <= 4;
+    }
+    if (!scheduler || !canonicalActive || !schedulerActive || !schedulerTask ||
+        !schedulerShapes || !schedulerPlacements || !manifestCount ||
+        !manifestOutputAxis || !manifestCounter || !manifestScheduler ||
+        !manifestDomain || !manifestReplicas || !validComposedShape ||
+        !composedCount ||
+        composedCount.getInt() != composedRows * composedCols ||
+        !schedulerComposedShape || !schedulerComposedCount ||
+        *schedulerComposedShape != composedShape.getValue() ||
+        *schedulerComposedCount != composedCount.getInt() ||
+        *manifestCount < 2 || *manifestCount > 4 ||
+        *schedulerTask != parentName ||
+        canonicalActive.getInt() != *schedulerActive ||
+        *manifestCount != *schedulerActive ||
+        group->second.size() != static_cast<size_t>(*manifestCount) ||
+        manifestReplicas.size() != group->second.size() ||
+        manifestScheduler != scheduler || *manifestOutputAxis < 0 ||
+        *manifestCounter < 0 ||
+        !parent->second.sourceIterationDomainCertified ||
+        !parent->second.sourceIterationDomainComplete ||
+        parent->second.sourceIterationMultiplicity <= 0)
+      return reject("manifest is not bound to the canonical f45 decision");
+
+    SmallVector<CounterBounds> originalBounds;
+    if (!buildOriginalAmoebaCounterBounds(canonical, originalBounds, error))
+      return false;
+    ArrayAttr expectedDomain =
+        originalAmoebaBoundsAttr(function.getContext(), originalBounds);
+    if (*manifestCounter >= static_cast<int64_t>(originalBounds.size()) ||
+        manifestDomain != expectedDomain)
+      return reject("manifest source domain differs from canonical counter "
+                    "bounds");
+
+    SmallVector<DictionaryAttr> shapes(*manifestCount);
+    for (Attribute attribute : schedulerShapes) {
+      auto shape = dyn_cast<DictionaryAttr>(attribute);
+      auto id = originalAmoebaInteger(shape, "replica_id");
+      auto cgraCount = originalAmoebaInteger(shape, "cgra_count");
+      auto rows = originalAmoebaInteger(shape, "placement_rows");
+      auto cols = originalAmoebaInteger(shape, "placement_cols");
+      auto row = originalAmoebaInteger(shape, "row");
+      auto col = originalAmoebaInteger(shape, "col");
+      auto text = originalAmoebaString(shape, "shape");
+      int64_t parsedRows = 0, parsedCols = 0;
+      bool parsed = text &&
+                    !text->split('x').first.getAsInteger(10, parsedRows) &&
+                    !text->split('x').second.getAsInteger(10, parsedCols) &&
+                    !text->split('x').second.contains('x');
+      if (!shape || !id || !cgraCount || !rows || !cols || !row || !col ||
+          !text || !parsed || *id < 0 || *id >= *manifestCount || shapes[*id] ||
+          *rows <= 0 || *cols <= 0 || *row < 0 || *col < 0 || *rows > 4 ||
+          *cols > 4 || *row > 3 || *col > 3 || *rows != parsedRows ||
+          *cols != parsedCols || *cgraCount != *rows * *cols ||
+          *cgraCount != composedCount.getInt() ||
+          !((*rows == composedRows && *cols == composedCols) ||
+            (*rows == composedCols && *cols == composedRows)) ||
+          *row > 4 - *rows || *col > 4 - *cols)
+        return reject("f45 replica-shape inventory is malformed");
+      shapes[*id] = shape;
+    }
+    for (DictionaryAttr shape : shapes)
+      if (!shape)
+        return reject("f45 replica-shape inventory is incomplete");
+
+    SmallVector<SmallVector<Attribute>> placementsById(*manifestCount);
+    std::set<std::pair<int64_t, int64_t>> uniqueCells;
+    for (Attribute attribute : schedulerPlacements) {
+      auto placement = dyn_cast<DictionaryAttr>(attribute);
+      auto id = originalAmoebaInteger(placement, "replica_id");
+      auto row = originalAmoebaInteger(placement, "row");
+      auto col = originalAmoebaInteger(placement, "col");
+      auto context = originalAmoebaInteger(placement, "context_id");
+      auto start = originalAmoebaInteger(placement, "scheduler_start_time");
+      auto end = originalAmoebaInteger(placement, "scheduler_end_time");
+      auto duration = originalAmoebaInteger(placement, "scheduler_duration");
+      if (!placement || !id || !row || !col || !context || !start || !end ||
+          !duration || *id < 0 || *id >= *manifestCount || *row < 0 ||
+          *row >= 4 || *col < 0 || *col >= 4 || *context < 0 || *context >= 6 ||
+          *start < 0 || *end <= *start || *duration != *end - *start ||
+          !uniqueCells.emplace(*row, *col).second)
+        return reject("f45 placement record is malformed or repeats a cell");
+      auto baseRow = originalAmoebaInteger(shapes[*id], "row");
+      auto baseCol = originalAmoebaInteger(shapes[*id], "col");
+      auto rows = originalAmoebaInteger(shapes[*id], "placement_rows");
+      auto cols = originalAmoebaInteger(shapes[*id], "placement_cols");
+      if (!baseRow || !baseCol || !rows || !cols || *row < *baseRow ||
+          *row >= *baseRow + *rows || *col < *baseCol ||
+          *col >= *baseCol + *cols)
+        return reject("f45 placement cell escapes its recorded shape");
+      placementsById[*id].push_back(attribute);
+    }
+    for (int64_t id = 0; id < *manifestCount; ++id) {
+      auto count = originalAmoebaInteger(shapes[id], "cgra_count");
+      if (!count || placementsById[id].size() != static_cast<size_t>(*count))
+        return reject("f45 placement cells do not cover each replica shape");
+    }
+
+    SmallVector<Attribute> summaries(manifestReplicas.begin(),
+                                     manifestReplicas.end());
+    SmallVector<bool> seenIds(*manifestCount, false);
+    for (const ReplicaRecord &record : group->second) {
+      TaskflowTaskOp child = record.child;
+      if (record.sourceOwnedTiling || record.count != *manifestCount ||
+          record.id < 0 || record.id >= *manifestCount || seenIds[record.id])
+        return reject("manifest group is not a complete ordinary replica set");
+      seenIds[record.id] = true;
+      auto summary = dyn_cast<DictionaryAttr>(summaries[record.id]);
+      auto summaryId = originalAmoebaInteger(summary, "replica_id");
+      auto summaryName = originalAmoebaString(summary, "task_name");
+      auto summaryShape = summary ? summary.get("replica_shape") : Attribute();
+      auto summaryPlacements =
+          summary ? summary.getAs<ArrayAttr>("placements") : ArrayAttr();
+      auto summaryBounds =
+          summary ? summary.getAs<ArrayAttr>("partition_bounds") : ArrayAttr();
+      auto summaryWork = originalAmoebaInteger(summary, "source_work_count");
+      auto childMetadata = children.find(child.getTaskName().str());
+      auto decision =
+          child->getAttrOfType<DictionaryAttr>(kReplicaDecisionAttr);
+      auto childPlacements =
+          child->getAttrOfType<ArrayAttr>(kReplicaPlacementsAttr);
+      auto realization =
+          child->getAttrOfType<DictionaryAttr>(kPartitionRealizationAttr);
+      auto replicaId = child->getAttrOfType<IntegerAttr>("amoeba.replica.id");
+      auto replicaCount =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.count");
+      auto shardAxis =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
+      auto outputAxis =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.output_shard_axis");
+      auto decisionMode =
+          child->getAttrOfType<BoolAttr>(kOriginalAmoebaDecisionModeAttr);
+      if (canonical->hasAttr(kOriginalAmoebaDecisionModeAttr) ||
+          !decisionMode || !decisionMode.getValue() ||
+          child->hasAttr("profile_info") ||
+          child->hasAttr("task_orchestration_info"))
+        return reject("replica shell does not carry the trusted fixed-decision "
+                      "mode or retains parent-only profile metadata");
+      if (!summary || summary.size() != 6 || !summaryId || !summaryName ||
+          !summaryShape || !summaryPlacements || !summaryBounds ||
+          !summaryWork || childMetadata == children.end() || !decision ||
+          !childPlacements || decision.size() != 3 || !realization ||
+          realization.size() != 13 || !replicaId || !replicaCount ||
+          !shardAxis || !outputAxis || summaryId != record.id ||
+          *summaryName != child.getTaskName() ||
+          summaryShape != shapes[record.id] ||
+          summaryPlacements != OpBuilder(function.getContext())
+                                   .getArrayAttr(placementsById[record.id]) ||
+          childPlacements != summaryPlacements ||
+          decision.getAs<DictionaryAttr>("scheduler_record") != scheduler ||
+          decision.get("replica_shape") != shapes[record.id] ||
+          decision.getAs<ArrayAttr>("placements") != summaryPlacements ||
+          replicaId.getInt() != record.id ||
+          replicaCount.getInt() != *manifestCount ||
+          shardAxis.getInt() != *manifestCounter ||
+          outputAxis.getInt() != *manifestOutputAxis ||
+          record.shardAxis != *manifestCounter ||
+          record.outputShardAxis != *manifestOutputAxis)
+        return reject("replica decision metadata differs from its scheduler "
+                      "record, id, shape, placement, or proved output axis");
+
+      auto schema = originalAmoebaString(realization, "schema");
+      auto status = originalAmoebaString(realization, "status");
+      auto origin = originalAmoebaString(realization, "origin");
+      auto f45Axes = realization.getAs<BoolAttr>("f45_axis_and_bounds_present");
+      auto realizedAxis =
+          originalAmoebaInteger(realization, "selected_output_axis");
+      auto realizedCounter =
+          originalAmoebaInteger(realization, "selected_counter_ordinal");
+      auto realizedCount =
+          originalAmoebaInteger(realization, "original_replica_count");
+      auto realizedId = originalAmoebaInteger(realization, "replica_id");
+      auto realizedDomain = realization.getAs<ArrayAttr>("original_domain");
+      auto realizedBounds = realization.getAs<ArrayAttr>("partition_bounds");
+      auto realizedWork =
+          originalAmoebaInteger(realization, "source_work_count");
+      auto multiplicity =
+          originalAmoebaInteger(realization, "internal_multiplicity");
+      auto decisionBinding =
+          originalAmoebaString(realization, "decision_binding");
+      SmallVector<CounterBounds> childBounds;
+      if (!buildOriginalAmoebaCounterBounds(child, childBounds, error))
+        return false;
+      ArrayAttr expectedBounds =
+          originalAmoebaBoundsAttr(function.getContext(), childBounds);
+      int64_t volume = 0;
+      if (!checkedCounterVolume(childBounds, volume) ||
+          parent->second.sourceIterationMultiplicity <= 0 ||
+          volume > std::numeric_limits<int64_t>::max() /
+                       parent->second.sourceIterationMultiplicity)
+        return reject("replica source-work volume is invalid or overflows");
+      int64_t expectedWork =
+          volume * parent->second.sourceIterationMultiplicity;
+      if (!schema ||
+          *schema != "amoeba-source-certified-replica-realization-v1" ||
+          !status || *status != "verified-source-certified-realization-v1" ||
+          !origin ||
+          *origin !=
+              "orbit-native-materializer-selected-counter-axis-after-f45" ||
+          !f45Axes || f45Axes.getValue() || !realizedAxis ||
+          *realizedAxis != *manifestOutputAxis || !realizedCounter ||
+          *realizedCounter != *manifestCounter || !realizedCount ||
+          *realizedCount != *manifestCount || !realizedId ||
+          *realizedId != record.id || realizedDomain != expectedDomain ||
+          realizedBounds != expectedBounds || summaryBounds != expectedBounds ||
+          !realizedWork || *realizedWork != expectedWork ||
+          *summaryWork != expectedWork ||
+          childMetadata->second.taskflowTripCount != volume ||
+          childMetadata->second.sourceIterationWorkCount != expectedWork ||
+          childMetadata->second.tripCount != record.childTripCount ||
+          !multiplicity ||
+          *multiplicity != parent->second.sourceIterationMultiplicity ||
+          !decisionBinding ||
+          *decisionBinding != "amoeba.task_scheduler_schedule_info")
+        return reject("native source partition metadata differs from exact "
+                      "child counter bounds or source-work count");
+      verifiedChildren.insert(child.getTaskName().str());
+    }
+    if (llvm::any_of(seenIds, [](bool seen) { return !seen; }))
+      return reject("manifest group omits a replica id");
+    verifiedParents.insert(parentName);
+  }
+
+  for (const auto &entry : children) {
+    TaskflowTaskOp child = entry.second.op;
+    if (!child->hasAttr(kPartitionRealizationAttr))
+      continue;
+    auto parentName =
+        child->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+    if (!parentName || verifiedParents.find(parentName.getValue().str()) ==
+                           verifiedParents.end())
+      return reject("derived replica metadata is absent from the complete "
+                    "function manifest");
+  }
+  return true;
+}
+
 static std::string sourceTaskName(TaskflowTaskOp task) {
   if (auto parent = task->getAttrOfType<StringAttr>(
           "amoeba.tiling.parent_task"))
@@ -4110,6 +4568,13 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
       childFunction.emitError() << error;
       return signalPassFailure();
     }
+    std::set<std::string> verifiedOriginalAmoebaChildren;
+    if (!validateOriginalAmoebaRealizationMetadata(
+            childFunction, parents, children, replicas,
+            verifiedOriginalAmoebaChildren, error)) {
+      childFunction.emitError() << error;
+      return signalPassFailure();
+    }
 
     std::map<std::string, BodyProof> proofs;
     for (const TaskMetadata &childTask : *childTasks) {
@@ -4138,8 +4603,9 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
       BodyProof proof;
       if (!proveTaskBody(parent->second.op, childTask.op, proof, error,
                          isSequentialKLineage(childTask.op),
-                         lineage != sourceOwnedLineage.end() &&
-                             lineage->second)) {
+                         lineage != sourceOwnedLineage.end() && lineage->second,
+                         verifiedOriginalAmoebaChildren.count(childTask.name) !=
+                             0)) {
         childFunction.emitError() << "replica body proof failed for child task "
                                   << childTask.name << ": " << error;
         return signalPassFailure();
@@ -4386,6 +4852,11 @@ static LogicalResult processSourceIterationDomainPartition(
   if (!collectReplicaLayout(*parentTasks, *childTasks, parents, children,
                             replicas, sourceOwnedLineage, error))
     return failure();
+  std::set<std::string> verifiedOriginalAmoebaChildren;
+  if (!validateOriginalAmoebaRealizationMetadata(
+          proofFunction, parents, children, replicas,
+          verifiedOriginalAmoebaChildren, error))
+    return failure();
 
   std::map<std::string, TaskflowTaskOp> actualChildren;
   currentChild.walk([&](TaskflowTaskOp task) {
@@ -4496,7 +4967,8 @@ static LogicalResult processSourceIterationDomainPartition(
     if (!proveTaskBody(canonicalTask, child.op, bodyProof, error,
                        isSequentialKLineage(child.op),
                        lineage != sourceOwnedLineage.end() &&
-                           lineage->second)) {
+                           lineage->second,
+                       verifiedOriginalAmoebaChildren.count(child.name) != 0)) {
       error = "source-domain child body proof failed for " + child.name +
               ": " + error;
       return failure();

@@ -160,6 +160,9 @@ traceKernelInput(Value value, KernelOp kernel,
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return finish(std::nullopt);
+  if (auto cast = dyn_cast<memref::CastOp>(definition))
+    return finish(traceKernelInput(cast.getSource(), kernel, visiting,
+                                   depth + 1));
   StringRef name = definition->getName().getStringRef();
   if (name == "neura.constant")
     return finish(detail::parseInputReference(definition->getAttr("value")));
@@ -219,6 +222,14 @@ authenticatedAccessInput(Operation *operation, Value base, KernelOp kernel) {
   if (std::optional<unsigned> shared =
           detail::accessInput(operation, base, kernel))
     return shared;
+  if (isa<memref::LoadOp, memref::StoreOp>(operation)) {
+    std::optional<unsigned> input = traceKernelInput(base, kernel);
+    if (!input || *input >= kernel.getInputs().size() ||
+        !isa<MemRefType>(base.getType()) ||
+        !isa<MemRefType>(kernel.getInputs()[*input].getType()))
+      return std::nullopt;
+    return input;
+  }
   if (!kernel || !isa<LoadIndexedOp, StoreIndexedOp>(operation))
     return std::nullopt;
   bool isLoad = isa<LoadIndexedOp>(operation);
@@ -421,12 +432,49 @@ public:
         for (Value index : store.getIndices())
           indices.push_back(index);
       } else if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-        accessRoot = resolveRoot(load.getMemref(), rootError).value_or(Value{});
+        KernelOp kernel = load->getParentOfType<KernelOp>();
+        if (!kernel) {
+          accessRoot =
+              resolveRoot(load.getMemref(), rootError).value_or(Value{});
+        } else {
+          inputIndex =
+              authenticatedAccessInput(operation, load.getMemref(), kernel);
+          if (inputIndex && task) {
+            accessRoot =
+                resolveKernelInputRoot(task, kernel, *inputIndex, rootError);
+            if (accessRoot && !isAuthenticatedIdentityMemRefView(
+                                  load.getMemref().getType(),
+                                  accessRoot.getType(), accessRoot, rootError,
+                                  /*requireCapacity=*/true))
+              accessRoot = {};
+          } else {
+            rootError =
+                "direct memref load lacks an authenticated task/kernel input";
+          }
+        }
         for (Value index : load.getIndices())
           indices.push_back(index);
       } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-        accessRoot =
-            resolveRoot(store.getMemref(), rootError).value_or(Value{});
+        KernelOp kernel = store->getParentOfType<KernelOp>();
+        if (!kernel) {
+          accessRoot =
+              resolveRoot(store.getMemref(), rootError).value_or(Value{});
+        } else {
+          inputIndex =
+              authenticatedAccessInput(operation, store.getMemref(), kernel);
+          if (inputIndex && task) {
+            accessRoot =
+                resolveKernelInputRoot(task, kernel, *inputIndex, rootError);
+            if (accessRoot && !isAuthenticatedIdentityMemRefView(
+                                  store.getMemref().getType(),
+                                  accessRoot.getType(), accessRoot, rootError,
+                                  /*requireCapacity=*/true))
+              accessRoot = {};
+          } else {
+            rootError =
+                "direct memref store lacks an authenticated task/kernel input";
+          }
+        }
         for (Value index : store.getIndices())
           indices.push_back(index);
       } else {
@@ -674,6 +722,19 @@ private:
       return true;
     if (auto cast = dyn_cast<memref::CastOp>(operation)) {
       std::string error;
+      if (KernelOp kernel = cast->getParentOfType<KernelOp>()) {
+        TaskflowTaskOp task = cast->getParentOfType<TaskflowTaskOp>();
+        std::optional<unsigned> input =
+            traceKernelInput(cast.getSource(), kernel);
+        if (!input || !task)
+          return false;
+        Value storageRoot =
+            resolveKernelInputRoot(task, kernel, *input, error);
+        return storageRoot && isAuthenticatedIdentityMemRefView(
+                                  cast.getSource().getType(),
+                                  cast.getResult().getType(), storageRoot,
+                                  error, /*requireCapacity=*/true);
+      }
       std::optional<Value> sourceRoot = resolveRoot(cast.getSource(), error);
       return sourceRoot && isAuthenticatedIdentityMemRefView(
                                cast.getSource().getType(),

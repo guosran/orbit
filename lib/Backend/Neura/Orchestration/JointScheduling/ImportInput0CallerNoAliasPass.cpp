@@ -957,6 +957,15 @@ struct ImportInput0CallerNoAliasPass
     // resulting attribute is an input-0 invocation no-alias fact for this
     // closed-world caller; it is not a general C++ ABI or numerical-semantic
     // assertion about the target body.
+    // The caller proof above has validated each logical shape against the
+    // selected target signature and the corresponding caller allocation root.
+    // Carry that exact fact onto the prepared target so downstream payload
+    // proofs can resolve dynamic memref results back to their authenticated
+    // caller storage domain.
+    for (auto [ordinal, argument] : llvm::enumerate(memrefArguments))
+      target.setArgAttr(
+          argument, kLogicalTransferShapeAttr,
+          DenseI64ArrayAttr::get(module.getContext(), expectedShapes[ordinal]));
     for (unsigned argument : memrefArguments)
       target.setArgAttr(argument, kNoAliasAttr,
                         UnitAttr::get(module.getContext()));

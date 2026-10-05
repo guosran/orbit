@@ -104,6 +104,10 @@ constexpr llvm::StringLiteral kDirectModelName =
     "orbit-cgra-ii-per-cgra-2x2-direct-4member-v1";
 constexpr llvm::StringLiteral kDirectCandidateStatus =
     "candidate_pending_amoeba_benchmark_overlap_audit";
+constexpr llvm::StringLiteral kDiagnosticUnsupportedPolicy =
+    "analytical-lower-bound-exceeds-diagnostic-runtime-ceiling-v1";
+constexpr llvm::StringLiteral kDiagnosticUnsupportedReason =
+    "analytical-lower-bound-exceeds-diagnostic-runtime-ceiling";
 constexpr llvm::StringLiteral kDirectSourceRepository =
     "https://github.com/guosran/cgra-ii-predictor";
 constexpr llvm::StringLiteral kDirectSourceBranch = "orbit-2x2-predictor";
@@ -934,7 +938,7 @@ static bool readFeatureQueries(
 static bool generateCurrentFeatureQueries(
     std::vector<CurrentTaskBody> &bodies, ArrayRef<std::string> names,
     bool directModel, std::vector<FeatureQuery> &queries, std::string &error,
-    bool allowUnsupportedAboveModelCeiling) {
+    bool allowUnsupportedAboveModelCeiling, double runtimeIICeiling) {
   queries.clear();
   ArrayRef<std::pair<int64_t, int64_t>> shapes =
       directModel ? ArrayRef<std::pair<int64_t, int64_t>>(kPerCgra2x2Shapes)
@@ -962,24 +966,32 @@ static bool generateCurrentFeatureQueries(
       query.resMII = resMII;
       query.lowerBound = lowerBound;
       query.startupCycles = body.startupCycles;
-      if (allowUnsupportedAboveModelCeiling &&
-          lowerBound > kFormalMax4ModelCeilingII) {
+      const double domainCeiling =
+          directModel ? runtimeIICeiling : kFormalMax4ModelCeilingII;
+      if (allowUnsupportedAboveModelCeiling && lowerBound > domainCeiling) {
         query.modelDomainUnsupported = true;
         queries.push_back(std::move(query));
         continue;
       }
-      if (directModel && lowerBound > kFormalMax4ModelCeilingII) {
+      if (directModel && lowerBound > domainCeiling) {
         error = "current task " + body.task + " shape rect-" +
                 std::to_string(rows) + "x" + std::to_string(columns) +
-                " has an analytical lower bound above the direct-model II "
-                "ceiling of 20; enable explicit unsupported-domain records";
+                " has an analytical lower bound above the direct-model runtime "
+                "II ceiling; enable explicit unsupported-domain records";
         return false;
       }
       if (directModel) {
         orbit::mapper_features::PerCgra2x2FeatureVector featureVector;
+        const auto featureInterval =
+            runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling
+                ? orbit::mapper_features::PerCgra2x2MapperFeatureInterval::
+                      Diagnostic23
+                : orbit::mapper_features::PerCgra2x2MapperFeatureInterval::
+                      Training20;
         if (!orbit::mapper_features::computePerCgra2x2MapperFeatures(
                 body.graph, static_cast<int>(rows), static_cast<int>(columns),
-                recMII, resMII, lowerBound, featureVector, error)) {
+                recMII, resMII, lowerBound, featureVector, error,
+                featureInterval)) {
           error = "current task " + body.task + " shape rect-" +
                   std::to_string(rows) + "x" + std::to_string(columns) +
                   " direct feature extraction failed: " + error;
@@ -1128,7 +1140,9 @@ static bool writeCatalogue(
     const std::vector<MLPEnsemblePrediction> &predictions,
     const PersistentMLCostCache &cache,
     std::optional<json::Object> architectureTransfer,
-    bool allowUnsupportedAboveModelCeiling, StringRef canonicalModuleWitness) {
+    bool allowUnsupportedAboveModelCeiling, StringRef canonicalModuleWitness,
+    double runtimeIICeiling, StringRef trainingArchitectureText,
+    StringRef runtimeArchitectureText, std::string &error) {
   json::Object root;
   root["schema"] = "amoeba-task-shape-cost";
   root["function"] = function.str();
@@ -1184,6 +1198,16 @@ static bool writeCatalogue(
                      {"member_seeds", std::move(memberSeeds)},
                      {"reduction", "arithmetic_mean"},
                      {"uncertainty", "population_standard_deviation"}};
+    if (runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
+      metadata["diagnostic_only"] = true;
+      metadata["formal"] = false;
+      json::Object diagnosticOverride;
+      if (!makePerCgra2x2DiagnosticOverrideMetadata(
+              trainingArchitectureText, runtimeArchitectureText,
+              diagnosticOverride, error))
+        return false;
+      metadata["diagnostic_override"] = std::move(diagnosticOverride);
+    }
   }
   metadata["communication_latency"] = "scored_by_scheduler";
   metadata["ranking_policy"] =
@@ -1196,9 +1220,12 @@ static bool writeCatalogue(
       {"hits", static_cast<int64_t>(cache.getHitCount())},
       {"misses", static_cast<int64_t>(cache.getMissCount())},
       {"trip_count_in_identity", false}};
-  if (allowUnsupportedAboveModelCeiling) {
+  if (allowUnsupportedAboveModelCeiling ||
+      runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
     metadata["unsupported_prediction_policy"] =
-        "analytical-lower-bound-exceeds-model-ceiling-v1";
+        runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling
+            ? kDiagnosticUnsupportedPolicy.str()
+            : "analytical-lower-bound-exceeds-model-ceiling-v1";
     metadata["model_interval_max_ii"] = kFormalMax4ModelCeilingII;
     metadata["canonical_module_witness"] = canonicalModuleWitness.str();
   }
@@ -1211,15 +1238,26 @@ static bool writeCatalogue(
     const FeatureQuery &query = queries[index];
     const MLPEnsemblePrediction &prediction = predictions[index];
     if (query.modelDomainUnsupported) {
-      entries.push_back(json::Object{
+      json::Object unsupportedEntry{
           {"task", query.task},
           {"mapper_tile_rows", query.rows},
           {"mapper_tile_cols", query.cols},
           {"support_status", "unsupported"},
           {"status", kModelDomainUnsupportedStatus.str()},
-          {"unsupported_reason", kModelDomainUnsupportedReason.str()},
+          {"unsupported_reason",
+           runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling
+               ? kDiagnosticUnsupportedReason.str()
+               : kModelDomainUnsupportedReason.str()},
           {"analytical_lower_bound", query.lowerBound},
-          {"model_interval_max_ii", kFormalMax4ModelCeilingII}});
+          {"model_interval_max_ii", kFormalMax4ModelCeilingII}};
+      if (runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
+        unsupportedEntry["training_ceiling_ii"] =
+            kPerCgra2x2TrainingIICeiling;
+        unsupportedEntry["runtime_ceiling_ii"] = runtimeIICeiling;
+        unsupportedEntry["extrapolation_status"] =
+            "outside-diagnostic-runtime-domain";
+      }
+      entries.push_back(std::move(unsupportedEntry));
       continue;
     }
     json::Object entry{
@@ -1251,6 +1289,20 @@ static bool writeCatalogue(
       }
       entry["direct_ensemble_members"] = std::move(members);
       entry["candidate_only"] = true;
+      if (runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
+        const bool extrapolated = query.lowerBound >
+                                      kPerCgra2x2TrainingIICeiling ||
+                                  llvm::any_of(
+                                      directPredictions[index].memberPredictions,
+                                      [](double value) {
+                                        return value >
+                                               kPerCgra2x2TrainingIICeiling;
+                                      });
+        entry["training_ceiling_ii"] = kPerCgra2x2TrainingIICeiling;
+        entry["runtime_ceiling_ii"] = runtimeIICeiling;
+        entry["extrapolation_status"] =
+            extrapolated ? "out-of-training-ceiling" : "within-training-ceiling";
+      }
     }
     entries.push_back(std::move(entry));
   }
@@ -1330,6 +1382,11 @@ struct PredictAnalyticalTaskCostCatalogPass
       llvm::cl::desc("Record C++-proved mapper lower bounds above the model "
                      "interval as explicit unsupported shapes"),
       llvm::cl::init(false)};
+  Option<double> diagnosticIICeiling{
+      *this, "diagnostic-ii-ceiling",
+      llvm::cl::desc("Opt into direct-model-only II extrapolation at exactly "
+                     "23; training ceiling remains 20"),
+      llvm::cl::init(kPerCgra2x2TrainingIICeiling)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -1339,6 +1396,24 @@ struct PredictAnalyticalTaskCostCatalogPass
     };
     const bool directModelMode =
         llvm::StringRef(modelNamespace) == kPerCgra2x2ModelNamespace;
+    if (diagnosticIICeiling != kPerCgra2x2TrainingIICeiling &&
+        diagnosticIICeiling != kPerCgra2x2DiagnosticIICeiling) {
+      fail("diagnostic-ii-ceiling accepts only 20 (default) or 23");
+      return;
+    }
+    if (diagnosticIICeiling == kPerCgra2x2DiagnosticIICeiling &&
+        !directModelMode) {
+      fail("diagnostic-ii-ceiling=23 is supported only by the direct per-CGRA "
+           "2x2 model");
+      return;
+    }
+    if (diagnosticIICeiling == kPerCgra2x2DiagnosticIICeiling &&
+        !allowUnsupportedAboveModelCeiling) {
+      fail("diagnostic-ii-ceiling=23 requires explicit unsupported-domain "
+           "records for shapes whose lower bound exceeds 23");
+      return;
+    }
+    const double runtimeIICeiling = diagnosticIICeiling;
     if (spaceFile.empty() || ensembleFile.empty() ||
         (!directModelMode && checkpointDirectory.empty()) ||
         architectureContract.empty() || architecturePath.empty() ||
@@ -1398,9 +1473,11 @@ struct PredictAnalyticalTaskCostCatalogPass
     MLCostCacheResources cacheResources;
     json::Object directSourceModel;
     if (directModelMode) {
-      // The direct bundle validates its embedded exact architecture YAML
-      // against the caller's byte-for-byte source before any cache access.
-      if (!directModel.load(ensembleFile, architectureText, error) ||
+      // The direct bundle retains its exact training architecture text.  The
+      // explicit 23 diagnostic accepts only a runtime YAML formed by the one
+      // ctrl_mem_items 20 -> 23 substitution.
+      if (!directModel.load(ensembleFile, architectureText, runtimeIICeiling,
+                            error) ||
           !readDirectSourceModel(ensembleFile, directSourceModel, error)) {
         fail(error);
         return;
@@ -1464,7 +1541,8 @@ struct PredictAnalyticalTaskCostCatalogPass
     std::vector<FeatureQuery> generatedQueries;
     if (!generateCurrentFeatureQueries(currentBodies, featureNames,
                                        directModelMode, generatedQueries, error,
-                                       allowUnsupportedAboveModelCeiling)) {
+                                       allowUnsupportedAboveModelCeiling,
+                                       runtimeIICeiling)) {
       fail(error);
       return;
     }
@@ -1571,7 +1649,7 @@ struct PredictAnalyticalTaskCostCatalogPass
         double mean = 0.0;
         for (double value : directPrediction.memberPredictions) {
           if (!std::isfinite(value) || value < query.lowerBound ||
-              value > kFormalMax4ModelCeilingII + 1.0e-6) {
+              value > runtimeIICeiling + 1.0e-6) {
             fail("direct member prediction violates finite/lower-bound/ceiling "
                  "contract");
             return;
@@ -1620,7 +1698,7 @@ struct PredictAnalyticalTaskCostCatalogPass
         }
         if (!std::isfinite(prediction.predictedII) ||
             prediction.predictedII < query.lowerBound ||
-            prediction.predictedII > kFormalMax4ModelCeilingII + 1.0e-6 ||
+            prediction.predictedII > runtimeIICeiling + 1.0e-6 ||
             !std::isfinite(prediction.predictedIIStd) ||
             prediction.predictedIIStd < 0.0) {
           fail("model prediction violates finite/lower-bound/ceiling contract");
@@ -1647,7 +1725,10 @@ struct PredictAnalyticalTaskCostCatalogPass
                   candidateCount, queries, predictions, cache,
                   std::move(architectureTransfer),
                   allowUnsupportedAboveModelCeiling,
-                  neighborhoodReplaySourceText(module));
+                  neighborhoodReplaySourceText(module), runtimeIICeiling,
+                  directModelMode ? directModel.getTrainingArchitectureText()
+                                  : llvm::StringRef(),
+                  architectureText, error);
             },
             error)) {
       fail(error);
@@ -1688,14 +1769,35 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
   const auto namespaceValue = root->getString("namespace");
   const bool directModel =
       namespaceValue && *namespaceValue == kPerCgra2x2ModelNamespace;
+  const json::Object *diagnostic = metadata->getObject("diagnostic_override");
+  const bool diagnosticOverride = diagnostic != nullptr;
+  double runtimeIICeiling = kFormalMax4ModelCeilingII;
+  if (diagnosticOverride) {
+    auto architecturePath = metadata->getString("architecture_path");
+    std::string currentArchitectureText;
+    if (!directModel || !architecturePath ||
+        !readTextFile(*architecturePath, currentArchitectureText, error) ||
+        !validatePerCgra2x2DiagnosticMetadata(
+            *metadata, currentArchitectureText, error))
+      return fail(error.empty()
+                      ? "diagnostic override metadata is missing or invalid"
+                      : error);
+    runtimeIICeiling = kPerCgra2x2DiagnosticIICeiling;
+  } else if (metadata->get("diagnostic_only") || metadata->get("formal")) {
+    return fail("diagnostic catalogue is missing its diagnostic_override proof");
+  }
   ArrayRef<std::pair<int64_t, int64_t>> shapes =
       directModel ? ArrayRef<std::pair<int64_t, int64_t>>(kPerCgra2x2Shapes)
                   : ArrayRef<std::pair<int64_t, int64_t>>(kFormalMax4Shapes);
   auto witness = metadata->getString("canonical_module_witness");
   auto policy = metadata->getString("unsupported_prediction_policy");
   auto ceiling = metadata->getNumber("model_interval_max_ii");
+  const llvm::StringRef expectedUnsupportedPolicy =
+      diagnosticOverride ? llvm::StringRef(kDiagnosticUnsupportedPolicy)
+                         : llvm::StringRef(
+                               "analytical-lower-bound-exceeds-model-ceiling-v1");
   if (!witness || *witness != neighborhoodReplaySourceText(module) || !policy ||
-      *policy != "analytical-lower-bound-exceeds-model-ceiling-v1" ||
+      *policy != expectedUnsupportedPolicy ||
       !ceiling || !std::isfinite(*ceiling) ||
       *ceiling != kFormalMax4ModelCeilingII)
     return fail("model-domain catalogue source binding or interval policy "
@@ -1797,7 +1899,7 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
           directModel ? entry->getArray("direct_ensemble_members") : nullptr;
       if (!predictedII || !startup || !std::isfinite(*predictedII) ||
           !std::isfinite(*startup) || *predictedII < expected->second ||
-          *predictedII > kFormalMax4ModelCeilingII + 1.0e-6 ||
+          *predictedII > runtimeIICeiling + 1.0e-6 ||
           *startup <= 0.0 ||
           (directModel &&
            (!members || members->size() != 4 || entry->get("baseline_ii") ||
@@ -1820,7 +1922,7 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
           if (!memberIndex || *memberIndex != static_cast<int64_t>(index) ||
               !seed || *seed != kDirectMemberSeeds[index] || !value ||
               !std::isfinite(*value) || *value < expected->second ||
-              *value > kFormalMax4ModelCeilingII + 1.0e-6)
+              *value > runtimeIICeiling + 1.0e-6)
             return fail(
                 "direct model-domain row has an invalid member prediction");
           memberValues[index] = *value;
@@ -1840,23 +1942,63 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
             !meanSource || *meanSource != "direct_four_member_arithmetic_mean")
           return fail(
               "direct model-domain aggregate disagrees with its four members");
+        if (diagnosticOverride) {
+          auto rowTrainingCeiling = entry->getNumber("training_ceiling_ii");
+          auto rowRuntimeCeiling = entry->getNumber("runtime_ceiling_ii");
+          auto extrapolationStatus = entry->getString("extrapolation_status");
+          const bool extrapolated =
+              expected->second > kPerCgra2x2TrainingIICeiling ||
+              llvm::any_of(memberValues, [](double value) {
+                return value > kPerCgra2x2TrainingIICeiling;
+              });
+          if (!rowTrainingCeiling ||
+              *rowTrainingCeiling != kPerCgra2x2TrainingIICeiling ||
+              !rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
+              !extrapolationStatus ||
+              *extrapolationStatus !=
+                  (extrapolated ? "out-of-training-ceiling"
+                                : "within-training-ceiling"))
+            return fail("diagnostic prediction row omits its exact training "
+                        "and runtime interval status");
+        } else if (entry->get("training_ceiling_ii") ||
+                   entry->get("runtime_ceiling_ii") ||
+                   entry->get("extrapolation_status")) {
+          return fail("ordinary model prediction carries an unbound "
+                      "diagnostic status");
+        }
       }
       continue;
     }
     auto status = entry->getString("status");
     auto reason = entry->getString("unsupported_reason");
     auto rowCeiling = entry->getNumber("model_interval_max_ii");
+    auto rowRuntimeCeiling = entry->getNumber("runtime_ceiling_ii");
+    auto rowTrainingCeiling = entry->getNumber("training_ceiling_ii");
+    auto unsupportedReason = diagnosticOverride
+                                 ? llvm::StringRef(
+                                       kDiagnosticUnsupportedReason)
+                                 : llvm::StringRef(
+                                       kModelDomainUnsupportedReason);
     if (*supportStatus != "unsupported" || !status ||
         *status != kModelDomainUnsupportedStatus || !reason ||
-        *reason != kModelDomainUnsupportedReason || !rowCeiling ||
+        *reason != unsupportedReason || !rowCeiling ||
         !std::isfinite(*rowCeiling) ||
         *rowCeiling != kFormalMax4ModelCeilingII ||
-        expected->second <= kFormalMax4ModelCeilingII ||
+        expected->second <= runtimeIICeiling ||
         entry->get("predicted_ii") || entry->get("startup_cycles") ||
         entry->get("predicted_ii_std") || entry->get("ii_mean_source") ||
         entry->get("direct_ensemble_members") || entry->get("model_status") ||
         entry->get("production_ready") ||
-        entry->get("mapper_success_probability"))
+        entry->get("mapper_success_probability") ||
+        (diagnosticOverride &&
+         (!rowTrainingCeiling ||
+          *rowTrainingCeiling != kPerCgra2x2TrainingIICeiling ||
+          !rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
+          entry->getString("extrapolation_status") !=
+              "outside-diagnostic-runtime-domain")) ||
+        (!diagnosticOverride &&
+         (rowTrainingCeiling || rowRuntimeCeiling ||
+          entry->get("extrapolation_status"))))
       return fail("unsupported model-domain row is not justified by the "
                   "current source lower bound");
   }

@@ -6,6 +6,7 @@
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -690,20 +691,174 @@ bool FormalMax4MLPEnsemble::predict(llvm::ArrayRef<double> features,
   return true;
 }
 
+namespace mlir {
+namespace amoeba {
+namespace neura {
+namespace joint_scheduling {
+
+bool validatePerCgra2x2RuntimeContract(
+    double runtimeIICeiling, llvm::StringRef trainingArchitectureText,
+    llvm::StringRef runtimeArchitectureText, std::string &error) {
+  if (trainingArchitectureText.empty() || runtimeArchitectureText.empty()) {
+    error = "training and runtime architecture text are required";
+    return false;
+  }
+  if (runtimeIICeiling == kPerCgra2x2TrainingIICeiling) {
+    if (trainingArchitectureText != runtimeArchitectureText) {
+      error = "default direct-model inference requires exact training/runtime "
+              "architecture text equality";
+      return false;
+    }
+    return true;
+  }
+  if (runtimeIICeiling != kPerCgra2x2DiagnosticIICeiling) {
+    error = "direct-model runtime II ceiling must be exactly 20 or diagnostic "
+            "23";
+    return false;
+  }
+
+  constexpr llvm::StringLiteral trainingLine = "ctrl_mem_items: 20";
+  constexpr llvm::StringLiteral runtimeLine = "ctrl_mem_items: 23";
+  const size_t position = trainingArchitectureText.find(trainingLine);
+  if (position == llvm::StringRef::npos ||
+      trainingArchitectureText.find(trainingLine, position + trainingLine.size()) !=
+          llvm::StringRef::npos) {
+    error = "diagnostic architecture must contain exactly one training "
+            "ctrl_mem_items: 20 field";
+    return false;
+  }
+  const size_t previousNewline =
+      trainingArchitectureText.substr(0, position).rfind('\n');
+  const size_t lineStart = previousNewline == llvm::StringRef::npos
+                               ? 0
+                               : previousNewline + 1;
+  llvm::StringRef indentation = trainingArchitectureText.substr(
+      lineStart, position - lineStart);
+  const size_t lineEnd = position + trainingLine.size();
+  if (llvm::any_of(indentation, [](char character) {
+        return character != ' ' && character != '\t';
+      }) ||
+      (lineEnd < trainingArchitectureText.size() &&
+       trainingArchitectureText[lineEnd] != '\r' &&
+       trainingArchitectureText[lineEnd] != '\n')) {
+    error = "diagnostic ctrl_mem_items change must target one complete YAML "
+            "field line";
+    return false;
+  }
+  std::string expectedRuntime = trainingArchitectureText.str();
+  expectedRuntime.replace(position, trainingLine.size(), runtimeLine.data(),
+                          runtimeLine.size());
+  if (runtimeArchitectureText != expectedRuntime) {
+    error = "diagnostic runtime architecture must differ only by the exact "
+            "ctrl_mem_items: 20 to 23 field change";
+    return false;
+  }
+  return true;
+}
+
+bool makePerCgra2x2DiagnosticOverrideMetadata(
+    llvm::StringRef trainingArchitectureText,
+    llvm::StringRef runtimeArchitectureText, json::Object &overrideMetadata,
+    std::string &error) {
+  error.clear();
+  overrideMetadata.clear();
+  if (!validatePerCgra2x2RuntimeContract(
+          kPerCgra2x2DiagnosticIICeiling, trainingArchitectureText,
+          runtimeArchitectureText, error))
+    return false;
+  overrideMetadata = json::Object{
+      {"schema", kPerCgra2x2DiagnosticSchema.str()},
+      {"training_ii_ceiling", kPerCgra2x2TrainingIICeiling},
+      {"runtime_ii_ceiling", kPerCgra2x2DiagnosticIICeiling},
+      {"extrapolation_enabled", true},
+      {"formal", false},
+      {"output_rule", kPerCgra2x2DiagnosticOutputRule.str()},
+      {"training_architecture_exact_yaml_text",
+       trainingArchitectureText.str()},
+      {"runtime_architecture_exact_yaml_text", runtimeArchitectureText.str()}};
+  return true;
+}
+
+bool validatePerCgra2x2DiagnosticMetadata(
+    const json::Object &predictorMetadata,
+    llvm::StringRef currentRuntimeArchitectureText, std::string &error) {
+  error.clear();
+  const json::Object *overrideMetadata =
+      predictorMetadata.getObject("diagnostic_override");
+  std::optional<double> trainingCeiling = overrideMetadata
+                                              ? overrideMetadata->getNumber(
+                                                    "training_ii_ceiling")
+                                              : std::nullopt;
+  std::optional<double> runtimeCeiling = overrideMetadata
+                                             ? overrideMetadata->getNumber(
+                                                   "runtime_ii_ceiling")
+                                             : std::nullopt;
+  std::optional<llvm::StringRef> trainingArchitecture =
+      overrideMetadata
+          ? overrideMetadata->getString(
+                "training_architecture_exact_yaml_text")
+          : std::nullopt;
+  std::optional<llvm::StringRef> runtimeArchitecture =
+      overrideMetadata
+          ? overrideMetadata->getString("runtime_architecture_exact_yaml_text")
+          : std::nullopt;
+  std::string architectureError;
+  if (!overrideMetadata || overrideMetadata->size() != 8 ||
+      overrideMetadata->getString("schema") != kPerCgra2x2DiagnosticSchema ||
+      !trainingCeiling ||
+      *trainingCeiling != kPerCgra2x2TrainingIICeiling || !runtimeCeiling ||
+      *runtimeCeiling != kPerCgra2x2DiagnosticIICeiling ||
+      !overrideMetadata->getBoolean("extrapolation_enabled").value_or(false) ||
+      overrideMetadata->getBoolean("formal").value_or(true) ||
+      overrideMetadata->getString("output_rule") !=
+          kPerCgra2x2DiagnosticOutputRule ||
+      !predictorMetadata.getBoolean("diagnostic_only").value_or(false) ||
+      predictorMetadata.getBoolean("formal").value_or(true) ||
+      !trainingArchitecture || trainingArchitecture->empty() ||
+      !runtimeArchitecture || runtimeArchitecture->empty() ||
+      *runtimeArchitecture != currentRuntimeArchitectureText ||
+      !validatePerCgra2x2RuntimeContract(
+          kPerCgra2x2DiagnosticIICeiling,
+          trainingArchitecture ? *trainingArchitecture : llvm::StringRef(),
+          runtimeArchitecture ? *runtimeArchitecture : llvm::StringRef(),
+          architectureError)) {
+    error = architectureError.empty()
+                ? "direct diagnostic override metadata is missing, forged, or "
+                  "differs from the exact runtime architecture"
+                : architectureError;
+    return false;
+  }
+  return true;
+}
+
+} // namespace joint_scheduling
+} // namespace neura
+} // namespace amoeba
+} // namespace mlir
+
 bool PerCgra2x2DirectEnsemble::load(
     llvm::StringRef ensemblePath, llvm::StringRef expectedArchitectureText,
     std::string &error) {
+  return load(ensemblePath, expectedArchitectureText,
+              kPerCgra2x2TrainingIICeiling, error);
+}
+
+bool PerCgra2x2DirectEnsemble::load(
+    llvm::StringRef ensemblePath, llvm::StringRef runtimeArchitectureText,
+    double runtimeIICeiling, std::string &error) {
   loaded = false;
   modelNamespace.clear();
   featureContractId.clear();
   shapeProtocolId.clear();
   architectureText.clear();
+  this->runtimeArchitectureText.clear();
   featureNames.clear();
   selectedFeatureNames.clear();
   selectedFeatureIndices.clear();
   members.clear();
   mapperIICeiling = 0.0F;
-  if (ensemblePath.empty() || expectedArchitectureText.empty()) {
+  this->runtimeIICeiling = 0.0F;
+  if (ensemblePath.empty() || runtimeArchitectureText.empty()) {
     error = "direct ensemble path and expected architecture text are required";
     return false;
   }
@@ -845,12 +1000,17 @@ bool PerCgra2x2DirectEnsemble::load(
   }
 
   const json::Object *architecture = root.getObject("architecture");
+  std::string trainingArchitectureText;
   if (!architecture ||
       !requireExactString(*architecture, "name",
                           "AMOEBA_4x4_CGRA_2x2_Tiles", error) ||
-      !requireExactString(*architecture, "exact_yaml_text",
-                          expectedArchitectureText, error)) {
-    error = "direct ensemble architecture text does not exactly match target";
+      !getRequiredString(*architecture, "exact_yaml_text",
+                         trainingArchitectureText, error) ||
+      !validatePerCgra2x2RuntimeContract(
+          runtimeIICeiling, trainingArchitectureText, runtimeArchitectureText,
+          error)) {
+    if (error.empty())
+      error = "direct ensemble training/runtime architecture contract is invalid";
     return false;
   }
 
@@ -956,9 +1116,11 @@ bool PerCgra2x2DirectEnsemble::load(
   modelNamespace = kPerCgra2x2ModelNamespace.str();
   featureContractId = kPerCgra2x2FeatureContractId.str();
   shapeProtocolId = kPerCgra2x2ShapeProtocolId.str();
-  architectureText = expectedArchitectureText.str();
+  architectureText = std::move(trainingArchitectureText);
+  this->runtimeArchitectureText = runtimeArchitectureText.str();
   members = std::move(parsedMembers);
   mapperIICeiling = static_cast<float>(ceiling);
+  this->runtimeIICeiling = static_cast<float>(runtimeIICeiling);
   loaded = true;
   return true;
 }
@@ -984,8 +1146,9 @@ bool PerCgra2x2DirectEnsemble::predict(
   if (!finiteNumber(recMii) || !finiteNumber(resMii) ||
       !finiteNumber(lowerBound) || recMii < 0.0 || resMii < 0.0 ||
       lowerBound != std::max(recMii, resMii) ||
-      lowerBound > mapperIICeiling) {
-    error = "direct-model lower bound must equal max(RecMII, ResMII) in [0, 20]";
+      lowerBound > runtimeIICeiling) {
+    error = "direct-model lower bound must equal max(RecMII, ResMII) and fit "
+            "the explicitly loaded runtime interval";
     return false;
   }
   SmallVector<float, kPerCgra2x2MapperFeatureWidth> input;
@@ -1020,7 +1183,7 @@ bool PerCgra2x2DirectEnsemble::predict(
       hidden1.push_back(gelu(linear(member.layer1Weight, member.layer1Bias,
                                     hidden0, index, 64)));
     float raw = linear(member.layer2Weight, member.layer2Bias, hidden1, 0, 32);
-    float value = std::min(lower + softplus(raw), mapperIICeiling);
+    float value = std::min(lower + softplus(raw), runtimeIICeiling);
     if (!std::isfinite(value) || value < lower) {
       error = "direct ensemble produced an invalid prediction";
       return false;

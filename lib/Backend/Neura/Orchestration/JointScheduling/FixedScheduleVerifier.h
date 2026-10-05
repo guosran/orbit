@@ -7,13 +7,22 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mlir::amoeba::neura::joint_scheduling {
 
-// A bridge to the production TaskCommunicationModel. Querying with reserve=false
-// compares rectangle endpoint pairs; reserve=true commits the chosen pair in
-// the current trial, exactly as production TaskScheduler does.
+// Optional per-task CGRA inventory supplied by a source-trace-aware caller.
+// Coordinates are (row, column); verification canonicalizes a private copy to
+// row-major order for deterministic communication endpoint replay.
+using FixedScheduleOccupiedCell = std::pair<int, int>;
+using FixedScheduleOccupiedCellInventory =
+    std::vector<std::vector<FixedScheduleOccupiedCell>>;
+
+// A bridge to the production TaskCommunicationModel. Querying with
+// reserve=false compares occupied-cell endpoint pairs (the default inventory is
+// each task's rectangle); reserve=true commits the chosen pair in the current
+// trial.
 class FixedScheduleCommunication {
 public:
   // A checkpoint is valid only for the provider instance that created it and
@@ -126,7 +135,8 @@ FixedScheduleScore verifyAndScoreFixedSchedule(
     int gridRows, int gridCols, const std::vector<ExactScheduleTask> &tasks,
     const std::vector<ExactSchedulePlacement> &placements,
     const std::vector<unsigned> &taskOrder,
-    FixedScheduleCommunication &communication);
+    FixedScheduleCommunication &communication,
+    const FixedScheduleOccupiedCellInventory *occupiedCells = nullptr);
 
 } // namespace mlir::amoeba::neura::joint_scheduling
 #endif // AMOEBA_FIXED_SCHEDULE_VERIFIER_H
