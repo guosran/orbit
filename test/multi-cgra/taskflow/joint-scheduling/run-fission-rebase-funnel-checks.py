@@ -41,6 +41,22 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def fixture_source_text(text: str) -> str:
+    """Return MLIR source with line comments removed for structural guards."""
+    return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+
+
+def has_authentic_affine_fixture_source(text: str) -> bool:
+    source = fixture_source_text(text)
+    return (
+        "@fission_rebase_disjoint_history" in source
+        and source.count("affine.for %i = 0 to 4") == 2
+        and source.count("memref.alloc()") == 4
+        and "taskflow.task @FissionTask" not in source
+        and "amoeba.source_iteration_domain" not in source
+    )
+
+
 def action_footprint(action: dict[str, Any]) -> set[str] | None:
     family = action.get("family", "")
     if action.get("canonicalReset") is True or family in (
@@ -225,12 +241,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    fixture_text = args.fixture.read_text()
-    if "@fission_rebase_disjoint_history" not in fixture_text or \
-            fixture_text.count("affine.for %i = 0 to 4") != 2 or \
-            fixture_text.count("memref.alloc()") != 4 or \
-            "taskflow.task @FissionTask" in fixture_text or \
-            "amoeba.source_iteration_domain" in fixture_text:
+    if not has_authentic_affine_fixture_source(args.fixture.read_text()):
         fail("fixture must use two authentic affine source loops and four distinct allocations")
 
     output = args.search_output.resolve()
@@ -335,9 +346,20 @@ def main() -> None:
             len(body.encode("utf-8")) != witness.get("candidate_module_bytes"):
         fail("fission family witness omitted or changed the exact module body")
     witness_history = witness.get("action_history", {})
+    witness_fission_targets = {
+        primitive.get("firstTask")
+        for fission in witness_history.get("fissionActions", [])
+        if isinstance(fission, dict) and fission.get("family") == "fission"
+        for primitive in fission.get("primitives", [])
+        if isinstance(primitive, dict)
+        and primitive.get("kind") == "fission"
+        and isinstance(primitive.get("firstTask"), str)
+        and primitive.get("firstTask")
+    }
     if witness_history.get("known") is not True or \
-            not witness_history.get("fissionActions") or \
-            "Task_0.split." not in body or "Task_1" not in body:
+            not witness_fission_targets or \
+            any(f"{target}.split." not in body
+                for target in witness_fission_targets):
         fail("fission best witness lacks its authenticated fission history or split body")
     if witness.get("cost_catalogue_snapshot_available"):
         cost_json = witness.get("cost_catalogue_exact_json")
