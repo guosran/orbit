@@ -41,6 +41,9 @@ constexpr llvm::StringLiteral kCommonMapperIIProvenance =
     "native-neura-map-to-accelerator-v1";
 constexpr llvm::StringLiteral kCanonicalWitnessFormat =
     "mlir-generic-print-use-local-scope-v1";
+constexpr llvm::StringLiteral
+    kDiagnosticMinimumLegalProfileInitializationAttr =
+        "amoeba.diagnostic_minimum_legal_profile_initialization";
 
 static std::optional<int64_t> checkedFormulaDuration(double startup,
                                                      int64_t ii,
@@ -246,6 +249,70 @@ static bool normalizeSemanticProjection(ModuleOp module,
   return printGeneric(module, projection);
 }
 
+static bool validateDiagnosticMinimumLegalProfileInitializations(
+    llvm::ArrayRef<TaskMetadata> currentTasks,
+    llvm::ArrayRef<CommonAmoebaTaskProfiles> authenticatedProfiles,
+    int64_t runtimeIICeiling, std::string &error) {
+  if (currentTasks.size() != authenticatedProfiles.size()) {
+    error = "diagnostic profile initialization task inventory is incomplete";
+    return false;
+  }
+
+  for (auto [index, task] : llvm::enumerate(currentTasks)) {
+    Attribute raw = task.op->getAttr(
+        kDiagnosticMinimumLegalProfileInitializationAttr);
+    if (!raw)
+      continue;
+
+    const std::string context =
+        "common parent profile task=" + task.name +
+        " diagnostic minimum legal profile initialization";
+    auto fail = [&](llvm::StringRef reason) {
+      error = context + ": " + reason.str();
+      return false;
+    };
+    if (runtimeIICeiling != 23)
+      return fail("requires the explicit diagnostic II ceiling 23");
+
+    auto marker = dyn_cast<DictionaryAttr>(raw);
+    if (!marker || marker.size() != 2)
+      return fail(
+          "must contain exactly composed_cgra_count and composed_cgra_shape");
+    auto count = marker.getAs<IntegerAttr>("composed_cgra_count");
+    auto shape = marker.getAs<StringAttr>("composed_cgra_shape");
+    if (!count || !count.getType().isSignlessInteger(32) || !shape)
+      return fail("has malformed count or shape fields");
+
+    const CommonAmoebaTaskProfiles &profiles = authenticatedProfiles[index];
+    if (profiles.task != task.name)
+      return fail("authenticated mapper-profile task order differs");
+    if (profiles.profilesByShape.count("1x1"))
+      return fail("is present despite a successful 1-CGRA profile");
+
+    const CommonAmoebaMapperShapeProfile *expected = nullptr;
+    // The verifier authenticates profile rows and attempt records in this
+    // canonical candidate order. Iterating it here preserves the profiler's
+    // original order as the final tie breaker after count and latency.
+    for (llvm::StringRef candidateShape : kProfileShapes) {
+      auto found = profiles.profilesByShape.find(candidateShape.str());
+      if (found == profiles.profilesByShape.end())
+        continue;
+      const CommonAmoebaMapperShapeProfile &candidate = found->second;
+      if (!expected || candidate.cgraCount < expected->cgraCount ||
+          (candidate.cgraCount == expected->cgraCount &&
+           candidate.estimatedLatency < expected->estimatedLatency))
+        expected = &candidate;
+    }
+    if (!expected || expected->cgraCount <= 1)
+      return fail("has no authenticated multi-CGRA fallback profile");
+    if (count.getInt() != expected->cgraCount ||
+        shape.getValue() != expected->shape)
+      return fail(
+          "does not match the deterministic minimum legal mapper profile");
+  }
+  return true;
+}
+
 } // namespace
 
 bool verifyCommonAmoebaParentProfiles(
@@ -414,19 +481,6 @@ bool verifyCommonAmoebaParentProfiles(
   if (!currentCandidate || currentCandidate.getValue() != *candidateId ||
       !currentScope || currentScope.getValue() != *candidateScope)
     return fail("current F45 function candidate identity or scope differs from common profile");
-
-  OwningOpRef<ModuleOp> canonicalProjection(
-      cast<ModuleOp>((*canonicalModule)->clone()));
-  OwningOpRef<ModuleOp> currentProjection(
-      cast<ModuleOp>(currentModule->clone()));
-  std::string canonicalSemanticText;
-  std::string currentSemanticText;
-  if (!normalizeSemanticProjection(*canonicalProjection,
-                                   canonicalSemanticText) ||
-      !normalizeSemanticProjection(*currentProjection,
-                                   currentSemanticText) ||
-      canonicalSemanticText != currentSemanticText)
-    return fail("current F45 module changes pre-F45 taskflow semantics outside the verified scheduler/source-certificate allowlist");
 
   result = CommonAmoebaParentProfiles{};
   result.profilePath = profilePath.str();
@@ -600,6 +654,36 @@ bool verifyCommonAmoebaParentProfiles(
         *mapperSucceeded != hasProfile)
       return fail("common parent profile candidate-attempt inventory is incomplete or inconsistent");
   }
+
+  // This F45-only diagnostic marker is meaningful only when it agrees with
+  // the exact profile inventory authenticated above. Validate it before
+  // projecting it out of the semantic comparison below.
+  if (!validateDiagnosticMinimumLegalProfileInitializations(
+          currentTasks, result.tasks, runtimeIICeiling, error))
+    return false;
+
+  OwningOpRef<ModuleOp> canonicalProjection(
+      cast<ModuleOp>((*canonicalModule)->clone()));
+  OwningOpRef<ModuleOp> currentProjection(
+      cast<ModuleOp>(currentModule->clone()));
+  std::string projectionError;
+  FailureOr<func::FuncOp> projectedFunction = selectTaskFunction(
+      *currentProjection, currentFunction.getSymName().getValue(), projectionError);
+  if (failed(projectedFunction))
+    return fail(
+        "cannot select current function for common semantic projection: " +
+        projectionError);
+  projectedFunction->walk([&](taskflow::TaskflowTaskOp task) {
+    task->removeAttr(kDiagnosticMinimumLegalProfileInitializationAttr);
+  });
+  std::string canonicalSemanticText;
+  std::string currentSemanticText;
+  if (!normalizeSemanticProjection(*canonicalProjection,
+                                   canonicalSemanticText) ||
+      !normalizeSemanticProjection(*currentProjection,
+                                   currentSemanticText) ||
+      canonicalSemanticText != currentSemanticText)
+    return fail("current F45 module changes pre-F45 taskflow semantics outside the verified scheduler/source-certificate allowlist");
 
   return true;
 }
