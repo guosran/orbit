@@ -214,6 +214,101 @@ def mutate_task(text: str, task_name: str, transform, label: str) -> str:
     return text[:begin] + after + text[end:]
 
 
+def add_source_forwarding_data_moves(module: str) -> str:
+    """Model only the producer-store and consumer-load routing wrappers."""
+    def wrap_producer_store(task: str) -> str:
+        lines = task.splitlines()
+        store_index = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if line.lstrip().startswith("memref.store ")
+            ),
+            None,
+        )
+        if store_index is None:
+            fail("producer fixture lost its memref store")
+        store_match = re.match(
+            r'^(\s*)memref\.store\s+(%[A-Za-z0-9_.$-]+)(,.*)$',
+            lines[store_index],
+        )
+        if not store_match:
+            fail("cannot parse producer store value")
+        indent, stored, suffix = store_match.groups()
+        value_def = next(
+            (
+                line
+                for line in lines
+                if re.match(
+                    rf'^\s*{re.escape(stored)}\s*=\s*arith\.addi\b', line
+                )
+            ),
+            None,
+        )
+        type_match = re.search(r":\s*([^\s]+)\s*$", value_def or "")
+        if not value_def or not type_match:
+            fail("producer stored value is not the fixture's typed add result")
+        wrapper = "%test_producer_store_data_mov"
+        lines.insert(
+            store_index,
+            f'{indent}{wrapper} = "neura.data_mov"({stored}) : '
+            f"({type_match.group(1)}) -> {type_match.group(1)}",
+        )
+        lines[store_index + 1] = f"{indent}memref.store {wrapper}{suffix}"
+        return "\n".join(lines)
+
+    def wrap_consumer_load(task: str) -> str:
+        lines = task.splitlines()
+        multiply_index = next(
+            (i for i, line in enumerate(lines) if "arith.muli " in line), None
+        )
+        if multiply_index is None:
+            fail("consumer fixture lost its arith multiply")
+        multiply = lines[multiply_index]
+        multiply_match = re.search(
+            r"arith\.muli\s+(%[A-Za-z0-9_.$-]+)\s*,", multiply
+        )
+        if not multiply_match:
+            fail("cannot parse consumer multiply input")
+        loaded = multiply_match.group(1)
+        load_index = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if re.match(
+                    rf'^\s*{re.escape(loaded)}\s*=\s*memref\.load\b', line
+                )
+            ),
+            None,
+        )
+        if load_index is None:
+            fail("consumer multiply is not fed by the fixture's indexed load")
+        type_match = re.search(r":\s*([^\s]+)\s*$", multiply)
+        if not type_match:
+            fail("cannot determine consumer load value type")
+        indent = re.match(r"^\s*", multiply).group(0)
+        wrapper = "%test_consumer_load_data_mov"
+        lines.insert(
+            multiply_index,
+            f'{indent}{wrapper} = "neura.data_mov"({loaded}) : '
+            f"({type_match.group(1)}) -> {type_match.group(1)}",
+        )
+        multiply_index += 1
+        lines[multiply_index] = (
+            multiply[: multiply_match.start(1)]
+            + wrapper
+            + multiply[multiply_match.end(1) :]
+        )
+        return "\n".join(lines)
+
+    module = mutate_task(
+        module, PRODUCER, wrap_producer_store, "producer stored-value DataMov"
+    )
+    return mutate_task(
+        module, CONSUMER, wrap_consumer_load, "consumer load-value DataMov"
+    )
+
+
 def parse_neura_definitions(text: str) -> dict[str, tuple[str, list[str]]]:
     definitions: dict[str, tuple[str, list[str]]] = {}
     for line in text.splitlines():
@@ -239,17 +334,22 @@ def producer_store_data_mov(module: str) -> tuple[int, str, str, str]:
         (
             index
             for index, line in enumerate(lines)
-            if line.lstrip().startswith('"neura.store_indexed"')
+            if line.lstrip().startswith("memref.store ")
+            or line.lstrip().startswith('"neura.store_indexed"')
         ),
         None,
     )
     if store_index is None:
-        fail("producer fixture lost its indexed store")
+        fail("producer fixture lost its store")
     store_match = re.search(
-        r'"neura\.store_indexed"\((%[A-Za-z0-9_.$-]+)', lines[store_index]
+        r"memref\.store\s+(%[A-Za-z0-9_.$-]+)", lines[store_index]
     )
     if not store_match:
-        fail("cannot read producer indexed-store value")
+        store_match = re.search(
+            r'"neura\.store_indexed"\((%[A-Za-z0-9_.$-]+)', lines[store_index]
+        )
+    if not store_match:
+        fail("cannot read producer store value")
     stored_value = store_match.group(1)
     definition_index = next(
         (
@@ -308,15 +408,26 @@ def add_type_changing_forwarded_moves(module: str) -> str:
         module
     )
     store_match = re.search(
-        r'("neura\.store_indexed"\()(%[A-Za-z0-9_.$-]+)(,)', store_line
+        r'(memref\.store\s+)(%[A-Za-z0-9_.$-]+)(,)', store_line
     )
     if not store_match:
-        fail("cannot rewrite producer indexed-store value for type tamper")
+        store_match = re.search(
+            r'("neura\.store_indexed"\()(%[A-Za-z0-9_.$-]+)(,)', store_line
+        )
+    if not store_match:
+        fail("cannot rewrite producer store value for type tamper")
     source_type = type_signature.split(" -> ", 1)[0][1:-1]
     result_type = type_signature.split(" -> ", 1)[1]
-    if source_type != result_type or "!neura.data<i32," not in result_type:
+    if source_type != result_type:
+        fail(f"fixture DataMov is not identity typed: {type_signature}")
+    if result_type == "i32":
+        alternate_type = "i64"
+    elif "!neura.data<i32," in result_type:
+        alternate_type = result_type.replace(
+            "!neura.data<i32,", "!neura.data<i64,", 1
+        )
+    else:
         fail(f"fixture no longer has the expected i32 DataMov: {type_signature}")
-    alternate_type = result_type.replace("!neura.data<i32,", "!neura.data<i64,", 1)
     indent = re.match(r"^\s*", store_line).group(0)
     first = "%test_type_changing_data_mov"
     second = "%test_type_restoring_data_mov"
@@ -348,7 +459,8 @@ def add_second_kernel_block(module: str) -> str:
             index
             for index, line in enumerate(lines)
             if re.match(
-                r'^\s*(?:%[A-Za-z0-9_.$-]+\s*=\s*)?"neura\.kernel"', line
+                r'^\s*(?:%[A-Za-z0-9_.$-]+\s*=\s*)?(?:"neura\.kernel"|neura\.kernel\b)',
+                line,
             )
         ),
         None,
@@ -359,8 +471,12 @@ def add_second_kernel_block(module: str) -> str:
     kernel_plain = mask_quoted_strings(kernel_text)
     marker = kernel_plain.find("({")
     if marker < 0:
+        marker = kernel_plain.find("neura.kernel")
+    if marker < 0:
         fail("cannot locate producer kernel region")
-    body_open = marker + 1
+    body_open = kernel_plain.find("{", marker)
+    if body_open < 0:
+        fail("cannot locate producer kernel body")
     depth = 0
     body_close = None
     for position in range(body_open, len(kernel_plain)):
@@ -385,6 +501,7 @@ def add_second_kernel_block(module: str) -> str:
             line
             for line in kernel_body_lines
             if line.lstrip().startswith('"neura.yield"')
+            or line.lstrip().startswith("neura.yield")
         ),
         None,
     )
@@ -395,11 +512,11 @@ def add_second_kernel_block(module: str) -> str:
     prefix = kernel_text[:body_close]
     suffix = kernel_text[body_close:]
     extra_block = (
-        f"\n{block_indent}^bb1(%test_other_block_input: !neura.data<i32, i1>):\n"
+        f"\n{block_indent}^bb1:\n"
+        f"{operation_indent}%test_other_block_constant = arith.constant 0 : i32\n"
         f'{operation_indent}%test_other_block_move = "neura.data_mov"('
-        "%test_other_block_input) : (!neura.data<i32, i1>) -> "
-        "!neura.data<i32, i1>\n"
-        f'{operation_indent}{yield_line.lstrip()}\n'
+        "%test_other_block_constant) : (i32) -> i32\n"
+        f"{operation_indent}{yield_line.lstrip()}\n"
     )
     changed_kernel = prefix + extra_block + suffix
     rewritten = "\n".join(lines[:kernel_start]) + changed_kernel
@@ -412,11 +529,13 @@ def assert_one_transparent_forwarding_move(
     multiplies = [
         line
         for line in fused_task.splitlines()
-        if '"neura.mul"(' in line
+        if '"neura.mul"(' in line or "arith.muli " in line
     ]
     if len(multiplies) != 1:
         fail(f"{label}: expected one fused consumer multiply, got {len(multiplies)}")
     operands_match = re.search(r'"neura\.mul"\(([^)]*)\)', multiplies[0])
+    if not operands_match:
+        operands_match = re.search(r"arith\.muli\s+(.+?)\s*:\s*", multiplies[0])
     if not operands_match:
         fail(f"{label}: cannot parse fused consumer multiply operands")
     operands = re.findall(r"%[A-Za-z0-9_.$-]+", operands_match.group(1))
@@ -473,17 +592,30 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="pc-composite-source-domain-") as temp:
         directory = pathlib.Path(temp)
         canonical = directory / "canonical.mlir"
+        route_expanded = directory / "route-expanded-unbound.mlir"
+        source_for_binding = directory / "route-expanded-source.mlir"
         source_pipeline = (
             "builtin.module(func.func(construct-hyperblock-from-task),"
             "assign-accelerator,classify-task-and-counter,"
-            "convert-taskflow-to-neura,func.func(lower-affine-to-neura),"
-            "insert-data-mov,bind-source-iteration-domain)"
+            "convert-taskflow-to-neura,lower-affine-to-neura)"
         )
         run(
             [
                 optimizer,
                 str(fixture),
                 f"--pass-pipeline={source_pipeline}",
+                "-o",
+                str(route_expanded),
+            ],
+            expect_success=True,
+        )
+        source_text = add_source_forwarding_data_moves(route_expanded.read_text())
+        source_for_binding.write_text(source_text)
+        run(
+            [
+                optimizer,
+                str(source_for_binding),
+                "--pass-pipeline=builtin.module(bind-source-iteration-domain)",
                 "-o",
                 str(canonical),
             ],
@@ -680,14 +812,11 @@ def main() -> None:
             )
         ):
             fail("retained load sharing did not record one load and zero stores removed")
-        retained_add_results = [
-            result
-            for result, _ in re.findall(
-                r'^\s*(%[A-Za-z0-9_.$-]+)\s*=\s*"neura\.add"\(([^)]*)\)',
-                retained_task,
-                flags=re.MULTILINE,
-            )
-        ]
+        retained_add_results = re.findall(
+            r'^\s*(%[A-Za-z0-9_.$-]+)\s*=\s*(?:"neura\.add"\(|arith\.addi\s)',
+            retained_task,
+            flags=re.MULTILINE,
+        )
         if len(retained_add_results) != 1:
             fail("retained fusion lost the fixture's unique producer add")
         assert_one_transparent_forwarding_move(
