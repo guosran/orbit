@@ -214,7 +214,7 @@ def main() -> None:
     parser.add_argument("--scheduled", type=Path, required=True)
     parser.add_argument("--function", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--cpu-list", default="12")
+    parser.add_argument("--cpu-list", default="8")
     args = parser.parse_args()
     for name in ("optimizer", "architecture", "network", "canonical",
                  "profiles", "scheduled"):
