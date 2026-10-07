@@ -155,14 +155,19 @@ def has_disjoint_fission_rebase(event: dict[str, Any]) -> bool:
         return False
     fission_primitive = fission_primitives[0]
     if not isinstance(fission_primitive, dict) or \
+            fission_primitive.get("kind") != "fission" or \
             not fission_primitive.get("firstTask") or \
             fission_primitive.get("secondTask"):
         return False
     target = fission_primitive["firstTask"]
+    if target != "Task_0":
+        return False
     if not any(
         isinstance(fission, dict)
         and any(
-            isinstance(primitive, dict) and primitive.get("firstTask") == target
+            isinstance(primitive, dict)
+            and primitive.get("kind") == "fission"
+            and primitive.get("firstTask") == target
             for primitive in fission.get("primitives", [])
         )
         for fission in fission_actions
@@ -172,6 +177,17 @@ def has_disjoint_fission_rebase(event: dict[str, Any]) -> bool:
         not isinstance(prior, dict)
         or (footprint := action_footprint(prior)) is None
         or target in footprint
+        for prior in prior_actions
+    ):
+        return False
+    if not any(
+        isinstance(prior, dict)
+        and prior.get("family") == "shape"
+        and prior.get("shapeTask") == "Task_1"
+        and isinstance(prior.get("shapeRows"), int)
+        and prior["shapeRows"] > 0
+        and isinstance(prior.get("shapeCols"), int)
+        and prior["shapeCols"] > 0
         for prior in prior_actions
     ):
         return False
@@ -211,9 +227,11 @@ def main() -> None:
 
     fixture_text = args.fixture.read_text()
     if "@fission_rebase_disjoint_history" not in fixture_text or \
-            "taskflow.task @FissionTask" not in fixture_text or \
-            "taskflow.task @OrdinaryTask" not in fixture_text:
-        fail("fixture does not contain the intended independent fission and ordinary tasks")
+            fixture_text.count("affine.for %i = 0 to 4") != 2 or \
+            fixture_text.count("memref.alloc()") != 4 or \
+            "taskflow.task @FissionTask" in fixture_text or \
+            "amoeba.source_iteration_domain" in fixture_text:
+        fail("fixture must use two authentic affine source loops and four distinct allocations")
 
     output = args.search_output.resolve()
     summary_path = output / "diagnostics" / "family-funnel-summary.json"
@@ -264,6 +282,23 @@ def main() -> None:
     history = archived_by_id[matched["candidate_id"]]["action_history"]
     if not history.get("canonicalFactKey") or not history.get("initialShapes"):
         fail("rebased archive history lacks canonical fact key or complete initial shapes")
+    initial_shape_records = history["initialShapes"]
+    if not isinstance(initial_shape_records, list):
+        fail("rebased initial shapes are not an array")
+    initial_shape_by_task = {
+        shape.get("task"): shape
+        for shape in initial_shape_records
+        if isinstance(shape, dict) and isinstance(shape.get("task"), str)
+    }
+    if not all(
+        name in initial_shape_by_task
+        for name in ("Task_0.split.0", "Task_0.split.1", "Task_1")
+    ):
+        fail("rebased initial shapes do not preserve both fission children and Task_1")
+    for child in ("Task_0.split.0", "Task_0.split.1"):
+        child_shape = initial_shape_by_task[child]
+        if child_shape.get("rows") != 1 or child_shape.get("cols") != 1:
+            fail("rebased fission child did not retain its default 1x1 shape")
     event_history = matched["typed_action_history"]
     for field in ("canonicalFactKey", "initialShapes", "fissionActions", "actions"):
         if event_history.get(field) != history.get(field):
@@ -302,7 +337,7 @@ def main() -> None:
     witness_history = witness.get("action_history", {})
     if witness_history.get("known") is not True or \
             not witness_history.get("fissionActions") or \
-            "FissionTask.split." not in body:
+            "Task_0.split." not in body or "Task_1" not in body:
         fail("fission best witness lacks its authenticated fission history or split body")
     if witness.get("cost_catalogue_snapshot_available"):
         cost_json = witness.get("cost_catalogue_exact_json")
