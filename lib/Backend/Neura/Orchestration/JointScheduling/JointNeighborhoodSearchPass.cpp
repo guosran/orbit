@@ -2652,8 +2652,9 @@ public:
       // once avoids storing a second authoritative ranking in the checkpoint.
       for (size_t index = 0; index < archive.size(); ++index)
         if (archive[index].valid) insertRankedArchiveIndex(index, archive);
-      if (!writeFamilyFunnelSidecars(outputDir, round, archive, beam, pending,
-                                     pendingCursor, "", error)) {
+      if (!writeFamilyFunnelSidecars(outputDir, checkpointPath, round, archive,
+                                     beam, pending, pendingCursor, "",
+                                     error)) {
         fatal(error);
         return;
       }
@@ -5744,7 +5745,7 @@ private:
         !readFileBytes(state.costPath, costCatalogueJSON, error))
       return false;
     uint64_t operationCount = 0;
-    state.module->walk([&](Operation *) { ++operationCount; });
+    state.module.get().walk([&](Operation *) { ++operationCount; });
     json::Array pathFamilies;
     for (const std::string &family : bestFamilies)
       pathFamilies.push_back(family);
@@ -5965,7 +5966,8 @@ private:
   }
 
   bool writeFamilyFunnelSidecars(
-      StringRef outputDirectory, int64_t currentRound,
+      StringRef outputDirectory, StringRef checkpointPath,
+      int64_t currentRound,
       ArrayRef<ArchiveRecord> archive, ArrayRef<SearchState> beam,
       ArrayRef<PendingNeighbor> pending, uint64_t pendingCursor,
       StringRef stopReason,
@@ -6205,7 +6207,7 @@ private:
           {"schema", kFamilyFunnelSchema},
           {"through_round", currentRound},
           {"stage", stage.getValue()}, {"function", functionName.getValue()},
-          {"action_family", family}, {"presence", presenceValue},
+          {"action_family", family.str()}, {"presence", presenceValue},
           {"source_binding_witness", bindingPath}})
                    << "\n";
     }
@@ -6259,7 +6261,7 @@ private:
         {"source_contract_path", sourceContractFile.getValue()},
         {"prepared_source_path", preparedSourceFile.getValue()},
         {"source_binding_witness", bindingPath},
-        {"checkpoint", checkpointPath},
+        {"checkpoint", checkpointPath.str()},
         {"max_rounds", maxRounds.getValue()},
         {"max_candidates", maxCandidates.getValue()},
         {"beam_width", beamWidth.getValue()},
@@ -6387,8 +6389,8 @@ private:
     if (diagnosticIICeiling == 23)
       root["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
-    if (!writeFamilyFunnelSidecars(outputDir, round, archive, beam, pending,
-                                   pendingCursor, stopReason, error))
+    if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
+                                   pending, pendingCursor, stopReason, error))
       return false;
     journalBytes = newJournalBytes; journalArchiveCount = archive.size(); dirtyJournalIndices.clear();
     // Snapshot deletion happens only after a checkpoint binds the amended
