@@ -29,8 +29,7 @@ def run(command: list[str], expect_success: bool) -> subprocess.CompletedProcess
     return result
 
 
-def task_span(text: str, task_name: str) -> tuple[int, int]:
-    # Ignore quoted source witnesses when locating the actual region braces.
+def mask_quoted_strings(text: str) -> str:
     masked = list(text)
     quoted = False
     escaped = False
@@ -46,7 +45,12 @@ def task_span(text: str, task_name: str) -> tuple[int, int]:
         elif char == '"':
             masked[index] = " "
             quoted = True
-    plain = "".join(masked)
+    return "".join(masked)
+
+
+def task_span(text: str, task_name: str) -> tuple[int, int]:
+    # Ignore quoted source witnesses when locating the actual region braces.
+    plain = mask_quoted_strings(text)
     start = plain.find(f"taskflow.task @{task_name}")
     if start < 0:
         fail(f"missing task {task_name}")
@@ -71,6 +75,14 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     if text.count(old) != 1:
         fail(f"{label}: expected exactly one occurrence of {old!r}")
     return text.replace(old, new, 1)
+
+
+def replace_once_unquoted(text: str, old: str, new: str, label: str) -> str:
+    plain = mask_quoted_strings(text)
+    if plain.count(old) != 1:
+        fail(f"{label}: expected exactly one unquoted occurrence of {old!r}")
+    start = plain.index(old)
+    return text[:start] + new + text[start + len(old):]
 
 
 def extract_graph_facts(
@@ -258,7 +270,7 @@ def main() -> None:
 
         reject(
             "forged-eliminated-load-count",
-            replace_once(
+            replace_once_unquoted(
                 positive,
                 "amoeba.neura.fusion.eliminated_loads = 1 : i64",
                 "amoeba.neura.fusion.eliminated_loads = 0 : i64",
