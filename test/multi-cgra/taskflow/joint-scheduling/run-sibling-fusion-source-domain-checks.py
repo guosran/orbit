@@ -73,6 +73,21 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def extract_graph_facts(
+    optimizer: str, module: pathlib.Path, function: str, output: pathlib.Path
+) -> dict[str, object]:
+    pipeline = (
+        "builtin.module(extract-joint-task-graph-facts{"
+        f"function={function} output={output} fact-only=true"
+        "})"
+    )
+    run(
+        [optimizer, str(module), f"--pass-pipeline={pipeline}", "-o", "/dev/null"],
+        expect_success=True,
+    )
+    return json.loads(output.read_text())
+
+
 def mutate_task(text: str, task_name: str, transform, label: str) -> str:
     begin, end = task_span(text, task_name)
     body = transform(text[begin:end])
@@ -184,6 +199,31 @@ def main() -> None:
             ],
             expect_success=True,
         )
+        graph_facts = extract_graph_facts(
+            optimizer,
+            candidate,
+            FUNCTION,
+            directory / "sibling-graph-facts.json",
+        )
+        fused_record = next(
+            (
+                task
+                for task in graph_facts.get("tasks", [])
+                if task.get("task_name") == "Task_A.fuse.Task_B"
+            ),
+            None,
+        )
+        if fused_record is None or fused_record.get("neura_fusion") != {
+            "mode": "sibling",
+            "eliminated_loads": 1,
+            "eliminated_stores": 0,
+            "sibling_first": "Task_A",
+            "sibling_second": "Task_B",
+        }:
+            fail(
+                "fact extraction did not preserve valid sibling shared-read "
+                f"metadata: {fused_record}"
+            )
 
         def reject(label: str, mutant: str) -> None:
             path = directory / f"{label}.mlir"
@@ -202,6 +242,16 @@ def main() -> None:
             diagnostics = result.stdout + result.stderr
             if "source iteration-domain partition is unproven" not in diagnostics:
                 fail(f"{label}: failed outside the source-proof diagnostic\n{diagnostics}")
+
+        reject(
+            "forged-eliminated-load-count",
+            replace_once(
+                positive,
+                "amoeba.neura.fusion.eliminated_loads = 1 : i64",
+                "amoeba.neura.fusion.eliminated_loads = 0 : i64",
+                "sibling eliminated load count",
+            ),
+        )
 
         reject(
             "forged-parent-name",

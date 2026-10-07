@@ -2192,7 +2192,10 @@ neuraFusionDescriptor(TaskflowTaskOp task, std::string &error) {
     return std::nullopt;
   }
   if (mode.getValue() == "sibling") {
-    if (loads.getInt() != 0 || stores.getInt() != 0 ||
+    // Sibling fusion can share any number of equivalent reads, but it keeps
+    // both tasks' output stores. The source-owned canonical replay verifies
+    // the exact eliminated-load count before this metadata is used as proof.
+    if (loads.getInt() < 0 || stores.getInt() != 0 ||
         !siblingFirst || !siblingSecond ||
         siblingFirst.getValue().empty() || siblingSecond.getValue().empty() ||
         siblingFirst.getValue() == siblingSecond.getValue()) {
@@ -2205,10 +2208,16 @@ neuraFusionDescriptor(TaskflowTaskOp task, std::string &error) {
                         {"sibling_first", siblingFirst.getValue().str()},
                         {"sibling_second", siblingSecond.getValue().str()}};
   }
+  // Retained fusion keeps the producer output store and may share one
+  // consumer load. Forwarded fusion removes exactly one load and store. The
+  // source-owned canonical replay authenticates these counts against the
+  // original tasks and the materialized body.
   if ((mode.getValue() != "retained" && mode.getValue() != "forwarded") ||
       siblingFirst || siblingSecond ||
-      loads.getInt() != (mode.getValue() == "forwarded" ? 1 : 0) ||
-      stores.getInt() != (mode.getValue() == "forwarded" ? 1 : 0)) {
+      (mode.getValue() == "retained" &&
+       (loads.getInt() < 0 || loads.getInt() > 1 || stores.getInt() != 0)) ||
+      (mode.getValue() == "forwarded" &&
+       (loads.getInt() != 1 || stores.getInt() != 1))) {
     error = "incomplete or invalid amoeba.neura.fusion metadata";
     return std::nullopt;
   }

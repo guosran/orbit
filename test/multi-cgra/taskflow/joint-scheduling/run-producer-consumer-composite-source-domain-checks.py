@@ -105,6 +105,21 @@ def contains_unquoted(text: str, expected: str) -> bool:
     return expected in mask_quoted_strings(text)
 
 
+def extract_graph_facts(
+    optimizer: str, module: pathlib.Path, function: str, output: pathlib.Path
+) -> dict[str, object]:
+    pipeline = (
+        "builtin.module(extract-joint-task-graph-facts{"
+        f"function={function} output={output} fact-only=true"
+        "})"
+    )
+    run(
+        [optimizer, str(module), f"--pass-pipeline={pipeline}", "-o", "/dev/null"],
+        expect_success=True,
+    )
+    return json.loads(output.read_text())
+
+
 def substitute_first_unquoted(
     text: str, pattern: str, replacement: str, label: str
 ) -> str:
@@ -436,6 +451,29 @@ def main() -> None:
             ],
             expect_success=True,
         )
+        retained_graph_facts = extract_graph_facts(
+            optimizer,
+            retained_candidate,
+            FUNCTION,
+            directory / "retained-graph-facts.json",
+        )
+        retained_record = next(
+            (
+                task
+                for task in retained_graph_facts.get("tasks", [])
+                if task.get("task_name") == FUSED
+            ),
+            None,
+        )
+        if retained_record is None or retained_record.get("neura_fusion") != {
+            "mode": "retained",
+            "eliminated_loads": 1,
+            "eliminated_stores": 0,
+        }:
+            fail(
+                "fact extraction did not preserve valid retained 1/0 metadata: "
+                f"{retained_record}"
+            )
         tampered_counts = replace_once_unquoted(
             retained_text,
             "amoeba.neura.fusion.eliminated_loads = 1 : i64",
@@ -459,6 +497,36 @@ def main() -> None:
             tampered_result.stdout + tampered_result.stderr
         ):
             fail("composite source proof did not reject forged retained load counts")
+
+        forged_store_count = directory / "retained-store-count-tamper.mlir"
+        forged_store_count.write_text(
+            replace_once_unquoted(
+                retained_text,
+                "amoeba.neura.fusion.eliminated_stores = 0 : i64",
+                "amoeba.neura.fusion.eliminated_stores = 1 : i64",
+                "retained store count",
+            )
+        )
+        facts_output = directory / "forged-retained-store-count-facts.json"
+        facts_pipeline = (
+            "builtin.module(extract-joint-task-graph-facts{"
+            f"function={FUNCTION} output={facts_output} fact-only=true"
+            "})"
+        )
+        forged_store_result = run(
+            [
+                optimizer,
+                str(forged_store_count),
+                f"--pass-pipeline={facts_pipeline}",
+                "-o",
+                "/dev/null",
+            ],
+            expect_success=False,
+        )
+        if "incomplete or invalid amoeba.neura.fusion metadata" not in (
+            forged_store_result.stdout + forged_store_result.stderr
+        ):
+            fail("fact extraction did not reject a forged retained store count")
 
         public = run(
             [
