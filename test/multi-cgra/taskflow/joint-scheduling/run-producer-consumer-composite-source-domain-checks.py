@@ -465,14 +465,29 @@ def main() -> None:
             ),
             None,
         )
-        if retained_record is None or retained_record.get("neura_fusion") != {
+        expected_retained_fusion = {
             "mode": "retained",
             "eliminated_loads": 1,
             "eliminated_stores": 0,
-        }:
+        }
+        if (
+            retained_record is None
+            or retained_record.get("neura_fusion") != expected_retained_fusion
+        ):
             fail(
                 "fact extraction did not preserve valid retained 1/0 metadata: "
                 f"{retained_record}"
+            )
+        structural_nodes = retained_graph_facts.get("structural_key", {}).get(
+            "nodes", []
+        )
+        if not any(
+            node.get("neura_fusion") == expected_retained_fusion
+            for node in structural_nodes
+        ):
+            fail(
+                "graph structural key dropped the retained elimination counts: "
+                f"{structural_nodes}"
             )
         tampered_counts = replace_once_unquoted(
             retained_text,

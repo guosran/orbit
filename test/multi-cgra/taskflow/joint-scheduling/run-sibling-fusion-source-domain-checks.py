@@ -213,16 +213,29 @@ def main() -> None:
             ),
             None,
         )
-        if fused_record is None or fused_record.get("neura_fusion") != {
+        expected_fusion = {
             "mode": "sibling",
             "eliminated_loads": 1,
             "eliminated_stores": 0,
             "sibling_first": "Task_A",
             "sibling_second": "Task_B",
-        }:
+        }
+        if (
+            fused_record is None
+            or fused_record.get("neura_fusion") != expected_fusion
+        ):
             fail(
                 "fact extraction did not preserve valid sibling shared-read "
                 f"metadata: {fused_record}"
+            )
+        structural_nodes = graph_facts.get("structural_key", {}).get("nodes", [])
+        if not any(
+            node.get("neura_fusion") == expected_fusion
+            for node in structural_nodes
+        ):
+            fail(
+                "graph structural key dropped the sibling eliminated-load "
+                f"count: {structural_nodes}"
             )
 
         def reject(label: str, mutant: str) -> None:

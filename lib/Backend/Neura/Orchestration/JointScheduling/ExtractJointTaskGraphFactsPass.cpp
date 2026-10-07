@@ -2203,7 +2203,7 @@ neuraFusionDescriptor(TaskflowTaskOp task, std::string &error) {
       return std::nullopt;
     }
     return json::Object{{"mode", "sibling"},
-                        {"eliminated_loads", 0},
+                        {"eliminated_loads", loads.getInt()},
                         {"eliminated_stores", 0},
                         {"sibling_first", siblingFirst.getValue().str()},
                         {"sibling_second", siblingSecond.getValue().str()}};
