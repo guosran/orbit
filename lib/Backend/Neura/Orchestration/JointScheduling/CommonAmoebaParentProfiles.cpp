@@ -668,7 +668,7 @@ bool verifyCommonAmoebaParentProfiles(
       cast<ModuleOp>(currentModule->clone()));
   std::string projectionError;
   FailureOr<func::FuncOp> projectedFunction = selectTaskFunction(
-      *currentProjection, currentFunction.getSymName().getValue(), projectionError);
+      *currentProjection, currentFunction.getSymName(), projectionError);
   if (failed(projectedFunction))
     return fail(
         "cannot select current function for common semantic projection: " +
