@@ -69,11 +69,13 @@ namespace json = llvm::json;
 
 namespace {
 
-constexpr StringLiteral kSearchSchema = "orbit-neighborhood-search-v1";
+constexpr StringLiteral kSearchSchema = "orbit-neighborhood-search-v2";
 constexpr StringLiteral kCheckpointSchema =
-    "orbit-neighborhood-search-checkpoint-v4";
+    "orbit-neighborhood-search-checkpoint-v6";
 constexpr StringLiteral kDiagnostic23CheckpointSchema =
-    "orbit-neighborhood-search-checkpoint-v5";
+    "orbit-neighborhood-search-checkpoint-v7";
+constexpr StringLiteral kFamilyFunnelSchema =
+    "orbit-joint-neighborhood-family-funnel-v1";
 constexpr StringLiteral kTypedActionHistorySchema =
     "orbit-joint-neighborhood-typed-actions-v1";
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
@@ -457,6 +459,8 @@ static json::Object typedActionObject(const NeighborhoodAction &action);
 static bool parseShapeArray(const json::Array *array,
                             std::vector<NeighborhoodShape> &shapes);
 static json::Array stringArray(ArrayRef<std::string> values);
+static bool parseStringArray(const json::Array *array,
+                             std::vector<std::string> &values);
 static bool parseTypedAction(const json::Object &object,
                              NeighborhoodAction &action);
 
@@ -1178,6 +1182,167 @@ struct PendingNeighbor {
   NeighborhoodAction action;
 };
 
+struct FamilyFunnelCounters {
+  uint64_t menu = 0;
+  uint64_t generated = 0;
+  uint64_t attempted = 0;
+  uint64_t materialized = 0;
+  uint64_t reject = 0;
+  uint64_t unique = 0;
+  uint64_t duplicate = 0;
+  uint64_t costPreparationAttempted = 0;
+  uint64_t freshCostPrepared = 0;
+  uint64_t freshCostScored = 0;
+  uint64_t cacheReused = 0;
+  uint64_t costShapeCacheHits = 0;
+  uint64_t costShapeCacheMisses = 0;
+  uint64_t schedulerCalls = 0;
+  uint64_t schedulerPass = 0;
+  uint64_t schedulerReject = 0;
+  uint64_t archive = 0;
+  uint64_t pendingUnattempted = 0;
+  std::map<std::string, uint64_t> rejectReasons;
+  std::map<std::string, uint64_t> pendingUnattemptedReasons;
+  std::vector<std::string> pendingUnattemptedActionSignatures;
+};
+
+using FamilyFunnelRound = std::map<std::string, FamilyFunnelCounters>;
+using FamilyFunnelByRound = std::map<int64_t, FamilyFunnelRound>;
+
+struct CandidateCostCacheObservation {
+  std::string graphCostKey;
+  bool known = false;
+  bool reused = false;
+};
+
+static json::Object familyFunnelCountersObject(
+    const FamilyFunnelCounters &counters) {
+  json::Object rejectReasons;
+  for (const auto &[reason, count] : counters.rejectReasons)
+    rejectReasons[reason] = static_cast<int64_t>(count);
+  json::Object pendingReasons;
+  for (const auto &[reason, count] : counters.pendingUnattemptedReasons)
+    pendingReasons[reason] = static_cast<int64_t>(count);
+  return json::Object{
+      {"menu", static_cast<int64_t>(counters.menu)},
+      {"generated", static_cast<int64_t>(counters.generated)},
+      {"attempted", static_cast<int64_t>(counters.attempted)},
+      {"materialized", static_cast<int64_t>(counters.materialized)},
+      {"reject", static_cast<int64_t>(counters.reject)},
+      {"unique", static_cast<int64_t>(counters.unique)},
+      {"duplicate", static_cast<int64_t>(counters.duplicate)},
+      {"cost_preparation_attempted",
+       static_cast<int64_t>(counters.costPreparationAttempted)},
+      {"fresh_cost_prepared",
+       static_cast<int64_t>(counters.freshCostPrepared)},
+      {"fresh_cost_scored", static_cast<int64_t>(counters.freshCostScored)},
+      {"cache_reused", static_cast<int64_t>(counters.cacheReused)},
+      {"cost_shape_cache_hits",
+       static_cast<int64_t>(counters.costShapeCacheHits)},
+      {"cost_shape_cache_misses",
+       static_cast<int64_t>(counters.costShapeCacheMisses)},
+      {"scheduler_calls", static_cast<int64_t>(counters.schedulerCalls)},
+      {"scheduler_pass", static_cast<int64_t>(counters.schedulerPass)},
+      {"scheduler_reject", static_cast<int64_t>(counters.schedulerReject)},
+      {"archive", static_cast<int64_t>(counters.archive)},
+      {"pending_unattempted",
+       static_cast<int64_t>(counters.pendingUnattempted)},
+      {"pending_unattempted_action_signatures",
+       stringArray(counters.pendingUnattemptedActionSignatures)},
+      {"pending_unattempted_reasons", std::move(pendingReasons)},
+      {"reject_reasons", std::move(rejectReasons)}};
+}
+
+static bool parseFamilyFunnelCounters(const json::Object &object,
+                                      FamilyFunnelCounters &counters) {
+  auto readCount = [&](StringRef key, uint64_t &target) {
+    auto value = object.getInteger(key);
+    if (!value || *value < 0)
+      return false;
+    target = static_cast<uint64_t>(*value);
+    return true;
+  };
+  if (!readCount("menu", counters.menu) ||
+      !readCount("generated", counters.generated) ||
+      !readCount("attempted", counters.attempted) ||
+      !readCount("materialized", counters.materialized) ||
+      !readCount("reject", counters.reject) ||
+      !readCount("unique", counters.unique) ||
+      !readCount("duplicate", counters.duplicate) ||
+      !readCount("cost_preparation_attempted",
+                 counters.costPreparationAttempted) ||
+      !readCount("fresh_cost_prepared", counters.freshCostPrepared) ||
+      !readCount("fresh_cost_scored", counters.freshCostScored) ||
+      !readCount("cache_reused", counters.cacheReused) ||
+      !readCount("cost_shape_cache_hits", counters.costShapeCacheHits) ||
+      !readCount("cost_shape_cache_misses",
+                 counters.costShapeCacheMisses) ||
+      !readCount("scheduler_calls", counters.schedulerCalls) ||
+      !readCount("scheduler_pass", counters.schedulerPass) ||
+      !readCount("scheduler_reject", counters.schedulerReject) ||
+      !readCount("archive", counters.archive) ||
+      !readCount("pending_unattempted", counters.pendingUnattempted) ||
+      !parseStringArray(object.getArray("pending_unattempted_action_signatures"),
+                        counters.pendingUnattemptedActionSignatures))
+    return false;
+  const json::Object *reasons = object.getObject("reject_reasons");
+  const json::Object *pendingReasons =
+      object.getObject("pending_unattempted_reasons");
+  if (!reasons || !pendingReasons)
+    return false;
+  for (const auto &[reasonRef, value] : *reasons) {
+    auto count = value.getAsInteger();
+    if (!count || *count < 0)
+      return false;
+    counters.rejectReasons.emplace(reasonRef.str(),
+                                   static_cast<uint64_t>(*count));
+  }
+  for (const auto &[reasonRef, value] : *pendingReasons) {
+    auto count = value.getAsInteger();
+    if (!count || *count < 0)
+      return false;
+    counters.pendingUnattemptedReasons.emplace(
+        reasonRef.str(), static_cast<uint64_t>(*count));
+  }
+  return true;
+}
+
+static json::Array typedActionArray(ArrayRef<NeighborhoodAction> actions) {
+  json::Array result;
+  for (const NeighborhoodAction &action : actions)
+    result.push_back(typedActionObject(action));
+  return result;
+}
+
+static std::set<std::string> typedHistoryFamilies(
+    const SearchState::TypedActionHistory &history) {
+  std::set<std::string> families;
+  if (!history.known)
+    return families;
+  for (const NeighborhoodAction &action : history.fissionActions)
+    families.insert(action.family);
+  for (const NeighborhoodAction &action : history.actions)
+    families.insert(action.family);
+  return families;
+}
+
+static std::string familyWitnessFilename(StringRef candidateID) {
+  auto safe = [](StringRef value) {
+    std::string result;
+    for (char character : value) {
+      const bool alphaNumeric =
+          (character >= 'a' && character <= 'z') ||
+          (character >= 'A' && character <= 'Z') ||
+          (character >= '0' && character <= '9');
+      result.push_back(alphaNumeric || character == '-' || character == '_'
+                           ? character
+                           : '-');
+    }
+    return result.empty() ? std::string("unknown") : result;
+  };
+  return "family-best-witness-" + safe(candidateID) + ".json";
+}
+
 struct CostGuidedAction {
   uint64_t targetCycles = 0;
   NeighborhoodAction action;
@@ -1267,11 +1432,147 @@ static uint64_t perRoundScoreQuota(uint64_t scoredCount,
   return remaining / divisor + (remaining % divisor != 0 ? 1 : 0);
 }
 
+static bool ordinaryActionFamilyHasKnownTaskEffects(StringRef family) {
+  return family == "shape" || family == "replica" || family == "tiling" ||
+         family == "k-tiling" ||
+         family == "producer-consumer-co-tiling" ||
+         family == "producer-consumer-co-k-tiling" || family == "fusion" ||
+         family == "fusion-plus-tiling" || family == "tiling-plus-fusion" ||
+         family == "fusion-plus-shape" || family == "sibling-fusion";
+}
+
+static bool ordinaryFamilyAllowsPrimitiveKind(StringRef family,
+                                              StringRef kind) {
+  if (family == "replica")
+    return kind == "replica";
+  if (family == "tiling" || family == "producer-consumer-co-tiling" ||
+      family == "fusion-plus-tiling" || family == "tiling-plus-fusion")
+    return kind == "tile" ||
+           ((family == "fusion-plus-tiling" ||
+             family == "tiling-plus-fusion") &&
+            kind == "fusion");
+  if (family == "k-tiling" ||
+      family == "producer-consumer-co-k-tiling")
+    return kind == "k-tile";
+  if (family == "fusion")
+    return kind == "fusion";
+  if (family == "fusion-plus-shape")
+    return kind == "fusion";
+  if (family == "sibling-fusion")
+    return kind == "sibling-fusion";
+  return false;
+}
+
+static std::string ordinaryActionFootprintFailure(
+    const NeighborhoodAction &action, std::set<std::string> &footprint) {
+  footprint.clear();
+  if (action.canonicalReset || action.family == "canonical-reset")
+    return "canonical_reset";
+  if (action.family == "lineage-replacement")
+    return "lineage_replacement";
+  if (action.family == "fission")
+    return "fission_in_ordinary_history";
+  if (action.family == "identity")
+    return "global_or_unknown_footprint";
+  if (!ordinaryActionFamilyHasKnownTaskEffects(action.family))
+    return "unknown_action_family";
+  const bool shapeFamily = action.family == "shape";
+  const bool fusionShapeFamily = action.family == "fusion-plus-shape";
+  if ((shapeFamily || fusionShapeFamily) != !action.shapeTask.empty())
+    return "unknown_footprint";
+  if (shapeFamily && !action.primitives.empty())
+    return "unknown_primitive_family";
+  if (!action.shapeTask.empty())
+    footprint.insert(action.shapeTask);
+  bool sawTile = false;
+  bool sawFusion = false;
+  bool sawPrimitive = false;
+  for (const NeighborhoodPrimitive &primitive : action.primitives) {
+    const StringRef kind = primitive.kind;
+    const bool fusionPrimitive = kind == "fusion" ||
+                                 kind == "sibling-fusion";
+    if (kind != "tile" && kind != "k-tile" && kind != "replica" &&
+        !fusionPrimitive)
+      return "unknown_primitive_kind";
+    if (!ordinaryFamilyAllowsPrimitiveKind(action.family, kind))
+      return "unknown_primitive_family";
+    if (primitive.firstTask.empty())
+      return "unknown_footprint";
+    if (fusionPrimitive &&
+        (primitive.secondTask.empty() ||
+         primitive.secondTask == primitive.firstTask))
+      return "unknown_footprint";
+    if (!fusionPrimitive && !primitive.secondTask.empty())
+      return "unknown_footprint";
+    footprint.insert(primitive.firstTask);
+    if (!primitive.secondTask.empty())
+      footprint.insert(primitive.secondTask);
+    sawPrimitive = true;
+    sawTile |= kind == "tile";
+    sawFusion |= fusionPrimitive;
+  }
+  if (action.family == "replica" &&
+      (!sawPrimitive || action.primitives.size() != 1))
+    return "unknown_footprint";
+  if (action.family == "tiling" &&
+      (!sawTile || action.primitives.size() != 1))
+    return "unknown_footprint";
+  if (action.family == "k-tiling" && action.primitives.size() != 1)
+    return "unknown_footprint";
+  if ((action.family == "producer-consumer-co-tiling" ||
+       action.family == "producer-consumer-co-k-tiling") &&
+      action.primitives.size() != 2)
+    return "unknown_footprint";
+  if ((action.family == "fusion" || action.family == "sibling-fusion") &&
+      action.primitives.size() != 1)
+    return "unknown_footprint";
+  if (action.family == "fusion-plus-tiling" &&
+      (action.primitives.size() != 2 || !sawTile || !sawFusion))
+    return "unknown_footprint";
+  if (action.family == "tiling-plus-fusion" &&
+      (action.primitives.size() != 3 || !sawTile || !sawFusion))
+    return "unknown_footprint";
+  if (fusionShapeFamily &&
+      (action.primitives.size() != 1 || !sawFusion))
+    return "unknown_footprint";
+  if (footprint.empty())
+    return "global_or_unknown_footprint";
+  return {};
+}
+
+static std::string fissionHistoryConflictReason(
+    const SearchState::TypedActionHistory &history,
+    const NeighborhoodAction &fission) {
+  if (!history.known)
+    return "history_unknown";
+  if (fission.primitives.size() != 1 ||
+      fission.primitives.front().firstTask.empty())
+    return "malformed_fission_target";
+  const std::string &target = fission.primitives.front().firstTask;
+  for (const NeighborhoodAction &action : history.fissionActions)
+    if (action.primitives.size() == 1 &&
+        action.primitives.front().firstTask == target)
+      return "target_already_fissioned";
+  for (const NeighborhoodAction &action : history.actions) {
+    std::set<std::string> footprint;
+    std::string failure = ordinaryActionFootprintFailure(action, footprint);
+    if (!failure.empty())
+      return failure;
+    if (footprint.count(target))
+      return !action.shapeTask.empty() ||
+                     StringRef(action.family).contains("shape")
+                 ? "shape_target_overlap"
+                 : "task_footprint_overlap";
+  }
+  return {};
+}
+
 static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
     ArrayRef<SearchState> beam, StringRef functionName, StringRef stage,
     unsigned round, unsigned maxPartitionFactor,
     ModuleOp preparedTaskflowSource, uint64_t maxFissionActionsPerTask,
     ArrayRef<NeighborhoodAction> canonicalFissionActions,
+    FamilyFunnelRound &roundFunnel,
     std::string &enumerationError) {
   enumerationError.clear();
   const bool fissionStage =
@@ -1294,28 +1595,25 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
       enumerationError = actionEnumerationError;
       return {};
     }
-    if (!indexed.value().actionHistory.known && fissionStage) {
-      actions.erase(std::remove_if(actions.begin(), actions.end(),
-                                   [](const NeighborhoodAction &action) {
-        return action.family == "fission";
-      }), actions.end());
-    } else if (fissionStage) {
-      std::set<std::string> alreadyFissioned;
-      for (const NeighborhoodAction &action :
-           indexed.value().actionHistory.fissionActions)
-        if (!action.primitives.empty())
-          alreadyFissioned.insert(action.primitives.front().firstTask);
-      bool canAddFission = indexed.value().actionHistory.actions.empty();
-      actions.erase(std::remove_if(actions.begin(), actions.end(),
-                                   [&](const NeighborhoodAction &action) {
-        return action.family == "fission" &&
-               (!canAddFission || action.primitives.size() != 1 ||
-                alreadyFissioned.count(
-                    action.primitives.front().firstTask));
-      }), actions.end());
+    for (const NeighborhoodAction &action : actions)
+      ++roundFunnel[action.family].menu;
+    std::vector<NeighborhoodAction> admitted;
+    admitted.reserve(actions.size());
+    for (NeighborhoodAction &action : actions) {
+      if (fissionStage && action.family == "fission") {
+        const std::string reason =
+            fissionHistoryConflictReason(indexed.value().actionHistory,
+                                         action);
+        if (!reason.empty()) {
+          ++roundFunnel[action.family].reject;
+          ++roundFunnel[action.family].rejectReasons["menu:" + reason];
+          continue;
+        }
+      }
+      admitted.push_back(std::move(action));
     }
     FamilyMap &families = grouped[indexed.index()];
-    for (NeighborhoodAction &action : actions) {
+    for (NeighborhoodAction &action : admitted) {
       const std::string family = action.family;
       const std::string target = actionTargetKey(action);
       const uint64_t targetCycles =
@@ -1367,6 +1665,7 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
           continue;
         PendingNeighbor neighbor;
         if (familyIt->second.take(neighbor)) {
+          ++roundFunnel[neighbor.action.family].generated;
           pending.push_back(std::move(neighbor));
           emitted = true;
         }
@@ -1473,6 +1772,15 @@ struct ParallelBatchItem {
   std::string actionFamily;
   ParallelBatchItemKind kind = ParallelBatchItemKind::Rejected;
   size_t jobIndex = 0;
+  bool materialized = false;
+  bool materializationRejected = false;
+  bool unique = false;
+  bool duplicate = false;
+  bool cacheReused = false;
+  bool freshCostPrepared = false;
+  bool freshCostScored = false;
+  uint64_t costShapeCacheHits = 0;
+  uint64_t costShapeCacheMisses = 0;
   SearchState state;
 };
 
@@ -2130,7 +2438,11 @@ public:
       return;
     }
     if (!ensureDirectory(outputDir, error) ||
-        !ensureDirectory(outputDir + "/candidates", error)) { fatal(error); return; }
+        !ensureDirectory(outputDir + "/candidates", error) ||
+        !ensureDirectory(outputDir + "/diagnostics", error)) {
+      fatal(error);
+      return;
+    }
     const std::string candidatesDir = outputDir + "/candidates";
     const std::string checkpointPath = checkpoint.empty() ? outputDir + "/checkpoint.json" : checkpoint;
     journalPath = outputDir + "/archive.journal.jsonl";
@@ -2340,6 +2652,11 @@ public:
       // once avoids storing a second authoritative ranking in the checkpoint.
       for (size_t index = 0; index < archive.size(); ++index)
         if (archive[index].valid) insertRankedArchiveIndex(index, archive);
+      if (!writeFamilyFunnelSidecars(outputDir, round, archive, beam, pending,
+                                     pendingCursor, "", error)) {
+        fatal(error);
+        return;
+      }
     } else {
       SearchState identity;
       identity.id = "neighborhood-" + std::to_string(nextSerial++);
@@ -2637,6 +2954,9 @@ public:
             return false;
           }
           if (!registerCandidate(seed, archive, seenKeys, rejectedCount, candidatesDir, error)) return false;
+          if (seed.scored &&
+              !persistBestFamilyWitnesses(seed, archive, outputDir, error))
+            return false;
           if (seed.scored) beam.push_back(std::move(seed));
           ++imported;
           if (required) break;
@@ -2675,7 +2995,8 @@ public:
             static_cast<unsigned>(maxPartitionFactor.getValue()),
             preparedTaskflowSource.get(),
             static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
-            canonicalFissionActions, actionEnumerationError);
+            canonicalFissionActions, familyFunnelByRound[round],
+            actionEnumerationError);
         if (!actionEnumerationError.empty()) {
           fatal(actionEnumerationError);
           return;
@@ -2697,12 +3018,29 @@ public:
         const std::string actionFamily = neighbor.action.family;
         if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
         SearchState &parent = beam[neighbor.parent];
+        FamilyFunnelCounters &funnel =
+            familyFunnelByRound[round][actionFamily];
         SearchState child;
         child.id = "neighborhood-" + std::to_string(nextSerial++);
         child.parentId = parent.id; child.path = parent.path;
         child.path.push_back(actionSignature(neighbor.action));
         child.shapes = parent.shapes; child.module = parent.module->clone();
         std::string reason, diagnostic, materializeError;
+        ++funnel.attempted;
+        bool materialized = false;
+        bool unique = false;
+        bool duplicate = false;
+        bool freshCostPrepared = false;
+        bool cacheReused = false;
+        bool freshCostScored = false;
+        bool schedulerCalled = false;
+        bool schedulerPassed = false;
+        bool schedulerRejected = false;
+        bool archived = false;
+        bool expandCandidate = false;
+        uint64_t costShapeCacheHits = 0;
+        uint64_t costShapeCacheMisses = 0;
+        std::string outcomeReason;
         NeighborMaterialization materialization = materializeNeighbor(
             child, parent, canonical, functionName, outputDir,
             neighbor.action, canonicalFactKey, nextSerial, reason, diagnostic,
@@ -2712,43 +3050,155 @@ public:
           return;
         }
         if (materialization == NeighborMaterialization::Rejected) {
+          outcomeReason =
+              (reason.empty() ? "unsupported_or_unknown_action" : reason) +
+              ":" + diagnostic;
+          ++funnel.reject;
+          ++funnel.rejectReasons["materialize:" +
+                                 StringRef(outcomeReason)
+                                     .take_front(StringRef(outcomeReason).find(':'))
+                                     .str()];
           ++rejectedCount; appendRejected(archive, child,
-              (reason.empty() ? "unsupported_or_unknown_action" : reason) + ":" + diagnostic, round);
+                                           outcomeReason, round);
+          archived = true;
         } else {
+          materialized = true;
+          ++funnel.materialized;
           if (!child.key.empty() && child.rejectReason.empty()) {
             if (!seenKeys.insert(child.key).second) {
+              duplicate = true;
+              ++funnel.duplicate;
               ++rejectedCount;
               if (!mergeDuplicate(child, canonical, functionName, archive,
                                   outputDir, candidatesDir, nextSerial, error)) {
                 fatal(error);
                 return;
               }
+              archived = true;
             } else {
+              unique = true;
+              ++funnel.unique;
               child.keyReserved = true;
+              CandidateCostCacheObservation cacheObservation =
+                  observeCandidateCostCache(child, functionName,
+                                            canonicalFactKey,
+                                            costCacheLoaded);
+              cacheReused = cacheObservation.known &&
+                            cacheObservation.reused;
+              ++funnel.costPreparationAttempted;
+              if (cacheReused)
+                ++funnel.cacheReused;
+              const uint64_t oldCostHits = costCacheHits;
+              const uint64_t oldCostMisses = costCacheMisses;
+              const uint64_t oldSchedulerCalls = productionSchedulerCalls;
               if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
                   candidatesDir, canonicalFactKey, costCacheLoaded, costCache,
                   round, scoredCount, /*chargeRoundQuota=*/true, nextSerial,
                   error) ||
                   !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error)) { fatal(error); return; }
+              if (child.scored &&
+                  !persistBestFamilyWitnesses(child, archive, outputDir,
+                                              error)) {
+                fatal(error);
+                return;
+              }
+              archived = true;
+              costShapeCacheHits = costCacheHits - oldCostHits;
+              costShapeCacheMisses = costCacheMisses - oldCostMisses;
+              funnel.costShapeCacheHits += costShapeCacheHits;
+              funnel.costShapeCacheMisses += costShapeCacheMisses;
+              const bool generatedFreshCatalogue =
+                  cacheObservation.known && !cacheObservation.reused &&
+                  !cacheObservation.graphCostKey.empty() &&
+                  graphCostPaths.count(cacheObservation.graphCostKey);
+              if (generatedFreshCatalogue) {
+                freshCostPrepared = true;
+                ++funnel.freshCostPrepared;
+              }
+              schedulerCalled = productionSchedulerCalls > oldSchedulerCalls;
+              schedulerPassed = schedulerCalled && child.scored;
+              schedulerRejected = schedulerCalled && !child.scored;
+              if (schedulerCalled)
+                ++funnel.schedulerCalls;
+              if (schedulerPassed)
+                ++funnel.schedulerPass;
+              if (schedulerRejected) {
+                ++funnel.schedulerReject;
+                outcomeReason = child.rejectReason;
+                ++funnel.reject;
+                ++funnel.rejectReasons[
+                    "scheduler:" +
+                    StringRef(outcomeReason)
+                        .take_front(StringRef(outcomeReason).find(':'))
+                        .str()];
+              } else if (!child.scored) {
+                outcomeReason = child.rejectReason;
+                if (outcomeReason.empty())
+                  outcomeReason = "candidate_not_scored";
+                ++funnel.reject;
+                ++funnel.rejectReasons[
+                    "candidate:" +
+                    StringRef(outcomeReason)
+                        .take_front(StringRef(outcomeReason).find(':'))
+                        .str()];
+              }
+              freshCostScored = freshCostPrepared && schedulerCalled;
+              if (freshCostScored)
+                ++funnel.freshCostScored;
               archive.back().round = round;
               if (child.scored) {
                 ++successfulFamilyScores[neighbor.action.family];
-                generated.push_back(std::move(child));
-                // Keep the expansion frontier bounded rather than serializing
-                // every evaluated program in a round. Four diverse slots remain
-                // available independently of the twelve cost-selected slots.
-                generated = selectBeam(std::move(generated), beamWidth, diversitySlots);
+                expandCandidate = true;
               }
             }
           } else if (child.key.empty() && child.rejectReason.empty()) {
+            outcomeReason =
+                "active_transfer_proof_unsupported:proof preparation returned no candidate key";
+            ++funnel.reject;
+            ++funnel.rejectReasons["candidate:active_transfer_proof_unsupported"];
             ++rejectedCount;
-            appendRejected(archive, child,
-                           "active_transfer_proof_unsupported:"
-                               "proof preparation returned no candidate key",
-                           round);
+            appendRejected(archive, child, outcomeReason, round);
+            archived = true;
           } else if (child.key.empty()) {
-            ++rejectedCount; appendRejected(archive, child, child.rejectReason, round);
+            outcomeReason = child.rejectReason;
+            ++funnel.reject;
+            ++funnel.rejectReasons[
+                "candidate:" +
+                StringRef(outcomeReason)
+                    .take_front(StringRef(outcomeReason).find(':'))
+                    .str()];
+            ++rejectedCount;
+            appendRejected(archive, child, outcomeReason, round);
+            archived = true;
           }
+        }
+        if (archived)
+          ++funnel.archive;
+        json::Object eventResult{
+            {"attempted", true}, {"materialized", materialized},
+            {"reject_reason", outcomeReason}, {"unique", unique},
+            {"duplicate", duplicate},
+            {"fresh_cost_prepared", freshCostPrepared},
+            {"fresh_cost_scored", freshCostScored},
+            {"cache_reused", cacheReused},
+            {"cost_shape_cache_hits",
+             static_cast<int64_t>(costShapeCacheHits)},
+            {"cost_shape_cache_misses",
+             static_cast<int64_t>(costShapeCacheMisses)},
+            {"scheduler_calls", schedulerCalled ? 1 : 0},
+            {"scheduler_pass", schedulerPassed},
+            {"scheduler_reject", schedulerRejected},
+            {"archive", archived}};
+        appendFamilyFunnelCandidateEvent(
+            round, actionFamily, child.id, child.parentId, neighbor.action,
+            child.actionHistory, std::move(eventResult));
+        if (expandCandidate) {
+          generated.push_back(std::move(child));
+          // Keep the expansion frontier bounded rather than serializing every
+          // evaluated program in a round. Four diverse slots remain available
+          // independently of the twelve cost-selected slots.
+          generated = selectBeam(std::move(generated), beamWidth,
+                                 diversitySlots);
         }
         ++pendingCursor; ++actionsSinceCheckpoint;
         consumePendingActionFamily(remainingPendingFamilies, actionFamily);
@@ -2812,6 +3262,9 @@ public:
               return;
             }
             SearchState &parent = beam[neighbor.parent];
+            FamilyFunnelCounters &funnel =
+                familyFunnelByRound[round][neighbor.action.family];
+            ++funnel.attempted;
             SearchState child;
             child.id = "neighborhood-" + std::to_string(nextSerial++);
             child.parentId = parent.id;
@@ -2834,10 +3287,13 @@ public:
             }
             if (materialization == NeighborMaterialization::Rejected) {
               item.kind = ParallelBatchItemKind::Rejected;
+              item.materializationRejected = true;
               item.state.rejectReason =
                   (reason.empty() ? "unsupported_or_unknown_action" : reason) +
                   ":" + diagnostic;
             } else {
+              item.materialized = true;
+              ++funnel.materialized;
               if (item.state.key.empty()) {
                 item.kind = ParallelBatchItemKind::Rejected;
                 item.state.rejectReason = "graph_facts_unknown";
@@ -2847,8 +3303,23 @@ public:
                 // archive record exists.  Duplicates from an older batch can
                 // be merged immediately at the same ordered commit point.
                 item.kind = ParallelBatchItemKind::Duplicate;
+                item.duplicate = true;
+                ++funnel.duplicate;
               } else {
                 item.state.keyReserved = true;
+                item.unique = true;
+                ++funnel.unique;
+                CandidateCostCacheObservation cacheObservation =
+                    observeCandidateCostCache(item.state, functionName,
+                                              canonicalFactKey,
+                                              costCacheLoaded);
+                item.cacheReused = cacheObservation.known &&
+                                   cacheObservation.reused;
+                ++funnel.costPreparationAttempted;
+                if (item.cacheReused)
+                  ++funnel.cacheReused;
+                const uint64_t oldCostHits = costCacheHits;
+                const uint64_t oldCostMisses = costCacheMisses;
                 if (!prepareParallelCandidate(
                         item.state, canonical, functionName, stage, outputDir,
                         canonicalFactKey, costCacheLoaded, costCache,
@@ -2856,6 +3327,17 @@ public:
                   fatal(error);
                   return;
                 }
+                funnel.costShapeCacheHits += costCacheHits - oldCostHits;
+                funnel.costShapeCacheMisses += costCacheMisses - oldCostMisses;
+                item.costShapeCacheHits = costCacheHits - oldCostHits;
+                item.costShapeCacheMisses =
+                    costCacheMisses - oldCostMisses;
+                item.freshCostPrepared =
+                    cacheObservation.known && !cacheObservation.reused &&
+                    !cacheObservation.graphCostKey.empty() &&
+                    graphCostPaths.count(cacheObservation.graphCostKey);
+                if (item.freshCostPrepared)
+                  ++funnel.freshCostPrepared;
                 if (item.state.rejectReason.empty() &&
                     !item.state.choices.empty()) {
                   item.kind = ParallelBatchItemKind::Score;
@@ -2930,13 +3412,26 @@ public:
           const auto commitBegan = std::chrono::steady_clock::now();
           for (ParallelBatchItem &item : items) {
             SearchState &child = item.state;
+            FamilyFunnelCounters &funnel =
+                familyFunnelByRound[round][item.actionFamily];
+            bool schedulerPassed = false;
+            bool schedulerRejected = false;
             if (item.kind == ParallelBatchItemKind::Rejected) {
               ++rejectedCount;
+              const std::string rejectReason =
+                  child.rejectReason.empty() ? "unsupported_or_unknown_action"
+                                             : child.rejectReason;
+              ++funnel.reject;
+              ++funnel.rejectReasons[
+                  (item.materializationRejected ? "materialize:" :
+                                                   "candidate:") +
+                  StringRef(rejectReason)
+                      .take_front(StringRef(rejectReason).find(':'))
+                      .str()];
               appendRejected(archive, child,
-                             child.rejectReason.empty()
-                                 ? "unsupported_or_unknown_action"
-                                 : child.rejectReason,
+                             rejectReason,
                              round);
+              ++funnel.archive;
             } else if (item.kind == ParallelBatchItemKind::Duplicate) {
               ++rejectedCount;
               if (!mergeDuplicate(child, canonical, functionName, archive,
@@ -2944,6 +3439,7 @@ public:
                 fatal(error);
                 return;
               }
+              ++funnel.archive;
             } else {
               ParallelScoreResult &result = results[item.jobIndex];
               // Every production invocation consumes one budget unit, even
@@ -2951,30 +3447,71 @@ public:
               ++scoredCount;
               ++productionSchedulerCalls;
               ++roundScoredCount;
+              ++funnel.schedulerCalls;
+              if (item.freshCostPrepared) {
+                ++funnel.freshCostScored;
+                item.freshCostScored = true;
+              }
               if (result.scored) {
                 child.schedule = std::move(result.schedule);
                 child.score = child.schedule.makespan;
                 child.scored = true;
                 child.rejectReason.clear();
+                schedulerPassed = true;
+                ++funnel.schedulerPass;
                 ++successfulFamilyScores[item.actionFamily];
               } else {
                 child.rejectReason = "production_scheduler_rejected";
                 if (!result.error.empty())
                   child.rejectReason += ":" + result.error;
                 child.scored = false;
+                schedulerRejected = true;
+                ++funnel.schedulerReject;
+                ++funnel.reject;
+                ++funnel.rejectReasons[
+                    "scheduler:production_scheduler_rejected"];
               }
               if (!registerCandidate(child, archive, seenKeys, rejectedCount,
                                      candidatesDir, error)) {
                 fatal(error);
                 return;
               }
+              if (child.scored &&
+                  !persistBestFamilyWitnesses(child, archive, outputDir,
+                                              error)) {
+                fatal(error);
+                return;
+              }
               archive.back().round = round;
+              ++funnel.archive;
               if (child.scored) {
                 generated.push_back(std::move(child));
                 generated = selectBeam(std::move(generated), beamWidth,
                                        diversitySlots);
               }
             }
+            const PendingNeighbor &attempt =
+                pending[item.pendingIndex];
+            json::Object eventResult{
+                {"attempted", true},
+                {"materialized", item.materialized},
+                {"reject_reason", child.rejectReason},
+                {"unique", item.unique}, {"duplicate", item.duplicate},
+                {"fresh_cost_prepared", item.freshCostPrepared},
+                {"fresh_cost_scored", item.freshCostScored},
+                {"cache_reused", item.cacheReused},
+                {"cost_shape_cache_hits",
+                 static_cast<int64_t>(item.costShapeCacheHits)},
+                {"cost_shape_cache_misses",
+                 static_cast<int64_t>(item.costShapeCacheMisses)},
+                {"scheduler_calls",
+                 item.kind == ParallelBatchItemKind::Score ? 1 : 0},
+                {"scheduler_pass", schedulerPassed},
+                {"scheduler_reject", schedulerRejected},
+                {"archive", true}};
+            appendFamilyFunnelCandidateEvent(
+                round, item.actionFamily, child.id, child.parentId,
+                attempt.action, child.actionHistory, std::move(eventResult));
             ++actionsSinceCheckpoint;
           }
           parallelCommitMilliseconds +=
@@ -3007,6 +3544,23 @@ public:
       if (stopReason == "explicit-pause" ||
           scoredCount >= static_cast<uint64_t>(maxCandidates))
         break;
+      for (size_t index = static_cast<size_t>(pendingCursor);
+           index < pending.size(); ++index) {
+        const PendingNeighbor &unattempted = pending[index];
+        FamilyFunnelCounters &funnel =
+            familyFunnelByRound[round][unattempted.action.family];
+        ++funnel.pendingUnattempted;
+        ++funnel.pendingUnattemptedReasons["round_score_quota"];
+        funnel.pendingUnattemptedActionSignatures.push_back(
+            actionSignature(unattempted.action));
+        if (unattempted.parent >= beam.size()) {
+          fatal("pending neighbor parent outside beam while recording funnel frontier");
+          return;
+        }
+        appendPendingFamilyFunnelEvent(round, unattempted,
+                                       beam[unattempted.parent],
+                                       "round_score_quota");
+      }
       ++round; pending.clear(); pendingCursor = 0;
       remainingPendingFamilies.clear();
       successfulFamilyScores.clear();
@@ -3555,13 +4109,17 @@ private:
     if (action.family == "fission") {
       if (stageNumber(stage) != 6 || !preparedTaskflowSource ||
           !parent.actionHistory.known ||
-          !parent.actionHistory.actions.empty() ||
           action.primitives.size() != 1 ||
           !llvm::any_of(canonicalFissionActions,
                         [&](const NeighborhoodAction &allowed) {
             return actionSignature(allowed) == actionSignature(action);
           })) {
-        reason = "fission_requires_source_verified_unchanged_search_state";
+        reason = "fission_requires_authenticated_source_history";
+        return NeighborMaterialization::Rejected;
+      }
+      reason = fissionHistoryConflictReason(parent.actionHistory, action);
+      if (!reason.empty()) {
+        reason = "fission_history_conflict:" + reason;
         return NeighborMaterialization::Rejected;
       }
       for (const NeighborhoodAction &prior :
@@ -3569,10 +4127,11 @@ private:
         if (prior.primitives.size() == 1 &&
             prior.primitives.front().firstTask ==
                 action.primitives.front().firstTask) {
-          reason = "fission_target_was_already_split";
-          return NeighborMaterialization::Rejected;
+            reason = "fission_target_was_already_split";
+            return NeighborMaterialization::Rejected;
         }
       child.actionHistory.fissionActions.push_back(action);
+      child.actionHistory.canonicalFactKey = "source-replay-pending";
       OwningOpRef<ModuleOp> effectiveCanonical;
       if (!buildFissionCanonical(canonical,
                                  child.actionHistory.fissionActions,
@@ -3581,39 +4140,90 @@ private:
           return NeighborMaterialization::Fatal;
         return NeighborMaterialization::Rejected;
       }
-      child.module = effectiveCanonical->clone();
+      OwningOpRef<ModuleOp> priorCanonical;
+      if (!buildFissionCanonical(canonical,
+                                 parent.actionHistory.fissionActions,
+                                 priorCanonical, reason, fatalError)) {
+        if (!fatalError.empty())
+          return NeighborMaterialization::Fatal;
+        reason = "fission_prior_source_history_unavailable:" + reason;
+        return NeighborMaterialization::Rejected;
+      }
+      FailureOr<func::FuncOp> priorFunction =
+          selectTaskFunction(priorCanonical.get(), functionName, diagnostic);
+      if (failed(priorFunction)) {
+        reason = "fission_prior_source_function_missing:" + diagnostic;
+        return NeighborMaterialization::Rejected;
+      }
+      FailureOr<SmallVector<TaskMetadata>> priorMetadata =
+          collectAnalyticalTaskMetadata(*priorFunction, diagnostic);
+      if (failed(priorMetadata) ||
+          !sameTaskSet(*priorMetadata, parent.actionHistory.initialShapes)) {
+        reason = "fission_parent_initial_shapes_do_not_cover_source_history";
+        if (!diagnostic.empty())
+          reason += ":" + diagnostic;
+        return NeighborMaterialization::Rejected;
+      }
       FailureOr<func::FuncOp> splitFunction =
-          selectTaskFunction(child.module.get(), functionName, diagnostic);
+          selectTaskFunction(effectiveCanonical.get(), functionName,
+                             diagnostic);
       if (failed(splitFunction)) {
         reason = "fission_lowered_task_function_missing";
         return NeighborMaterialization::Rejected;
       }
-      child.shapes = initialShapes(*splitFunction);
-      if (child.shapes.empty()) {
+      std::vector<NeighborhoodShape> rebasedInitialShapes =
+          initialShapes(*splitFunction);
+      if (rebasedInitialShapes.empty()) {
         reason = "fission_lowered_task_graph_is_empty";
         return NeighborMaterialization::Rejected;
       }
-      // Source fission creates fresh unit-shaped children, while unaffected
-      // task names keep the parent's already validated shape assignments.
-      // This transfers only shape choices; the changed graph gets fresh costs.
-      synchronizeShapes(*splitFunction, parent.shapes, child.shapes);
-      child.key.clear();
-      child.factKey.clear();
-      child.rejectReason.clear();
-      if (!prepareCandidateKey(child, functionName, outputDirectory, serial,
-                               fatalError))
-        return NeighborMaterialization::Fatal;
-      if (child.key.empty()) {
-        reason = child.rejectReason.empty()
-                     ? "fission_graph_facts_unknown"
-                     : child.rejectReason;
+      std::map<std::string, NeighborhoodShape> priorInitialShapes;
+      for (const NeighborhoodShape &shape :
+           parent.actionHistory.initialShapes)
+        if (!priorInitialShapes.emplace(shape.task, shape).second) {
+          reason = "fission_parent_initial_shapes_repeat_task";
+          return NeighborMaterialization::Rejected;
+        }
+      // Rebase only by stable task name. New fission children retain their
+      // source-created 1x1 shapes, while unaffected bootstrap choices such as
+      // Ray Task13 survive before ordinary typed actions are replayed.
+      for (NeighborhoodShape &shape : rebasedInitialShapes) {
+        auto prior = priorInitialShapes.find(shape.task);
+        if (prior == priorInitialShapes.end()) {
+          shape.rows = 1;
+          shape.cols = 1;
+        } else {
+          shape.rows = prior->second.rows;
+          shape.cols = prior->second.cols;
+        }
+      }
+      FailureOr<SmallVector<TaskMetadata>> splitMetadata =
+          collectAnalyticalTaskMetadata(*splitFunction, diagnostic);
+      if (failed(splitMetadata) ||
+          !sameTaskSet(*splitMetadata, rebasedInitialShapes)) {
+        reason = "fission_rebased_initial_shapes_do_not_cover_task_set";
+        if (!diagnostic.empty())
+          reason += ":" + diagnostic;
         return NeighborMaterialization::Rejected;
       }
-      child.actionHistory.canonicalFactKey = child.factKey;
-      child.actionHistory.initialShapes = child.shapes;
-      child.actionHistory.actions.clear();
+      child.actionHistory.initialShapes = std::move(rebasedInitialShapes);
       child.actionHistory.dependencies.clear();
       child.actionHistory.taskProducers.clear();
+      SearchState replayed;
+      if (!replayTypedActionHistory(child.actionHistory, canonical,
+                                    functionName, outputDirectory, serial,
+                                    replayed, reason, fatalError)) {
+        if (!fatalError.empty())
+          return NeighborMaterialization::Fatal;
+        reason = "fission_complete_history_replay_failed:" + reason;
+        return NeighborMaterialization::Rejected;
+      }
+      child.module = std::move(replayed.module);
+      child.shapes = std::move(replayed.shapes);
+      child.key = std::move(replayed.key);
+      child.factKey = std::move(replayed.factKey);
+      child.rejectReason.clear();
+      child.actionHistory = std::move(replayed.actionHistory);
       return NeighborMaterialization::Applied;
     }
     if (action.family == "lineage-replacement") {
@@ -4157,6 +4767,38 @@ private:
     (*selected)->setAttr("amoeba.graph_variant_id",
                         StringAttr::get(state.module->getContext(), state.factKey));
     return true;
+  }
+
+  CandidateCostCacheObservation observeCandidateCostCache(
+      const SearchState &state, StringRef function,
+      StringRef canonicalFactKey, bool costCacheLoaded) const {
+    CandidateCostCacheObservation observation;
+    if (state.factKey.empty())
+      return observation;
+    observation.known = true;
+    if (state.factKey == canonicalFactKey && costCacheLoaded) {
+      observation.reused = true;
+      return observation;
+    }
+    std::string error;
+    FailureOr<func::FuncOp> selected =
+        selectTaskFunction(state.module.get(), function, error);
+    if (failed(selected)) {
+      observation.known = false;
+      return observation;
+    }
+    FailureOr<SmallVector<TaskMetadata>> metadata =
+        collectAnalyticalTaskMetadata(*selected, error);
+    if (failed(metadata)) {
+      observation.known = false;
+      return observation;
+    }
+    observation.graphCostKey = state.factKey;
+    for (const TaskMetadata &task : *metadata)
+      observation.graphCostKey += "|" + task.name;
+    observation.reused = graphCostCaches.count(observation.graphCostKey) ||
+                         graphCostPaths.count(observation.graphCostKey);
+    return observation;
   }
 
   // Perform every mutable, source-owned part of candidate evaluation before
@@ -4849,6 +5491,7 @@ private:
         {"max_partition_factor", maxPartitionFactor.getValue()},
         {"tie_key_policy", "cost-numeric-shape-schedule-graph-key-v1"},
         {"search_contract", kSearchSchema},
+        {"family_funnel_contract", kFamilyFunnelSchema},
         {"checkpoint_contract",
          checkpointSchemaForCeiling(diagnosticIICeiling.getValue())}};
     if (diagnosticIICeiling == 23)
@@ -4862,7 +5505,7 @@ private:
       objectBinding["max_fission_actions_per_task"] =
           maxFissionActionsPerTask.getValue();
       objectBinding["fission_source_replay"] =
-          "orbit-taskflow-fission-source-replay-v1";
+          "orbit-taskflow-fission-source-replay-v2-ordinary-suffix-rebase";
     }
     // Network costs are independent of mapper-II cache entries, but the
     // production schedule depends on this exact resource. Bind its bytes
@@ -5054,6 +5697,616 @@ private:
     return false;
   }
 
+  bool persistBestFamilyWitnesses(
+      const SearchState &state, ArrayRef<ArchiveRecord> archive,
+      StringRef outputDirectory, std::string &error) {
+    if (!state.scored || !state.module)
+      return true;
+    std::set<std::string> candidateFamilies =
+        typedHistoryFamilies(state.actionHistory);
+    if (candidateFamilies.empty())
+      return true;
+
+    const ArchiveRecord *candidateRecord = nullptr;
+    for (const ArchiveRecord &record : archive)
+      if (record.id == state.id && record.valid) {
+        candidateRecord = &record;
+        break;
+      }
+    if (!candidateRecord)
+      return true;
+
+    std::vector<std::string> bestFamilies;
+    for (const std::string &family : candidateFamilies) {
+      const ArchiveRecord *best = nullptr;
+      for (const ArchiveRecord &record : archive) {
+        if (!record.valid)
+          continue;
+        std::set<std::string> recordFamilies =
+            typedHistoryFamilies(record.actionHistory);
+        if (!recordFamilies.count(family))
+          continue;
+        if (!best || archiveLess(record, *best))
+          best = &record;
+      }
+      if (best != candidateRecord)
+        continue;
+      bestFamilies.push_back(family);
+    }
+    if (bestFamilies.empty())
+      return true;
+
+    std::string moduleIR = neighborhoodReplaySourceText(state.module.get());
+    std::string costCatalogueJSON;
+    const bool hasCostCatalogue =
+        !state.costPath.empty() && llvm::sys::fs::exists(state.costPath);
+    if (hasCostCatalogue &&
+        !readFileBytes(state.costPath, costCatalogueJSON, error))
+      return false;
+    uint64_t operationCount = 0;
+    state.module->walk([&](Operation *) { ++operationCount; });
+    json::Array pathFamilies;
+    for (const std::string &family : bestFamilies)
+      pathFamilies.push_back(family);
+
+    json::Object witnessBinding{
+        {"stage", stage.getValue()},
+        {"function", functionName.getValue()},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"architecture_path", architecturePath.getValue()},
+        {"protocol_path", protocolFile.getValue()},
+        {"source_contract_path", sourceContractFile.getValue()},
+        {"prepared_source_path", preparedSourceFile.getValue()},
+        {"source_binding_witness", bindingPath},
+        {"checkpoint_contract",
+         checkpointSchemaForCeiling(diagnosticIICeiling.getValue()).str()}};
+    json::Object witness{
+        {"schema", "orbit-joint-neighborhood-family-best-witness-v1"},
+        {"typed_path_families", std::move(pathFamilies)},
+        {"candidate_id", candidateRecord->id},
+        {"parent_candidate_id", candidateRecord->parentId},
+        {"candidate_key", candidateRecord->key},
+        {"graph_facts_key", candidateRecord->factKey},
+        {"graph_variant_id", candidateRecord->graphId},
+        {"predicted_whole_program_cycles", candidateRecord->score},
+        {"global_rank_recorded_in_family_funnel_summary", true},
+        {"candidate_path_at_archive", candidateRecord->candidatePath},
+        {"cost_catalogue_path_at_archive", candidateRecord->costPath},
+        {"candidate_module_bytes", static_cast<int64_t>(moduleIR.size())},
+        {"candidate_module_operation_count",
+         static_cast<int64_t>(operationCount)},
+        {"candidate_module_ir", std::move(moduleIR)},
+        {"cost_catalogue_snapshot_available", hasCostCatalogue},
+        {"cost_catalogue_snapshot_bytes",
+         static_cast<int64_t>(costCatalogueJSON.size())},
+        {"cost_catalogue_exact_json", std::move(costCatalogueJSON)},
+        {"task_choices", choiceRecords(candidateRecord->choices)},
+        {"task_costs", costRecords(candidateRecord->choices,
+                                    candidateRecord->costs,
+                                    candidateRecord->durations)},
+        {"task_schedule", scheduleRecords(
+                               candidateRecord->choices,
+                               candidateRecord->schedule.placements)},
+        {"action_path", stringArray(candidateRecord->path)},
+        {"action_history",
+         typedActionHistoryObject(candidateRecord->actionHistory)},
+        {"binding", std::move(witnessBinding)}};
+    const std::string diagnosticsDirectory =
+        outputDirectory.str() + "/diagnostics";
+    if (!ensureDirectory(diagnosticsDirectory, error) ||
+        !diskGuard(error) ||
+        !writeTextAtomically(
+            diagnosticsDirectory + "/" +
+                familyWitnessFilename(candidateRecord->id),
+            jsonText(json::Value(std::move(witness))) + "\n", error))
+      return false;
+    return true;
+  }
+
+  void appendFamilyFunnelCandidateEvent(
+      int64_t round, StringRef family, StringRef candidateID,
+      StringRef parentID, const NeighborhoodAction &action,
+      const SearchState::TypedActionHistory &history,
+      json::Object result) {
+    std::set<std::string> primitiveKinds;
+    for (const NeighborhoodPrimitive &primitive : action.primitives)
+      primitiveKinds.insert(primitive.kind);
+    json::Array primitiveKindArray;
+    for (const std::string &kind : primitiveKinds)
+      primitiveKindArray.push_back(kind);
+    json::Array initialShapes;
+    if (history.known)
+      for (const NeighborhoodShape &shape : history.initialShapes)
+        initialShapes.push_back(shapeObject(shape));
+    json::Object typedHistory{
+        {"schema", kTypedActionHistorySchema},
+        {"known", history.known},
+        {"canonicalFactKey", history.canonicalFactKey},
+        {"initialShapes", std::move(initialShapes)},
+        {"fissionActions", typedActionArray(history.fissionActions)},
+        {"actions", typedActionArray(history.actions)}};
+    json::Object binding{
+        {"stage", stage.getValue()},
+        {"function", functionName.getValue()},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"architecture_path", architecturePath.getValue()},
+        {"protocol_path", protocolFile.getValue()},
+        {"source_contract_path", sourceContractFile.getValue()},
+        {"prepared_source_path", preparedSourceFile.getValue()},
+        {"source_binding_witness", bindingPath},
+        {"checkpoint_contract",
+         checkpointSchemaForCeiling(diagnosticIICeiling.getValue()).str()}};
+    if (stageNumber(stage) == 6)
+      binding["fission_source_replay"] =
+          "orbit-taskflow-fission-source-replay-v2-ordinary-suffix-rebase";
+    json::Object event{
+        {"record_type", "candidate_attempt"},
+        {"schema", kFamilyFunnelSchema},
+        {"round", round},
+        {"action_family", family},
+        {"candidate_id", candidateID},
+        {"parent_id", parentID},
+        {"action", typedActionObject(action)},
+        {"typed_primitive_kinds", std::move(primitiveKindArray)},
+        {"typed_action_history", std::move(typedHistory)},
+        {"binding", std::move(binding)},
+        {"result", std::move(result)}};
+    familyFunnelEvents.push_back(jsonText(json::Value(std::move(event))));
+  }
+
+  void appendPendingFamilyFunnelEvent(
+      int64_t round, const PendingNeighbor &neighbor,
+      const SearchState &parent, StringRef reason) {
+    std::set<std::string> primitiveKinds;
+    for (const NeighborhoodPrimitive &primitive : neighbor.action.primitives)
+      primitiveKinds.insert(primitive.kind);
+    json::Array kinds;
+    for (const std::string &kind : primitiveKinds)
+      kinds.push_back(kind);
+    json::Array initialShapes;
+    for (const NeighborhoodShape &shape : parent.actionHistory.initialShapes)
+      initialShapes.push_back(shapeObject(shape));
+    json::Object history{
+        {"schema", kTypedActionHistorySchema},
+        {"known", parent.actionHistory.known},
+        {"canonicalFactKey", parent.actionHistory.canonicalFactKey},
+        {"initialShapes", std::move(initialShapes)},
+        {"fissionActions",
+         typedActionArray(parent.actionHistory.fissionActions)},
+        {"actions", typedActionArray(parent.actionHistory.actions)}};
+    json::Object event{
+        {"record_type", "pending_unattempted"},
+        {"schema", kFamilyFunnelSchema},
+        {"round", round},
+        {"action_family", neighbor.action.family},
+        {"candidate_id", ""},
+        {"parent_id", parent.id},
+        {"action", typedActionObject(neighbor.action)},
+        {"typed_primitive_kinds", std::move(kinds)},
+        {"typed_action_history", std::move(history)},
+        {"status", "not_attempted_at_checkpoint"},
+        {"pending_reason", reason.str()},
+        {"source_binding_witness", bindingPath}};
+    familyFunnelEvents.push_back(jsonText(json::Value(std::move(event))));
+  }
+
+  json::Array familyFunnelRoundsObject() const {
+    json::Array rounds;
+    for (const auto &[round, families] : familyFunnelByRound) {
+      json::Object counts;
+      for (const auto &[family, counters] : families)
+        counts[family] = familyFunnelCountersObject(counters);
+      rounds.push_back(json::Object{{"round", round},
+                                    {"families", std::move(counts)}});
+    }
+    return rounds;
+  }
+
+  bool restoreFamilyFunnel(const json::Object &root, std::string &error) {
+    const json::Array *rounds = root.getArray("family_funnel_rounds");
+    const json::Array *events = root.getArray("family_funnel_events");
+    if (!rounds || !events) {
+      error = "checkpoint lacks family funnel continuation state";
+      return false;
+    }
+    familyFunnelByRound.clear();
+    for (const json::Value &value : *rounds) {
+      const json::Object *roundObject = value.getAsObject();
+      auto round = roundObject ? roundObject->getInteger("round")
+                               : std::nullopt;
+      const json::Object *families =
+          roundObject ? roundObject->getObject("families") : nullptr;
+      if (!round || *round < 0 || !families) {
+        error = "checkpoint family funnel round is malformed";
+        return false;
+      }
+      FamilyFunnelRound parsedFamilies;
+      for (const auto &[familyRef, familyValue] : *families) {
+        const json::Object *counts = familyValue.getAsObject();
+        FamilyFunnelCounters parsed;
+        if (!counts ||
+            !parseFamilyFunnelCounters(*counts, parsed) ||
+            !parsedFamilies.emplace(familyRef.str(), std::move(parsed)).second) {
+          error = "checkpoint family funnel counters are malformed";
+          return false;
+        }
+      }
+      if (!familyFunnelByRound.emplace(*round, std::move(parsedFamilies)).second) {
+        error = "checkpoint family funnel repeats a round";
+        return false;
+      }
+    }
+    familyFunnelEvents.clear();
+    for (const json::Value &value : *events) {
+      auto eventText = value.getAsString();
+      if (!eventText) {
+        error = "checkpoint family funnel event is malformed";
+        return false;
+      }
+      auto parsed = json::parse(*eventText);
+      const json::Object *eventObject =
+          parsed ? parsed->getAsObject() : nullptr;
+      auto schema = eventObject ? eventObject->getString("schema")
+                                : std::nullopt;
+      auto recordType = eventObject ? eventObject->getString("record_type")
+                                    : std::nullopt;
+      if (!eventObject || !schema || *schema != kFamilyFunnelSchema ||
+          !recordType) {
+        if (!parsed)
+          llvm::consumeError(parsed.takeError());
+        error = "checkpoint family funnel event schema is invalid";
+        return false;
+      }
+      familyFunnelEvents.push_back(eventText->str());
+    }
+    return true;
+  }
+
+  bool writeFamilyFunnelSidecars(
+      StringRef outputDirectory, int64_t currentRound,
+      ArrayRef<ArchiveRecord> archive, ArrayRef<SearchState> beam,
+      ArrayRef<PendingNeighbor> pending, uint64_t pendingCursor,
+      StringRef stopReason,
+      std::string &error) {
+    const std::string diagnosticsDirectory =
+        outputDirectory.str() + "/diagnostics";
+    if (!ensureDirectory(diagnosticsDirectory, error))
+      return false;
+
+    std::vector<const ArchiveRecord *> ranked;
+    for (const ArchiveRecord &record : archive)
+      if (record.valid)
+        ranked.push_back(&record);
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [](const ArchiveRecord *left,
+                        const ArchiveRecord *right) {
+      return archiveLess(*left, *right);
+    });
+    struct PathPresence {
+      std::set<std::string> archiveIDs;
+      std::set<std::string> scoredIDs;
+      std::set<std::string> passedIDs;
+      std::set<std::string> beamIDs;
+      std::map<uint64_t, const ArchiveRecord *> rankedRecords;
+    };
+    std::map<std::string, PathPresence> pathPresence;
+    auto recordFamilies = [](const ArchiveRecord &record) {
+      return typedHistoryFamilies(record.actionHistory);
+    };
+    for (const ArchiveRecord &record : archive) {
+      for (const std::string &family : recordFamilies(record))
+        pathPresence[family].archiveIDs.insert(record.id);
+      const bool schedulerWasCalled =
+          record.valid || StringRef(record.rejectReason).starts_with(
+                              "production_scheduler_rejected");
+      if (schedulerWasCalled)
+        for (const std::string &family : recordFamilies(record))
+          pathPresence[family].scoredIDs.insert(record.id);
+    }
+    for (size_t index = 0; index < ranked.size(); ++index) {
+      const ArchiveRecord &record = *ranked[index];
+      const uint64_t rank = index + 1;
+      for (const std::string &family : recordFamilies(record)) {
+        PathPresence &presence = pathPresence[family];
+        presence.passedIDs.insert(record.id);
+        presence.rankedRecords.emplace(rank, &record);
+      }
+    }
+    for (const auto &[round, families] : familyFunnelByRound)
+      for (const auto &[family, counters] : families)
+        pathPresence.try_emplace(family);
+    for (const SearchState &state : beam) {
+      std::set<std::string> families =
+          typedHistoryFamilies(state.actionHistory);
+      for (const std::string &family : families)
+        pathPresence[family].beamIDs.insert(state.id);
+    }
+
+    std::set<std::string> activeFamilyWitnessPaths;
+    auto candidateRankObject = [](uint64_t rank,
+                                  const ArchiveRecord &record,
+                                  StringRef witnessPath) {
+      json::Object candidate{
+          {"candidate_id", record.id},
+          {"score", record.score},
+          {"global_rank", static_cast<int64_t>(rank)},
+          {"candidate_path", record.candidatePath},
+          {"cost_catalogue_path", record.costPath}};
+      if (!witnessPath.empty())
+        candidate["family_witness_path"] = witnessPath.str();
+      return candidate;
+    };
+    json::Object pathPresenceRecords;
+    for (const auto &[family, presence] : pathPresence) {
+      json::Array archiveIDs, scoredIDs, passedIDs, beamIDs, ranks,
+          top5Candidates;
+      for (const std::string &id : presence.archiveIDs)
+        archiveIDs.push_back(id);
+      for (const std::string &id : presence.scoredIDs)
+        scoredIDs.push_back(id);
+      for (const std::string &id : presence.passedIDs)
+        passedIDs.push_back(id);
+      for (const std::string &id : presence.beamIDs)
+        beamIDs.push_back(id);
+      json::Value best = nullptr;
+      bool haveBest = false;
+      for (const auto &[rank, record] : presence.rankedRecords) {
+        ranks.push_back(static_cast<int64_t>(rank));
+        std::string witnessPath;
+        if (!haveBest) {
+          witnessPath = diagnosticsDirectory + "/" +
+                        familyWitnessFilename(record->id);
+          std::string witnessBytes;
+          if (!readFileBytes(witnessPath, witnessBytes, error))
+            return false;
+          auto parsedWitness = json::parse(witnessBytes);
+          const json::Object *witnessObject =
+              parsedWitness ? parsedWitness->getAsObject() : nullptr;
+          auto witnessSchema = witnessObject
+                                   ? witnessObject->getString("schema")
+                                   : std::nullopt;
+          auto witnessCandidateID = witnessObject
+                                        ? witnessObject->getString("candidate_id")
+                                        : std::nullopt;
+          const json::Array *witnessFamilies =
+              witnessObject ? witnessObject->getArray("typed_path_families")
+                            : nullptr;
+          const auto body = witnessObject
+                                ? witnessObject->getString("candidate_module_ir")
+                                : std::nullopt;
+          if (!witnessObject || !witnessSchema ||
+              *witnessSchema !=
+                  "orbit-joint-neighborhood-family-best-witness-v1" ||
+              !witnessCandidateID || *witnessCandidateID != record->id ||
+              !witnessFamilies || !body || body->empty() ||
+              !llvm::any_of(*witnessFamilies, [&](const json::Value &value) {
+                auto valueFamily = value.getAsString();
+                return valueFamily && *valueFamily == family;
+              })) {
+            if (!parsedWitness)
+              llvm::consumeError(parsedWitness.takeError());
+            error = "family-best witness does not authenticate its ranked candidate";
+            return false;
+          }
+          activeFamilyWitnessPaths.insert(witnessPath);
+        }
+        if (rank <= 5)
+          top5Candidates.push_back(
+              candidateRankObject(rank, *record, witnessPath));
+        if (!haveBest) {
+          best = candidateRankObject(rank, *record, witnessPath);
+          haveBest = true;
+        }
+      }
+      pathPresenceRecords[family] = json::Object{
+          {"scored", static_cast<int64_t>(presence.scoredIDs.size())},
+          {"scored_candidate_ids", std::move(scoredIDs)},
+          {"passed", static_cast<int64_t>(presence.passedIDs.size())},
+          {"passed_candidate_ids", std::move(passedIDs)},
+          {"beam", static_cast<int64_t>(presence.beamIDs.size())},
+          {"beam_candidate_ids", std::move(beamIDs)},
+          {"archive", static_cast<int64_t>(presence.archiveIDs.size())},
+          {"archive_candidate_ids", std::move(archiveIDs)},
+          {"top5", static_cast<int64_t>(top5Candidates.size())},
+          {"top5_candidates", std::move(top5Candidates)},
+          {"global_ranks", std::move(ranks)}, {"best", std::move(best)}};
+    }
+
+    std::map<std::string, FamilyFunnelCounters> totals;
+    auto addCounters = [](FamilyFunnelCounters &to,
+                          const FamilyFunnelCounters &from) {
+      to.menu += from.menu;
+      to.generated += from.generated;
+      to.attempted += from.attempted;
+      to.materialized += from.materialized;
+      to.reject += from.reject;
+      to.unique += from.unique;
+      to.duplicate += from.duplicate;
+      to.costPreparationAttempted += from.costPreparationAttempted;
+      to.freshCostPrepared += from.freshCostPrepared;
+      to.freshCostScored += from.freshCostScored;
+      to.cacheReused += from.cacheReused;
+      to.costShapeCacheHits += from.costShapeCacheHits;
+      to.costShapeCacheMisses += from.costShapeCacheMisses;
+      to.schedulerCalls += from.schedulerCalls;
+      to.schedulerPass += from.schedulerPass;
+      to.schedulerReject += from.schedulerReject;
+      to.archive += from.archive;
+      to.pendingUnattempted += from.pendingUnattempted;
+      for (const auto &[reason, count] : from.rejectReasons)
+        to.rejectReasons[reason] += count;
+      for (const auto &[reason, count] :
+           from.pendingUnattemptedReasons)
+        to.pendingUnattemptedReasons[reason] += count;
+      to.pendingUnattemptedActionSignatures.insert(
+          to.pendingUnattemptedActionSignatures.end(),
+          from.pendingUnattemptedActionSignatures.begin(),
+          from.pendingUnattemptedActionSignatures.end());
+    };
+    for (const auto &[round, families] : familyFunnelByRound)
+      for (const auto &[family, counts] : families)
+        addCounters(totals[family], counts);
+
+    std::map<int64_t, FamilyFunnelRound> roundSnapshots;
+    for (const auto &[round, families] : familyFunnelByRound)
+      roundSnapshots[round] = families;
+    FamilyFunnelRound &current = roundSnapshots[currentRound];
+    for (auto &[family, counters] : current) {
+      counters.pendingUnattempted = 0;
+      counters.pendingUnattemptedReasons.clear();
+      counters.pendingUnattemptedActionSignatures.clear();
+    }
+    for (size_t index = static_cast<size_t>(pendingCursor);
+         index < pending.size(); ++index) {
+      const PendingNeighbor &neighbor = pending[index];
+      if (neighbor.parent >= beam.size())
+        continue;
+      FamilyFunnelCounters &counters =
+          current[neighbor.action.family];
+      ++counters.pendingUnattempted;
+      const std::string pendingReason = stopReason.empty()
+                                            ? "checkpoint_frontier_remaining"
+                                            : stopReason.str();
+      ++counters.pendingUnattemptedReasons[pendingReason];
+      counters.pendingUnattemptedActionSignatures.push_back(
+          actionSignature(neighbor.action));
+      FamilyFunnelCounters &total = totals[neighbor.action.family];
+      ++total.pendingUnattempted;
+      ++total.pendingUnattemptedReasons[pendingReason];
+      total.pendingUnattemptedActionSignatures.push_back(
+          actionSignature(neighbor.action));
+    }
+
+    std::string jsonl;
+    llvm::raw_string_ostream funnelStream(jsonl);
+    for (const std::string &event : familyFunnelEvents)
+      funnelStream << event << "\n";
+    for (const auto &[round, families] : roundSnapshots)
+      for (const auto &[family, counters] : families) {
+        json::Object record = familyFunnelCountersObject(counters);
+        record["record_type"] = "round_family";
+        record["schema"] = kFamilyFunnelSchema;
+        record["round"] = round;
+        record["action_family"] = family;
+        record["current_edge_semantics"] =
+            "One count per current edge classified by its exact action family.";
+        record["stage"] = stage.getValue();
+        record["function"] = functionName.getValue();
+        record["source_repository"] = sourceRepository.getValue();
+        record["source_commit"] = sourceCommit.getValue();
+        record["source_binding_witness"] = bindingPath;
+        funnelStream << json::Value(std::move(record)) << "\n";
+      }
+    for (const auto &[family, presenceValue] : pathPresenceRecords) {
+      funnelStream << json::Value(json::Object{
+          {"record_type", "typed_path_presence"},
+          {"schema", kFamilyFunnelSchema},
+          {"through_round", currentRound},
+          {"stage", stage.getValue()}, {"function", functionName.getValue()},
+          {"action_family", family}, {"presence", presenceValue},
+          {"source_binding_witness", bindingPath}})
+                   << "\n";
+    }
+    for (size_t index = static_cast<size_t>(pendingCursor);
+         index < pending.size(); ++index) {
+      const PendingNeighbor &neighbor = pending[index];
+      if (neighbor.parent >= beam.size())
+        continue;
+      const SearchState &parent = beam[neighbor.parent];
+      json::Array kinds;
+      std::set<std::string> primitiveKinds;
+      for (const NeighborhoodPrimitive &primitive :
+           neighbor.action.primitives)
+        primitiveKinds.insert(primitive.kind);
+      for (const std::string &kind : primitiveKinds)
+        kinds.push_back(kind);
+      json::Object history{
+          {"known", parent.actionHistory.known},
+          {"fissionActions",
+           typedActionArray(parent.actionHistory.fissionActions)},
+          {"actions", typedActionArray(parent.actionHistory.actions)}};
+      funnelStream << json::Value(json::Object{
+          {"record_type", "pending_unattempted"},
+          {"schema", kFamilyFunnelSchema},
+          {"round", currentRound},
+          {"action_family", neighbor.action.family},
+          {"candidate_id", ""}, {"parent_id", parent.id},
+          {"action", typedActionObject(neighbor.action)},
+          {"typed_primitive_kinds", std::move(kinds)},
+          {"typed_action_history", std::move(history)},
+          {"status", "not_attempted_at_checkpoint"},
+          {"pending_reason", stopReason.empty()
+                                 ? "checkpoint_frontier_remaining"
+                                 : stopReason.str()},
+          {"source_binding_witness", bindingPath}})
+                   << "\n";
+    }
+    funnelStream.flush();
+
+    json::Object currentEdgeRecords;
+    for (const auto &[family, counters] : totals)
+      currentEdgeRecords[family] = familyFunnelCountersObject(counters);
+    json::Object summary{
+        {"schema", kFamilyFunnelSchema},
+        {"stage", stage.getValue()},
+        {"function", functionName.getValue()},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"architecture_path", architecturePath.getValue()},
+        {"protocol_path", protocolFile.getValue()},
+        {"source_contract_path", sourceContractFile.getValue()},
+        {"prepared_source_path", preparedSourceFile.getValue()},
+        {"source_binding_witness", bindingPath},
+        {"checkpoint", checkpointPath},
+        {"max_rounds", maxRounds.getValue()},
+        {"max_candidates", maxCandidates.getValue()},
+        {"beam_width", beamWidth.getValue()},
+        {"diversity_slots", diversitySlots.getValue()},
+        {"checkpoint_stop_reason", stopReason},
+        {"through_round", currentRound},
+        {"current_edge_semantics",
+         "menu counts are syntactic source inventory; generated and later counters classify current edges by exact action family. A current edge belongs to one exact family, so current-edge counts are additive across families. Typed full-path presence overlaps."},
+        {"path_presence_semantics",
+         "Only known histories contribute exact representative fissionActions and ordinary actions. Unknown histories and alternate paths are excluded. Candidate counts overlap across families and must not be summed."},
+        {"current_edge_by_family", std::move(currentEdgeRecords)},
+        {"typed_path_presence_by_family", std::move(pathPresenceRecords)}};
+    if (stageNumber(stage) == 6)
+      summary["fission_source_replay"] =
+          "orbit-taskflow-fission-source-replay-v2-ordinary-suffix-rebase";
+    const std::string summaryText =
+        jsonText(json::Value(std::move(summary))) + "\n";
+    if (!writeTextAtomically(diagnosticsDirectory + "/family-funnel.jsonl",
+                             jsonl, error) ||
+        !writeTextAtomically(
+            diagnosticsDirectory + "/family-funnel-summary.json",
+            summaryText, error))
+      return false;
+    std::error_code cleanupError;
+    const std::string witnessPrefix = "family-best-witness-";
+    for (std::filesystem::directory_iterator iterator(diagnosticsDirectory,
+                                                      cleanupError),
+         end;
+         !cleanupError && iterator != end; iterator.increment(cleanupError)) {
+      const std::string path = iterator->path().string();
+      const std::string filename = iterator->path().filename().string();
+      if (!StringRef(filename).starts_with(witnessPrefix) ||
+          !StringRef(filename).ends_with(".json") ||
+          activeFamilyWitnessPaths.count(path))
+        continue;
+      std::filesystem::remove(iterator->path(), cleanupError);
+      if (cleanupError)
+        break;
+    }
+    if (cleanupError) {
+      error = "cannot retire stale family-best witness: " +
+              cleanupError.message();
+      return false;
+    }
+    return true;
+  }
+
   bool saveCheckpoint(StringRef path, int64_t round, uint64_t nextSerial,
                       uint64_t scoredCount, uint64_t rejectedCount,
                       StringRef canonicalFactKey, const std::vector<ArchiveRecord> &archive,
@@ -5083,9 +6336,12 @@ private:
       if (journal.fail()) { error = "archive journal close/write failure"; return false; }
     }
     const uint64_t newJournalBytes = journalBytes + additions.size();
-    json::Array beams, generatedStates, neighbors, graphCosts, witnesses;
+    json::Array beams, generatedStates, neighbors, graphCosts, witnesses,
+        funnelEvents;
     for (const auto &state : beam) beams.push_back(stateObject(state));
     for (const auto &state : generated) generatedStates.push_back(stateObject(state));
+    for (const std::string &event : familyFunnelEvents)
+      funnelEvents.push_back(event);
     for (const auto &neighbor : pending)
       neighbors.push_back(json::Object{{"parent", int64_t(neighbor.parent)},
                                        {"action", actionObject(neighbor.action)}});
@@ -5125,10 +6381,15 @@ private:
         {"witness_dictionary", std::move(witnesses)}, {"graph_cost_catalogues", std::move(graphCosts)},
         {"archive_journal_path", journalPath}, {"archive_journal_bytes", int64_t(newJournalBytes)},
         {"archive_count", int64_t(archive.size())}, {"stop_reason", stopReason},
+        {"family_funnel_rounds", familyFunnelRoundsObject()},
+        {"family_funnel_events", std::move(funnelEvents)},
         {"search_scope", kSearchScope}, {"best_found", true}, {"exhaustive", false}};
     if (diagnosticIICeiling == 23)
       root["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
+    if (!writeFamilyFunnelSidecars(outputDir, round, archive, beam, pending,
+                                   pendingCursor, stopReason, error))
+      return false;
     journalBytes = newJournalBytes; journalArchiveCount = archive.size(); dirtyJournalIndices.clear();
     // Snapshot deletion happens only after a checkpoint binds the amended
     // archive. A failed checkpoint always leaves the previous replay inputs.
@@ -5156,6 +6417,8 @@ private:
     if (!root || !parseCheckpointHeader(*root, functionName, stage, sourceRepository,
         sourceCommit, architecturePath, protocolFile, diagnosticIICeiling,
         error)) return false;
+    if (!restoreFamilyFunnel(*root, error))
+      return false;
     auto savedRound = root->getInteger("round"), serial = root->getInteger("next_serial"),
          count = root->getInteger("scored_candidates"), rejected = root->getInteger("rejected_candidates"),
          roundCount = root->getInteger("round_scored_candidates"),
@@ -5607,6 +6870,11 @@ private:
         {"stop_reason", stopReason}, {"checkpoint", checkpointPath},
         {"identity_control_retained", true}, {"previous_winner_requested", previousWinnerRequested},
         {"native_top5_required", true}, {"numeric_trace_sram_separate", true},
+        {"family_funnel_schema", kFamilyFunnelSchema},
+        {"family_funnel_path",
+         outputDirectory.str() + "/diagnostics/family-funnel.jsonl"},
+        {"family_funnel_summary_path",
+         outputDirectory.str() + "/diagnostics/family-funnel-summary.json"},
         {"native_shortlist_count", int64_t(ranked.size())}};
     if (diagnosticIICeiling == 23)
       metadata["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
@@ -5757,6 +7025,8 @@ private:
   std::map<std::string, std::string> bodyWitnessIds, graphWitnessIds;
   std::map<std::string, std::string> activeTransferWitnessIds, witnessPaths;
   std::map<std::string, std::unique_ptr<TaskShapeCostCache>> graphCostCaches;
+  FamilyFunnelByRound familyFunnelByRound;
+  std::vector<std::string> familyFunnelEvents;
 
 };
 
