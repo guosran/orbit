@@ -3914,7 +3914,21 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
   if (plan.forwarded || plan.shareConsumerLoad) {
     Value stored = producerStore ? producerStore.getValueToStore()
                                  : producerIndexedStore.getValue();
-    forwardedValue = kernelMapping.lookupOrDefault(stored);
+    // The producer's stored value commonly already has a DataMov wrapper.
+    // The consumer's eliminated load is replaced by a value that its own
+    // original DataMov wrapper will consume.  Forward the underlying value so
+    // cloning the consumer does not create a DataMov(DataMov(value)) chain;
+    // mapper inputs are required to have one transparent DataMov between a
+    // materialized producer and their consumer.  Only peel identity wrappers
+    // in the producer kernel block, preserving any annotated, type-changing,
+    // or cross-block move by rejecting the fusion.
+    auto storedSource = peelIdentityDataMov(
+        stored, &producerKernel.getBody().front());
+    if (!storedSource)
+      return reject(consumer,
+                    "post-Neura fusion cannot forward through a non-identity "
+                    "producer DataMov chain");
+    forwardedValue = kernelMapping.lookupOrDefault(*storedSource);
   }
   for (Operation &operation : consumerKernel.getBody().front()) {
     if (isa<neura::YieldOp>(&operation))

@@ -55,22 +55,47 @@ def task_span(text: str, task_name: str) -> tuple[int, int]:
     # Ignore quoted source witnesses when locating the actual region braces.
     plain = mask_quoted_strings(text)
     start = plain.find(f"taskflow.task @{task_name}")
-    if start < 0:
-        fail(f"missing task {task_name}")
-    signature = re.search(r":\s*\(", plain[start:])
-    if not signature:
-        fail(f"missing type signature for {task_name}")
-    body = plain.find("{", start + signature.start())
-    if body < 0:
-        fail(f"missing body for {task_name}")
-    depth = 0
-    for position in range(body, len(plain)):
-        if plain[position] == "{":
-            depth += 1
-        elif plain[position] == "}":
-            depth -= 1
-            if depth == 0:
-                return text.rfind("\n", 0, start) + 1, position + 1
+    if start >= 0:
+        signature = re.search(r":\s*\(", plain[start:])
+        if not signature:
+            fail(f"missing type signature for {task_name}")
+        body = plain.find("{", start + signature.start())
+        if body < 0:
+            fail(f"missing body for {task_name}")
+        depth = 0
+        for position in range(body, len(plain)):
+            if plain[position] == "{":
+                depth += 1
+            elif plain[position] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text.rfind("\n", 0, start) + 1, position + 1
+
+    # Captured canonical candidates use generic taskflow.task syntax.  Locate
+    # the operation header by its explicit task_name attribute and balance the
+    # actual region braces while ignoring serialized source-proof strings.
+    generic = re.search(
+        rf'(?m)^\s*(?:%[A-Za-z0-9_.$-]+(?::[0-9]+)?\s*=\s*)?'
+        rf'"taskflow\.task"[^\n]*\btask_name\s*=\s*"{re.escape(task_name)}"',
+        text,
+    )
+    if generic:
+        line_start = text.rfind("\n", 0, generic.start()) + 1
+        region = plain.find("({", generic.end())
+        if region < 0:
+            fail(f"missing generic task body for {task_name}")
+        body = region + 1
+        depth = 0
+        for position in range(body, len(plain)):
+            if plain[position] == "{":
+                depth += 1
+            elif plain[position] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = position + 1
+                    if end < len(text) and text[end] == ")":
+                        end += 1
+                    return line_start, end
     fail(f"unterminated task body for {task_name}")
 
 
@@ -189,6 +214,230 @@ def mutate_task(text: str, task_name: str, transform, label: str) -> str:
     return text[:begin] + after + text[end:]
 
 
+def parse_neura_definitions(text: str) -> dict[str, tuple[str, list[str]]]:
+    definitions: dict[str, tuple[str, list[str]]] = {}
+    for line in text.splitlines():
+        match = re.match(
+            r'^\s*(%[A-Za-z0-9_.$-]+)\s*=\s*"neura\.([A-Za-z0-9_]+)"\(([^)]*)\)',
+            line,
+        )
+        if not match:
+            continue
+        result, operation, operands = match.groups()
+        definitions[result] = (
+            operation,
+            re.findall(r"%[A-Za-z0-9_.$-]+", operands),
+        )
+    return definitions
+
+
+def producer_store_data_mov(module: str) -> tuple[int, str, str, str]:
+    begin, end = task_span(module, PRODUCER)
+    task = module[begin:end]
+    lines = task.splitlines()
+    store_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith('"neura.store_indexed"')
+        ),
+        None,
+    )
+    if store_index is None:
+        fail("producer fixture lost its indexed store")
+    store_match = re.search(
+        r'"neura\.store_indexed"\((%[A-Za-z0-9_.$-]+)', lines[store_index]
+    )
+    if not store_match:
+        fail("cannot read producer indexed-store value")
+    stored_value = store_match.group(1)
+    definition_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(
+                rf'^\s*{re.escape(stored_value)}\s*=\s*"neura\.data_mov"\(',
+                line,
+            )
+        ),
+        None,
+    )
+    if definition_index is None:
+        fail("producer store value is not an explicit DataMov wrapper")
+    definition = lines[definition_index]
+    type_match = re.search(r"\s:\s(.*)$", definition)
+    if not type_match:
+        fail("cannot read producer DataMov type signature")
+    return store_index, stored_value, type_match.group(1), lines[store_index]
+
+
+def add_forwarded_move_attribute(module: str, move_value: str) -> str:
+    begin, end = task_span(module, PRODUCER)
+    task = module[begin:end]
+    lines = task.splitlines()
+    definition_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(
+                rf'^\s*{re.escape(move_value)}\s*=\s*"neura\.data_mov"\(',
+                line,
+            )
+        ),
+        None,
+    )
+    if definition_index is None:
+        fail("cannot find forwarded producer DataMov for attribute tamper")
+    line = lines[definition_index]
+    operands_end = line.find(")")
+    if operands_end < 0 or line[operands_end + 1 :].lstrip().startswith("{"):
+        fail("forwarded producer DataMov already has or lacks its attribute slot")
+    lines[definition_index] = (
+        line[: operands_end + 1]
+        + ' {test_nonidentity_route = "keep"}'
+        + line[operands_end + 1 :]
+    )
+    return module[:begin] + "\n".join(lines) + module[end:]
+
+
+def add_type_changing_forwarded_moves(module: str) -> str:
+    begin, end = task_span(module, PRODUCER)
+    task = module[begin:end]
+    lines = task.splitlines()
+    store_index, stored_value, type_signature, store_line = producer_store_data_mov(
+        module
+    )
+    store_match = re.search(
+        r'("neura\.store_indexed"\()(%[A-Za-z0-9_.$-]+)(,)', store_line
+    )
+    if not store_match:
+        fail("cannot rewrite producer indexed-store value for type tamper")
+    source_type = type_signature.split(" -> ", 1)[0][1:-1]
+    result_type = type_signature.split(" -> ", 1)[1]
+    if source_type != result_type or "!neura.data<i32," not in result_type:
+        fail(f"fixture no longer has the expected i32 DataMov: {type_signature}")
+    alternate_type = result_type.replace("!neura.data<i32,", "!neura.data<i64,", 1)
+    indent = re.match(r"^\s*", store_line).group(0)
+    first = "%test_type_changing_data_mov"
+    second = "%test_type_restoring_data_mov"
+    lines.insert(
+        store_index,
+        f'{indent}{first} = "neura.data_mov"({stored_value}) : '
+        f'({source_type}) -> {alternate_type}',
+    )
+    lines.insert(
+        store_index + 1,
+        f'{indent}{second} = "neura.data_mov"({first}) : '
+        f'({alternate_type}) -> {result_type}',
+    )
+    store_index += 2
+    lines[store_index] = (
+        store_line[: store_match.start(2)]
+        + second
+        + store_line[store_match.end(2) :]
+    )
+    return module[:begin] + "\n".join(lines) + module[end:]
+
+
+def add_second_kernel_block(module: str) -> str:
+    begin, end = task_span(module, PRODUCER)
+    task = module[begin:end]
+    lines = task.splitlines()
+    kernel_start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(
+                r'^\s*(?:%[A-Za-z0-9_.$-]+\s*=\s*)?"neura\.kernel"', line
+            )
+        ),
+        None,
+    )
+    if kernel_start is None:
+        fail("producer fixture lost its Neura kernel")
+    kernel_text = "\n".join(lines[kernel_start:])
+    kernel_plain = mask_quoted_strings(kernel_text)
+    marker = kernel_plain.find("({")
+    if marker < 0:
+        fail("cannot locate producer kernel region")
+    body_open = marker + 1
+    depth = 0
+    body_close = None
+    for position in range(body_open, len(kernel_plain)):
+        if kernel_plain[position] == "{":
+            depth += 1
+        elif kernel_plain[position] == "}":
+            depth -= 1
+            if depth == 0:
+                body_close = position
+                break
+    if body_close is None:
+        fail("unterminated producer kernel region")
+    if not any('"neura.data_mov"' in line for line in lines[kernel_start:]):
+        fail("producer kernel has no DataMov to exercise the multi-block guard")
+    kernel_body_lines = lines[kernel_start:]
+    block_line = next(
+        (line for line in kernel_body_lines if line.lstrip().startswith("^bb0")),
+        None,
+    )
+    yield_line = next(
+        (
+            line
+            for line in kernel_body_lines
+            if line.lstrip().startswith('"neura.yield"')
+        ),
+        None,
+    )
+    if block_line is None or yield_line is None:
+        fail("producer kernel is missing its single-block terminator")
+    block_indent = re.match(r"^\s*", block_line).group(0)
+    operation_indent = block_indent + "  "
+    prefix = kernel_text[:body_close]
+    suffix = kernel_text[body_close:]
+    extra_block = (
+        f"\n{block_indent}^bb1(%test_other_block_input: !neura.data<i32, i1>):\n"
+        f'{operation_indent}%test_other_block_move = "neura.data_mov"('
+        "%test_other_block_input) : (!neura.data<i32, i1>) -> "
+        "!neura.data<i32, i1>\n"
+        f'{operation_indent}{yield_line.lstrip()}\n'
+    )
+    changed_kernel = prefix + extra_block + suffix
+    rewritten = "\n".join(lines[:kernel_start]) + changed_kernel
+    return module[:begin] + rewritten + module[end:]
+
+
+def assert_one_transparent_forwarding_move(
+    fused_task: str, producer_result: str, label: str
+) -> None:
+    multiplies = [
+        line
+        for line in fused_task.splitlines()
+        if '"neura.mul"(' in line
+    ]
+    if len(multiplies) != 1:
+        fail(f"{label}: expected one fused consumer multiply, got {len(multiplies)}")
+    operands_match = re.search(r'"neura\.mul"\(([^)]*)\)', multiplies[0])
+    if not operands_match:
+        fail(f"{label}: cannot parse fused consumer multiply operands")
+    operands = re.findall(r"%[A-Za-z0-9_.$-]+", operands_match.group(1))
+    definitions = parse_neura_definitions(fused_task)
+    if not operands:
+        fail(f"{label}: fused consumer multiply has no SSA input")
+    value = operands[0]
+    moves: list[str] = []
+    while value in definitions and definitions[value][0] == "data_mov":
+        move_operands = definitions[value][1]
+        if len(move_operands) != 1:
+            fail(f"{label}: malformed DataMov on forwarded path")
+        moves.append(value)
+        value = move_operands[0]
+    if len(moves) != 1 or value != producer_result:
+        fail(
+            f"{label}: expected consumer DataMov -> producer value "
+            f"{producer_result}, got moves={moves}, root={value}"
+        )
+
+
 def typed_fusion_action(
     mode: str = "producer-consumer-forwarded",
 ) -> dict[str, object]:
@@ -227,8 +476,8 @@ def main() -> None:
         source_pipeline = (
             "builtin.module(func.func(construct-hyperblock-from-task),"
             "assign-accelerator,classify-task-and-counter,"
-            "convert-taskflow-to-neura,lower-affine-to-neura,"
-            "bind-source-iteration-domain)"
+            "convert-taskflow-to-neura,func.func(lower-affine-to-neura),"
+            "insert-data-mov,bind-source-iteration-domain)"
         )
         run(
             [
@@ -345,8 +594,7 @@ def main() -> None:
         if len(adds) != 1 or len(multiplies) != 1:
             fail("forwarded fusion lost the fixture's unique add/multiply chain")
         add_result, _ = adds[0]
-        if add_result not in [part.strip() for part in multiplies[0][1].split(",")]:
-            fail("consumer multiply is not directly connected to the producer result")
+        assert_one_transparent_forwarding_move(fused, add_result, "forwarded fusion")
         run(
             [
                 optimizer,
@@ -432,6 +680,19 @@ def main() -> None:
             )
         ):
             fail("retained load sharing did not record one load and zero stores removed")
+        retained_add_results = [
+            result
+            for result, _ in re.findall(
+                r'^\s*(%[A-Za-z0-9_.$-]+)\s*=\s*"neura\.add"\(([^)]*)\)',
+                retained_task,
+                flags=re.MULTILINE,
+            )
+        ]
+        if len(retained_add_results) != 1:
+            fail("retained fusion lost the fixture's unique producer add")
+        assert_one_transparent_forwarding_move(
+            retained_task, retained_add_results[0], "retained fusion"
+        )
         retained_loads = re.findall(
             load_pattern, retained_task, flags=re.MULTILINE
         )
@@ -489,6 +750,44 @@ def main() -> None:
                 "graph structural key dropped the retained elimination counts: "
                 f"{structural_nodes}"
             )
+
+        def expect_fusion_rejected(label: str, mutant: str, reason: str) -> None:
+            path = directory / f"{label}.mlir"
+            path.write_text(mutant)
+            result = run(
+                [
+                    optimizer,
+                    str(path),
+                    "--materialize-neura-joint-rewrite="
+                    "first-task-name=Task second-task-name=Consumer "
+                    "fusion-mode=producer-consumer-retained",
+                    "-o",
+                    "/dev/null",
+                ],
+                expect_success=False,
+            )
+            diagnostics = result.stdout + result.stderr
+            if reason not in diagnostics:
+                fail(f"{label}: expected fail-closed reason {reason!r}:\n{diagnostics}")
+
+        canonical_text = canonical.read_text()
+        _, stored_value, _, _ = producer_store_data_mov(canonical_text)
+        expect_fusion_rejected(
+            "annotated-forwarded-datamov",
+            add_forwarded_move_attribute(canonical_text, stored_value),
+            "non-identity producer DataMov chain",
+        )
+        expect_fusion_rejected(
+            "type-changing-forwarded-datamovs",
+            add_type_changing_forwarded_moves(canonical_text),
+            "non-identity producer DataMov chain",
+        )
+        expect_fusion_rejected(
+            "multi-block-producer-kernel",
+            add_second_kernel_block(canonical_text),
+            "requires one stateless kernel per task",
+        )
+
         tampered_counts = replace_once_unquoted(
             retained_text,
             "amoeba.neura.fusion.eliminated_loads = 1 : i64",
