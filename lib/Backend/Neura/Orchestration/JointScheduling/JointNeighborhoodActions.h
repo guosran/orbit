@@ -2,6 +2,7 @@
 #define ORBIT_JOINT_NEIGHBORHOOD_ACTIONS_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include <cstdint>
@@ -21,6 +22,9 @@ struct NeighborhoodPrimitive {
   std::string mode;
   int64_t axis = 0;
   int64_t factor = 1;
+  // Source node ordinals for the prefix of a Taskflow fission action. Empty
+  // for every other primitive kind.
+  std::vector<unsigned> leftNodes;
 };
 struct NeighborhoodAction {
   std::string family;
@@ -36,7 +40,17 @@ struct NeighborhoodAction {
 std::vector<NeighborhoodAction> enumerateNeighborhoodActions(
     ModuleOp module, llvm::StringRef function,
     llvm::ArrayRef<NeighborhoodShape> shapes, llvm::StringRef stage,
-    unsigned round, unsigned maxPartitionFactor = 4);
+    unsigned round, unsigned maxPartitionFactor = 4,
+    ModuleOp preparedTaskflowSource = {},
+    uint64_t maxFissionActionsPerTask = 64,
+    std::string *enumerationError = nullptr,
+    std::vector<std::string> *fissionDiagnostics = nullptr,
+    llvm::ArrayRef<NeighborhoodAction> precomputedFissionActions = {});
+mlir::FailureOr<std::vector<NeighborhoodAction>>
+enumerateTaskflowFissionNeighborhoodActions(
+    ModuleOp preparedTaskflowSource, llvm::StringRef function,
+    uint64_t maxFissionActionsPerTask,
+    std::vector<std::string> &diagnostics, std::string &error);
 // Must match the cap used for enumeration when replaying an action.
 bool applyNeighborhoodAction(
     ModuleOp cloned, ModuleOp canonical, llvm::StringRef function,

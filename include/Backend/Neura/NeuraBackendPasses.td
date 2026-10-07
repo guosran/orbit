@@ -434,6 +434,12 @@ def SearchJointNeighborhood : Pass<"search-joint-neighborhood", "ModuleOp"> {
     Option<"maxPartitionFactor", "max-partition-factor", "int64_t",
            /*default=*/"4",
            "Independent authenticated cumulative tiling/replica cap: 4 or 8.">,
+    Option<"preparedSourceFile", "prepared-source-file", "std::string",
+           /*default=*/"\"\"",
+           "Exact pre-Neura prepared Taskflow source, required by full-joint-fission.">,
+    Option<"maxFissionActionsPerTask", "max-fission-actions-per-task", "int64_t",
+           /*default=*/"64",
+           "Complete legal fission cut cap per task; overflow fails closed.">,
     Option<"historicalNativeWinner", "historical-native-winner", "std::string",
            /*default=*/"\"\"",
            "Optional source-owned historical native control selection JSONL.">
@@ -466,6 +472,21 @@ def ReplayJointNeighborhoodActions
            "Cumulative neighborhood stage enabled for supplied actions.">,
     Option<"maxPartitionFactor", "max-partition-factor", "int64_t",
            /*default=*/"8", "Authenticated cumulative partition cap: 1, 2, 4, or 8.">,
+    Option<"preparedSourceFile", "prepared-source-file", "std::string",
+           /*default=*/"\"\"",
+           "Exact pre-Neura prepared Taskflow source, required by full-joint-fission.">,
+    Option<"maxFissionActionsPerTask", "max-fission-actions-per-task", "int64_t",
+           /*default=*/"64",
+           "Complete legal fission cut cap per task; overflow fails closed.">,
+    Option<"expectedCandidateFile", "expected-candidate-file", "std::string",
+           /*default=*/"\"\"",
+           "Optional exact Search candidate to compare after source replay.">,
+    Option<"activeTransferArgumentsText", "active-transfer-arguments", "std::string",
+           /*default=*/"\"\"",
+           "Exact ordered active-transfer argument indices bound by the action file.">,
+    Option<"activeTransferRequireProven", "active-transfer-require-proven", "bool",
+           /*default=*/"false",
+           "Require source-derived active-transfer facts for all bound indices.">,
     Option<"outputDir", "output-dir", "std::string", /*default=*/"\"\"",
            "New directory for the complete candidate, facts, and exact inputs.">
   ];
@@ -473,6 +494,13 @@ def ReplayJointNeighborhoodActions
       "::mlir::amoeba::neura::createReplayJointNeighborhoodActionsPass()";
   let dependentDialects = ["mlir::func::FuncDialect",
                            "mlir::taskflow::TaskflowDialect"];
+}
+
+def VerifyTaskflowFissionSourceReplay
+    : Pass<"verify-taskflow-fission-source-replay", "ModuleOp"> {
+  let summary = "Verify exact typed source-owned DFG fission replay";
+  let constructor =
+      "::mlir::amoeba::neura::createVerifyTaskflowFissionSourceReplayPass()";
 }
 
 def ProveStaticActiveTransferShapes

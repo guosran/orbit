@@ -9,9 +9,12 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
 #include "JointNeighborhoodActions.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "TaskflowFissionSourceReplay.h"
 #include "Backend/Neura/Orchestration/SourceIterationDomain.h"
+#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
 
@@ -24,6 +27,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -57,11 +61,18 @@ struct ReplayInputs {
   std::string function;
   std::string stage;
   unsigned maxPartitionFactor = 8;
+  uint64_t maxFissionActionsPerTask = 64;
   std::vector<NeighborhoodAction> actions;
   std::vector<NeighborhoodShape> initialShapes;
+  std::vector<NeighborhoodShape> requestedInitialShapes;
+  std::vector<NeighborhoodAction> canonicalFissionActions;
+  std::vector<std::string> fissionDiagnostics;
+  bool hasRequestedInitialShapes = false;
   std::string actionBytes;
   std::string canonicalBytes;
   std::string candidateBytes;
+  std::string preparedSourcePath;
+  std::string preparedSourceBytes;
 };
 
 static bool readFile(StringRef path, std::string &bytes, std::string &error) {
@@ -91,6 +102,25 @@ static std::string moduleText(ModuleOp module) {
   return text;
 }
 
+static std::string candidateComparisonText(ModuleOp module,
+                                           StringRef functionName,
+                                           std::string &error) {
+  OwningOpRef<ModuleOp> normalized = module.clone();
+  if (!normalized) {
+    error = "cannot clone candidate module for exact replay comparison";
+    return {};
+  }
+  FailureOr<func::FuncOp> function =
+      selectTaskFunction(normalized.get(), functionName, error);
+  if (failed(function))
+    return {};
+  // Search adds this derived identifier while preparing the graph-fact key.
+  // It does not change the candidate program. Preserve every other operation
+  // and attribute so source, body, fission, and proof mismatches fail closed.
+  (*function)->removeAttr("amoeba.graph_variant_id");
+  return moduleText(normalized.get());
+}
+
 static bool parseBoundModule(StringRef text, MLIRContext *context,
                              StringRef label, OwningOpRef<ModuleOp> &module,
                              std::string &error) {
@@ -114,7 +144,10 @@ static bool parsePrimitive(const json::Object &object,
   auto mode = object.getString("mode");
   auto axis = object.getInteger("axis");
   auto factor = object.getInteger("factor");
+  const json::Array *leftNodes = object.getArray("leftNodes");
   if (!kind || !firstTask || !secondTask || !mode || !axis || !factor)
+    return false;
+  if (object.get("leftNodes") && !leftNodes)
     return false;
   primitive.kind = kind->str();
   primitive.firstTask = firstTask->str();
@@ -122,6 +155,22 @@ static bool parsePrimitive(const json::Object &object,
   primitive.mode = mode->str();
   primitive.axis = *axis;
   primitive.factor = *factor;
+  if (leftNodes)
+    for (const json::Value &value : *leftNodes) {
+      auto node = value.getAsInteger();
+      if (!node || *node < 0 ||
+          static_cast<uint64_t>(*node) >
+              std::numeric_limits<unsigned>::max())
+        return false;
+      primitive.leftNodes.push_back(static_cast<unsigned>(*node));
+    }
+  const bool fission = primitive.kind == "fission";
+  if ((fission && primitive.leftNodes.empty()) ||
+      (!fission && !primitive.leftNodes.empty()))
+    return false;
+  for (size_t index = 1; index < primitive.leftNodes.size(); ++index)
+    if (primitive.leftNodes[index - 1] >= primitive.leftNodes[index])
+      return false;
   return true;
 }
 
@@ -156,6 +205,16 @@ static bool parseAction(const json::Object &object,
       return false;
     action.primitives.push_back(std::move(primitive));
   }
+  if (action.family == "fission" &&
+      (action.primitives.size() != 1 || action.canonicalReset ||
+       !action.shapeTask.empty() || action.shapeRows != 0 ||
+       action.shapeCols != 0 || action.primitives.front().kind != "fission"))
+    return false;
+  if (action.family != "fission" &&
+      llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
+        return p.kind == "fission";
+      }))
+    return false;
   return !action.family.empty() && !action.label.empty();
 }
 
@@ -165,6 +224,7 @@ static bool isKnownFamily(StringRef family) {
          family == "replica" || family == "tiling" || family == "k-tiling" ||
          family == "producer-consumer-co-tiling" ||
          family == "producer-consumer-co-k-tiling" || family == "fusion" ||
+         family == "fission" ||
          family == "fusion-plus-shape" || family == "fusion-plus-tiling" ||
          family == "tiling-plus-fusion" || family == "sibling-fusion";
 }
@@ -180,6 +240,8 @@ static unsigned familyStage(StringRef family) {
       family == "fusion-plus-tiling" || family == "tiling-plus-fusion" ||
       family == "sibling-fusion")
     return 5;
+  if (family == "fission")
+    return 6;
   return 1;
 }
 
@@ -195,6 +257,9 @@ static unsigned stageNumber(StringRef stage) {
   if (stage == "s5" || stage == "full-joint" ||
       stage == "shape-temporal-replica-tiling-fusion")
     return 5;
+  if (stage == "s6" || stage == "full-joint-fission" ||
+      stage == "shape-temporal-replica-tiling-fusion-fission")
+    return 6;
   return 0;
 }
 
@@ -217,7 +282,8 @@ static bool actionEqual(const NeighborhoodAction &lhs,
     const NeighborhoodPrimitive &right = rhs.primitives[index];
     if (left.kind != right.kind || left.firstTask != right.firstTask ||
         left.secondTask != right.secondTask || left.mode != right.mode ||
-        left.axis != right.axis || left.factor != right.factor)
+        left.axis != right.axis || left.factor != right.factor ||
+        left.leftNodes != right.leftNodes)
       return false;
   }
   return true;
@@ -226,8 +292,11 @@ static bool actionEqual(const NeighborhoodAction &lhs,
 static bool readInputs(const json::Object &root, StringRef canonicalInput,
                        StringRef candidateInput, StringRef functionOption,
                        StringRef stageOption, unsigned factorOption,
+                       StringRef preparedSourceOption,
+                       uint64_t maxFissionActionsPerTaskOption,
                        MLIRContext *context, ModuleOp inputModule,
                        ReplayInputs &inputs, OwningOpRef<ModuleOp> &canonical,
+                       OwningOpRef<ModuleOp> &preparedSource,
                        std::string &error) {
   auto schema = root.getString("schema");
   auto canonicalPath = root.getString("canonicalInput");
@@ -235,6 +304,9 @@ static bool readInputs(const json::Object &root, StringRef canonicalInput,
   auto function = root.getString("function");
   auto stage = root.getString("stage");
   auto factor = root.getInteger("maxPartitionFactor");
+  auto fissionCap = root.getInteger("maxFissionActionsPerTask");
+  auto preparedSourcePath = root.getString("preparedSourceInput");
+  auto preparedSourceExactBytes = root.getString("preparedSourceExactBytes");
   auto actions = root.getArray("actions");
   if (!schema || *schema != kActionSchema || !canonicalPath || !candidatePath ||
       !function || !stage || !factor || !actions) {
@@ -266,7 +338,46 @@ static bool readInputs(const json::Object &root, StringRef canonicalInput,
   inputs.function = function->str();
   inputs.stage = stage->str();
   inputs.maxPartitionFactor = factorOption;
+  inputs.maxFissionActionsPerTask = maxFissionActionsPerTaskOption;
+  const bool fissionStage = enabledStage == 6;
+  if (fissionStage) {
+    if (preparedSourceOption.empty() || !preparedSourcePath ||
+        !preparedSourceExactBytes || !fissionCap ||
+        *preparedSourcePath != preparedSourceOption ||
+        *fissionCap != static_cast<int64_t>(maxFissionActionsPerTaskOption) ||
+        maxFissionActionsPerTaskOption == 0) {
+      error = "full-joint-fission replay requires exact prepared-source-file and cut-cap bindings";
+      return false;
+    }
+    inputs.preparedSourcePath = preparedSourceOption.str();
+    if (!readFile(preparedSourceOption, inputs.preparedSourceBytes, error))
+      return false;
+    if (inputs.preparedSourceBytes != *preparedSourceExactBytes) {
+      error = "prepared-source-file bytes differ from the action-file source binding";
+      return false;
+    }
+    preparedSource = parseSourceString<ModuleOp>(inputs.preparedSourceBytes,
+                                                 context);
+    if (!preparedSource || failed(verify(preparedSource->getOperation()))) {
+      error = "prepared-source-file is not a verified ModuleOp";
+      return false;
+    }
+    FailureOr<std::vector<NeighborhoodAction>> fissionActions =
+        enumerateTaskflowFissionNeighborhoodActions(
+            preparedSource.get(), inputs.function,
+            maxFissionActionsPerTaskOption, inputs.fissionDiagnostics,
+            error);
+    if (failed(fissionActions))
+      return false;
+    inputs.canonicalFissionActions = std::move(*fissionActions);
+  } else if (!preparedSourceOption.empty() || preparedSourcePath ||
+             preparedSourceExactBytes || fissionCap) {
+    error = "prepared source and fission cut cap are valid only at full-joint-fission";
+    return false;
+  }
 
+  bool sawNonFissionAction = false;
+  std::set<std::string> fissionTargets;
   for (const json::Value &value : *actions) {
     const json::Object *actionObject = value.getAsObject();
     NeighborhoodAction action;
@@ -281,6 +392,22 @@ static bool readInputs(const json::Object &root, StringRef canonicalInput,
     if (familyStage(action.family) > enabledStage) {
       error = "action_disabled_at_stage:" + action.label;
       return false;
+    }
+    if (action.family == "fission") {
+      if (!fissionStage || sawNonFissionAction ||
+          action.primitives.size() != 1 ||
+          !fissionTargets
+               .insert(action.primitives.front().firstTask)
+               .second ||
+          !llvm::any_of(inputs.canonicalFissionActions,
+                        [&](const NeighborhoodAction &legal) {
+            return actionEqual(action, legal);
+          })) {
+        error = "fission action must be a unique complete-source enumerated prefix action";
+        return false;
+      }
+    } else {
+      sawNonFissionAction = true;
     }
     if (action.family == "lineage-replacement") {
       error = "lineage_replacement_requires_an_explicit_canonical_path:" +
@@ -318,6 +445,16 @@ static bool readInputs(const json::Object &root, StringRef canonicalInput,
   if (!parseBoundModule(inputs.canonicalBytes, context, "canonical input",
                         canonical, error))
     return false;
+  if (fissionStage &&
+      failed(verifyTaskflowFissionCanonicalLowering(
+          preparedSource.get(), canonical.get(), error)))
+    return false;
+
+  if (fissionStage && !fissionTargets.empty() &&
+      inputs.candidateBytes != inputs.canonicalBytes) {
+    error = "source fission replay must start from the exact canonical candidate input";
+    return false;
+  }
 
   auto canonicalFunction =
       selectTaskFunction(*canonical, inputs.function, error);
@@ -354,15 +491,21 @@ static bool readInputs(const json::Object &root, StringRef canonicalInput,
       }
     }
   }
-  candidateFunction->walk([&](taskflow::TaskflowTaskOp task) {
-    std::string name = task.getTaskName().str();
-    auto found = byName.find(name);
-    inputs.initialShapes.push_back(
-        found == byName.end() ? NeighborhoodShape{name, 1, 1} : found->second);
-  });
-  if (actionsInitialShapes && byName.size() != inputs.initialShapes.size()) {
-    error = "initialShapes does not bind exactly the current candidate tasks";
-    return false;
+  inputs.hasRequestedInitialShapes = actionsInitialShapes != nullptr;
+  if (!fissionTargets.empty()) {
+    for (auto &[name, shape] : byName)
+      inputs.requestedInitialShapes.push_back(shape);
+  } else {
+    candidateFunction->walk([&](taskflow::TaskflowTaskOp task) {
+      std::string name = task.getTaskName().str();
+      auto found = byName.find(name);
+      inputs.initialShapes.push_back(
+          found == byName.end() ? NeighborhoodShape{name, 1, 1} : found->second);
+    });
+    if (actionsInitialShapes && byName.size() != inputs.initialShapes.size()) {
+      error = "initialShapes does not bind exactly the current candidate tasks";
+      return false;
+    }
   }
   // Preserve source task order so both the initial history and the selected
   // shapes can be authenticated by the complete-program search controller.
@@ -596,6 +739,8 @@ static bool writeText(StringRef path, StringRef text, std::string &error) {
 
 static bool publishReplay(StringRef outputDir, StringRef canonicalBytes,
                           StringRef candidateBytes, StringRef actionBytes,
+                          StringRef preparedSourceBytes,
+                          StringRef expectedCandidateBytes,
                           StringRef candidateText, StringRef factsText,
                           std::string &error) {
   if (llvm::sys::fs::exists(outputDir)) {
@@ -651,6 +796,22 @@ static bool publishReplay(StringRef outputDir, StringRef canonicalBytes,
     cleanup();
     return false;
   }
+  if (!preparedSourceBytes.empty()) {
+    path = temporary;
+    llvm::sys::path::append(path, "prepared-source.mlir");
+    if (!writeText(path, preparedSourceBytes, error)) {
+      cleanup();
+      return false;
+    }
+  }
+  if (!expectedCandidateBytes.empty()) {
+    path = temporary;
+    llvm::sys::path::append(path, "expected-candidate.mlir");
+    if (!writeText(path, expectedCandidateBytes, error)) {
+      cleanup();
+      return false;
+    }
+  }
   ec = llvm::sys::fs::rename(temporary, outputDir);
   if (ec) {
     error = "cannot publish complete replay output directory: " + ec.message();
@@ -681,6 +842,7 @@ public:
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<func::FuncDialect, taskflow::TaskflowDialect>();
+    registerTaskflowFissionCanonicalLoweringDependencies(registry);
     mlir::amoeba::neura::createMaterializeJointTaskReplicasPass()
         ->getDependentDialects(registry);
     mlir::amoeba::neura::createMaterializeNeuraJointRewritePass()
@@ -698,6 +860,16 @@ public:
   Option<std::string> stage{*this, "stage", llvm::cl::init("full-joint")};
   Option<int64_t> maxPartitionFactor{*this, "max-partition-factor",
                                      llvm::cl::init(8)};
+  Option<std::string> preparedSourceFile{*this, "prepared-source-file",
+                                         llvm::cl::init("")};
+  Option<int64_t> maxFissionActionsPerTask{
+      *this, "max-fission-actions-per-task", llvm::cl::init(64)};
+  Option<std::string> expectedCandidateFile{
+      *this, "expected-candidate-file", llvm::cl::init("")};
+  Option<std::string> activeTransferArgumentsText{
+      *this, "active-transfer-arguments", llvm::cl::init("")};
+  Option<bool> activeTransferRequireProven{
+      *this, "active-transfer-require-proven", llvm::cl::init(false)};
   Option<std::string> outputDir{*this, "output-dir", llvm::cl::init("")};
 
   void runOnOperation() override {
@@ -717,6 +889,10 @@ public:
       fail("max-partition-factor must be one of {1, 2, 4, 8}");
       return;
     }
+    if (maxFissionActionsPerTask <= 0) {
+      fail("max-fission-actions-per-task must be positive");
+      return;
+    }
     std::string actionBytes;
     std::string error;
     if (!readFile(actionFile, actionBytes, error)) {
@@ -733,15 +909,78 @@ public:
       fail("action file root must be a JSON object");
       return;
     }
+    SmallVector<unsigned> activeArguments;
+    const json::Array *boundActiveArguments =
+        root->getArray("activeTransferArguments");
+    auto boundRequireProven = root->getBoolean("activeTransferRequireProven");
+    if (!activeTransferArgumentsText.empty()) {
+      if (stageNumber(stage) != 6 || !boundActiveArguments ||
+          !boundRequireProven ||
+          *boundRequireProven != activeTransferRequireProven) {
+        fail("active-transfer replay requires exact stage-6 action-file binding");
+        return;
+      }
+      SmallVector<StringRef> tokens;
+      StringRef(activeTransferArgumentsText.getValue()).split(tokens, ',');
+      for (StringRef token : tokens) {
+        unsigned index = 0;
+        if (token.empty() || !llvm::all_of(token, llvm::isDigit) ||
+            token.getAsInteger(10, index) ||
+            (!activeArguments.empty() && index <= activeArguments.back())) {
+          fail("active-transfer-arguments must be strictly increasing unsigned indices");
+          return;
+        }
+        activeArguments.push_back(index);
+      }
+      if (boundActiveArguments->size() != activeArguments.size()) {
+        fail("active-transfer action-file argument count differs from CLI");
+        return;
+      }
+      for (auto [index, value] : llvm::enumerate(*boundActiveArguments)) {
+        auto argument = value.getAsInteger();
+        if (!argument || *argument < 0 ||
+            static_cast<uint64_t>(*argument) != activeArguments[index]) {
+          fail("active-transfer action-file indices differ from CLI");
+          return;
+        }
+      }
+    } else if (root->get("activeTransferArguments") ||
+               root->get("activeTransferRequireProven") ||
+               activeTransferRequireProven) {
+      fail("active-transfer action-file binding requires nonempty CLI arguments");
+      return;
+    }
     ReplayInputs inputs;
     inputs.actionBytes = std::move(actionBytes);
     OwningOpRef<ModuleOp> canonical;
+    OwningOpRef<ModuleOp> preparedSource;
     if (!readInputs(*root, canonicalInput, candidateInput, functionName, stage,
                     static_cast<unsigned>(maxPartitionFactor),
+                    preparedSourceFile,
+                    static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
                     inputModule.getContext(), inputModule, inputs, canonical,
+                    preparedSource,
                     error)) {
       fail(error);
       return;
+    }
+    std::string expectedCandidateBytes;
+    OwningOpRef<ModuleOp> expectedCandidate;
+    bool expectedCandidateMatched = false;
+    if (!expectedCandidateFile.empty()) {
+      if (stageNumber(inputs.stage) != 6) {
+        fail("expected-candidate-file is valid only for full-joint-fission replay");
+        return;
+      }
+      if (!readFile(expectedCandidateFile, expectedCandidateBytes, error)) {
+        fail(error);
+        return;
+      }
+      if (!parseBoundModule(expectedCandidateBytes, inputModule.getContext(),
+                            "expected candidate", expectedCandidate, error)) {
+        fail(error);
+        return;
+      }
     }
     if (llvm::sys::fs::exists(outputDir)) {
       fail("replay output directory already exists: " + outputDir.getValue());
@@ -770,23 +1009,163 @@ public:
       fail("unknown cumulative ablation stage");
       return;
     }
-
-    OwningOpRef<ModuleOp> working = inputModule.clone();
-    std::vector<NeighborhoodShape> initialShapes = inputs.initialShapes;
-    std::vector<NeighborhoodShape> shapes = std::move(inputs.initialShapes);
-    json::Array initialShapeFacts = shapeFacts(initialShapes);
     json::Array stepFacts;
     const unsigned apiCap = inputs.maxPartitionFactor <= 4 ? 4 : 8;
-    for (size_t index = 0; index < inputs.actions.size(); ++index) {
+    OwningOpRef<ModuleOp> effectiveCanonical = canonical->clone();
+    OwningOpRef<ModuleOp> working = inputModule.clone();
+    std::vector<NeighborhoodShape> shapes = inputs.initialShapes;
+    size_t fissionActionCount = 0;
+    while (fissionActionCount < inputs.actions.size() &&
+           inputs.actions[fissionActionCount].family == "fission")
+      ++fissionActionCount;
+    if (fissionActionCount != 0) {
+      SmallVector<mlir::amoeba::neura::TaskflowFissionAction> sourceActions;
+      for (size_t index = 0; index < fissionActionCount; ++index) {
+        const NeighborhoodAction &action = inputs.actions[index];
+        const NeighborhoodPrimitive &primitive = action.primitives.front();
+        mlir::amoeba::neura::TaskflowFissionAction sourceAction;
+        sourceAction.function = functionName.getValue();
+        sourceAction.task = primitive.firstTask;
+        sourceAction.leftNodes.append(primitive.leftNodes.begin(),
+                                      primitive.leftNodes.end());
+        sourceActions.push_back(std::move(sourceAction));
+        stepFacts.push_back(json::Object{
+            {"index", static_cast<int64_t>(index)},
+            {"label", action.label}, {"family", action.family},
+            {"status", "exact-source-replay-verified"},
+            {"counter_domain_policy",
+             "retained-per-operation-not-disjoint-firing-partitions"}});
+      }
+      OwningOpRef<ModuleOp> fissionedSource = preparedSource->clone();
+      for (const auto &action : sourceActions) {
+        if (failed(mlir::amoeba::neura::materializeTaskflowFission(
+                fissionedSource.get(), action.function, action.task,
+                action.leftNodes, error))) {
+          fail("typed source fission materialization failed:" + error);
+          return;
+        }
+      }
+      if (!fissionedSource ||
+          failed(mlir::amoeba::neura::verifyTaskflowFissionReplay(
+              preparedSource.get(), fissionedSource.get(), sourceActions,
+              error))) {
+        fail("typed source fission replay failed:" + error);
+        return;
+      }
+      if (failed(lowerPreparedTaskflowFissionSource(
+              fissionedSource.get(), effectiveCanonical, error))) {
+        fail("fixed canonical lowering of fissioned source failed:" + error);
+        return;
+      }
+      working = effectiveCanonical->clone();
+      auto splitFunction = selectTaskFunction(*working, functionName, error);
+      if (failed(splitFunction)) {
+        fail("fissioned canonical Taskflow function is missing:" + error);
+        return;
+      }
+      shapes.clear();
+      splitFunction->walk([&](taskflow::TaskflowTaskOp task) {
+        std::string name = task.getTaskName().str();
+        NeighborhoodShape shape{name, 1, 1};
+        auto requested = llvm::find_if(
+            inputs.requestedInitialShapes,
+            [&](const NeighborhoodShape &candidate) {
+              return candidate.task == name;
+            });
+        if (requested != inputs.requestedInitialShapes.end())
+          shape = *requested;
+        shapes.push_back(std::move(shape));
+      });
+      if (inputs.hasRequestedInitialShapes &&
+          inputs.requestedInitialShapes.size() != shapes.size()) {
+        fail("initialShapes does not bind exactly the fissioned canonical tasks");
+        return;
+      }
+      auto splitCanonicalFunction =
+          selectTaskFunction(*effectiveCanonical, functionName, error);
+      auto splitCurrentFunction =
+          selectTaskFunction(*working, functionName, error);
+      if (failed(splitCanonicalFunction) || failed(splitCurrentFunction) ||
+          !verifySourceState(*splitCanonicalFunction, *splitCurrentFunction,
+                             error)) {
+        fail("fissioned canonical source-domain proof failed:" + error);
+        return;
+      }
+      if (!checkCumulativeCap(*working, functionName,
+                              inputs.maxPartitionFactor, error)) {
+        fail("fissioned canonical cumulative partition cap rejected:" + error);
+        return;
+      }
+    }
+    std::vector<NeighborhoodShape> initialShapes = shapes;
+    json::Array initialShapeFacts = shapeFacts(initialShapes);
+    auto prepareActiveTransfers = [&](ModuleOp module, bool trustedRewrite) {
+      if (activeArguments.empty())
+        return true;
+      auto function = selectTaskFunction(module, functionName, error);
+      if (failed(function))
+        return false;
+      for (unsigned requested : activeArguments)
+        if (requested >= function->getNumArguments() ||
+            !isa<MemRefType>(function->getArgument(requested).getType())) {
+          error = "active-transfer replay argument is out of range or not a memref";
+          return false;
+        }
+      for (unsigned index = 0; index < function->getNumArguments(); ++index) {
+        if (!isa<MemRefType>(function->getArgument(index).getType()))
+          continue;
+        bool requested = llvm::is_contained(activeArguments, index);
+        bool supplied = hasStaticActiveTransferShapeFacts(*function, index);
+        if (!requested && !supplied)
+          continue;
+        if (trustedRewrite || !supplied) {
+          if (failed(rederiveAndStoreStaticActiveTransferShapeProof(
+                  *function, index, &error)))
+            return false;
+        } else if (failed(verifyStaticActiveTransferShapeProof(
+                       *function, index, &error))) {
+          return false;
+        }
+        if (failed(verifyStaticActiveTransferShapeProof(*function, index, &error)))
+          return false;
+        if (requested && activeTransferRequireProven &&
+            !analyzeStaticActiveTransferShape(*function, index).proven) {
+          error = "required active-transfer proof is unknown after replay";
+          return false;
+        }
+      }
+      return true;
+    };
+    // Source replay owns the new split baseline. Imported seed proofs are
+    // checked before use; only a trusted materialization may refresh them.
+    if (!prepareActiveTransfers(effectiveCanonical.get(), false) ||
+        !prepareActiveTransfers(working.get(), false)) {
+      fail("active_transfer_seed_replay_unproven:" + error);
+      return;
+    }
+    auto activeCanonicalFunction =
+        selectTaskFunction(*effectiveCanonical, functionName, error);
+    if (failed(activeCanonicalFunction)) {
+      fail("cannot select effective canonical task function:" + error);
+      return;
+    }
+    for (size_t index = fissionActionCount; index < inputs.actions.size(); ++index) {
       const NeighborhoodAction &action = inputs.actions[index];
       auto current = selectTaskFunction(*working, functionName, error);
       if (failed(current) ||
-          !verifySourceState(*canonicalFunction, *current, error)) {
+          !verifySourceState(*activeCanonicalFunction, *current, error)) {
         fail("source_iteration_domain_action_predecessor_unproven:" + error);
         return;
       }
+      std::string enumerationError;
       std::vector<NeighborhoodAction> available = enumerateNeighborhoodActions(
-          *working, functionName, shapes, stage, /*round=*/1, apiCap);
+          *working, functionName, shapes, stage, /*round=*/1, apiCap,
+          preparedSource.get(), inputs.maxFissionActionsPerTask,
+          &enumerationError, nullptr, inputs.canonicalFissionActions);
+      if (!enumerationError.empty()) {
+        fail("fission action enumeration failed:" + enumerationError);
+        return;
+      }
       if (!llvm::any_of(available, [&](const NeighborhoodAction &candidate) {
             return actionEqual(action, candidate);
           })) {
@@ -795,7 +1174,7 @@ public:
       }
 
       OwningOpRef<ModuleOp> trial = working->clone();
-      OwningOpRef<ModuleOp> actionCanonical = canonical->clone();
+      OwningOpRef<ModuleOp> actionCanonical = effectiveCanonical->clone();
       suspendSourceCertificates(*trial);
       suspendSourceCertificates(*actionCanonical);
       std::vector<NeighborhoodShape> nextShapes = shapes;
@@ -814,8 +1193,8 @@ public:
       current = selectTaskFunction(*trial, functionName, error);
       if (failed(current) ||
           failed(proveAndRefreshSourceIterationDomainPartition(
-              *canonicalFunction, *current, error)) ||
-          failed(verifySourceIterationDomainPartition(*canonicalFunction,
+              *activeCanonicalFunction, *current, error)) ||
+          failed(verifySourceIterationDomainPartition(*activeCanonicalFunction,
                                                       *current, error))) {
         fail("source_iteration_domain_action_proof_failed:" + action.label +
              ":" + error);
@@ -823,6 +1202,10 @@ public:
       }
       if (failed(verify(trial->getOperation()))) {
         fail("action_output_verifier_failed:" + action.label);
+        return;
+      }
+      if (!prepareActiveTransfers(trial.get(), true)) {
+        fail("active_transfer_action_replay_unproven:" + action.label + ":" + error);
         return;
       }
       if (!checkCumulativeCap(*trial, functionName, inputs.maxPartitionFactor,
@@ -845,9 +1228,30 @@ public:
 
     currentFunction = selectTaskFunction(*working, functionName, error);
     if (failed(currentFunction) ||
-        !verifySourceState(*canonicalFunction, *currentFunction, error)) {
+        !verifySourceState(*activeCanonicalFunction, *currentFunction, error)) {
       fail("source_iteration_domain_final_candidate_unproven:" + error);
       return;
+    }
+    if (!expectedCandidateFile.empty()) {
+      std::string replayComparable =
+          candidateComparisonText(working.get(), functionName, error);
+      if (replayComparable.empty()) {
+        fail("cannot normalize reconstructed candidate for exact comparison:" +
+             error);
+        return;
+      }
+      std::string expectedComparable =
+          candidateComparisonText(expectedCandidate.get(), functionName, error);
+      if (expectedComparable.empty()) {
+        fail("cannot normalize expected candidate for exact comparison:" +
+             error);
+        return;
+      }
+      if (replayComparable != expectedComparable) {
+        fail("expected_candidate_exact_replay_mismatch");
+        return;
+      }
+      expectedCandidateMatched = true;
     }
     json::Array taskFacts;
     if (!sourceFacts(*currentFunction, taskFacts, error)) {
@@ -860,14 +1264,20 @@ public:
         {"canonical_input_path", inputs.canonicalPath},
         {"candidate_input_path", inputs.candidatePath},
         {"action_file_path", actionFile.getValue()},
+        {"prepared_source_input_path", inputs.preparedSourcePath},
         {"canonical_input_witness", "canonical-input.mlir"},
         {"candidate_input_witness", "candidate-input.mlir"},
+        {"prepared_source_input_witness",
+         inputs.preparedSourceBytes.empty() ? "" : "prepared-source.mlir"},
         {"action_file_witness", "actions.json"},
         {"candidate_module", "candidate.mlir"},
         {"function", inputs.function},
         {"stage", inputs.stage},
         {"max_partition_factor",
          static_cast<int64_t>(inputs.maxPartitionFactor)},
+        {"max_fission_actions_per_task",
+         static_cast<int64_t>(inputs.maxFissionActionsPerTask)},
+        {"fission_source_replay_verified", fissionActionCount != 0},
         {"actions_applied", static_cast<int64_t>(stepFacts.size())},
         {"steps", std::move(stepFacts)},
         {"initial_shapes", std::move(initialShapeFacts)},
@@ -878,6 +1288,22 @@ public:
         {"prediction_run", false},
         {"native_mapping_run", false},
         {"ranking_performed", false}};
+    if (!expectedCandidateFile.empty()) {
+      facts["expected_candidate_path"] = expectedCandidateFile.getValue();
+      facts["expected_candidate_witness"] = "expected-candidate.mlir";
+      facts["expected_candidate_exact_replay_match"] =
+          expectedCandidateMatched;
+      facts["expected_candidate_comparison"] =
+          "exact-generic-module-after-removing-only-function-graph-variant-id";
+    }
+    if (!activeArguments.empty()) {
+      json::Array arguments;
+      for (unsigned index : activeArguments)
+        arguments.push_back(static_cast<int64_t>(index));
+      facts["active_transfer_replay_verified"] = true;
+      facts["active_transfer_arguments"] = std::move(arguments);
+      facts["active_transfer_require_proven"] = activeTransferRequireProven.getValue();
+    }
     // A path replayed from the exact canonical input is also a source-owned
     // seed manifest. The search still replays its history, re-proves the full
     // candidate, and charges its score to the normal budget before admitting
@@ -903,18 +1329,36 @@ public:
       facts["candidate_path"] = candidatePath.str().str();
       facts["shapes"] = shapeFacts(shapes);
       facts["action_path"] = std::move(path);
+      json::Array fissionActionRows, neighborhoodActionRows;
+      for (const json::Value &value : *actions) {
+        const json::Object *action = value.getAsObject();
+        auto family = action ? action->getString("family") : std::nullopt;
+        if (!family) {
+          fail("authenticated action list lost its family field");
+          return;
+        }
+        if (*family == "fission")
+          fissionActionRows.push_back(value);
+        else
+          neighborhoodActionRows.push_back(value);
+      }
       facts["action_history"] = json::Object{
           {"schema", "orbit-joint-neighborhood-typed-actions-v1"},
           {"known", true},
-          {"canonicalFactKey", "graph-0"},
+          {"canonicalFactKey", fissionActionCount
+                                   ? "source-replay-pending"
+                                   : "graph-0"},
           {"initialShapes", shapeFacts(initialShapes)},
-          {"actions", json::Array(*actions)},
+          {"actions", std::move(neighborhoodActionRows)},
+          {"fissionActions", std::move(fissionActionRows)},
           {"unknownReason", ""}};
     }
     std::string factsText = jsonText(json::Value(std::move(facts)));
     std::string candidateText = moduleText(*working);
     if (!publishReplay(outputDir, inputs.canonicalBytes, inputs.candidateBytes,
-                       inputs.actionBytes, candidateText, factsText, error)) {
+                       inputs.actionBytes, inputs.preparedSourceBytes,
+                       expectedCandidateBytes, candidateText, factsText,
+                       error)) {
       fail(error);
       return;
     }

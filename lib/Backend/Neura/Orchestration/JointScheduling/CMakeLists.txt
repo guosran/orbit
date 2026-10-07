@@ -19,6 +19,8 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   OriginalAmoebaCtrlToDataFlowPass.cpp
   OriginalAmoebaProfileCostAdapter.cpp
   RetimingOriginalAmoebaFixedDecisionsPass.cpp
+  CommonAmoebaParentProfiles.cpp
+  CommonMapperReplayWrapper.cpp
   ProductionFixedScheduleCommunication.cpp
   EnumerateJointSemanticRewritePass.cpp
   EnumerateJointGraphClosurePass.cpp
@@ -27,6 +29,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   PrepareJointDiagnosticCandidatePass.cpp
   ProveStaticActiveTransferShapesPass.cpp
   JointNeighborhoodActions.cpp
+  TaskflowFissionSourceReplay.cpp
   PruneJointGraphCandidatesPass.cpp
   EnumerateApplicationRewriteActionsPass.cpp
   MaterializeJointSemanticRewritePass.cpp
@@ -59,6 +62,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   LINK_LIBS PUBLIC
   MLIRAmoebaNeuraAnalyticalBasedTaskOrchestration
   MLIRAmoebaNeuraBackendOptions
+  MLIRAmoebaTaskflowFission
   MLIRAmoebaNeuraOrchestrationUtil
   MLIRArithDialect
   MLIRBytecodeWriter

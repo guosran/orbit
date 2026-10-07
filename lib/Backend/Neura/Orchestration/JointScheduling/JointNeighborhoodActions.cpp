@@ -12,6 +12,7 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
+#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "TaskflowDialect/TaskflowOps.h"
@@ -105,6 +106,9 @@ static unsigned stageNumber(StringRef stage) {
   // These are the protocol's explicit names.  Keep them ahead of substring
   // matching so a future descriptive stage name cannot silently lose a
   // dimension.
+  if (value == "s6" || value == "full-joint-fission" ||
+      value == "shape-temporal-replica-tiling-fusion-fission")
+    return 6;
   if (value == "s5" || value == "full-joint" ||
       value == "shape-temporal-replica-tiling-fusion")
     return 5;
@@ -1467,8 +1471,16 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
 std::vector<NeighborhoodAction>
 mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
     ModuleOp module, StringRef functionName, ArrayRef<NeighborhoodShape> shapes,
-    StringRef stage, unsigned round, unsigned maxPartitionFactor) {
+    StringRef stage, unsigned round, unsigned maxPartitionFactor,
+    ModuleOp preparedTaskflowSource, uint64_t maxFissionActionsPerTask,
+    std::string *enumerationError,
+    std::vector<std::string> *fissionDiagnostics,
+    ArrayRef<NeighborhoodAction> precomputedFissionActions) {
   std::vector<NeighborhoodAction> actions;
+  if (enumerationError)
+    enumerationError->clear();
+  if (fissionDiagnostics)
+    fissionDiagnostics->clear();
   if (!isSupportedMaxPartitionFactor(maxPartitionFactor))
     return actions;
   SmallVector<std::string> names = taskNames(module, functionName);
@@ -1706,6 +1718,94 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
     }
   }
 
+  if (stageId >= 6) {
+    if (!preparedTaskflowSource) {
+      if (enumerationError)
+        *enumerationError =
+            "full-joint-fission requires the authenticated prepared Taskflow source";
+      return {};
+    }
+    if (maxFissionActionsPerTask == 0) {
+      if (enumerationError)
+        *enumerationError = "max-fission-actions-per-task must be positive";
+      return {};
+    }
+    std::string selectError;
+    if (failed(selectTaskFunction(preparedTaskflowSource, functionName,
+                                  selectError))) {
+      if (enumerationError)
+        *enumerationError =
+            "prepared Taskflow source function is unavailable: " +
+            selectError;
+      return {};
+    }
+    for (const NeighborhoodAction &action : precomputedFissionActions)
+      addUniqueAction(actions, action);
+  }
+
+  return actions;
+}
+
+FailureOr<std::vector<NeighborhoodAction>>
+mlir::amoeba::neura::joint_scheduling::
+enumerateTaskflowFissionNeighborhoodActions(
+    ModuleOp preparedTaskflowSource, StringRef functionName,
+    uint64_t maxFissionActionsPerTask,
+    std::vector<std::string> &diagnostics, std::string &error) {
+  diagnostics.clear();
+  error.clear();
+  if (!preparedTaskflowSource || maxFissionActionsPerTask == 0) {
+    error = "fission enumeration requires prepared source and a positive cut cap";
+    return failure();
+  }
+  FailureOr<func::FuncOp> sourceFunction =
+      selectTaskFunction(preparedTaskflowSource, functionName, error);
+  if (failed(sourceFunction))
+    return failure();
+  std::vector<NeighborhoodAction> actions;
+  sourceFunction->walk([&](TaskflowTaskOp task) {
+    if (!error.empty())
+      return;
+    std::string diagnostic;
+    FailureOr<SmallVector<SmallVector<unsigned>>> partitions =
+        mlir::amoeba::neura::enumerateTaskflowFissionPartitions(
+            task, maxFissionActionsPerTask, diagnostic);
+    if (failed(partitions)) {
+      error = "fission_enumeration_limit_exceeded:" +
+              task.getTaskName().str() + ":" + diagnostic;
+      return;
+    }
+    if (partitions->empty()) {
+      diagnostics.push_back(task.getTaskName().str() + ":unsupported:" +
+                            diagnostic);
+      return;
+    }
+    diagnostics.push_back(task.getTaskName().str() + ":supported:" +
+                          std::to_string(partitions->size()));
+    for (const SmallVector<unsigned> &leftNodes : *partitions) {
+      NeighborhoodAction action;
+      action.family = "fission";
+      NeighborhoodPrimitive primitive;
+      primitive.kind = "fission";
+      primitive.firstTask = task.getTaskName().str();
+      primitive.leftNodes.assign(leftNodes.begin(), leftNodes.end());
+      action.primitives.push_back(std::move(primitive));
+      std::string label = "fission:" + task.getTaskName().str() + ":left=";
+      for (unsigned index = 0; index < leftNodes.size(); ++index) {
+        if (index)
+          label += ",";
+        label += std::to_string(leftNodes[index]);
+      }
+      action.label = std::move(label);
+      actions.push_back(std::move(action));
+    }
+  });
+  if (!error.empty())
+    return failure();
+  llvm::stable_sort(actions, [](const NeighborhoodAction &lhs,
+                                const NeighborhoodAction &rhs) {
+    return lhs.label < rhs.label;
+  });
   return actions;
 }
 
@@ -1731,6 +1831,13 @@ bool mlir::amoeba::neura::joint_scheduling::applyNeighborhoodAction(
   if (action.family == "lineage-replacement") {
     reason = "lineage_replacement_requires_canonical_path_replay";
     diagnostic = action.shapeTask.empty() ? action.label : action.shapeTask;
+    return false;
+  }
+  if (action.family == "fission" ||
+      llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
+        return lower(p.kind) == "fission";
+      })) {
+    reason = "fission_requires_authenticated_pre_neura_source_replay";
     return false;
   }
   if (!actionHasDuplicateLineageFactor(action.primitives, maxPartitionFactor,

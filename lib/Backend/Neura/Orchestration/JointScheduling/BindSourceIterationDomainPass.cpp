@@ -11,7 +11,11 @@
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -127,6 +131,14 @@ struct VerifySourceIterationDomainPartitionsPass
   }
   Option<std::string> parentModule{*this, "parent-module", llvm::cl::init("")};
   Option<std::string> functionName{*this, "function", llvm::cl::init("")};
+  void getDependentDialects(DialectRegistry &registry) const override {
+    // Verification may deterministically replay source-owned tiling or fusion
+    // in a nested pass manager. Register the same dialect closure as those
+    // materializers before the outer pass can run on a threaded context.
+    registry.insert<affine::AffineDialect, arith::ArithDialect,
+                    func::FuncDialect, memref::MemRefDialect, scf::SCFDialect,
+                    TaskflowDialect, neura::NeuraDialect>();
+  }
   void runOnOperation() override {
     std::string error;
     if (parentModule.empty() || functionName.empty()) {

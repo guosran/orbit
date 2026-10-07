@@ -175,6 +175,9 @@ struct TaskScheduleEntry {
   int64_t startCycle = 0;
   int64_t endCycle = 0;
   llvm::SmallVector<std::pair<int, int>> positions;
+  // Parallel to `positions`. Ordinary tasks use replica ID 0; aggregate F45
+  // parent tasks retain the exact replica identity for every assigned cell.
+  llvm::SmallVector<int> replicaIds;
 };
 
 // Reusable one-shot scheduler/placer for Taskflow task graphs.
@@ -238,7 +241,17 @@ private:
   // Searches legal grid positions and returns the best-scoring placement for
   // one task under the current scheduling mode.
   TaskPlacement findBestPlacement(TaskNode *task_node, int cgra_count,
-                                  TaskMemoryGraph &graph);
+                                  TaskMemoryGraph &graph,
+                                  int64_t required_start = -1,
+                                  bool defer_aggregate_communication = false,
+                                  int64_t *next_communication_ready = nullptr);
+
+  // Checks dependencies and, when requested, commits the single routed
+  // transfer for each producer/consumer task pair. Aggregate parent replicas
+  // call this once after collecting all replica regions.
+  bool communicationReady(TaskNode *task_node,
+                          const TaskPlacement &placement, bool commit,
+                          int64_t &ready_time);
 
   // Parses a cgra_shape attribute string into its base placement shape.
   CgraShape parseCgraShapeToBase(StringRef cgra_shape, int cgra_count);
@@ -256,6 +269,9 @@ private:
   SchedulingMode mode_;
   ShapeSelectionPolicy shape_selection_policy_;
   TaskCommunicationModel *communication_model_ = nullptr;
+  // Zero preserves the legacy unbounded context allocation when the selected
+  // architecture does not specify per_cgra_defaults.context_mem_items.
+  int context_mem_items_ = 0;
   int64_t schedule_makespan_ = 0;
   std::string communication_error_;
   llvm::SmallVector<TaskScheduleEntry> schedule_entries_;

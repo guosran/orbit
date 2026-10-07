@@ -749,7 +749,10 @@ static bool collectCurrentTaskBodies(
     // Keep one SSA namespace across the kernel result and its nested region;
     // useLocalScope would restart numbering in the region and make the text
     // parser see duplicate values.
-    item.mapperFunction.print(mapperStream);
+    // Feature extraction must use the same IR syntax regardless of the
+    // caller's output flags; custom wrapper returns otherwise add a DFG node.
+    item.mapperFunction.print(mapperStream,
+                              OpPrintingFlags().printGenericOpForm());
     mapperStream.flush();
 
     CurrentTaskBody current;
@@ -1615,8 +1618,16 @@ struct PredictAnalyticalTaskCostCatalogPass
       return;
     }
     PersistentMLCostCache cache;
+    const double cacheRuntimeIICeiling =
+        directModelMode ? directModel.getRuntimeIICeiling()
+                        : kFormalMax4ModelCeilingII;
+    const llvm::StringRef cacheTrainingArchitectureText =
+        directModelMode ? directModel.getTrainingArchitectureText()
+                        : llvm::StringRef();
     if (!cache.load(cacheFile, modelSchema, featureContractId,
-                    architectureContract, cacheResources, error)) {
+                    architectureContract, cacheResources,
+                    cacheRuntimeIICeiling, cacheTrainingArchitectureText,
+                    error)) {
       fail(error);
       return;
     }

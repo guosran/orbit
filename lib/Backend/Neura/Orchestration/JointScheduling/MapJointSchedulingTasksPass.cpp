@@ -7,15 +7,16 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
 #include "MapperCostAnalysis.h"
+#include "CommonMapperReplayWrapper.h"
 #include "SpatialTaskCandidateSpace.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
-#include "MapperCounterBounds.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
 #include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 
 #include "NeuraDialect/NeuraAttributes.h"
 #include "NeuraDialect/Architecture/Architecture.h"
+#include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
 #include "TaskflowDialect/TaskflowOps.h"
@@ -27,6 +28,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -42,11 +44,17 @@
 #include <memory>
 
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::taskflow;
+using ::mlir::amoeba::neura::joint_scheduling::RectShape;
+using ::mlir::amoeba::neura::joint_scheduling::buildCommonMapperReplayWrapper;
+using ::mlir::amoeba::neura::joint_scheduling::printCommonMapperReplayWrapper;
+namespace json = llvm::json;
 namespace json = llvm::json;
 
 namespace {
@@ -104,6 +112,134 @@ static bool hasAllUnitRewriteEvidence(func::FuncOp function,
     return WalkResult::advance();
   });
   return foundEvidence;
+}
+
+static bool hasParentProfileRewriteEvidence(func::FuncOp function,
+                                            std::string &error) {
+  if (hasAllUnitRewriteEvidence(function, error)) {
+    error.replace(0, error.find(" rejects"), "parent profile export rejects");
+    return true;
+  }
+  bool foundEvidence = false;
+  function->walk([&](Operation *operation) {
+    for (NamedAttribute attribute : operation->getAttrs()) {
+      StringRef name = attribute.getName().strref();
+      const bool aggregateMarker =
+          name.starts_with("amoeba.aggregate.") ||
+          name.starts_with("amoeba.original_amoeba.") ||
+          ((name.starts_with("amoeba.") ||
+            name.starts_with("joint_scheduling_")) &&
+           name.contains("aggregate")) ||
+          name == "amoeba.semantic.completion_only";
+      if (!aggregateMarker)
+        continue;
+      error = "parent profile export rejects aggregate/replica rewrite "
+              "evidence attribute " +
+              name.str();
+      foundEvidence = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return foundEvidence;
+}
+
+struct ParentProfileRow {
+  std::string task;
+  std::string shape;
+  std::string preMapperWrapper;
+  int64_t candidateIndex = 0;
+  int64_t cgraCount = 0;
+  int64_t mapperRows = 0;
+  int64_t mapperCols = 0;
+  int64_t compiledII = 0;
+  int64_t steps = 0;
+  int64_t materializedOperationCount = 0;
+  int64_t sampleTripCount = 0;
+  int64_t estimatedLatency = 0;
+  int64_t stepsFormulaLatency = 0;
+  int64_t sourceIterationWorkCount = 0;
+  std::string sourceIterationDomainStatus;
+  double structuralStartupCycles = 0.0;
+};
+
+struct ParentProfileAttempt {
+  std::string task;
+  std::string shape;
+  int64_t candidateIndex = 0;
+  int64_t cgraCount = 0;
+  bool profileCreated = false;
+  bool mapperSucceeded = false;
+  std::string failureReason;
+};
+
+static bool isNestedInFusedMapperOperation(Operation *operation) {
+  for (Operation *parent = operation ? operation->getParentOp() : nullptr;
+       parent; parent = parent->getParentOp()) {
+    if (parent->getName().getStringRef().contains(
+            ::mlir::neura::attr::val::kOpFused))
+      return true;
+  }
+  return false;
+}
+
+static bool collectActualMapperProfileFacts(Region &body, int64_t &steps,
+                                            int64_t &materializedOperations,
+                                            std::string &error) {
+  int64_t maximumTimeStep = -1;
+  body.walk([&](Operation *operation) {
+    // The wrapper terminator is a control-flow artifact, not a mapped Neura
+    // operation. The mapper's materialization predicate intentionally only
+    // filters Neura operations, so exclude func.return before applying it.
+    if (isa<func::ReturnOp>(operation) ||
+        isNestedInFusedMapperOperation(operation))
+      return WalkResult::advance();
+
+    const bool materialized =
+        !::mlir::neura::is_non_materialized(operation);
+    auto locations = operation->getAttrOfType<ArrayAttr>("mapping_locs");
+    if (materialized) {
+      if (materializedOperations == std::numeric_limits<int64_t>::max()) {
+        error = "materialized mapper operation count exceeds int64";
+        return WalkResult::interrupt();
+      }
+      ++materializedOperations;
+      if (!locations) {
+        error = "a materialized mapper operation has no mapping_locs";
+        return WalkResult::interrupt();
+      }
+      if (locations.empty()) {
+        error = "a materialized mapper operation has empty mapping_locs";
+        return WalkResult::interrupt();
+      }
+    }
+
+    if (!locations || locations.empty()) {
+      return WalkResult::advance();
+    }
+    for (Attribute location : locations) {
+      auto dictionary = dyn_cast<DictionaryAttr>(location);
+      auto timeStep = dictionary
+                          ? dictionary.getAs<IntegerAttr>("time_step")
+                          : IntegerAttr();
+      if (!timeStep || timeStep.getInt() < 0) {
+        error = "mapper emitted a malformed mapping_locs time_step";
+        return WalkResult::interrupt();
+      }
+      maximumTimeStep = std::max(maximumTimeStep, timeStep.getInt());
+    }
+    return WalkResult::advance();
+  });
+  if (!error.empty())
+    return false;
+  if (maximumTimeStep < 0 ||
+      maximumTimeStep == std::numeric_limits<int64_t>::max() ||
+      materializedOperations <= 0) {
+    error = "mapper emitted no complete materialized mapping profile";
+    return false;
+  }
+  steps = maximumTimeStep + 1;
+  return true;
 }
 
 static bool deriveStructuralStartupCycles(func::FuncOp mapperWrapper,
@@ -187,6 +323,11 @@ struct MapJointSchedulingTasksPass
       llvm::cl::desc("Use source-certified all-1x1 mapper durations without "
                      "ML costs."),
       llvm::cl::init(false)};
+  Option<std::string> parentProfileOutput{
+      *this, "parent-profile-output",
+      llvm::cl::desc("Export real mapper profiles for every legal area<=4 "
+                     "parent-task rectangle without scheduling."),
+      llvm::cl::init("")};
   Option<std::string> expectedTraceSha256{
       *this, "expected-trace-sha256",
       llvm::cl::desc("Expected selected schedule trace identity."),
@@ -207,10 +348,40 @@ struct MapJointSchedulingTasksPass
   bool productionScheduler = false;
   std::string baselineArchitectureText;
   llvm::StringMap<int64_t> baselineSourceWorkCounts;
+  llvm::StringMap<std::string> baselineSourceDomainStatuses;
+  std::string parentProfileCanonicalModuleText;
+  std::string parentProfileCanonicalFunctionText;
+  int64_t parentProfileGridRows = 0;
+  int64_t parentProfileGridCols = 0;
+  int64_t parentProfilePerCgraRows = 0;
+  int64_t parentProfilePerCgraCols = 0;
   std::string productionDispatchPolicy;
   int64_t productionFixedPointIterations = 10;
+  std::vector<ParentProfileRow> parentProfileRows;
+  std::vector<ParentProfileAttempt> parentProfileAttempts;
+
+  bool isParentProfileMode() const {
+    return !parentProfileOutput.getValue().empty();
+  }
 
   LogicalResult loadStartupCycles(ModuleOp module, StringRef function) {
+    if (isParentProfileMode()) {
+      if (allUnitBaseline.getValue() || !scoreFile.getValue().empty())
+        return module.emitError(
+            "parent profile export is mutually exclusive with scores and "
+            "all-unit baseline");
+      if (candidateId.getValue().empty())
+        return module.emitError(
+            "parent profile export requires a materialized candidate-id");
+      if (!expectedTraceSha256.getValue().empty() ||
+          !expectedScoreSha256.getValue().empty())
+        return module.emitError(
+            "parent profile export has no score or trace fingerprints");
+      exactScores = false;
+      productionScheduler = false;
+      materializedCandidateId = candidateId.getValue();
+      return success();
+    }
     if (allUnitBaseline.getValue()) {
       if (!scoreFile.getValue().empty())
         return module.emitError("all-unit baseline must not consume an ML "
@@ -368,102 +539,77 @@ struct MapJointSchedulingTasksPass
     return success();
   }
 
-  LogicalResult mapTask(TaskflowTaskOp task) {
+  LogicalResult mapTask(TaskflowTaskOp task,
+                        const RectShape *profileShape = nullptr,
+                        int64_t profileIndex = 0,
+                        bool *expectedMapperFailure = nullptr) {
+    if (expectedMapperFailure)
+      *expectedMapperFailure = false;
+    const bool profileOnly = profileShape != nullptr;
     if (!task->hasAttr("amoeba.joint_shape_orientation_fixed"))
       return task.emitError("task has no fixed joint-scheduling shape");
-    auto mapper_rows =
+    auto selectedMapperRows =
         task->getAttrOfType<IntegerAttr>("amoeba.selected_mapper_tile_rows");
-    auto mapper_cols =
+    auto selectedMapperCols =
         task->getAttrOfType<IntegerAttr>("amoeba.selected_mapper_tile_cols");
-    if (!mapper_rows || !mapper_cols || mapper_rows.getInt() <= 0 ||
-        mapper_cols.getInt() <= 0 ||
-        mapper_rows.getInt() > std::numeric_limits<int>::max() ||
-        mapper_cols.getInt() > std::numeric_limits<int>::max())
+    const int64_t mapperRows =
+        profileOnly ? profileShape->mapperRows
+                    : (selectedMapperRows ? selectedMapperRows.getInt() : 0);
+    const int64_t mapperCols =
+        profileOnly ? profileShape->mapperCols
+                    : (selectedMapperCols ? selectedMapperCols.getInt() : 0);
+    if (mapperRows <= 0 || mapperCols <= 0 ||
+        mapperRows > std::numeric_limits<int>::max() ||
+        mapperCols > std::numeric_limits<int>::max())
       return task.emitError("selected mapper rectangle is missing or invalid");
-
-    SmallVector<::mlir::neura::KernelOp> kernels;
-    task.walk(
-        [&](::mlir::neura::KernelOp kernel) { kernels.push_back(kernel); });
-    if (kernels.size() != 1)
-      return task.emitError("per-task mapper replay requires exactly one "
-                            "neura.kernel");
-    ::mlir::neura::KernelOp kernel = kernels.front();
-    if (kernel.getBody().empty())
-      return task.emitError("cannot map an empty neura.kernel");
-
-    // Dataflow kernels can publish their results through neura.return_value
-    // while ending the body with a void neura.yield. The temporary function
-    // follows the yield contract; the original kernel keeps its result types.
-    SmallVector<Type> wrapperResultTypes;
-    bool sawYield = false;
-    for (Block &block : kernel.getBody()) {
-      auto yield = dyn_cast<::mlir::neura::YieldOp>(block.getTerminator());
-      if (!yield)
-        continue;
-      SmallVector<Type> blockResultTypes;
-      for (Value result : yield.getResults())
-        blockResultTypes.push_back(result.getType());
-      if (!sawYield) {
-        wrapperResultTypes = std::move(blockResultTypes);
-        sawYield = true;
-      } else if (wrapperResultTypes != blockResultTypes) {
-        return task.emitError("mapper replay kernel yields inconsistent "
-                              "result types");
-      }
-    }
-    if (!sawYield)
-      return task.emitError("mapper replay kernel has no terminal neura.yield");
 
     MLIRContext *context = task.getContext();
     Location location = task.getLoc();
-    ModuleOp temporary = ModuleOp::create(location);
     OpBuilder builder(context);
-    builder.setInsertionPointToStart(temporary.getBody());
-    SmallVector<Type> argument_types;
-    for (BlockArgument argument : kernel.getBody().front().getArguments())
-      argument_types.push_back(argument.getType());
-    auto wrapper = builder.create<func::FuncOp>(
-        location, "__joint_task_mapper_replay__",
-        builder.getFunctionType(argument_types, wrapperResultTypes));
-    wrapper->setAttr("accelerator", builder.getStringAttr("neura"));
-    IRMapping mapping;
-    kernel.getBody().cloneInto(&wrapper.getBody(), mapping);
-    for (Block &block : wrapper.getBody()) {
-      if (auto yield =
-              dyn_cast<::mlir::neura::YieldOp>(block.getTerminator())) {
-        builder.setInsertionPoint(yield);
-        SmallVector<Value> returnValues;
-        for (Value result : yield.getResults()) {
-          // InsertDataMovPass only wraps Neura consumers. Give the mapper a
-          // routed producer for an operand-bearing func.return as well.
-          auto move = builder.create<::mlir::neura::DataMovOp>(
-              location, result.getType(), result);
-          returnValues.push_back(move.getResult());
-        }
-        builder.create<func::ReturnOp>(location, returnValues);
-        yield.erase();
-      }
+    ::mlir::neura::KernelOp kernel;
+    task.walk([&](::mlir::neura::KernelOp candidate) { kernel = candidate; });
+    ModuleOp temporary = ModuleOp::create(location);
+    std::string wrapperError;
+    func::FuncOp wrapper = buildCommonMapperReplayWrapper(
+        task, temporary, "__joint_task_mapper_replay__", wrapperError);
+    if (!wrapper)
+      return task.emitError() << wrapperError;
+
+    std::string preMapperWrapper;
+    if (profileOnly) {
+      preMapperWrapper = printCommonMapperReplayWrapper(wrapper);
     }
 
-    if (failed(::mlir::amoeba::neura::joint_scheduling::prepareMapperCounterBounds(wrapper)))
-      return task.emitError("invalid counter metadata or unprepared mapper body");
-
-    if (allUnitBaseline.getValue()) {
+    if (allUnitBaseline.getValue() || profileOnly) {
       auto currentArchitecture = llvm::MemoryBuffer::getFile(
           ::mlir::amoeba::getNeuraArchitectureSpecFile());
       if (!currentArchitecture ||
-          (*currentArchitecture)->getBuffer() != baselineArchitectureText)
-        return task.emitError("mapper architecture changed during all-unit "
-                              "baseline replay");
-      double startup = 0.0;
-      std::string startupError;
-      if (!deriveStructuralStartupCycles(wrapper, startup, startupError))
-        return task.emitError() << "cannot derive structural startup cycles: "
-                                << startupError;
-      if (!std::isfinite(startup) || startup <= 0.0 ||
-          !startupCycles.try_emplace(task.getTaskName(), startup).second)
-        return task.emitError("all-unit baseline structural startup is "
-                              "invalid or duplicated");
+          (*currentArchitecture)->getBuffer() != baselineArchitectureText) {
+        if (allUnitBaseline.getValue())
+          return task.emitError("mapper architecture changed during all-unit "
+                                "baseline replay");
+        return task.emitError("mapper architecture changed during source-owned "
+                              "mapper replay");
+      }
+      if (!profileOnly ||
+          startupCycles.find(task.getTaskName()) == startupCycles.end()) {
+        double startup = 0.0;
+        std::string startupError;
+        if (!deriveStructuralStartupCycles(wrapper, startup, startupError))
+          return task.emitError()
+                 << "cannot derive structural startup cycles: "
+                 << startupError;
+        const bool inserted =
+            startupCycles.try_emplace(task.getTaskName(), startup).second;
+        if (!std::isfinite(startup) || startup <= 0.0)
+          return task.emitError(
+              allUnitBaseline.getValue()
+                  ? "all-unit baseline structural startup is invalid or duplicated"
+                  : "source-owned mapper structural startup is invalid");
+        if (!inserted && !profileOnly)
+          return task.emitError(
+              "all-unit baseline structural startup is invalid or duplicated");
+      }
     }
 
     std::string errorForCache;
@@ -475,15 +621,19 @@ struct MapJointSchedulingTasksPass
         return task.emitError() << "cannot create mapper cache: " << ec.message();
       std::string key;
       llvm::raw_string_ostream keyStream(key);
-      keyStream << "orbit-exact-task-mapper-cache-v1\nrows=" << mapper_rows.getInt()
-                << " cols=" << mapper_cols.getInt() << "\n";
+      keyStream << "orbit-exact-task-mapper-cache-v1\nrows=" << mapperRows
+                << " cols=" << mapperCols << "\n";
       wrapper.print(keyStream, OpPrintingFlags().useLocalScope());
       auto architecture = llvm::MemoryBuffer::getFile(::mlir::amoeba::getNeuraArchitectureSpecFile());
       if (!architecture) return task.emitError("cannot read mapper cache architecture");
-      if (allUnitBaseline.getValue() &&
-          (*architecture)->getBuffer() != baselineArchitectureText)
-        return task.emitError("mapper architecture changed during all-unit "
-                              "baseline replay");
+      if ((allUnitBaseline.getValue() || profileOnly) &&
+          (*architecture)->getBuffer() != baselineArchitectureText) {
+        if (allUnitBaseline.getValue())
+          return task.emitError("mapper architecture changed during all-unit "
+                                "baseline replay");
+        return task.emitError("mapper architecture changed during source-owned "
+                              "mapper replay");
+      }
       keyStream << "\narchitecture:\n" << (*architecture)->getBuffer();
       keyStream.flush();
       {
@@ -518,15 +668,21 @@ struct MapJointSchedulingTasksPass
     PassManager manager(context);
     manager.addPass(::mlir::neura::createInsertDataMovPass());
     ::mlir::neura::MapToAcceleratorOptions options;
-    options.x_tiles = static_cast<int>(mapper_cols.getInt());
-    options.y_tiles = static_cast<int>(mapper_rows.getInt());
+    options.x_tiles = static_cast<int>(mapperCols);
+    options.y_tiles = static_cast<int>(mapperRows);
     manager.addPass(::mlir::neura::createMapToAcceleratorPass(options));
-    if (failed(manager.run(temporary)))
+    if (failed(manager.run(temporary))) {
+      if (profileOnly && expectedMapperFailure) {
+        *expectedMapperFailure = true;
+        return failure();
+      }
       return task.emitError("real per-task mapper replay failed");
+    }
 
       ++mappingCacheMisses;
     }
-    task->setAttr("amoeba.mapper_cache_hit", builder.getBoolAttr(cacheHit));
+    if (!profileOnly)
+      task->setAttr("amoeba.mapper_cache_hit", builder.getBoolAttr(cacheHit));
 
     auto mapping_info = wrapper->getAttrOfType<DictionaryAttr>(
         ::mlir::neura::attr::kMappingInfo);
@@ -543,8 +699,8 @@ struct MapJointSchedulingTasksPass
             ? mapping_info.getAs<IntegerAttr>(::mlir::neura::attr::kXTiles)
             : IntegerAttr();
     if (!compiled_ii || compiled_ii.getInt() <= 0 || !mapped_rows ||
-        !mapped_cols || mapped_rows.getInt() != mapper_rows.getInt() ||
-        mapped_cols.getInt() != mapper_cols.getInt())
+        !mapped_cols || mapped_rows.getInt() != mapperRows ||
+        mapped_cols.getInt() != mapperCols)
       return task.emitError(
           "mapper result does not match the selected oriented rectangle");
 
@@ -558,20 +714,24 @@ struct MapJointSchedulingTasksPass
             }, errorForCache))
       return task.emitError() << errorForCache;
 
-    // Preserve the actual mapped operations, not merely the mapper metadata.
-    for (Block &block : wrapper.getBody()) {
-      if (auto return_op = dyn_cast<func::ReturnOp>(block.getTerminator())) {
-        builder.setInsertionPoint(return_op);
-        builder.create<::mlir::neura::YieldOp>(location, ValueRange{},
-                                               return_op.getOperands());
-        return_op.erase();
+    if (!profileOnly) {
+      // Preserve the actual mapped operations, not merely the mapper metadata.
+      for (Block &block : wrapper.getBody()) {
+        if (auto return_op = dyn_cast<func::ReturnOp>(block.getTerminator())) {
+          builder.setInsertionPoint(return_op);
+          builder.create<::mlir::neura::YieldOp>(location, ValueRange{},
+                                                 return_op.getOperands());
+          return_op.erase();
+        }
       }
+      kernel.getBody().takeBody(wrapper.getBody());
     }
-    kernel.getBody().takeBody(wrapper.getBody());
 
-    task->setAttr("compiled_ii", compiled_ii);
-    task->setAttr("amoeba.mapper_mapping_info", mapping_info);
-    task->setAttr("amoeba.mapper_replay_verified", builder.getUnitAttr());
+    if (!profileOnly) {
+      task->setAttr("compiled_ii", compiled_ii);
+      task->setAttr("amoeba.mapper_mapping_info", mapping_info);
+      task->setAttr("amoeba.mapper_replay_verified", builder.getUnitAttr());
+    }
     auto tripCount =
         task->getAttrOfType<IntegerAttr>("amoeba.selected_trip_count");
     auto startup = startupCycles.find(task.getTaskName());
@@ -585,15 +745,30 @@ struct MapJointSchedulingTasksPass
         duration > std::numeric_limits<int64_t>::max())
       return task.emitError("real mapped task duration exceeds int64");
     const int64_t roundedDuration = static_cast<int64_t>(std::ceil(duration));
+    int64_t steps = 0;
+    int64_t materializedOperationCount = 0;
+    if (profileOnly) {
+      std::string profileError;
+      if (!collectActualMapperProfileFacts(wrapper.getBody(), steps,
+                                           materializedOperationCount,
+                                           profileError))
+        return task.emitError() << "cannot extract actual mapper profile: "
+                                << profileError;
+    }
     SmallVector<NamedAttribute> profile;
     profile.push_back(builder.getNamedAttr(
         "duration", builder.getI64IntegerAttr(roundedDuration)));
-    if (allUnitBaseline.getValue()) {
-      auto sourceWork = baselineSourceWorkCounts.find(task.getTaskName());
-      if (sourceWork == baselineSourceWorkCounts.end() ||
-          sourceWork->second < tripCount.getInt())
+    auto sourceWork = baselineSourceWorkCounts.find(task.getTaskName());
+    if ((allUnitBaseline.getValue() || profileOnly) &&
+        (sourceWork == baselineSourceWorkCounts.end() ||
+         sourceWork->second < tripCount.getInt())) {
+      if (allUnitBaseline.getValue())
         return task.emitError("all-unit baseline has no validated source work "
                               "count");
+      return task.emitError("source-owned mapper profile has no validated "
+                            "source work count");
+    }
+    if (allUnitBaseline.getValue()) {
       StringRef durationProvenance =
           "source-owned-all-unit-mapped-duration";
       profile.push_back(builder.getNamedAttr(
@@ -619,7 +794,233 @@ struct MapJointSchedulingTasksPass
       task->setAttr("amoeba.mapper_ml_prediction_status",
                     builder.getStringAttr("unknown"));
     }
-    task->setAttr("profile_info", builder.getDictionaryAttr(profile));
+    if (profileOnly) {
+      const long double stepsDuration =
+          static_cast<long double>(steps) +
+          static_cast<long double>(compiled_ii.getInt()) *
+              static_cast<long double>(tripCount.getInt() - 1);
+      if (!std::isfinite(stepsDuration) || stepsDuration < 1 ||
+          stepsDuration > std::numeric_limits<int64_t>::max())
+        return task.emitError("steps-based profile duration exceeds int64");
+      ParentProfileRow row;
+      row.task = task.getTaskName().str();
+      row.shape = profileShape->toCgraShapeAttrValue();
+      row.preMapperWrapper = std::move(preMapperWrapper);
+      row.candidateIndex = profileIndex;
+      row.cgraCount = profileShape->cgraCount();
+      row.mapperRows = mapperRows;
+      row.mapperCols = mapperCols;
+      row.compiledII = compiled_ii.getInt();
+      row.steps = steps;
+      row.materializedOperationCount = materializedOperationCount;
+      row.sampleTripCount = tripCount.getInt();
+      row.estimatedLatency = roundedDuration;
+      row.stepsFormulaLatency = static_cast<int64_t>(std::ceil(stepsDuration));
+      row.sourceIterationWorkCount = sourceWork->second;
+      auto domainStatus =
+          baselineSourceDomainStatuses.find(task.getTaskName());
+      if (domainStatus == baselineSourceDomainStatuses.end())
+        return task.emitError("parent profile export has no source-domain "
+                              "provenance status");
+      row.sourceIterationDomainStatus = domainStatus->second;
+      row.structuralStartupCycles = startup->second;
+      parentProfileRows.push_back(std::move(row));
+      parentProfileAttempts.push_back(
+          {task.getTaskName().str(), profileShape->toCgraShapeAttrValue(),
+           profileIndex, profileShape->cgraCount(), true, true, ""});
+    } else {
+      task->setAttr("profile_info", builder.getDictionaryAttr(profile));
+    }
+    return success();
+  }
+
+  LogicalResult writeParentProfile(ModuleOp module, func::FuncOp function,
+                                   ArrayRef<TaskflowTaskOp> tasks,
+                                   ArrayRef<RectShape> shapes) {
+    if (tasks.empty() || shapes.empty() ||
+        tasks.size() > static_cast<size_t>(
+                           std::numeric_limits<int64_t>::max()) /
+                           shapes.size())
+      return module.emitError("parent profile task/shape inventory is invalid");
+    const int64_t expectedAttempts =
+        static_cast<int64_t>(tasks.size() * shapes.size());
+    if (parentProfileAttempts.size() !=
+        static_cast<size_t>(expectedAttempts))
+      return module.emitError("parent profile attempt inventory is incomplete");
+    llvm::StringSet<> attemptKeys;
+    llvm::StringSet<> profileKeys;
+    for (const ParentProfileAttempt &attempt : parentProfileAttempts) {
+      if (attempt.candidateIndex <= 0 ||
+          attempt.candidateIndex > static_cast<int64_t>(shapes.size()))
+        return module.emitError("parent profile attempt inventory is malformed "
+                                "or duplicated");
+      const RectShape &expectedShape =
+          shapes[static_cast<size_t>(attempt.candidateIndex - 1)];
+      if (attempt.shape != expectedShape.toCgraShapeAttrValue() ||
+          attempt.cgraCount != expectedShape.cgraCount() ||
+          attempt.profileCreated != attempt.mapperSucceeded ||
+          !attemptKeys.insert(attempt.task + "\n" + attempt.shape).second)
+        return module.emitError("parent profile attempt inventory is malformed "
+                                "or duplicated");
+    }
+    for (TaskflowTaskOp task : tasks) {
+      for (const RectShape &shape : shapes) {
+        if (!attemptKeys.count(task.getTaskName().str() + "\n" +
+                               shape.toCgraShapeAttrValue()))
+          return module.emitError("parent profile attempt inventory omits a "
+                                  "task/shape pair");
+      }
+    }
+    for (const ParentProfileRow &row : parentProfileRows) {
+      const std::string key = row.task + "\n" + row.shape;
+      if (!attemptKeys.count(key) || !profileKeys.insert(key).second)
+        return module.emitError("parent profile rows do not match unique "
+                                "successful attempts");
+    }
+    for (const ParentProfileAttempt &attempt : parentProfileAttempts) {
+      const std::string key = attempt.task + "\n" + attempt.shape;
+      if (attempt.profileCreated != static_cast<bool>(profileKeys.count(key)))
+        return module.emitError("parent profile success attempt and row "
+                                "inventories disagree");
+    }
+
+    constexpr StringLiteral profileProvenance =
+        "source-owned-common-parent-profile-only-mapped-duration-v1";
+    json::Array taskRecords;
+    taskRecords.reserve(tasks.size());
+    for (TaskflowTaskOp task : tasks) {
+      json::Array profiles;
+      for (const ParentProfileRow &row : parentProfileRows) {
+        if (row.task != task.getTaskName())
+          continue;
+        json::Object profile;
+        profile["composed_cgra_count"] = row.cgraCount;
+        profile["composed_cgra_shape"] = row.shape;
+        profile["compiled_ii"] = row.compiledII;
+        profile["steps"] = row.steps;
+        profile["materialized_operation_count"] =
+            row.materializedOperationCount;
+        profile["sample_trip_count"] = row.sampleTripCount;
+        profile["estimated_latency"] = row.estimatedLatency;
+        profile["mapper_succeeded"] = true;
+        profile["mapper_tile_rows"] = row.mapperRows;
+        profile["mapper_tile_cols"] = row.mapperCols;
+        profile["structural_startup_cycles"] =
+            row.structuralStartupCycles;
+        profile["duration_provenance"] = profileProvenance.str();
+        profile["duration_formula"] =
+            "ceil(structural_startup_cycles + compiled_ii * "
+            "(sample_trip_count - 1))";
+        profile["steps_formula_estimated_latency"] = row.stepsFormulaLatency;
+        profile["startup_steps_match"] =
+            row.estimatedLatency == row.stepsFormulaLatency;
+        profile["source_iteration_work_count"] =
+            row.sourceIterationWorkCount;
+        profile["source_iteration_domain_status"] =
+            row.sourceIterationDomainStatus;
+        profile["source_iteration_domain_certified"] = true;
+        profile["source_iteration_domain_complete"] = true;
+        profile["pre_mapper_wrapper_byte_count"] =
+            static_cast<int64_t>(row.preMapperWrapper.size());
+        profile["pre_mapper_wrapper_bytes"] = row.preMapperWrapper;
+        profile["candidate_index_in_task"] = row.candidateIndex;
+        profiles.push_back(std::move(profile));
+      }
+      auto sourceWork = baselineSourceWorkCounts.find(task.getTaskName());
+      auto sourceDomainStatus =
+          baselineSourceDomainStatuses.find(task.getTaskName());
+      auto tripCount = task->getAttrOfType<IntegerAttr>(
+          "amoeba.selected_trip_count");
+      if (sourceWork == baselineSourceWorkCounts.end() ||
+          sourceDomainStatus == baselineSourceDomainStatuses.end() ||
+          !tripCount || tripCount.getInt() <= 0)
+        return module.emitError(
+            "parent profile task has incomplete source iteration evidence");
+      json::Object taskRecord;
+      taskRecord["task"] = task.getTaskName().str();
+      taskRecord["sample_trip_count"] = tripCount.getInt();
+      taskRecord["source_iteration_work_count"] = sourceWork->second;
+      taskRecord["source_iteration_domain_status"] = sourceDomainStatus->second;
+      taskRecord["source_iteration_domain_certified"] = true;
+      taskRecord["source_iteration_domain_complete"] = true;
+      taskRecord["profiles"] = std::move(profiles);
+      taskRecords.push_back(std::move(taskRecord));
+    }
+
+    json::Array attempts;
+    attempts.reserve(parentProfileAttempts.size());
+    for (const ParentProfileAttempt &attempt : parentProfileAttempts) {
+      json::Object record;
+      record["task"] = attempt.task;
+      record["candidate_index_in_task"] = attempt.candidateIndex;
+      record["shape"] = attempt.shape;
+      record["composed_cgra_count"] = attempt.cgraCount;
+      record["profile_created"] = attempt.profileCreated;
+      record["mapper_succeeded"] = attempt.mapperSucceeded;
+      if (!attempt.failureReason.empty())
+        record["failure_reason"] = attempt.failureReason;
+      attempts.push_back(std::move(record));
+    }
+
+    json::Array shapeDomain;
+    shapeDomain.reserve(shapes.size());
+    for (const RectShape &shape : shapes)
+      shapeDomain.push_back(shape.toCgraShapeAttrValue());
+
+    json::Object root;
+    root["format"] = "amoeba-task-profile-v1";
+    root["function"] = function.getSymName().str();
+    root["task_count"] = static_cast<int64_t>(tasks.size());
+    root["expected_candidate_count"] = expectedAttempts;
+    root["completed_candidate_count"] = expectedAttempts;
+    root["candidate_id"] = candidateId.getValue();
+    root["candidate_scope"] =
+        ::mlir::amoeba::neura::joint_scheduling::kSearchScope.str();
+    root["profile_provenance"] = profileProvenance.str();
+    root["source_iteration_domain_coverage_verified"] = true;
+    root["startup_provenance"] =
+        "source-owned-cpp-route-expanded-structural-critical-path-v1";
+    root["mapper_ii_provenance"] = "native-neura-map-to-accelerator-v1";
+    root["duration_formula"] =
+        "ceil(structural_startup_cycles + compiled_ii * "
+        "(sample_trip_count - 1))";
+    root["shape_domain"] = std::move(shapeDomain);
+    root["architecture_spec_path"] =
+        ::mlir::amoeba::getNeuraArchitectureSpecFile();
+    root["architecture_spec_text"] = baselineArchitectureText;
+    root["hardware_coordinates"] = json::Object{
+        {"multi_cgra_grid_rows", parentProfileGridRows},
+        {"multi_cgra_grid_cols", parentProfileGridCols},
+        {"per_cgra_tile_rows", parentProfilePerCgraRows},
+        {"per_cgra_tile_cols", parentProfilePerCgraCols},
+        {"total_mapper_rows",
+         parentProfileGridRows * parentProfilePerCgraRows},
+        {"total_mapper_cols",
+         parentProfileGridCols * parentProfilePerCgraCols}};
+    root["canonical_witness_format"] =
+        "mlir-generic-print-use-local-scope-v1";
+    root["canonical_module_witness_byte_count"] =
+        static_cast<int64_t>(parentProfileCanonicalModuleText.size());
+    root["canonical_module_witness_bytes"] =
+        parentProfileCanonicalModuleText;
+    root["canonical_function_witness_byte_count"] =
+        static_cast<int64_t>(parentProfileCanonicalFunctionText.size());
+    root["canonical_function_witness_bytes"] =
+        parentProfileCanonicalFunctionText;
+    root["whole_program_scheduler_invoked"] = false;
+    root["tasks"] = std::move(taskRecords);
+    root["candidate_attempts"] = std::move(attempts);
+
+    std::string writeError;
+    if (!::mlir::amoeba::neura::joint_scheduling::writeAtomically(
+            parentProfileOutput.getValue(),
+            [&](llvm::raw_ostream &stream) {
+              stream << json::Value(std::move(root)) << "\n";
+              return true;
+            },
+            writeError))
+      return module.emitError() << "cannot publish parent profile: "
+                                << writeError;
     return success();
   }
 
@@ -632,6 +1033,18 @@ struct MapJointSchedulingTasksPass
     if (failed(selectedFunction)) {
       module.emitError() << error;
       return signalPassFailure();
+    }
+    if (isParentProfileMode()) {
+      llvm::raw_string_ostream moduleStream(parentProfileCanonicalModuleText);
+      module.print(moduleStream,
+                   OpPrintingFlags().printGenericOpForm().useLocalScope());
+      moduleStream.flush();
+      llvm::raw_string_ostream functionStream(
+          parentProfileCanonicalFunctionText);
+      (*selectedFunction).print(
+          functionStream,
+          OpPrintingFlags().printGenericOpForm().useLocalScope());
+      functionStream.flush();
     }
     for (func::FuncOp function : module.getOps<func::FuncOp>()) {
       if (function == *selectedFunction)
@@ -646,6 +1059,7 @@ struct MapJointSchedulingTasksPass
     }
     if (failed(loadStartupCycles(module, selectedFunction->getSymName())))
       return signalPassFailure();
+    const bool parentProfileMode = isParentProfileMode();
     if (allUnitBaseline.getValue()) {
       auto candidate = (*selectedFunction)->getAttrOfType<StringAttr>(
           "joint_scheduling_candidate_id");
@@ -664,6 +1078,60 @@ struct MapJointSchedulingTasksPass
         return signalPassFailure();
       }
     }
+    llvm::SmallVector<RectShape> parentProfileShapes;
+    if (parentProfileMode) {
+      auto candidate = (*selectedFunction)->getAttrOfType<StringAttr>(
+          "joint_scheduling_candidate_id");
+      auto scope = (*selectedFunction)->getAttrOfType<StringAttr>(
+          "joint_scheduling_candidate_scope");
+      if (!candidate || candidate.getValue() != materializedCandidateId ||
+          !scope || scope.getValue() !=
+                        ::mlir::amoeba::neura::joint_scheduling::kSearchScope) {
+        selectedFunction->emitError(
+            "parent profile export requires a source-bound static-shape "
+            "candidate with the requested candidate-id");
+        return signalPassFailure();
+      }
+      std::string rewriteError;
+      if (hasParentProfileRewriteEvidence(*selectedFunction, rewriteError)) {
+        selectedFunction->emitError() << rewriteError;
+        return signalPassFailure();
+      }
+      const auto &architecture = ::mlir::neura::getArchitecture();
+      parentProfileGridRows = architecture.getMultiCgraRows();
+      parentProfileGridCols = architecture.getMultiCgraColumns();
+      parentProfilePerCgraRows = architecture.getPerCgraRows();
+      parentProfilePerCgraCols = architecture.getPerCgraColumns();
+      parentProfileShapes =
+          ::mlir::amoeba::neura::joint_scheduling::enumerateStaticRectShapes(
+              architecture.getMultiCgraRows(),
+              architecture.getMultiCgraColumns(),
+              architecture.getPerCgraRows(),
+              architecture.getPerCgraColumns(), 4);
+      if (parentProfileShapes.empty()) {
+        selectedFunction->emitError(
+            "parent profile export has no legal area<=4 mapper shapes");
+        return signalPassFailure();
+      }
+      constexpr std::array<const char *, 8> canonicalShapeOrder = {
+          "1x1", "1x2", "2x1", "1x3", "3x1", "2x2", "1x4", "4x1"};
+      llvm::SmallVector<RectShape> orderedShapes;
+      for (const char *rawSpelling : canonicalShapeOrder) {
+        StringRef spelling(rawSpelling);
+        auto shape = llvm::find_if(parentProfileShapes, [&](const RectShape &v) {
+          return spelling == v.toCgraShapeAttrValue();
+        });
+        if (shape != parentProfileShapes.end())
+          orderedShapes.push_back(*shape);
+      }
+      if (orderedShapes.size() != parentProfileShapes.size()) {
+        selectedFunction->emitError(
+            "parent profile export found a legal rectangle outside the "
+            "canonical area<=4 profile domain");
+        return signalPassFailure();
+      }
+      parentProfileShapes = std::move(orderedShapes);
+    }
     SmallVector<TaskflowTaskOp> tasks;
     selectedFunction->walk([&](TaskflowTaskOp task) { tasks.push_back(task); });
     if (tasks.empty()) {
@@ -678,6 +1146,43 @@ struct MapJointSchedulingTasksPass
       if (!selected || selected.getValue() != materializedCandidateId) {
         task.emitError("mapper replay candidate identity does not match IR");
         return signalPassFailure();
+      }
+    }
+    if (parentProfileMode) {
+      for (TaskflowTaskOp task : tasks) {
+        auto selectedCount = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_cgra_count");
+        auto mapperRows = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_mapper_tile_rows");
+        auto mapperCols = task->getAttrOfType<IntegerAttr>(
+            "amoeba.selected_mapper_tile_cols");
+        auto shape =
+            task->getAttrOfType<StringAttr>("amoeba.selected_cgra_shape");
+        auto cgraCount = task->getAttrOfType<IntegerAttr>("cgra_count");
+        auto cgraShape = task->getAttrOfType<StringAttr>("cgra_shape");
+        const RectShape *canonicalShape = nullptr;
+        if (shape) {
+          for (const RectShape &candidateShape : parentProfileShapes)
+            if (shape.getValue() == candidateShape.toCgraShapeAttrValue()) {
+              canonicalShape = &candidateShape;
+              break;
+            }
+        }
+        if (!canonicalShape || !selectedCount ||
+            selectedCount.getInt() != canonicalShape->cgraCount() ||
+            !mapperRows || mapperRows.getInt() != canonicalShape->mapperRows ||
+            !mapperCols || mapperCols.getInt() != canonicalShape->mapperCols ||
+            !cgraCount || cgraCount.getInt() != canonicalShape->cgraCount() ||
+            !cgraShape || cgraShape.getValue() != shape.getValue() ||
+            !task->getAttrOfType<UnitAttr>(
+                "amoeba.joint_shape_orientation_fixed") ||
+            task->hasAttr("active_replicas") || task->hasAttr("replicas") ||
+            task->hasAttr("replica_shapes") ||
+            task->hasAttr("original_replica_count")) {
+          task.emitError("parent profile export requires a well-formed fixed "
+                         "orientation legal area<=4 shape");
+          return signalPassFailure();
+        }
       }
     }
     if (allUnitBaseline.getValue()) {
@@ -707,15 +1212,25 @@ struct MapJointSchedulingTasksPass
           return signalPassFailure();
         }
       }
+    }
+    if (allUnitBaseline.getValue() || parentProfileMode) {
+      const StringRef modeLabel = parentProfileMode ? "parent profile export"
+                                                    : "all-unit baseline";
       std::string metadataError;
       FailureOr<llvm::SmallVector<
           ::mlir::amoeba::neura::joint_scheduling::TaskMetadata>> metadata =
           ::mlir::amoeba::neura::joint_scheduling::collectAnalyticalTaskMetadata(
               *selectedFunction, metadataError);
       if (failed(metadata)) {
-        module.emitError() << "all-unit baseline requires a valid complete "
-                              "source-domain certificate: "
-                           << metadataError;
+        if (parentProfileMode)
+          module.emitError() << modeLabel
+                            << " requires a valid complete source-domain "
+                               "certificate: "
+                            << metadataError;
+        else
+          module.emitError() << "all-unit baseline requires a valid complete "
+                                "source-domain certificate: "
+                             << metadataError;
         return signalPassFailure();
       }
       for (const auto &entry : *metadata) {
@@ -723,44 +1238,91 @@ struct MapJointSchedulingTasksPass
             "amoeba.selected_trip_count");
         if (!entry.sourceIterationDomainCertified ||
             !entry.sourceIterationDomainComplete || !entry.tripCountKnown ||
-            entry.tripCount <= 0 || entry.sourceIterationWorkCount < entry.tripCount) {
-          module.emitError() << "all-unit baseline requires a complete, "
-                                "source-owned iteration-domain certificate "
-                                "and proven current count for task "
-                             << entry.name;
+            entry.tripCount <= 0 ||
+            entry.sourceIterationWorkCount < entry.tripCount) {
+          if (parentProfileMode)
+            module.emitError() << modeLabel
+                              << " requires a complete, source-owned "
+                                 "iteration-domain certificate and proven "
+                                 "current count for task "
+                              << entry.name;
+          else
+            module.emitError() << "all-unit baseline requires a complete, "
+                                  "source-owned iteration-domain certificate "
+                                  "and proven current count for task "
+                               << entry.name;
           return signalPassFailure();
         }
         if (!selectedTrip || selectedTrip.getInt() != entry.tripCount) {
-          module.emitError() << "all-unit baseline current Taskflow firing "
-                                "count does not match its selected candidate "
-                                "count for task "
-                             << entry.name;
+          if (parentProfileMode)
+            module.emitError() << modeLabel
+                              << " current Taskflow firing count does not "
+                                 "match its source-certified count for task "
+                              << entry.name;
+          else
+            module.emitError() << "all-unit baseline current Taskflow firing "
+                                  "count does not match its selected candidate "
+                                  "count for task "
+                               << entry.name;
           return signalPassFailure();
         }
-        baselineSourceWorkCounts[entry.name] = entry.sourceIterationWorkCount;
+        baselineSourceWorkCounts[entry.name] =
+            entry.sourceIterationWorkCount;
+        if (parentProfileMode)
+          baselineSourceDomainStatuses[entry.name] =
+              entry.sourceIterationDomainStatus;
       }
       if (metadata->size() != tasks.size()) {
-        module.emitError("all-unit baseline source count coverage differs "
-                         "from the selected task set");
+        if (parentProfileMode)
+          module.emitError() << modeLabel
+                             << " source count coverage differs from the "
+                                "selected task set";
+        else
+          module.emitError("all-unit baseline source count coverage differs "
+                           "from the selected task set");
         return signalPassFailure();
       }
       llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> architecture =
           llvm::MemoryBuffer::getFile(
               ::mlir::amoeba::getNeuraArchitectureSpecFile());
       if (!architecture || (*architecture)->getBuffer().empty()) {
-        module.emitError("all-unit baseline cannot read the current mapper "
-                         "architecture");
+        if (parentProfileMode)
+          module.emitError() << modeLabel
+                             << " cannot read the current mapper architecture";
+        else
+          module.emitError("all-unit baseline cannot read the current mapper "
+                           "architecture");
         return signalPassFailure();
       }
       baselineArchitectureText = (*architecture)->getBuffer().str();
     }
-    if (!allUnitBaseline.getValue() && startupCycles.size() != tasks.size()) {
+    if (!allUnitBaseline.getValue() && !parentProfileMode &&
+        startupCycles.size() != tasks.size()) {
       module.emitError("selected score task coverage does not match replay");
       return signalPassFailure();
     }
-    for (TaskflowTaskOp task : tasks)
-      if (failed(mapTask(task)))
-        return signalPassFailure();
+    if (parentProfileMode) {
+      for (TaskflowTaskOp task : tasks) {
+        for (auto [shapeIndex, shape] : llvm::enumerate(parentProfileShapes)) {
+          bool expectedMapperFailure = false;
+          if (failed(mapTask(task, &shape,
+                             static_cast<int64_t>(shapeIndex + 1),
+                             &expectedMapperFailure))) {
+            if (!expectedMapperFailure)
+              return signalPassFailure();
+            parentProfileAttempts.push_back(
+                {task.getTaskName().str(), shape.toCgraShapeAttrValue(),
+                 static_cast<int64_t>(shapeIndex + 1), shape.cgraCount(),
+                 false, false,
+                 "native-neura-map-to-accelerator-failed"});
+          }
+        }
+      }
+    } else {
+      for (TaskflowTaskOp task : tasks)
+        if (failed(mapTask(task)))
+          return signalPassFailure();
+    }
     if (startupCycles.size() != tasks.size()) {
       module.emitError("structural startup coverage does not match mapper replay");
       return signalPassFailure();
@@ -826,6 +1388,19 @@ struct MapJointSchedulingTasksPass
       (*selectedFunction)->setAttr(
           "joint_scheduling_candidate_id",
           StringAttr::get(module.getContext(), "candidate-0"));
+    }
+    if (parentProfileMode) {
+      if (failed(writeParentProfile(module, *selectedFunction, tasks,
+                                    parentProfileShapes)))
+        return signalPassFailure();
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_mapper_profile_export_only",
+          UnitAttr::get(module.getContext()));
+      (*selectedFunction)->setAttr(
+          "joint_scheduling_mapper_profile_export_provenance",
+          StringAttr::get(
+              module.getContext(),
+              "source-owned-common-parent-profile-only-mapped-duration-v1"));
     }
     (*selectedFunction)->setAttr("joint_scheduling_mapper_cache_hits", IntegerAttr::get(IntegerType::get(module.getContext(), 64), mappingCacheHits));
     (*selectedFunction)->setAttr("joint_scheduling_mapper_cache_misses", IntegerAttr::get(IntegerType::get(module.getContext(), 64), mappingCacheMisses));

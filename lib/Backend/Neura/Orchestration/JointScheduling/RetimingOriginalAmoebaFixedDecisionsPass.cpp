@@ -9,7 +9,10 @@
 #include "AnalyticalMLPInference.h"
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
+#include "CommonAmoebaParentProfiles.h"
+#include "CommonMapperReplayWrapper.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
+#include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
 #include "NeuraDialect/Architecture/Architecture.h"
@@ -1812,7 +1815,8 @@ static bool verifyOriginalProfileBinding(
 
 static bool readTaskTrace(TaskflowTaskOp task, unsigned taskIndex,
                           unsigned dispatchIndex, OriginalTraceTask &trace,
-                          std::string &error) {
+                          std::string &error,
+                          bool commonProfileDuration = false) {
   auto fail = [&](StringRef message) {
     error = "task " + task.getTaskName().str() + ": " + message.str();
     return false;
@@ -1892,7 +1896,7 @@ static bool readTaskTrace(TaskflowTaskOp task, unsigned taskIndex,
                               formulaDuration) ||
       !checkedF45SchedulerDuration(formulaDuration, *activeReplicas,
                                    expectedF45Duration) ||
-      expectedF45Duration != *profileDuration)
+      (!commonProfileDuration && expectedF45Duration != *profileDuration))
     return fail("F45 profile_info duration is inconsistent with the full "
                 "mapper formula and original active-replica ceil divisor");
 
@@ -2054,7 +2058,8 @@ struct OriginalScheduleInventory {
 
 static bool readOriginalScheduleInventory(
     func::FuncOp function, ArrayRef<TaskMetadata> tasks,
-    OriginalScheduleInventory &inventory, std::string &error) {
+    OriginalScheduleInventory &inventory, std::string &error,
+    bool commonProfileDuration = false) {
   auto fail = [&](StringRef reason) {
     error = "original throughput-guided schedule inventory: " + reason.str();
     return false;
@@ -2128,7 +2133,7 @@ static bool readOriginalScheduleInventory(
         inventory.dispatchOrder[*dispatchIndex] != index)
       return fail("parent task dispatch index disagrees with original order");
     if (!readTaskTrace(task, index, static_cast<unsigned>(*dispatchIndex),
-                       inventory.traces[index], error))
+                       inventory.traces[index], error, commonProfileDuration))
       return false;
     if (inventory.traces[index].sampleTripCount != tasks[index].tripCount)
       return fail("parent profile sample trip differs from compiler-inferred macro trip");
@@ -2610,10 +2615,32 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       *this, "replica-profile-evidence-file",
       llvm::cl::desc("Exact profiles and body exports for materialized replicas."),
       llvm::cl::init("")};
+  Option<std::string> commonParentProfileFile{
+      *this, "common-parent-profile-file",
+      llvm::cl::desc("Source-owned common-DGF parent mapper profiles."),
+      llvm::cl::init("")};
+  Option<std::string> commonCanonicalModuleFile{
+      *this, "common-canonical-module-file",
+      llvm::cl::desc("Exact pre-F45 canonical module used for common profiles."),
+      llvm::cl::init("")};
+  Option<std::string> commonSourceRepository{
+      *this, "common-source-repository",
+      llvm::cl::desc("Optional source repository provenance for common profiles."),
+      llvm::cl::init("")};
+  Option<std::string> commonSourceCommit{
+      *this, "common-source-commit",
+      llvm::cl::desc("Optional source commit provenance for common profiles."),
+      llvm::cl::init("")};
   Option<bool> originalF45ReplicaScaling{
       *this, "original-f45-replica-scaling",
       llvm::cl::desc("Preserve original F45 replica duration estimation without "
                      "claiming actual split-child mapper profiles."),
+      llvm::cl::init(false)};
+  Option<bool> rescheduleWithProductionScheduler{
+      *this, "reschedule-with-production-scheduler",
+      llvm::cl::desc("Keep original AMOEBA shape/count/replica choices but "
+                     "select new placements and dispatch with the common "
+                     "communication-aware ORBIT production scheduler."),
       llvm::cl::init(false)};
   Option<std::string> outputFile{*this, "output",
                                  llvm::cl::desc("Atomic JSON result path."),
@@ -2625,6 +2652,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    const bool useCommonParentProfile = !commonParentProfileFile.empty();
     const std::string currentInputModuleWitness =
         neighborhoodReplaySourceText(module);
     if (diagnosticIICeiling != 20 && diagnosticIICeiling != 23) {
@@ -2632,11 +2660,28 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           << "diagnostic-ii-ceiling accepts only 20 (default) or 23";
       return signalPassFailure();
     }
-    if (functionName.empty() || parentCostFile.empty() ||
-        bodyExportFile.empty() || outputFile.empty()) {
+    if (functionName.empty() || outputFile.empty() ||
+        (useCommonParentProfile
+             ? commonCanonicalModuleFile.empty()
+             : (parentCostFile.empty() || bodyExportFile.empty()))) {
+      module.emitError() << (useCommonParentProfile
+                                 ? "function, common-parent-profile-file, "
+                                   "common-canonical-module-file and output "
+                                   "are required"
+                                 : "function, parent-cost-file, "
+                                   "profile-body-export-file and output are "
+                                   "required");
+      return signalPassFailure();
+    }
+    if (useCommonParentProfile &&
+        (!rescheduleWithProductionScheduler ||
+         !originalF45ReplicaScaling || !bodyExportFile.empty() ||
+         !replicaProfileEvidenceFile.empty() ||
+         commonSourceRepository.empty() != commonSourceCommit.empty())) {
       module.emitError()
-          << "function, parent-cost-file, profile-body-export-file and output "
-             "are required";
+          << "common parent profiles require production-scheduler rescheduling, "
+             "explicit original-F45 replica scaling, no legacy body/child "
+             "profile files, and paired optional source repository/commit";
       return signalPassFailure();
     }
 
@@ -2654,11 +2699,15 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     if (assignedOriginalGraphId) {
       graphId = StringAttr::get(module.getContext(),
                                 kOriginalBaselineGraphVariantId);
-      function->setAttr("amoeba.graph_variant_id", graphId);
+      if (!useCommonParentProfile)
+        function->setAttr("amoeba.graph_variant_id", graphId);
     }
 
     FailureOr<llvm::SmallVector<TaskMetadata>> collectedCurrent =
-        collectAnalyticalTaskMetadata(function, error);
+        useCommonParentProfile
+            ? collectAnalyticalTaskMetadataForSourcePartitionProof(function,
+                                                                    error)
+            : collectAnalyticalTaskMetadata(function, error);
     if (failed(collectedCurrent) || collectedCurrent->empty()) {
       function.emitError() << (error.empty() ? "no static Taskflow tasks"
                                               : error);
@@ -2668,7 +2717,21 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     const bool hasReplicaEvidence = !replicaProfileEvidenceFile.empty();
     const bool hasDecisionManifest =
         function->hasAttr(kOriginalMaterializedDecisionsAttr);
-    if (originalF45ReplicaScaling &&
+    if (rescheduleWithProductionScheduler &&
+        (hasReplicaEvidence || hasDecisionManifest)) {
+      function.emitError()
+          << "production-scheduler rescheduling currently accepts only the "
+             "original parent task inventory, not materialized replica children";
+      return signalPassFailure();
+    }
+    if (rescheduleWithProductionScheduler && !originalF45ReplicaScaling) {
+      function.emitError()
+          << "production-scheduler rescheduling requires explicit "
+             "original-f45-replica-scaling=true for its duration policy";
+      return signalPassFailure();
+    }
+    const bool useOriginalF45ReplicaScaling = originalF45ReplicaScaling;
+    if (useOriginalF45ReplicaScaling &&
         (hasReplicaEvidence || hasDecisionManifest)) {
       function.emitError()
           << "original F45 replica scaling and actual materialized-child "
@@ -2732,19 +2795,21 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           auto active = task.op->getAttrOfType<IntegerAttr>("active_replicas");
           return active && active.getInt() > 1;
         });
-    // The original estimate consumes the unchanged parent module. Reprint
-    // that current module independently, including the graph label installed
-    // above, rather than trusting the catalog's serialized witness.
-    if (originalF45ReplicaScaling && hasScheduledReplicaInventory)
+    // Legacy predictor catalogues bind directly to the current module. The
+    // native common-profile path instead binds its pre-F45 canonical module
+    // through the exact witness verifier below.
+    if (!useCommonParentProfile && useOriginalF45ReplicaScaling &&
+        hasScheduledReplicaInventory)
       canonicalModuleWitness = neighborhoodReplaySourceText(module);
-    if (!originalF45ReplicaScaling &&
+    if (!useOriginalF45ReplicaScaling &&
         hasScheduledReplicaInventory != hasReplicaEvidence) {
       function.emitError()
           << "replica profile evidence presence does not match the canonical "
              "parent replica inventory";
       return signalPassFailure();
     }
-    if (!verifyOriginalAmoebaSourceDomainCoverage(
+    if (!useCommonParentProfile &&
+        !verifyOriginalAmoebaSourceDomainCoverage(
             sourceTasks, error, diagnosticIICeiling == 23,
             hasScheduledReplicaInventory)) {
       sourceFunction.emitError() << error;
@@ -2753,9 +2818,81 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
 
     OriginalScheduleInventory sourceSchedule;
     if (!readOriginalScheduleInventory(sourceFunction, sourceTasks,
-                                       sourceSchedule, error)) {
+                                       sourceSchedule, error, useCommonParentProfile)) {
       sourceFunction.emitError() << error;
       return signalPassFailure();
+    }
+    CommonAmoebaParentProfiles commonProfiles;
+    if (useCommonParentProfile) {
+      const int64_t commonPerCgraRows =
+          ::mlir::neura::getArchitecture().getPerCgraRows();
+      const int64_t commonPerCgraCols =
+          ::mlir::neura::getArchitecture().getPerCgraColumns();
+      if (sourceTasks.size() != currentTasks.size() || sourceFunction != function) {
+        function.emitError()
+            << "common parent profiles require the unchanged original F45 task inventory";
+        return signalPassFailure();
+      }
+      llvm::SmallVector<CommonAmoebaF45TaskChoice> choices;
+      choices.reserve(sourceTasks.size());
+      for (auto [index, task] : llvm::enumerate(sourceTasks)) {
+        const OriginalTraceTask &trace = sourceSchedule.traces[index];
+        if (trace.placement.selectedRows < 1 ||
+            trace.placement.selectedCols < 1 ||
+            trace.placement.selectedRows >
+                std::numeric_limits<int64_t>::max() / commonPerCgraRows ||
+            trace.placement.selectedCols >
+                std::numeric_limits<int64_t>::max() / commonPerCgraCols) {
+          task.op.emitError()
+              << "original F45 selected mapper rectangle is invalid";
+          return signalPassFailure();
+        }
+        choices.push_back(
+            {task.name, trace.selectedShape, trace.selectedCount,
+             trace.placement.selectedRows * commonPerCgraRows,
+             trace.placement.selectedCols * commonPerCgraCols,
+             static_cast<int64_t>(trace.placement.activeReplicas),
+             task.tripCount, trace.compiledII, trace.steps,
+             trace.materializedOperationCount, trace.profileDuration});
+      }
+      if (!verifyCommonAmoebaParentProfiles(
+              commonParentProfileFile.getValue(),
+              commonCanonicalModuleFile.getValue(), functionName.getValue(),
+              module, function, currentTasks, choices, diagnosticIICeiling,
+              commonProfiles, error)) {
+        function.emitError() << error;
+        return signalPassFailure();
+      }
+      if (!refreshCommonAmoebaSourceIterationBindings(function, error)) {
+        function.emitError() << error;
+        return signalPassFailure();
+      }
+      FailureOr<llvm::SmallVector<TaskMetadata>> reboundTasks =
+          collectAnalyticalTaskMetadata(function, error);
+      if (failed(reboundTasks) || reboundTasks->size() != sourceTasks.size()) {
+        function.emitError()
+            << (error.empty()
+                    ? "source-binding refresh changed the current task inventory"
+                    : error);
+        return signalPassFailure();
+      }
+      currentTasks = std::move(*reboundTasks);
+      sourceTasks = currentTasks;
+      if (!verifyOriginalAmoebaSourceDomainCoverage(
+              sourceTasks, error, diagnosticIICeiling == 23,
+              hasScheduledReplicaInventory)) {
+        function.emitError() << error;
+        return signalPassFailure();
+      }
+      if (assignedOriginalGraphId)
+        function->setAttr("amoeba.graph_variant_id", graphId);
+      OriginalScheduleInventory reboundSchedule;
+      if (!readOriginalScheduleInventory(sourceFunction, sourceTasks,
+                                         reboundSchedule, error, true)) {
+        sourceFunction.emitError() << error;
+        return signalPassFailure();
+      }
+      sourceSchedule = std::move(reboundSchedule);
     }
     for (const OriginalTraceTask &trace : sourceSchedule.traces) {
       if (trace.compiledII > diagnosticIICeiling) {
@@ -2909,7 +3046,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       traces = sourceSchedule.traces;
       for (auto [index, trace] : llvm::enumerate(traces)) {
         trace.placement.task = index;
-        if (originalF45ReplicaScaling) {
+        if (useOriginalF45ReplicaScaling) {
           trace.placement.occupiedCells = trace.originalOccupiedCells;
           trace.contextIds = trace.originalContextIds;
         }
@@ -2930,7 +3067,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     }
 
     OriginalAmoebaProfileBodyExport bodyExport;
-    if (!verifyOriginalProfileBinding(
+    if (!useCommonParentProfile && !verifyOriginalProfileBinding(
             parentCostFile.getValue(), bodyExportFile.getValue(),
             sourceFunction, graphId.getValue(), sourceTasks,
             sourceSchedule.traces, perCgraRows, perCgraCols,
@@ -2945,7 +3082,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     std::vector<std::string> expandedProfileFiles(tasks.size());
     std::vector<std::string> expandedBodyExportFiles(tasks.size());
     std::vector<OriginalAmoebaProfileBodyEvidence> expandedBodies(tasks.size());
-    if (hasReplicaEvidence) {
+    if (useCommonParentProfile) {
+      for (unsigned index = 0; index < tasks.size(); ++index)
+        parentTaskNames[index] = tasks[index].name;
+    } else if (hasReplicaEvidence) {
       for (const auto &entry : replicaEvidenceRecords) {
         const OriginalReplicaProfileEvidenceRef &reference = entry.second;
         auto decision = materializedDecisions.find(reference.parentTask);
@@ -3060,12 +3200,16 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     std::string catalogArchitecturePath;
     std::string catalogModelStatus;
     bool catalogProductionReady = false;
-    if (!readCostProvenance(parentCostFile.getValue(), sourceRepository,
-                            sourceCommit, catalogArchitecturePath,
-                            catalogProductionReady, catalogModelStatus,
-                            error) ||
-        !samePath(catalogArchitecturePath,
-                  ::mlir::amoeba::getNeuraArchitectureSpecFile())) {
+    if (useCommonParentProfile) {
+      sourceRepository = commonSourceRepository.getValue();
+      sourceCommit = commonSourceCommit.getValue();
+      catalogArchitecturePath = commonProfiles.architectureSpecPath;
+    } else if (!readCostProvenance(parentCostFile.getValue(), sourceRepository,
+                                   sourceCommit, catalogArchitecturePath,
+                                   catalogProductionReady, catalogModelStatus,
+                                   error) ||
+               !samePath(catalogArchitecturePath,
+                         ::mlir::amoeba::getNeuraArchitectureSpecFile())) {
       function.emitError() << (error.empty()
                                    ? "cost catalog architecture differs from "
                                      "the configured architecture"
@@ -3078,7 +3222,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             ? (hasReplicaEvidence ? canonicalModuleWitness
                                   : neighborhoodReplaySourceText(module))
             : std::string();
-    if (!costs.load(parentCostFile.getValue(), function.getSymName(), sourceTasks,
+    if (!useCommonParentProfile &&
+        !costs.load(parentCostFile.getValue(), function.getSymName(), sourceTasks,
                     sourceRepository, sourceCommit, catalogArchitecturePath,
                     graphId.getValue(), error, diagnosticIICeiling == 23,
                     costCanonicalModuleWitness)) {
@@ -3094,7 +3239,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     std::vector<double> startupCycles(tasks.size(), 0.0);
     llvm::json::Array taskCostsJson;
     for (unsigned index = 0; index < tasks.size(); ++index) {
-      const OriginalTraceTask &trace = traces[index];
+      OriginalTraceTask &trace = traces[index];
       int64_t mapperRows = 0;
       int64_t mapperCols = 0;
       if (trace.placement.selectedRows >
@@ -3111,23 +3256,60 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                                        trace.placement.selectedCols, mapperRows,
                                        mapperCols}};
       std::string costError;
-      const TaskShapeCost *cost = costs.get(choice, costError);
-      if (!cost || !cost->supported) {
-        tasks[index].op.emitError()
-            << (costError.empty() ? "selected original shape has no supported "
-                                    "bound startup cost"
-                                  : costError);
-        return signalPassFailure();
+      const TaskShapeCost *cost = nullptr;
+      double selectedStartup = 0.0;
+      std::optional<int64_t> duration;
+      if (useCommonParentProfile) {
+        auto taskProfileIndex = commonProfiles.taskIndices.find(tasks[index].name);
+        if (taskProfileIndex == commonProfiles.taskIndices.end() ||
+            taskProfileIndex->second >= commonProfiles.tasks.size()) {
+          tasks[index].op.emitError()
+              << "common parent profile omits the current source task";
+          return signalPassFailure();
+        }
+        auto profile = commonProfiles.tasks[taskProfileIndex->second]
+                           .profilesByShape.find(trace.selectedShape);
+        if (profile == commonProfiles.tasks[taskProfileIndex->second]
+                           .profilesByShape.end()) {
+          tasks[index].op.emitError()
+              << "common parent profile omits the selected F45 shape";
+          return signalPassFailure();
+        }
+        const CommonAmoebaMapperShapeProfile &selectedProfile =
+            profile->second;
+        trace.compiledII = selectedProfile.compiledII;
+        trace.steps = selectedProfile.steps;
+        trace.materializedOperationCount =
+            selectedProfile.materializedOperationCount;
+        trace.sampleTripCount = selectedProfile.sampleTripCount;
+        trace.fullMapperDuration = selectedProfile.estimatedLatency;
+        selectedStartup = selectedProfile.structuralStartupCycles;
+        duration = computeMappedDuration(trace.compiledII, selectedStartup,
+                                         tasks[index].tripCount, costError);
+        if (duration && *duration != selectedProfile.estimatedLatency) {
+          tasks[index].op.emitError()
+              << "common parent profile duration differs from its checked formula";
+          return signalPassFailure();
+        }
+      } else {
+        cost = costs.get(choice, costError);
+        if (!cost || !cost->supported) {
+          tasks[index].op.emitError()
+              << (costError.empty()
+                      ? "selected original shape has no supported bound startup cost"
+                      : costError);
+          return signalPassFailure();
+        }
+        selectedStartup = cost->startupCycles;
+        duration = computeMappedDuration(trace.compiledII, selectedStartup,
+                                         tasks[index].tripCount, costError);
       }
-      std::optional<int64_t> duration =
-          computeMappedDuration(trace.compiledII, cost->startupCycles,
-                                tasks[index].tripCount, costError);
       if (!duration) {
         tasks[index].op.emitError() << costError;
         return signalPassFailure();
       }
       fullParentMappedDurations[index] = *duration;
-      if (originalF45ReplicaScaling) {
+      if (useOriginalF45ReplicaScaling) {
         int64_t scaledDuration = 0;
         if (!checkedF45SchedulerDuration(
                 *duration, trace.placement.activeReplicas, scaledDuration)) {
@@ -3138,10 +3320,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         duration = scaledDuration;
       }
       durations[index] = *duration;
-      startupCycles[index] = cost->startupCycles;
+      startupCycles[index] = selectedStartup;
       llvm::json::Object item;
       item["task"] = tasks[index].name;
-      if (hasReplicaEvidence) {
+      if (hasReplicaEvidence || useCommonParentProfile) {
         item["parent_task"] = parentTaskNames[index];
         if (replicaIds[index])
           item["replica_id"] = static_cast<int64_t>(*replicaIds[index]);
@@ -3157,10 +3339,19 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       item["profile_sample_trip_count"] = trace.sampleTripCount;
       item["profile_steps"] = trace.steps;
       item["original_profile_duration_cycles"] = trace.profileDuration;
-      item["catalog_startup_cycles"] = cost->startupCycles;
-      item["catalog_predicted_ii_not_used"] = cost->predictedII;
+      if (useCommonParentProfile) {
+        item["structural_startup_cycles"] = selectedStartup;
+        item["full_parent_mapped_duration_cycles"] =
+            fullParentMappedDurations[index];
+        item["f45_source_scheduler_duration_cycles"] = trace.profileDuration;
+        item["replica_duration_rule"] =
+            "ceil-full-parent-mapped-duration-over-original-active-replicas-v1";
+      } else {
+        item["catalog_startup_cycles"] = cost->startupCycles;
+        item["catalog_predicted_ii_not_used"] = cost->predictedII;
+      }
       item["mapped_duration_cycles"] = *duration;
-      if (originalF45ReplicaScaling) {
+      if (useOriginalF45ReplicaScaling) {
         item["full_parent_mapped_duration_cycles"] =
             fullParentMappedDurations[index];
         item["original_active_replicas"] =
@@ -3171,7 +3362,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       item["selected_profile_shape"] = trace.selectedShape;
       item["selected_mapper_tile_rows"] = mapperRows;
       item["selected_mapper_tile_cols"] = mapperCols;
-      if (diagnosticIICeiling == 23 || hasReplicaEvidence) {
+      if (diagnosticIICeiling == 23 || hasReplicaEvidence ||
+          useCommonParentProfile) {
         item["source_iteration_domain_status"] =
             tasks[index].sourceIterationDomainStatus;
         item["source_iteration_domain_complete"] =
@@ -3202,12 +3394,795 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       }
     }
 
+    if (rescheduleWithProductionScheduler) {
+      // Reuse the production ORBIT scheduler after all original-source,
+      // mapper-body, cost-catalog, and numeric-domain checks above. Only the
+      // source resource decisions survive; the scheduler owns new cells,
+      // starts, dispatch, and committed network transfers.
+      OpBuilder builder(module.getContext());
+      function->setAttr("joint_scheduling_candidate_id",
+                        builder.getStringAttr("candidate-0"));
+      function->setAttr("joint_scheduling_graph_variant_id",
+                        builder.getStringAttr(graphId.getValue()));
+      function->removeAttr("joint_scheduling_exact_dispatch_order");
+      function->removeAttr("joint_scheduling_exact_replay_timing");
+      for (unsigned index = 0; index < tasks.size(); ++index) {
+        TaskflowTaskOp task = tasks[index].op;
+        task->removeAttr("amoeba.exact_schedule");
+        task->removeAttr("amoeba.exact_replay_mapped_timing");
+        task->setAttr("amoeba.joint_shape_orientation_fixed",
+                      builder.getUnitAttr());
+        task->setAttr("amoeba.aggregate_active_replicas",
+                      builder.getI32IntegerAttr(
+                          traces[index].placement.activeReplicas));
+        task->setAttr("cgra_shape",
+                      builder.getStringAttr(traces[index].selectedShape));
+        task->setAttr("cgra_count",
+                      builder.getI32IntegerAttr(traces[index].selectedCount));
+        task->setAttr("est_latency",
+                      builder.getI64IntegerAttr(durations[index]));
+        task->setAttr("amoeba.original_amoeba_selected_cgra_shape",
+                      builder.getStringAttr(traces[index].selectedShape));
+      }
+
+      taskflow::AnalyticalBasedTaskOrchestration priorityPolicy(
+          gridRows, gridCols, taskflow::SchedulingMode::SpatialTemporal,
+          /*communication_aware=*/true, /*fixed_dispatch=*/false);
+      taskflow::TaskScheduler productionScheduler(
+          gridRows, gridCols, taskflow::SchedulingMode::SpatialTemporal,
+          taskflow::ShapeSelectionPolicy::FixedOrientation, network->get());
+      if (!productionScheduler.schedule(
+              function, priorityPolicy.computeTaskPriority(function))) {
+        function.emitError()
+            << "common communication-aware ORBIT production scheduler "
+               "rejected the original AMOEBA resource decisions";
+        return signalPassFailure();
+      }
+      const int64_t productionMakespan =
+          productionScheduler.getScheduleMakespan();
+      if (productionMakespan <= 0 ||
+          productionScheduler.getScheduleEntries().size() != tasks.size() ||
+          productionScheduler.getDispatchOrder().size() != tasks.size()) {
+        function.emitError()
+            << "common production scheduler returned an incomplete or "
+               "overflowing result";
+        return signalPassFailure();
+      }
+
+      struct Cell {
+        int row;
+        int col;
+        int replica;
+        int context;
+      };
+      std::vector<const taskflow::TaskScheduleEntry *> entries(tasks.size(),
+                                                                nullptr);
+      std::vector<std::vector<Cell>> cells(tasks.size());
+      for (const taskflow::TaskScheduleEntry &entry :
+           productionScheduler.getScheduleEntries()) {
+        auto task = cast<TaskflowTaskOp>(entry.task);
+        auto found = taskIndices.find(task.getTaskName());
+        if (found == taskIndices.end() || entries[found->second]) {
+          function.emitError()
+              << "common scheduler entries do not match the source task inventory";
+          return signalPassFailure();
+        }
+        const unsigned index = found->second;
+        if (entry.endCycle - entry.startCycle != durations[index] ||
+            entry.positions.empty() ||
+            entry.replicaIds.size() != entry.positions.size()) {
+          task.emitError()
+              << "common scheduler entry disagrees with mapped duration or "
+                 "replica cell inventory";
+          return signalPassFailure();
+        }
+        entries[index] = &entry;
+        auto info = task->getAttrOfType<DictionaryAttr>(
+            "task_orchestration_info");
+        auto positions = info ? info.getAs<ArrayAttr>("cgra_positions")
+                              : ArrayAttr();
+        if (!positions || positions.size() != entry.positions.size()) {
+          task.emitError()
+              << "common scheduler IR result omits its complete cell inventory";
+          return signalPassFailure();
+        }
+        std::set<std::pair<int, int>> uniqueCells;
+        for (auto [cellIndex, attr] : llvm::enumerate(positions)) {
+          auto position = dyn_cast<DictionaryAttr>(attr);
+          auto row = getInteger(position, "row");
+          auto col = getInteger(position, "col");
+          auto replica = getInteger(position, "replica_id");
+          auto context = getInteger(position, "context_id");
+          auto [entryRow, entryCol] = entry.positions[cellIndex];
+          if (!position || !row || !col || !replica || !context ||
+              *row != entryRow || *col != entryCol || *context < 0 ||
+              *replica < 0 ||
+              *replica != entry.replicaIds[cellIndex] ||
+              *replica >= traces[index].placement.activeReplicas ||
+              !uniqueCells.emplace(static_cast<int>(*row),
+                                   static_cast<int>(*col))
+                   .second) {
+            task.emitError()
+                << "common scheduler cell or replica identity is malformed";
+            return signalPassFailure();
+          }
+          cells[index].push_back({static_cast<int>(*row),
+                                  static_cast<int>(*col),
+                                  static_cast<int>(*replica),
+                                  static_cast<int>(*context)});
+        }
+        for (unsigned replica = 0;
+             replica < traces[index].placement.activeReplicas; ++replica) {
+          std::set<std::pair<int, int>> region;
+          int minRow = gridRows, minCol = gridCols, maxRow = -1, maxCol = -1;
+          for (const Cell &cell : cells[index])
+            if (cell.replica == static_cast<int>(replica)) {
+              region.emplace(cell.row, cell.col);
+              minRow = std::min(minRow, cell.row);
+              minCol = std::min(minCol, cell.col);
+              maxRow = std::max(maxRow, cell.row);
+              maxCol = std::max(maxCol, cell.col);
+            }
+          const int rows = traces[index].placement.selectedRows;
+          const int cols = traces[index].placement.selectedCols;
+          if (region.size() != static_cast<size_t>(traces[index].selectedCount) ||
+              maxRow - minRow + 1 != rows || maxCol - minCol + 1 != cols) {
+            task.emitError()
+                << "common scheduler changed the selected per-replica "
+                   "shape or mapper orientation";
+            return signalPassFailure();
+          }
+          for (int row = minRow; row <= maxRow; ++row)
+            for (int col = minCol; col <= maxCol; ++col)
+              if (!region.count({row, col})) {
+                task.emitError()
+                    << "common scheduler emitted a non-rectangular replica "
+                       "region for a fixed mapper shape";
+                return signalPassFailure();
+              }
+        }
+      }
+      if (llvm::any_of(entries, [](const auto *entry) { return !entry; })) {
+        function.emitError()
+            << "common scheduler omitted a source task from its schedule";
+        return signalPassFailure();
+      }
+
+      std::vector<int64_t> latestDependencyReady(tasks.size(), 0);
+      std::set<std::pair<unsigned, unsigned>> typedDependencyPairs;
+      for (auto edge : (*network)->getTypedEdges()) {
+        auto producer = taskIndices.find(edge.producer.getTaskName());
+        auto consumer = taskIndices.find(edge.consumer.getTaskName());
+        if (producer == taskIndices.end() || consumer == taskIndices.end()) {
+          function.emitError()
+              << "typed communication dependency escapes the source task inventory";
+          return signalPassFailure();
+        }
+        const unsigned producerIndex = producer->second;
+        const unsigned consumerIndex = consumer->second;
+        typedDependencyPairs.emplace(producerIndex, consumerIndex);
+        latestDependencyReady[consumerIndex] = std::max(
+            latestDependencyReady[consumerIndex],
+            entries[producerIndex]->endCycle);
+      }
+      for (const auto &transfer : (*network)->getCommittedTransfers()) {
+        auto producer = taskIndices.find(
+            cast<TaskflowTaskOp>(transfer.producer).getTaskName());
+        auto consumer = taskIndices.find(
+            cast<TaskflowTaskOp>(transfer.consumer).getTaskName());
+        if (producer == taskIndices.end() || consumer == taskIndices.end()) {
+          function.emitError()
+              << "committed communication transfer escapes the source task inventory";
+          return signalPassFailure();
+        }
+        latestDependencyReady[consumer->second] = std::max(
+            latestDependencyReady[consumer->second], transfer.readyCycle);
+      }
+      std::vector<int64_t> idleCycles(tasks.size(), 0);
+      for (unsigned index = 0; index < tasks.size(); ++index) {
+        if (latestDependencyReady[index] > entries[index]->startCycle) {
+          tasks[index].op.emitError()
+              << "common scheduler starts before the latest typed dependency or route is ready";
+          return signalPassFailure();
+        }
+        idleCycles[index] =
+            entries[index]->startCycle - latestDependencyReady[index];
+      }
+
+      auto buildSchedule = [&]() {
+        llvm::json::Array schedule;
+        for (unsigned index = 0; index < tasks.size(); ++index) {
+          llvm::json::Object item;
+          item["task"] = tasks[index].name;
+          item["start_cycle"] = entries[index]->startCycle;
+          item["end_cycle"] = entries[index]->endCycle;
+          item["duration_cycles"] = durations[index];
+          item["idle_cycles"] = idleCycles[index];
+          item["active_replicas"] = static_cast<int64_t>(cells[index].empty()
+              ? 0 : traces[index].placement.activeReplicas);
+          item["selected_profile_shape"] = traces[index].selectedShape;
+          item["selected_cgra_count"] = traces[index].selectedCount;
+          item["selected_rows"] = traces[index].placement.selectedRows;
+          item["selected_cols"] = traces[index].placement.selectedCols;
+          llvm::json::Array occupiedCells;
+          llvm::json::Array replicas;
+          for (unsigned replica = 0;
+               replica < traces[index].placement.activeReplicas; ++replica) {
+            llvm::json::Array replicaCells;
+            int primaryRow = gridRows, primaryCol = gridCols;
+            for (const Cell &cell : cells[index])
+              if (cell.replica == static_cast<int>(replica)) {
+                if (replica == 0) {
+                  primaryRow = std::min(primaryRow, cell.row);
+                  primaryCol = std::min(primaryCol, cell.col);
+                }
+                llvm::json::Object cellJson{
+                    {"row", cell.row}, {"col", cell.col},
+                    {"replica_id", cell.replica},
+                    {"context_id", cell.context}};
+                occupiedCells.push_back(llvm::json::Object(cellJson));
+                replicaCells.push_back(std::move(cellJson));
+              }
+            replicas.push_back(llvm::json::Object{
+                {"replica_id", static_cast<int64_t>(replica)},
+                {"shape", traces[index].selectedShape},
+                {"cgra_count", traces[index].selectedCount},
+                {"cells", std::move(replicaCells)}});
+            if (replica == 0) {
+              item["actual_placed_shape"] = traces[index].selectedShape;
+              item["actual_placed_row"] = primaryRow;
+              item["actual_placed_col"] = primaryCol;
+              item["row"] = primaryRow;
+              item["col"] = primaryCol;
+              item["rows"] = traces[index].placement.selectedRows;
+              item["cols"] = traces[index].placement.selectedCols;
+            }
+          }
+          item["occupied_cells"] = std::move(occupiedCells);
+          item["replicas"] = std::move(replicas);
+          schedule.push_back(std::move(item));
+        }
+        return schedule;
+      };
+      auto buildDispatch = [&]() {
+        llvm::json::Array dispatch;
+        for (Operation *operation : productionScheduler.getDispatchOrder())
+          dispatch.push_back(
+              cast<TaskflowTaskOp>(operation).getTaskName().str());
+        return dispatch;
+      };
+
+      llvm::json::Array originalDecisionsJson;
+      for (unsigned index = 0; index < sourceTasks.size(); ++index) {
+        TaskMetadata sourceTask = sourceTasks[index];
+        const OriginalTraceTask &trace = sourceSchedule.traces[index];
+        llvm::json::Object item;
+        item["task"] = sourceTask.name;
+        item["selected_profile_shape"] = trace.selectedShape;
+        item["active_replicas"] =
+            static_cast<int64_t>(trace.placement.activeReplicas);
+        item["selected_cgra_count"] = trace.selectedCount;
+        item["dispatch_index"] = static_cast<int64_t>(
+            std::find(sourceSchedule.dispatchOrder.begin(),
+                      sourceSchedule.dispatchOrder.end(), index) -
+            sourceSchedule.dispatchOrder.begin());
+        item["original_scheduler_start_internal"] = trace.schedulerStart;
+        item["original_scheduler_end_internal"] = trace.schedulerEnd;
+        item["original_scheduler_duration_internal"] = trace.schedulerDuration;
+        item["original_profile_duration_cycles"] = trace.profileDuration;
+        if (trace.placement.activeReplicas > 1) {
+          if (trace.replicas.empty() ||
+              trace.originalOccupiedCells.size() !=
+                  trace.originalContextIds.size()) {
+            sourceTask.op.emitError()
+                << "original source trace omits its complete replica geometry";
+            return signalPassFailure();
+          }
+          const OriginalReplicaTrace &firstReplica = trace.replicas.front();
+          item["actual_placed_shape"] = firstReplica.shape;
+          item["actual_placed_row"] = firstReplica.row;
+          item["actual_placed_col"] = firstReplica.col;
+          llvm::json::Array originalCells;
+          for (auto [cellIndex, cell] :
+               llvm::enumerate(trace.originalOccupiedCells))
+            originalCells.push_back(llvm::json::Object{
+                {"row", cell.row}, {"col", cell.col},
+                {"replica_id", static_cast<int64_t>(cell.replicaId)},
+                {"context_id", trace.originalContextIds[cellIndex]}});
+          item["actual_cells"] = std::move(originalCells);
+          item["context_ids"] = integerArray(trace.originalContextIds);
+          llvm::json::Array originalReplicas;
+          for (const OriginalReplicaTrace &replica : trace.replicas) {
+            if (replica.occupiedCells.size() != replica.contextIds.size()) {
+              sourceTask.op.emitError()
+                  << "original replica trace omits exact context IDs";
+              return signalPassFailure();
+            }
+            llvm::json::Array replicaCells;
+            for (auto [cellIndex, cell] :
+                 llvm::enumerate(replica.occupiedCells))
+              replicaCells.push_back(llvm::json::Object{
+                  {"row", cell.row}, {"col", cell.col},
+                  {"replica_id", static_cast<int64_t>(replica.replicaId)},
+                  {"context_id", replica.contextIds[cellIndex]}});
+            originalReplicas.push_back(llvm::json::Object{
+                {"replica_id", static_cast<int64_t>(replica.replicaId)},
+                {"shape", replica.shape}, {"cgra_count", replica.cgraCount},
+                {"row", replica.row}, {"col", replica.col},
+                {"rows", replica.rows}, {"cols", replica.cols},
+                {"actual_cells", std::move(replicaCells)},
+                {"context_ids", integerArray(replica.contextIds)}});
+          }
+          item["replicas"] = std::move(originalReplicas);
+          item["original_profile_duration_binding"] = llvm::json::Object{
+              {"schema", "amoeba-original-f45-profile-duration-binding-v1"},
+              {"full_parent_mapper_duration_cycles", trace.fullMapperDuration},
+              {"f45_scheduler_duration_cycles", trace.profileDuration},
+              {"active_replicas",
+               static_cast<int64_t>(trace.placement.activeReplicas)},
+              {"compiled_ii", trace.compiledII},
+              {"sample_trip_count", trace.sampleTripCount},
+              {"steps", trace.steps},
+              {"materialized_operation_count", trace.materializedOperationCount},
+              {"rounding_rule",
+               "ceil-full-parent-duration-over-original-active-replicas-v1"},
+              {"status", "verified"}};
+        } else {
+          item["actual_placed_shape"] = trace.actualShape;
+          item["actual_placed_row"] = trace.placement.row;
+          item["actual_placed_col"] = trace.placement.col;
+          llvm::json::Array originalCells;
+          for (auto [cellIndex, cell] :
+               llvm::enumerate(trace.placement.occupiedCells))
+            originalCells.push_back(llvm::json::Object{
+                {"row", cell.row}, {"col", cell.col},
+                {"replica_id", static_cast<int64_t>(cell.replicaId)},
+                {"context_id", trace.originalContextIds[cellIndex]}});
+          item["actual_cells"] = std::move(originalCells);
+          item["context_ids"] = integerArray(trace.originalContextIds);
+        }
+        originalDecisionsJson.push_back(std::move(item));
+      }
+
+      const InterTaskNetworkSpec &networkSpec = (*network)->getNetworkSpec();
+      if (networkSpec.getLocalBandwidthBitsPerCycle() >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        function.emitError()
+            << "local-channel bandwidth exceeds signed 64-bit JSON";
+        return signalPassFailure();
+      }
+      llvm::json::Object networkJson{
+          {"schema", "inter-task-network-v1"},
+          {"resource_interval_semantics",
+           "half-open-start-inclusive-end-exclusive"},
+          {"version", static_cast<int64_t>(networkSpec.getVersion())},
+          {"rows", networkSpec.getRows()},
+          {"columns", networkSpec.getColumns()},
+          {"local_bandwidth_bits_per_cycle",
+           static_cast<int64_t>(networkSpec.getLocalBandwidthBitsPerCycle())}};
+      llvm::json::Array networkLinks;
+      for (auto [linkIndex, link] : llvm::enumerate(networkSpec.getLinks())) {
+        if (link.latency_cycles >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            link.bandwidth_bits_per_cycle >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+          function.emitError()
+              << "network contract exceeds signed 64-bit JSON";
+          return signalPassFailure();
+        }
+        networkLinks.push_back(llvm::json::Object{
+            {"link_index", static_cast<int64_t>(linkIndex)},
+            {"source_row", link.source.row},
+            {"source_col", link.source.column},
+            {"destination_row", link.destination.row},
+            {"destination_col", link.destination.column},
+            {"latency_cycles", static_cast<int64_t>(link.latency_cycles)},
+            {"bandwidth_bits_per_cycle",
+             static_cast<int64_t>(link.bandwidth_bits_per_cycle)}});
+      }
+      networkJson["links"] = std::move(networkLinks);
+
+      llvm::json::Array dependenciesJson;
+      for (auto [edgeIndex, edge] :
+           llvm::enumerate((*network)->getTypedEdges())) {
+        TaskflowTaskOp producerTask = edge.producer;
+        TaskflowTaskOp consumerTask = edge.consumer;
+        llvm::json::Object dependency;
+        dependency["edge_index"] = static_cast<int64_t>(edgeIndex);
+        dependency["edge_id"] = "edge-" + std::to_string(edgeIndex);
+        dependency["producer"] = producerTask.getTaskName().str();
+        dependency["consumer"] = consumerTask.getTaskName().str();
+        dependency["kind"] = stringifyTaskEdgeKind(edge.kind).str();
+        dependency["origin"] = stringifyTaskEdgeOrigin(edge.origin).str();
+        dependency["scope"] = stringifyTaskEdgeScope(edge.scope).str();
+        dependency["producer_segment"] =
+            stringifyTaskResultSegment(edge.producer_segment).str();
+        dependency["producer_index"] =
+            static_cast<int64_t>(edge.producer_index);
+        dependency["consumer_segment"] =
+            stringifyTaskOperandSegment(edge.consumer_segment).str();
+        dependency["consumer_index"] =
+            static_cast<int64_t>(edge.consumer_index);
+        dependency["payload_known"] = edge.payload_bits.has_value();
+        if (edge.payload_bits) {
+          if (*edge.payload_bits >
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            function.emitError() << "edge payload exceeds signed 64-bit JSON";
+            return signalPassFailure();
+          }
+          dependency["payload_bits"] =
+              static_cast<int64_t>(*edge.payload_bits);
+        } else {
+          dependency["payload_bits"] = nullptr;
+        }
+        dependency["transfer_region_lower"] =
+            integerArray(edge.transfer_region_lower);
+        dependency["transfer_region_upper"] =
+            integerArray(edge.transfer_region_upper);
+        dependenciesJson.push_back(std::move(dependency));
+      }
+
+      llvm::json::Array routesJson;
+      std::set<std::pair<unsigned, unsigned>> routedTaskPairs;
+      for (const auto &transfer : (*network)->getCommittedTransfers()) {
+        auto producer = std::find(taskOperations.begin(), taskOperations.end(),
+                                  transfer.producer);
+        auto consumer = std::find(taskOperations.begin(), taskOperations.end(),
+                                  transfer.consumer);
+        if (producer == taskOperations.end() ||
+            consumer == taskOperations.end() || transfer.links.empty()) {
+          function.emitError()
+              << "common scheduler committed an incomplete network route";
+          return signalPassFailure();
+        }
+        const unsigned producerIndex = static_cast<unsigned>(
+            std::distance(taskOperations.begin(), producer));
+        const unsigned consumerIndex = static_cast<unsigned>(
+            std::distance(taskOperations.begin(), consumer));
+        if (!routedTaskPairs.emplace(producerIndex, consumerIndex).second ||
+            transfer.readyCycle > entries[consumerIndex]->startCycle ||
+            transfer.payloadBits >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            transfer.pathLatencyCycles >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            transfer.bottleneckBandwidthBitsPerCycle >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            transfer.transferCycles >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+          function.emitError()
+              << "common scheduler route is duplicated, incomplete, or has "
+                 "oversized metrics";
+          return signalPassFailure();
+        }
+        llvm::json::Object route{
+            {"route_id", tasks[producerIndex].name + "->" +
+                             tasks[consumerIndex].name},
+            {"producer", tasks[producerIndex].name},
+            {"consumer", tasks[consumerIndex].name},
+            {"payload_bits", static_cast<int64_t>(transfer.payloadBits)},
+            {"path_latency_cycles",
+             static_cast<int64_t>(transfer.pathLatencyCycles)},
+            {"bottleneck_bandwidth_bits_per_cycle",
+             static_cast<int64_t>(
+                 transfer.bottleneckBandwidthBitsPerCycle)},
+            {"transfer_cycles",
+             static_cast<int64_t>(transfer.transferCycles)},
+            {"source_row", transfer.source.row},
+            {"source_col", transfer.source.column},
+            {"destination_row", transfer.destination.row},
+            {"destination_col", transfer.destination.column},
+            {"producer_finish_cycle", entries[producerIndex]->endCycle},
+            {"consumer_start_cycle", entries[consumerIndex]->startCycle},
+            {"ready_cycle", transfer.readyCycle},
+            {"start_cycle", transfer.links.front().startCycle}};
+        llvm::json::Array edgeIndices;
+        for (uint32_t edgeIndex : transfer.edgeIndices)
+          edgeIndices.push_back(static_cast<int64_t>(edgeIndex));
+        route["edge_indices"] = std::move(edgeIndices);
+        llvm::json::Array intervals;
+        for (const auto &link : transfer.links) {
+          if (link.startCycle != transfer.links.front().startCycle ||
+              link.startCycle < entries[producerIndex]->endCycle ||
+              transfer.readyCycle > entries[consumerIndex]->startCycle ||
+              link.startCycle < 0 || link.endCycle <= link.startCycle ||
+              link.endCycle != transfer.readyCycle) {
+            function.emitError()
+                << "common scheduler route interval is malformed or disagrees "
+                   "with its ready cycle";
+            return signalPassFailure();
+          }
+          llvm::json::Object interval{
+              {"start_cycle", link.startCycle},
+              {"end_cycle", link.endCycle}};
+          if (link.localChannel) {
+            interval["resource_kind"] = "local_channel";
+            interval["row"] = link.localCoordinate.row;
+            interval["col"] = link.localCoordinate.column;
+          } else {
+            if (link.linkIndex >= networkSpec.getLinks().size()) {
+              function.emitError()
+                  << "common scheduler route names an unknown network link";
+              return signalPassFailure();
+            }
+            interval["resource_kind"] = "network_link";
+            interval["link_index"] = static_cast<int64_t>(link.linkIndex);
+          }
+          intervals.push_back(std::move(interval));
+        }
+        route["intervals"] = std::move(intervals);
+        routesJson.push_back(std::move(route));
+      }
+
+      llvm::json::Array profileBindings;
+      for (auto [index, task] : llvm::enumerate(tasks)) {
+        const OriginalTraceTask &trace = traces[index];
+        if (useCommonParentProfile) {
+          const CommonAmoebaMapperShapeProfile &profile =
+              commonProfiles.tasks[index]
+                  .profilesByShape.at(trace.selectedShape);
+          profileBindings.push_back(llvm::json::Object{
+              {"schema", kCommonAmoebaParentProfileBindingSchema.str()},
+              {"task", task.name},
+              {"static_trip_count", task.tripCount},
+              {"source_iteration_domain_status",
+               task.sourceIterationDomainStatus},
+              {"source_iteration_domain_complete",
+               task.sourceIterationDomainComplete},
+              {"source_iteration_work_count",
+               task.sourceIterationWorkCount},
+              {"selected_profile_shape", trace.selectedShape},
+              {"selected_cgra_count", trace.selectedCount},
+              {"selected_mapper_tile_rows", profile.mapperTileRows},
+              {"selected_mapper_tile_cols", profile.mapperTileCols},
+              {"compiled_ii", profile.compiledII},
+              {"steps", profile.steps},
+              {"sample_trip_count", profile.sampleTripCount},
+              {"materialized_operation_count",
+               profile.materializedOperationCount},
+              {"structural_startup_cycles",
+               profile.structuralStartupCycles},
+              {"common_parent_full_mapped_duration_cycles",
+               fullParentMappedDurations[index]},
+              {"f45_source_scheduler_duration_cycles", trace.profileDuration},
+              {"mapped_duration_cycles", durations[index]},
+              {"original_active_replicas",
+               static_cast<int64_t>(trace.placement.activeReplicas)},
+              {"replica_duration_rule",
+               "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+              {"pre_mapper_wrapper_byte_count",
+               static_cast<int64_t>(profile.preMapperWrapperBytes.size())},
+              {"pre_mapper_wrapper_bytes", profile.preMapperWrapperBytes},
+              {"current_ir_wrapper_exact_match_verified", true},
+              {"mapper_succeeded", true}});
+        } else {
+          const OriginalAmoebaProfileBodyEvidence &body = expandedBodies[index];
+          profileBindings.push_back(llvm::json::Object{
+              {"task", task.name},
+              {"static_trip_count", task.tripCount},
+              {"task_signature", body.taskSignature},
+              {"counter_signature", body.counterSignature},
+              {"kernel_binding_signature", body.kernelBindingSignature},
+              {"normalized_mapper_body", body.normalizedMapperBody},
+              {"selected_profile_shape", trace.selectedShape},
+              {"selected_cgra_count", trace.selectedCount},
+              {"compiled_ii", trace.compiledII},
+              {"steps", trace.steps},
+              {"sample_trip_count", trace.sampleTripCount},
+              {"materialized_operation_count", trace.materializedOperationCount},
+              {"profile_duration_cycles", trace.profileDuration},
+              {"catalog_startup_cycles", startupCycles[index]},
+              {"full_parent_mapped_duration_cycles",
+               fullParentMappedDurations[index]},
+              {"mapped_duration_cycles", durations[index]},
+              {"replica_duration_rule",
+               "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+              {"original_active_replicas",
+               static_cast<int64_t>(trace.placement.activeReplicas)},
+              {"mapper_succeeded", true},
+              {"current_ir_body_equivalence_verified", true}});
+        }
+      }
+
+      llvm::json::Object schedulerContract{
+          {"backend", "orbit-production"},
+          {"dispatch_policy", "critical-path"},
+          {"timing", "common-explicit-network"}};
+      llvm::json::Object productionDecisions{
+          {"dispatch_order", buildDispatch()},
+          {"task_schedule", buildSchedule()}};
+      const StringRef sourceCoverageStatus =
+          originalAmoebaSourceDomainCoverageStatus(sourceTasks);
+      llvm::json::Object replicaTimingPolicy{
+          {"schema", "amoeba-original-f45-replica-scaling-v1"},
+          {"duration_formula", useCommonParentProfile
+                                    ? "ceil(ceil(structural_startup_cycles + "
+                                      "compiled_ii * (actual_mapper_firings - "
+                                      "1)) / original_active_replicas)"
+                                    : "ceil(ceil(catalog_startup_cycles + "
+                                      "compiled_ii * (source_macro_firings - "
+                                      "1)) / original_active_replicas)"},
+          {"replica_duration_rule",
+           "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+          {"child_mapper_profiles_used", false},
+          {"status", "original-f45-scheduler-estimate"}};
+      auto makeCommonProfileBinding = [&]() {
+        llvm::json::Object binding{
+            {"schema", kCommonAmoebaParentProfileBindingSchema.str()},
+            {"schema_version", int64_t(1)},
+            {"verified", true},
+            {"profile_file", commonProfiles.profilePath},
+            {"canonical_module_file", commonProfiles.canonicalModulePath},
+            {"function", commonProfiles.function},
+            {"candidate_id", commonProfiles.candidateId},
+            {"candidate_scope", commonProfiles.candidateScope},
+            {"profile_provenance", commonProfiles.profileProvenance},
+            {"canonical_witness_format", "mlir-generic-print-use-local-scope-v1"},
+            {"canonical_module_witness_byte_count",
+             static_cast<int64_t>(commonProfiles.canonicalModuleWitness.size())},
+            {"canonical_function_witness_byte_count",
+             static_cast<int64_t>(commonProfiles.canonicalFunctionWitness.size())},
+            {"architecture_spec_path", commonProfiles.architectureSpecPath},
+            {"architecture_spec_text", commonProfiles.architectureSpecText},
+            {"grid_rows", commonProfiles.gridRows},
+            {"grid_cols", commonProfiles.gridCols},
+            {"per_cgra_tile_rows", commonProfiles.perCgraTileRows},
+            {"per_cgra_tile_cols", commonProfiles.perCgraTileCols},
+            {"semantic_module_binding_status",
+             "verified-pre-f45-canonical-after-exact-scheduler-annotation-projection-v1"},
+            {"source_iteration_binding_refresh_status",
+             "refreshed-after-canonical-taskflow-and-mapper-wrapper-verification"},
+            {"parent_replica_duration_policy",
+             "ceil-full-common-parent-mapped-duration-over-original-active-replicas-v1"},
+            {"child_mapper_profiles_used", false}};
+        if (!commonSourceRepository.empty()) {
+          binding["source_repository"] = commonSourceRepository.getValue();
+          binding["source_commit"] = commonSourceCommit.getValue();
+        }
+        return binding;
+      };
+      llvm::json::Object result{
+          {"record_type", "result"},
+          {"schema", "amoeba-original-fixed-decision-retiming-v1"},
+          {"function", function.getSymName().str()},
+          {"graph_variant_id", graphId.getValue().str()},
+          {"candidate_id", "candidate-0"},
+          {"candidate_origin", "original-amoeba-throughput-guided"},
+          {"valid", true}, {"diagnostic_only", true}, {"formal_go", false},
+          {"scheduler", llvm::json::Object(schedulerContract)},
+          {"shared_scheduler_resource_only", true},
+          {"production_scheduler_decisions",
+           llvm::json::Object(productionDecisions)},
+          {"body_equivalence_checked", true},
+          {"body_equivalence_status",
+           "verified-current-kernel-equals-exported-original-normalized-body"},
+          {"iteration_domain_coverage_status", sourceCoverageStatus.str()},
+          {"iteration_domain_coverage_verified", true},
+          {"selected_profile_body_binding_schema",
+           kOriginalAmoebaProfileBindingSchema.str()},
+          {"selected_profile_body_binding_verified", true},
+          {"whole_program_result_scope",
+           "original-amoeba-resource-choices-rescheduled-by-common-orbit-"
+           "production-scheduler; placements-and-dispatch-are-new"},
+          {"required_external_evidence",
+           llvm::json::Array{"mapper-profiles-from-equivalent-correct-original-flow",
+                             "native-simulation-and-independent-trace"}},
+          {"mapper_success_evidence",
+           "source-inferred-success-only-profile-info; all-one-fallback-rejected"},
+          {"explicit_mapper_succeeded_attribute_present", false},
+          {"duration_source",
+           "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+          {"score_source",
+           "original-amoeba-shape-count-replicas-plus-orbit-production-"
+           "critical-path-and-explicit-network-scheduling"},
+          {"mapped_whole_program_cycles", productionMakespan},
+          {"predicted_whole_program_cycles", productionMakespan},
+          {"replayed_communication_edges",
+           static_cast<int64_t>(typedDependencyPairs.size())},
+          {"original_pipeline_interval", sourceSchedule.pipelineInterval},
+          {"original_internal_time_unit", sourceSchedule.internalTimeUnit},
+          {"original_internal_time_scale", sourceSchedule.internalTimeScale},
+          {"grid_rows", gridRows}, {"grid_cols", gridCols},
+          {"original_decisions", std::move(originalDecisionsJson)},
+          {"task_costs", std::move(taskCostsJson)},
+          {"dispatch_order", buildDispatch()},
+          {"task_schedule", buildSchedule()}};
+      if (useCommonParentProfile) {
+        result.erase("body_equivalence_checked");
+        result.erase("body_equivalence_status");
+        result.erase("selected_profile_body_binding_schema");
+        result.erase("selected_profile_body_binding_verified");
+        result["common_mapper_profile_binding"] = makeCommonProfileBinding();
+        result["common_mapper_profile_binding_verified"] = true;
+        result["mapper_success_evidence"] =
+            "explicit-source-owned-common-profile-mapper-succeeded-flag";
+        result["explicit_mapper_succeeded_attribute_present"] = true;
+      } else {
+        result["cost_catalog_namespace"] = costs.nameSpace().str();
+        result["cost_catalog_source_repository"] =
+            costs.sourceRepository().str();
+        result["cost_catalog_source_commit"] = sourceCommit;
+        result["cost_catalog_model_status"] = catalogModelStatus;
+        result["cost_catalog_production_ready"] = catalogProductionReady;
+        result["cost_catalog_architecture_path"] =
+            costs.architecturePath().str();
+      }
+      result["replica_timing_policy"] =
+          llvm::json::Object(replicaTimingPolicy);
+      llvm::json::Object fixedTrace{
+          {"schema", "amoeba-fixed-decision-trace-v1"},
+          {"candidate_id", "candidate-0"},
+          {"graph_variant_id", graphId.getValue().str()},
+          {"formal_go", false},
+          {"scheduler", llvm::json::Object(schedulerContract)},
+          {"shared_scheduler_resource_only", true},
+          {"production_scheduler_decisions",
+           llvm::json::Object(std::move(productionDecisions))},
+          {"dispatch_order", buildDispatch()},
+          {"task_schedule", buildSchedule()},
+          {"iteration_domain_coverage_status", sourceCoverageStatus.str()},
+          {"iteration_domain_coverage_verified", true},
+          {"body_equivalence_checked", !useCommonParentProfile},
+          {"communication_contract", std::move(networkJson)},
+          {"dependencies", std::move(dependenciesJson)},
+          {"routes", std::move(routesJson)},
+          {"task_profile_bindings", std::move(profileBindings)}};
+      fixedTrace["replica_timing_policy"] =
+          llvm::json::Object(replicaTimingPolicy);
+      if (useCommonParentProfile) {
+        fixedTrace["common_mapper_profile_binding"] =
+            makeCommonProfileBinding();
+        fixedTrace["common_mapper_profile_binding_verified"] = true;
+      }
+      fixedTrace["original_dispatch_order"] = [&]() {
+        llvm::json::Array dispatch;
+        for (const std::string &name : sourceSchedule.dispatchNames)
+          dispatch.push_back(name);
+        return dispatch;
+      }();
+      fixedTrace["original_resource_decisions"] = [&]() {
+        llvm::json::Array decisions;
+        for (unsigned index = 0; index < sourceTasks.size(); ++index) {
+          const OriginalTraceTask &trace = sourceSchedule.traces[index];
+          decisions.push_back(llvm::json::Object{
+              {"task", sourceTasks[index].name},
+              {"selected_profile_shape", trace.selectedShape},
+              {"selected_cgra_count", trace.selectedCount},
+              {"active_replicas",
+               static_cast<int64_t>(trace.placement.activeReplicas)}});
+        }
+        return decisions;
+      }();
+      result["fixed_decision_trace"] = std::move(fixedTrace);
+
+      function->setAttr("joint_scheduling_predicted_makespan",
+                        builder.getI64IntegerAttr(productionMakespan));
+      function->setAttr("joint_scheduling_dispatch_policy",
+                        builder.getStringAttr("critical-path"));
+      function->setAttr("joint_scheduling_scheduler_backend",
+                        builder.getStringAttr("orbit-production"));
+      function->setAttr(
+          "amoeba.original_amoeba_fixed_decision_reschedule",
+          builder.getStringAttr("orbit-production-common-scheduler-v1"));
+      if (!writeAtomically(
+              outputFile.getValue(),
+              [&](llvm::raw_ostream &out) {
+                writeJsonLine(out, std::move(result));
+                return true;
+              },
+              error)) {
+        function.emitError() << error;
+        return signalPassFailure();
+      }
+      return;
+    }
+
     OriginalAmoebaFixedDecisionResult retimed;
     if (!retimeOriginalAmoebaFixedDecisions(
             gridRows, gridCols, retimerTasks,
-            originalF45ReplicaScaling ? fullParentMappedDurations : durations,
+            useOriginalF45ReplicaScaling ? fullParentMappedDurations : durations,
             placements,
-            dispatchOrder, communication, retimed, originalF45ReplicaScaling)) {
+            dispatchOrder, communication, retimed,
+            useOriginalF45ReplicaScaling)) {
       function.emitError() << (retimed.rejection.empty()
                                    ? "original fixed-decision retiming failed"
                                    : retimed.rejection);
@@ -3425,7 +4400,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       profileBinding["profile_duration_cycles"] = trace.profileDuration;
       profileBinding["catalog_startup_cycles"] = startupCycles[index];
       profileBinding["mapped_duration_cycles"] = durations[index];
-      if (originalF45ReplicaScaling) {
+      if (useOriginalF45ReplicaScaling) {
         profileBinding["full_parent_mapped_duration_cycles"] =
             fullParentMappedDurations[index];
         profileBinding["original_active_replicas"] =
@@ -3519,7 +4494,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       }
 
       if (hasReplicaEvidence ||
-          (originalF45ReplicaScaling && trace.placement.activeReplicas > 1)) {
+          (useOriginalF45ReplicaScaling &&
+           trace.placement.activeReplicas > 1)) {
         if (trace.replicas.empty() ||
             trace.originalOccupiedCells.size() != trace.originalContextIds.size()) {
           function.emitError()
@@ -3686,7 +4662,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     }
 
     llvm::json::Object replicaTimingPolicy;
-    if (originalF45ReplicaScaling) {
+    if (useOriginalF45ReplicaScaling) {
       replicaTimingPolicy = llvm::json::Object{
           {"schema", "amoeba-original-f45-replica-scaling-v1"},
           {"duration_formula",
@@ -3698,7 +4674,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           {"status", "original-f45-scheduler-estimate"}};
     }
     llvm::json::Object result;
-    if (originalF45ReplicaScaling)
+    if (useOriginalF45ReplicaScaling)
       result["replica_timing_policy"] = llvm::json::Object(replicaTimingPolicy);
     result["record_type"] = "result";
     result["schema"] = "amoeba-original-fixed-decision-retiming-v1";
@@ -3720,7 +4696,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     result["iteration_domain_coverage_status"] = sourceCoverageStatus.str();
     result["iteration_domain_coverage_verified"] = true;
     result["iteration_domain_coverage_evidence"] =
-        originalF45ReplicaScaling
+        useOriginalF45ReplicaScaling
             ? "the complete original parent source domains, actual full-parent "
               "mapper bodies/profiles, and every original replica placement "
               "were verified; replica durations follow the original F45 "
@@ -3749,7 +4725,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         "source-inferred-success-only-profile-info; all-one-fallback-rejected";
     result["explicit_mapper_succeeded_attribute_present"] = false;
     result["duration_source"] =
-        originalF45ReplicaScaling
+        useOriginalF45ReplicaScaling
             ? "original-f45-replica-scaling-of-common-full-parent-compiled-ii-"
               "and-structural-startup-duration"
             : hasReplicaEvidence
@@ -3821,7 +4797,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     result["dispatch_order"] = std::move(dispatchJson);
     result["task_schedule"] = std::move(scheduleJson);
     llvm::json::Object fixedDecisionTrace;
-    if (originalF45ReplicaScaling)
+    if (useOriginalF45ReplicaScaling)
       fixedDecisionTrace["replica_timing_policy"] =
           llvm::json::Object(replicaTimingPolicy);
     fixedDecisionTrace["schema"] = "amoeba-fixed-decision-trace-v1";

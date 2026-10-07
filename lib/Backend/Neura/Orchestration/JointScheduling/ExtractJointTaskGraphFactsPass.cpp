@@ -2337,6 +2337,16 @@ struct ExtractJointTaskGraphFactsPass
                               {"task_index", static_cast<int64_t>(index)},
                               {"cost_query_supported", !factOnly},
                               {"native_mapper_input_supported", !factOnly}};
+      if (auto shape = task.op->getAttrOfType<StringAttr>("cgra_shape"))
+        taskRecord["resource_cgra_shape"] = shape.getValue().str();
+      if (auto count = task.op->getAttrOfType<IntegerAttr>("cgra_count"))
+        taskRecord["resource_cgra_count"] = count.getInt();
+      if (auto replicas = task.op->getAttrOfType<IntegerAttr>("active_replicas"))
+        taskRecord["resource_active_replicas"] = replicas.getInt();
+      if (auto shape = task.op->getAttrOfType<StringAttr>("composed_cgra_shape"))
+        taskRecord["resource_composed_cgra_shape"] = shape.getValue().str();
+      if (auto count = task.op->getAttrOfType<IntegerAttr>("composed_cgra_count"))
+        taskRecord["resource_composed_cgra_count"] = count.getInt();
       taskRecord["source_iteration_domain_status"] =
           task.sourceIterationDomainStatus;
       taskRecord["source_iteration_domain_certified"] =

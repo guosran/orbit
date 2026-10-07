@@ -1227,10 +1227,27 @@ bool PersistentMLCostCache::load(llvm::StringRef path,
                                  llvm::StringRef featureContractId,
                                  llvm::StringRef architectureContract,
                                  const MLCostCacheResources &resources,
+                                 double runtimeIICeiling,
+                                 llvm::StringRef
+                                     validatedTrainingArchitectureText,
                                  std::string &error) {
   entries.clear();
   hitCount = 0;
   missCount = 0;
+  const bool directModel = modelSchema == kPerCgra2x2EnsembleSchema;
+  if (directModel) {
+    if (!validatePerCgra2x2RuntimeContract(
+            runtimeIICeiling, validatedTrainingArchitectureText,
+            resources.architectureText, error)) {
+      error = "ML cache runtime architecture contract is invalid: " + error;
+      return false;
+    }
+  } else if (runtimeIICeiling != kPerCgra2x2TrainingIICeiling ||
+             !validatedTrainingArchitectureText.empty()) {
+    error = "non-direct ML cache requires the training II ceiling and no "
+            "direct-model architecture override";
+    return false;
+  }
   if (path.empty())
     return true;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -1310,7 +1327,6 @@ bool PersistentMLCostCache::load(llvm::StringRef path,
         !getRequiredNumber(*object, "predicted_ii_std",
                            entry.prediction.predictedIIStd, error))
       return false;
-    const bool directModel = modelSchema == kPerCgra2x2EnsembleSchema;
     if (!directModel &&
         (!getRequiredNumber(*object, "baseline_ii", entry.prediction.baselineII,
                             error) ||
@@ -1334,7 +1350,7 @@ bool PersistentMLCostCache::load(llvm::StringRef path,
         entry.facts.recMII <= 0.0 || entry.facts.resMII <= 0.0 ||
         entry.facts.lowerBound <= 0.0 ||
         entry.prediction.predictedII < entry.facts.lowerBound ||
-        entry.prediction.predictedII > kMapperIICeiling + kFactsTolerance ||
+        entry.prediction.predictedII > runtimeIICeiling + kFactsTolerance ||
         entry.prediction.predictedIIStd < 0.0) {
       error = "ML cache contains an invalid entry";
       return false;

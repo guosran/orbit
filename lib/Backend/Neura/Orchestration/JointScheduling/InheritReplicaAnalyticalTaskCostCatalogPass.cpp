@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCandidateCommon.h"
-#include "mlir/IR/Verifier.h"
 #include "AnalyticalTaskCostCatalog.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
@@ -30,9 +29,12 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -113,6 +115,19 @@ struct ReplicaRecord {
   int64_t mUpper = 0;
   int64_t nLower = 0;
   int64_t nUpper = 0;
+};
+
+enum class CompositeFusionKind {
+  Sibling,
+  ProducerConsumerRetained,
+  ProducerConsumerForwarded
+};
+
+struct CompositeFusionRecord {
+  std::string childName;
+  std::string firstParent;
+  std::string secondParent;
+  std::string materializerMode;
 };
 
 struct CounterBounds {
@@ -3750,6 +3765,7 @@ static bool collectReplicaLayout(
     std::map<std::string, TaskMetadata> &children,
     std::map<std::string, std::vector<ReplicaRecord>> &replicas,
     std::map<std::string, bool> &sourceOwnedLineage,
+    std::map<std::string, CompositeFusionRecord> &compositeFusions,
     std::string &error) {
   for (const TaskMetadata &task : parentTasks)
     if (!parents.emplace(task.name, task).second) {
@@ -3761,6 +3777,183 @@ static bool collectReplicaLayout(
       error = "child module repeats task " + task.name;
       return false;
     }
+
+  for (const TaskMetadata &task : childTasks) {
+    bool hasFusionMetadata = false;
+    for (NamedAttribute attribute : task.op->getAttrs())
+      hasFusionMetadata |= attribute.getName().strref().starts_with(
+          "amoeba.neura.fusion.");
+    if (!hasFusionMetadata)
+      continue;
+    auto mode = task.op->getAttrOfType<StringAttr>(
+        "amoeba.neura.fusion.mode");
+    auto loads = task.op->getAttrOfType<IntegerAttr>(
+        "amoeba.neura.fusion.eliminated_loads");
+    auto stores = task.op->getAttrOfType<IntegerAttr>(
+        "amoeba.neura.fusion.eliminated_stores");
+    auto first = task.op->getAttrOfType<StringAttr>(
+        "amoeba.neura.fusion.sibling_first");
+    auto second = task.op->getAttrOfType<StringAttr>(
+        "amoeba.neura.fusion.sibling_second");
+    auto rewrite = task.op->getAttrOfType<StringAttr>(
+        "amoeba.neura.joint_rewrite");
+    if (!mode || !loads || !stores || !rewrite) {
+      error = "composite source-domain proof requires exact post-Neura "
+              "fusion metadata";
+      return false;
+    }
+    CompositeFusionKind kind;
+    std::string materializerMode;
+    std::string firstName;
+    std::string secondName;
+    if (mode.getValue() == "sibling" &&
+        rewrite.getValue() == "post-neura-sibling-fusion" &&
+        loads.getInt() >= 0 && stores.getInt() >= 0 && first && second &&
+        !first.getValue().empty() && !second.getValue().empty() &&
+        first != second) {
+      kind = CompositeFusionKind::Sibling;
+      materializerMode = "sibling";
+      firstName = first.getValue().str();
+      secondName = second.getValue().str();
+    } else if (mode.getValue() == "retained" &&
+               rewrite.getValue() ==
+                   "post-neura-producer-consumer-retained" &&
+               ((loads.getInt() == 0 && stores.getInt() == 0) ||
+                (loads.getInt() == 1 && stores.getInt() == 0)) &&
+               !first && !second) {
+      // Unlike sibling fusion, retained producer-consumer materialization
+      // keeps the producer output store/completion; it may also share the
+      // consumer's matched load. Its derived task name encodes the ordered
+      // producer and consumer; canonical replay below proves the exact
+      // load/store elimination counts and body.
+      StringRef fusedName = task.name;
+      size_t separator = fusedName.find(".fuse.");
+      if (separator == StringRef::npos || separator == 0 ||
+          separator + StringRef(".fuse.").size() >= fusedName.size() ||
+          fusedName.find(".fuse.", separator + 1) != StringRef::npos) {
+        error = "retained producer-consumer fusion name does not encode one "
+                "ordered canonical parent pair";
+        return false;
+      }
+      kind = CompositeFusionKind::ProducerConsumerRetained;
+      materializerMode = "producer-consumer-retained";
+      firstName = fusedName.take_front(separator).str();
+      secondName = fusedName.drop_front(separator + StringRef(".fuse.").size())
+                       .str();
+    } else if (mode.getValue() == "forwarded" &&
+               rewrite.getValue() ==
+                   "post-neura-producer-consumer-forwarded" &&
+               loads.getInt() == 1 && stores.getInt() == 1 && !first &&
+               !second) {
+      StringRef fusedName = task.name;
+      size_t separator = fusedName.find(".fuse.");
+      if (separator == StringRef::npos || separator == 0 ||
+          separator + StringRef(".fuse.").size() >= fusedName.size() ||
+          fusedName.find(".fuse.", separator + 1) != StringRef::npos) {
+        error = "forwarded producer-consumer fusion name does not encode one "
+                "ordered canonical parent pair";
+        return false;
+      }
+      kind = CompositeFusionKind::ProducerConsumerForwarded;
+      materializerMode = "producer-consumer-forwarded";
+      firstName = fusedName.take_front(separator).str();
+      secondName = fusedName.drop_front(separator + StringRef(".fuse.").size())
+                       .str();
+    } else {
+      error = "composite source-domain proof supports only exact sibling or "
+              "retained/forwarded producer-consumer fusion metadata";
+      return false;
+    }
+    std::string expectedName =
+        (Twine(firstName) + ".fuse." + secondName).str();
+    if (task.name != expectedName) {
+      error = "composite fusion task name disagrees with its ordered parent "
+              "pair";
+      return false;
+    }
+    for (NamedAttribute attribute : task.op->getAttrs()) {
+      StringRef name = attribute.getName().strref();
+      if (name.starts_with("amoeba.neura.fusion.") &&
+          name != "amoeba.neura.fusion.mode" &&
+          name != "amoeba.neura.fusion.eliminated_loads" &&
+          name != "amoeba.neura.fusion.eliminated_stores" &&
+          name != "amoeba.neura.fusion.sibling_first" &&
+          name != "amoeba.neura.fusion.sibling_second") {
+        error = "composite source-domain proof rejects unknown fusion "
+                "metadata";
+        return false;
+      }
+    }
+    if (kind != CompositeFusionKind::Sibling &&
+        (task.op->hasAttr("amoeba.neura.fusion.sibling_first") ||
+         task.op->hasAttr("amoeba.neura.fusion.sibling_second"))) {
+      error = "producer-consumer fusion rejects sibling-only "
+              "parent metadata";
+      return false;
+    }
+    CompositeFusionRecord record{task.name, std::move(firstName),
+                                 std::move(secondName),
+                                 std::move(materializerMode)};
+    if (!compositeFusions.emplace(task.name, std::move(record)).second) {
+      error = "source-domain proof supports only one composite "
+              "fusion";
+      return false;
+    }
+  }
+
+  if (!compositeFusions.empty()) {
+    if (compositeFusions.size() != 1 ||
+        childTasks.size() + 1 != parentTasks.size()) {
+      error = "source-domain composite fusion supports one fused pair with "
+              "all other canonical tasks unchanged";
+      return false;
+    }
+    const CompositeFusionRecord &fusion = compositeFusions.begin()->second;
+    auto first = parents.find(fusion.firstParent);
+    auto second = parents.find(fusion.secondParent);
+    if (first == parents.end() || second == parents.end() ||
+        first == second || children.count(fusion.firstParent) ||
+        children.count(fusion.secondParent) ||
+        fusion.childName !=
+            (fusion.firstParent + ".fuse." + fusion.secondParent)) {
+      error = "composite fusion does not replace exactly two canonical parent "
+              "tasks";
+      return false;
+    }
+    auto fusedChild = children.find(fusion.childName);
+    if (first->second.tripCount != second->second.tripCount ||
+        fusedChild == children.end() ||
+        fusedChild->second.tripCount != first->second.tripCount) {
+      error = "composite fusion source tasks do not have one shared firing "
+              "count";
+      return false;
+    }
+    for (const auto &parent : parents) {
+      if (parent.first == fusion.firstParent ||
+          parent.first == fusion.secondParent)
+        continue;
+      auto child = children.find(parent.first);
+      if (child == children.end() ||
+          child->second.tripCount != parent.second.tripCount) {
+        error = "composite fusion changed or dropped an unrelated canonical "
+                "task";
+        return false;
+      }
+      for (NamedAttribute attribute : child->second.op->getAttrs()) {
+        StringRef name = attribute.getName().strref();
+        if (name.starts_with("amoeba.replica.") ||
+            name.starts_with("amoeba.tiling.") ||
+            name.starts_with("amoeba.neura.tiling.") ||
+            name.starts_with("amoeba.neura.fusion.")) {
+          error = "composite fusion composition rejects transformed unrelated "
+                  "tasks";
+          return false;
+        }
+      }
+    }
+    sourceOwnedLineage.clear();
+    return true;
+  }
 
   struct TilingFamily {
     std::string root;
@@ -4018,6 +4211,306 @@ static bool collectReplicaLayout(
     }
     if (!validateOrdinaryReplicaGroup(parent.second, groupRecords, error))
       return false;
+  }
+  return true;
+}
+
+static bool exactSimpleSourceCounterDomain(
+    TaskflowTaskOp task, const SourceIterationDomainInfo &domain,
+    std::string &error) {
+  if (!domain.complete || domain.internalMultiplicity != 1 ||
+      domain.axes.empty()) {
+    error = "composite fusion requires a complete taskflow-only source domain "
+            "with no internal iteration multiplicity";
+    return false;
+  }
+  SmallVector<TaskflowCounterOp> taskflowCounters;
+  task.walk([&](TaskflowCounterOp counter) {
+    taskflowCounters.push_back(counter);
+  });
+  SmallVector<neura::KernelOp> kernels;
+  task.walk([&](neura::KernelOp kernel) { kernels.push_back(kernel); });
+  if (taskflowCounters.size() != domain.axes.size() || kernels.size() != 1) {
+    error = "composite fusion source must have exactly one Taskflow and one "
+            "Neura counter for every certified domain axis";
+    return false;
+  }
+  SmallVector<neura::CounterOp> neuraCounters;
+  kernels.front().walk([&](neura::CounterOp counter) {
+    neuraCounters.push_back(counter);
+  });
+  if (neuraCounters.size() != domain.axes.size()) {
+    error = "composite fusion source Neura counters differ from its complete "
+            "Taskflow source domain";
+    return false;
+  }
+  for (auto [index, axis] : llvm::enumerate(domain.axes)) {
+    if (!axis.representedByTaskflow || axis.expandedInsideMapperFiring ||
+        axis.carriedValues != 0 || axis.resultUses != 0 ||
+        axis.ordinal != index) {
+      error = "composite fusion source domain contains an internal, recurrent, "
+              "or noncanonical counter axis";
+      return false;
+    }
+    CounterBounds taskflowBounds, neuraBounds;
+    if (!findTaskflowCounterBounds(task, axis.ordinal, taskflowBounds,
+                                   error) ||
+        !findNeuraCounterBounds(task, axis.ordinal, neuraBounds, error))
+      return false;
+    CounterBounds certified{axis.lower, axis.upper, axis.step};
+    if (!equalBounds(taskflowBounds, certified) ||
+        !equalBounds(neuraBounds, certified)) {
+      error = "composite fusion source counter mirrors differ from their exact "
+              "certified bounds";
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::string compositeSourceOriginBinding(
+    StringRef fusionKind,
+    StringRef firstName, const TaskMetadata &first, StringRef firstBinding,
+    StringRef secondName, const TaskMetadata &second,
+    StringRef secondBinding, StringRef domainWitness) {
+  std::string result;
+  llvm::raw_string_ostream stream(result);
+  if (fusionKind == "sibling")
+    stream << "amoeba-source-iteration-sibling-origin-v1\n";
+  else if (fusionKind == "producer-consumer-forwarded")
+    stream << "amoeba-source-iteration-producer-consumer-forwarded-origin-v1\n";
+  else
+    stream << "amoeba-source-iteration-producer-consumer-retained-origin-v1\n";
+  stream << "domain_witness_bytes=" << domainWitness.size() << ':'
+         << domainWitness << '\n'
+         << "first_name_bytes=" << firstName.size() << ':' << firstName
+         << '\n'
+         << "first_source_work_count=" << first.sourceIterationWorkCount
+         << '\n'
+         << "first_source_binding_bytes=" << firstBinding.size() << ':'
+         << firstBinding << '\n'
+         << "second_name_bytes=" << secondName.size() << ':' << secondName
+         << '\n'
+         << "second_source_work_count=" << second.sourceIterationWorkCount
+         << '\n'
+         << "second_source_binding_bytes=" << secondBinding.size() << ':'
+         << secondBinding << '\n';
+  stream.flush();
+  return result;
+}
+
+static std::string comparableSourceFunctionText(func::FuncOp function) {
+  OwningOpRef<func::FuncOp> copy =
+      cast<func::FuncOp>(function->clone());
+  // Joint neighborhood search writes a state-local variant identity on this
+  // function after source-owned fusion materialization. It does not alter the
+  // function body or the fusion proof, so omit only this search bookkeeping
+  // attribute when comparing the deterministic replay with the selected state.
+  copy.get()->removeAttr("amoeba.graph_variant_id");
+  copy->walk([&](TaskflowTaskOp task) {
+    task->removeAttr(kSourceIterationDomainAttr);
+    task->removeAttr(kSourceIterationControlBindingAttr);
+    task->removeAttr(kSourceIterationSourceControlBindingAttr);
+    task->removeAttr(kSourceIterationPartitionProofAttr);
+    task->removeAttr(kSourceIterationCapturePendingAttr);
+  });
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  copy->print(stream, OpPrintingFlags().printGenericOpForm().useLocalScope());
+  stream.flush();
+  return text;
+}
+
+// ReplayJointNeighborhoodActionsPass records an action-history partition
+// ledger after the source materializer has run. For a fusion of two
+// unchanged canonical parents, that ledger is exactly two identity roots.
+// Rebuild it from canonical task counters so it can be checked and included
+// in the exact body witness; never accept a candidate-provided ledger as the
+// proof itself.
+static FailureOr<ArrayAttr> expectedIdentityFusionLineage(
+    func::FuncOp canonicalFunction, const CompositeFusionRecord &fusion,
+    const SourceIterationDomainInfo &domain, std::string &error) {
+  if (!domain.complete || domain.internalMultiplicity != 1 ||
+      domain.axes.empty()) {
+    error = "composite fusion lineage requires one complete source firing";
+    return failure();
+  }
+  auto findCanonicalTask = [&](StringRef name) -> TaskflowTaskOp {
+    TaskflowTaskOp found;
+    canonicalFunction.walk([&](TaskflowTaskOp task) {
+      if (task.getTaskName() == name)
+        found = task;
+    });
+    return found;
+  };
+  Builder builder(canonicalFunction.getContext());
+  SmallVector<Attribute> roots;
+  for (StringRef name : {StringRef(fusion.firstParent),
+                         StringRef(fusion.secondParent)}) {
+    TaskflowTaskOp task = findCanonicalTask(name);
+    if (!task) {
+      error = "composite fusion lineage cannot find its canonical parent";
+      return failure();
+    }
+    for (StringRef attr : {StringRef(kNeighborhoodPartitionLineageAttr),
+                           StringRef("amoeba.neura.tiling.parent_task"),
+                           StringRef("amoeba.replica.parent_task"),
+                           StringRef("amoeba.tiling.parent_task"),
+                           StringRef("amoeba.semantic.k_tiled")})
+      if (task->hasAttr(attr)) {
+        error = "composite fusion identity lineage does not support already "
+                "partitioned canonical parents";
+        return failure();
+      }
+    SmallVector<int64_t> encodedDomain;
+    for (const SourceIterationAxis &axis : domain.axes)
+      encodedDomain.append({axis.lower, axis.upper, axis.step});
+    NamedAttrList fields;
+    fields.set("root", builder.getStringAttr(name));
+    fields.set("original", builder.getDenseI64ArrayAttr(encodedDomain));
+    SmallVector<Attribute> noSteps;
+    fields.set("steps", builder.getArrayAttr(noSteps));
+    roots.push_back(fields.getDictionary(canonicalFunction.getContext()));
+  }
+  return builder.getArrayAttr(roots);
+}
+
+static bool replayAndVerifyCompositeFusion(
+    func::FuncOp canonicalFunction, func::FuncOp currentFunction,
+    const CompositeFusionRecord &fusion,
+    const SourceIterationDomainInfo &domain, StringRef domainWitness,
+    std::string &error) {
+  auto simpleTaskName = [](StringRef name) {
+    return !name.empty() && llvm::all_of(name, [](char c) {
+             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '.';
+           });
+  };
+  if (!simpleTaskName(fusion.firstParent) ||
+      !simpleTaskName(fusion.secondParent)) {
+    error = "composite fusion parent names are outside the supported exact "
+            "source-name grammar";
+    return false;
+  }
+  ModuleOp canonicalModule = canonicalFunction->getParentOfType<ModuleOp>();
+  if (!canonicalModule) {
+    error = "composite fusion source replay has no canonical module";
+    return false;
+  }
+  OwningOpRef<ModuleOp> expectedModule =
+      cast<ModuleOp>(canonicalModule->clone());
+  std::string selectError;
+  FailureOr<func::FuncOp> expectedFunction =
+      selectTaskFunction(*expectedModule, canonicalFunction.getSymName(),
+                         selectError);
+  if (failed(expectedFunction)) {
+    error = selectError.empty()
+                ? "cannot select canonical composite fusion replay function"
+                : selectError;
+    return false;
+  }
+  std::unique_ptr<Pass> materializer =
+      mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
+  std::string options =
+      "first-task-name=\"" + fusion.firstParent +
+      "\" second-task-name=\"" + fusion.secondParent +
+      "\" fusion-mode=" + fusion.materializerMode;
+  if (!materializer ||
+      failed(materializer->initializeOptions(
+          options, [&](const llvm::Twine &message) {
+            error = message.str();
+            return failure();
+          }))) {
+    if (error.empty())
+      error = "cannot initialize source-owned composite fusion replay";
+    return false;
+  }
+  PassManager manager(expectedModule->getContext());
+  manager.enableVerifier(true);
+  manager.addPass(std::move(materializer));
+  std::string diagnosticText;
+  LogicalResult runResult = failure();
+  {
+    ScopedDiagnosticHandler capture(
+        expectedModule->getContext(), [&](Diagnostic &diagnostic) {
+          if (diagnosticText.empty()) {
+            llvm::raw_string_ostream stream(diagnosticText);
+            diagnostic.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
+    runResult = manager.run(*expectedModule);
+  }
+  if (failed(runResult) || failed(verify(expectedModule->getOperation()))) {
+    error = "canonical source-owned composite fusion replay failed";
+    if (!diagnosticText.empty())
+      error += ": " + diagnosticText;
+    return false;
+  }
+  expectedFunction = selectTaskFunction(*expectedModule,
+                                        canonicalFunction.getSymName(),
+                                        selectError);
+  if (failed(expectedFunction)) {
+    error = "cannot select materialized canonical composite fusion: " +
+            selectError;
+    return false;
+  }
+  std::string fusedName =
+      (Twine(fusion.firstParent) + ".fuse." + fusion.secondParent).str();
+  SmallVector<TaskflowTaskOp> expectedFused;
+  SmallVector<TaskflowTaskOp> currentFused;
+  expectedFunction->walk([&](TaskflowTaskOp task) {
+    if (task.getTaskName() == fusedName)
+      expectedFused.push_back(task);
+  });
+  currentFunction.walk([&](TaskflowTaskOp task) {
+    if (task.getTaskName() == fusedName)
+      currentFused.push_back(task);
+  });
+  if (expectedFused.size() != 1 || currentFused.size() != 1) {
+    error = "composite fusion replay did not identify the exact fused child";
+    return false;
+  }
+  for (StringRef attribute : {
+           StringRef("amoeba.neura.fusion.mode"),
+           StringRef("amoeba.neura.fusion.eliminated_loads"),
+           StringRef("amoeba.neura.fusion.eliminated_stores")}) {
+    if (expectedFused.front()->getAttr(attribute) !=
+        currentFused.front()->getAttr(attribute)) {
+      error = "composite fusion elimination metadata differs from the exact "
+              "source-owned materializer replay";
+      return false;
+    }
+  }
+  FailureOr<ArrayAttr> expectedLineage = expectedIdentityFusionLineage(
+      canonicalFunction, fusion, domain, error);
+  if (failed(expectedLineage))
+    return false;
+  Attribute actualLineage =
+      currentFused.front()->getAttr(kNeighborhoodPartitionLineageAttr);
+  if (actualLineage != *expectedLineage) {
+    error = "composite fusion action-history lineage differs from the exact "
+            "canonical parent roots";
+    return false;
+  }
+  expectedFused.front()->setAttr(kNeighborhoodPartitionLineageAttr,
+                                 *expectedLineage);
+  std::string expectedBinding = currentSourceIterationControlBinding(
+      expectedFused.front(), domainWitness);
+  std::string actualBinding = currentSourceIterationControlBinding(
+      currentFused.front(), domainWitness);
+  if (expectedBinding.empty() || actualBinding.empty() ||
+      expectedBinding != actualBinding) {
+    error = "current fused task shell, counters, memory roots, or mapper body "
+            "differs from deterministic canonical replay";
+    return false;
+  }
+  if (comparableSourceFunctionText(*expectedFunction) !=
+      comparableSourceFunctionText(currentFunction)) {
+    error = "composite fusion replay does not preserve exact canonical graph "
+            "coverage and remaining parent operations";
+    return false;
   }
   return true;
 }
@@ -4563,9 +5056,17 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
     std::map<std::string, TaskMetadata> children;
     std::map<std::string, std::vector<ReplicaRecord>> replicas;
     std::map<std::string, bool> sourceOwnedLineage;
+    std::map<std::string, CompositeFusionRecord> compositeFusions;
     if (!collectReplicaLayout(*parentTasks, *childTasks, parents, children,
-                              replicas, sourceOwnedLineage, error)) {
+                              replicas, sourceOwnedLineage, compositeFusions,
+                              error)) {
       childFunction.emitError() << error;
+      return signalPassFailure();
+    }
+    if (!compositeFusions.empty()) {
+      childFunction.emitError()
+          << "composite fusion requires a fresh prediction of the "
+             "combined mapper body; parent catalogue inheritance is refused";
       return signalPassFailure();
     }
     std::set<std::string> verifiedOriginalAmoebaChildren;
@@ -4849,8 +5350,10 @@ static LogicalResult processSourceIterationDomainPartition(
   std::map<std::string, TaskMetadata> children;
   std::map<std::string, std::vector<ReplicaRecord>> replicas;
   std::map<std::string, bool> sourceOwnedLineage;
+  std::map<std::string, CompositeFusionRecord> compositeFusions;
   if (!collectReplicaLayout(*parentTasks, *childTasks, parents, children,
-                            replicas, sourceOwnedLineage, error))
+                            replicas, sourceOwnedLineage, compositeFusions,
+                            error))
     return failure();
   std::set<std::string> verifiedOriginalAmoebaChildren;
   if (!validateOriginalAmoebaRealizationMetadata(
@@ -4872,7 +5375,136 @@ static LogicalResult processSourceIterationDomainPartition(
   SmallVector<PendingRefresh> pendingRefreshes;
   pendingRefreshes.reserve(childTasks->size());
 
-  for (const TaskMetadata &child : *childTasks) {
+  SmallVector<const TaskMetadata *> childProofOrder;
+  childProofOrder.reserve(childTasks->size());
+  for (const TaskMetadata &child : *childTasks)
+    if (compositeFusions.count(child.name))
+      childProofOrder.push_back(&child);
+  for (const TaskMetadata &child : *childTasks)
+    if (!compositeFusions.count(child.name))
+      childProofOrder.push_back(&child);
+  bool compositeGraphReplayVerified = false;
+
+  // Authenticate the one source-owned rewrite against a canonical clone
+  // before checking any remaining tasks. Retained producer-consumer fusion
+  // must pass the same complete, non-recurrent domain checks as sibling
+  // fusion. The source-owned materializer replay re-proves its ordered RAW
+  // edge, aliases, access indices, effects and complete task rewrite.
+  // Fusion may redirect downstream operands from both parent completions;
+  // exact whole-function replay proves those graph edges and all untouched
+  // task bodies/counters.
+  for (const TaskMetadata *childPointer : childProofOrder) {
+    const TaskMetadata &child = *childPointer;
+    auto fusion = compositeFusions.find(child.name);
+    if (fusion != compositeFusions.end()) {
+      auto first = parents.find(fusion->second.firstParent);
+      auto second = parents.find(fusion->second.secondParent);
+      auto actual = actualChildren.find(child.name);
+      if (first == parents.end() || second == parents.end() ||
+          actual == actualChildren.end()) {
+        error = "composite fusion source or fused child is absent from the "
+                "canonical graph";
+        return failure();
+      }
+      TaskflowTaskOp firstTask = first->second.op;
+      TaskflowTaskOp secondTask = second->second.op;
+      TaskflowTaskOp actualTask = actual->second;
+      auto firstDomain = firstTask->getAttrOfType<DictionaryAttr>(
+          kSourceIterationDomainAttr);
+      auto secondDomain = secondTask->getAttrOfType<DictionaryAttr>(
+          kSourceIterationDomainAttr);
+      auto firstSourceBinding = firstTask->getAttrOfType<StringAttr>(
+          kSourceIterationSourceControlBindingAttr);
+      auto secondSourceBinding = secondTask->getAttrOfType<StringAttr>(
+          kSourceIterationSourceControlBindingAttr);
+      if (!firstDomain || !secondDomain || firstDomain != secondDomain ||
+          !firstSourceBinding || firstSourceBinding.getValue().empty() ||
+          !secondSourceBinding || secondSourceBinding.getValue().empty()) {
+        error = "composite fusion parents lack the same exact complete source "
+                "domain or bound source-origin witnesses";
+        return failure();
+      }
+      std::string firstParseError;
+      std::string secondParseError;
+      FailureOr<SourceIterationDomainInfo> firstInfo =
+          parseSourceIterationDomain(firstTask, firstParseError);
+      FailureOr<SourceIterationDomainInfo> secondInfo =
+          parseSourceIterationDomain(secondTask, secondParseError);
+      if (failed(firstInfo) || failed(secondInfo)) {
+        error = "cannot parse complete composite source iteration domains: " +
+                (failed(firstInfo) ? firstParseError : secondParseError);
+        return failure();
+      }
+      std::string witness =
+          sourceIterationDomainCanonicalWitness(*firstInfo);
+      if (witness.empty() ||
+          witness != sourceIterationDomainCanonicalWitness(*secondInfo) ||
+          firstInfo->internalMultiplicity != 1 ||
+          secondInfo->internalMultiplicity != 1 ||
+          first->second.tripCount != second->second.tripCount ||
+          first->second.taskflowTripCount !=
+              second->second.taskflowTripCount ||
+          first->second.sourceIterationMultiplicity !=
+              second->second.sourceIterationMultiplicity ||
+          first->second.sourceIterationWorkCount !=
+              second->second.sourceIterationWorkCount ||
+          child.tripCount != first->second.tripCount ||
+          child.taskflowTripCount != first->second.taskflowTripCount ||
+          child.sourceIterationWorkCount !=
+              first->second.sourceIterationWorkCount) {
+        error = "composite fusion parents do not share one exact complete "
+                "source firing domain";
+        return failure();
+      }
+      if (!exactSimpleSourceCounterDomain(firstTask, *firstInfo, error) ||
+          !exactSimpleSourceCounterDomain(secondTask, *secondInfo, error) ||
+          !exactSimpleSourceCounterDomain(actualTask, *firstInfo, error))
+        return failure();
+      if (!replayAndVerifyCompositeFusion(canonicalParent, currentChild,
+                                          fusion->second, *firstInfo, witness,
+                                          error))
+        return failure();
+      compositeGraphReplayVerified = true;
+
+      std::string compositeSourceBinding = compositeSourceOriginBinding(
+          fusion->second.materializerMode, fusion->second.firstParent,
+          first->second,
+          firstSourceBinding.getValue(), fusion->second.secondParent,
+          second->second, secondSourceBinding.getValue(), witness);
+      std::string currentBinding =
+          currentSourceIterationControlBinding(actualTask, witness);
+      if (currentBinding.empty()) {
+        error = "fused composite task has no exact current body witness";
+        return failure();
+      }
+      if (!refreshBindings) {
+        auto existingDomain = actualTask->getAttrOfType<DictionaryAttr>(
+            kSourceIterationDomainAttr);
+        auto existingSourceBinding = actualTask->getAttrOfType<StringAttr>(
+            kSourceIterationSourceControlBindingAttr);
+        auto existingCurrentBinding = actualTask->getAttrOfType<StringAttr>(
+            kSourceIterationControlBindingAttr);
+        auto partitionProof = actualTask->getAttrOfType<StringAttr>(
+            kSourceIterationPartitionProofAttr);
+        if (actualTask->hasAttr(kSourceIterationCapturePendingAttr) ||
+            !existingDomain || existingDomain != firstDomain ||
+            !existingSourceBinding ||
+            existingSourceBinding.getValue() != compositeSourceBinding ||
+            !existingCurrentBinding ||
+            existingCurrentBinding.getValue() != currentBinding ||
+            !partitionProof || partitionProof.getValue() != witness) {
+          error = "imported composite fusion has a stale or forged combined "
+                  "source-origin/body certificate";
+          return failure();
+        }
+      }
+      pendingRefreshes.push_back(
+          {actualTask, firstDomain,
+           StringAttr::get(currentChild.getContext(), compositeSourceBinding),
+           std::move(witness), std::move(currentBinding)});
+      continue;
+    }
+
     auto lineage = sourceOwnedLineage.find(child.name);
     std::string sourceName =
         lineage == sourceOwnedLineage.end() || !lineage->second
@@ -4963,15 +5595,17 @@ static LogicalResult processSourceIterationDomainPartition(
         }
       }
     }
-    BodyProof bodyProof;
-    if (!proveTaskBody(canonicalTask, child.op, bodyProof, error,
-                       isSequentialKLineage(child.op),
-                       lineage != sourceOwnedLineage.end() &&
-                           lineage->second,
-                       verifiedOriginalAmoebaChildren.count(child.name) != 0)) {
-      error = "source-domain child body proof failed for " + child.name +
-              ": " + error;
-      return failure();
+    if (!compositeGraphReplayVerified) {
+      BodyProof bodyProof;
+      if (!proveTaskBody(
+              canonicalTask, child.op, bodyProof, error,
+              isSequentialKLineage(child.op),
+              lineage != sourceOwnedLineage.end() && lineage->second,
+              verifiedOriginalAmoebaChildren.count(child.name) != 0)) {
+        error = "source-domain child body proof failed for " + child.name +
+                ": " + error;
+        return failure();
+      }
     }
 
     std::string parseError;

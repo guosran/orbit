@@ -242,10 +242,15 @@ private:
 // closed rather than silently mixing model contracts.
 class PersistentMLCostCache {
 public:
+  // Direct-model callers provide the runtime ceiling and exact training YAML
+  // from an already-loaded PerCgra2x2DirectEnsemble. Loading then rechecks the
+  // 20 -> 23 diagnostic architecture substitution against the resource bytes.
   bool load(llvm::StringRef path, llvm::StringRef modelSchema,
             llvm::StringRef featureContractId,
             llvm::StringRef architectureContract,
-            const MLCostCacheResources &resources, std::string &error);
+            const MLCostCacheResources &resources, double runtimeIICeiling,
+            llvm::StringRef validatedTrainingArchitectureText,
+            std::string &error);
 
   bool lookup(const MLCostCacheKey &key, const MLCostCacheFacts &facts,
               MLPEnsemblePrediction &prediction) const;

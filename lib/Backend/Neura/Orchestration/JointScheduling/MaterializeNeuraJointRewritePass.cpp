@@ -67,6 +67,12 @@ constexpr StringLiteral kTilingOutputRegionLowersAttr =
     "amoeba.tiling.output_region_lowers";
 constexpr StringLiteral kTilingOutputRegionUppersAttr =
     "amoeba.tiling.output_region_uppers";
+constexpr StringLiteral kTilingInputRegionLowersAttr =
+    "amoeba.tiling.input_region_lowers";
+constexpr StringLiteral kTilingInputRegionUppersAttr =
+    "amoeba.tiling.input_region_uppers";
+constexpr StringLiteral kTilingInputRegionReasonsAttr =
+    "amoeba.tiling.input_region_reasons";
 
 static LogicalResult reject(Operation *operation, const Twine &message) {
   operation->emitError(message);
@@ -438,6 +444,11 @@ static std::optional<int64_t> constantIndex(Value value) {
     return constant.value();
   if (auto constant = value.getDefiningOp<arith::ConstantIntOp>())
     return constant.value();
+  if (auto constant = value.getDefiningOp<neura::ConstantOp>()) {
+    auto integer = dyn_cast<IntegerAttr>(constant.getValueAttr());
+    if (integer && integer.getValue().isSignedIntN(64))
+      return integer.getValue().getSExtValue();
+  }
   return std::nullopt;
 }
 
@@ -696,26 +707,10 @@ struct NeuraTilePlan {
   // completion-join verifier can continue to enforce disjoint coverage.
   SmallVector<int64_t> outputShape;
   bool outputNeedsStaticView = false;
-  // A narrow exception for an in-place rank-1 task. Such a task is legal only
-  // when every read and write names the same output root at the selected
-  // counter index; ordinary input/output aliasing remains rejected below.
+  // In-place tiling is legal only when every output access names the same
+  // root at matching output-counter coordinates; other writes are rejected.
   bool inPlaceSelectedIndex = false;
 };
-
-static bool forwardsCounterIndex(Value value, Value expected,
-                                 unsigned depth = 0) {
-  if (value == expected)
-    return true;
-  if (!value || depth >= 8)
-    return false;
-  Operation *definition = value.getDefiningOp();
-  if (!definition || definition->getNumOperands() != 1)
-    return false;
-  StringRef name = definition->getName().getStringRef();
-  if (name != "neura.data_mov" && name != "neura.ctrl_mov")
-    return false;
-  return forwardsCounterIndex(definition->getOperand(0), expected, depth + 1);
-}
 
 static std::optional<unsigned>
 kernelInputIndex(neura::KernelOp kernel, TaskflowTaskOp task, Value root) {
@@ -777,6 +772,12 @@ static bool forwardsKernelArgument(Value value, BlockArgument argument,
   return forwardsKernelArgument(definition->getOperand(0), argument,
                                 depth + 1);
 }
+
+static std::optional<unsigned>
+resolveKernelStorageInput(Operation *operation, neura::KernelOp kernel,
+                          StringRef foldedAttribute, Value base);
+static bool isProvenOutputCoordinate(Value value, neura::CounterOp counter,
+                                     unsigned depth = 0);
 
 static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
                                                Value outputRoot) {
@@ -842,9 +843,11 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
                     "the complete output rank");
     }
     for (auto [dimension, index] : llvm::enumerate(indices)) {
+      // Use the same all-arms coordinate proof as the non-in-place path: data
+      // movement, grants, and phi nodes are allowed only when every phi arm
+      // still names this exact output counter.
       if (dimension >= plan.kernelCounters.size() ||
-          !forwardsCounterIndex(
-              index, plan.kernelCounters[dimension].getCurrentIndex())) {
+          !isProvenOutputCoordinate(index, plan.kernelCounters[dimension])) {
         if (outputRank == 1)
           return reject(
               plan.task,
@@ -868,8 +871,8 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
     if (failed(result))
       return;
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-      auto input = accessInputIndex(operation, plan.kernel, "lhs_value",
-                                    load.getMemRef());
+      auto input = resolveKernelStorageInput(operation, plan.kernel,
+                                             "lhs_value", load.getMemRef());
       if (!input && outputRank == 2) {
         result = reject(plan.task,
                         "in-place tiling cannot prove a rank-2 load storage "
@@ -890,8 +893,8 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
       return;
     }
     if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-      auto input = accessInputIndex(operation, plan.kernel, "rhs_value",
-                                    store.getMemRef());
+      auto input = resolveKernelStorageInput(operation, plan.kernel,
+                                             "rhs_value", store.getMemRef());
       if (!input && outputRank == 2) {
         result = reject(plan.task,
                         "in-place tiling cannot prove a rank-2 store storage "
@@ -903,17 +906,19 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
           result = failure();
         else
           sawStore = true;
-      } else if (outputRank == 1) {
+      } else {
         result = reject(
             plan.task,
-            "rank-1 in-place tiling requires every store to write the output "
-            "root at the selected counter index");
+            outputRank == 1
+                ? "rank-1 in-place tiling requires every store to write the "
+                  "output root at the selected counter index"
+                : "in-place tiling rejects a store to a foreign storage root");
       }
       return;
     }
     if (auto load = dyn_cast<neura::LoadIndexedOp>(operation)) {
-      auto input = accessInputIndex(operation, plan.kernel, "lhs_value",
-                                    load.getBase());
+      auto input = resolveKernelStorageInput(operation, plan.kernel,
+                                             "lhs_value", load.getBase());
       if (!input && outputRank == 2) {
         result = reject(plan.task,
                         "in-place tiling cannot prove a rank-2 load storage "
@@ -934,8 +939,8 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
       return;
     }
     if (auto store = dyn_cast<neura::StoreIndexedOp>(operation)) {
-      auto input = accessInputIndex(operation, plan.kernel, "rhs_value",
-                                    store.getBase());
+      auto input = resolveKernelStorageInput(operation, plan.kernel,
+                                             "rhs_value", store.getBase());
       if (!input && outputRank == 2) {
         result = reject(plan.task,
                         "in-place tiling cannot prove a rank-2 store storage "
@@ -947,11 +952,13 @@ static LogicalResult proveInPlaceSelectedRegion(NeuraTilePlan &plan,
           result = failure();
         else
           sawStore = true;
-      } else if (outputRank == 1) {
+      } else {
         result = reject(
             plan.task,
-            "rank-1 in-place tiling requires every store to write the output "
-            "root at the selected counter index");
+            outputRank == 1
+                ? "rank-1 in-place tiling requires every store to write the "
+                  "output root at the selected counter index"
+                : "in-place tiling rejects a store to a foreign storage root");
       }
       return;
     }
@@ -1049,7 +1056,7 @@ resolveKernelStorageInput(Operation *operation, neura::KernelOp kernel,
 }
 
 static bool isProvenOutputCoordinate(Value value, neura::CounterOp counter,
-                                     unsigned depth = 0) {
+                                     unsigned depth) {
   if (value == counter.getCurrentIndex())
     return true;
   if (!value || depth >= 64)
@@ -1659,6 +1666,119 @@ static LogicalResult setProvenOutputRegionAttrs(OpBuilder &builder,
   return success();
 }
 
+static LogicalResult setProvenInPlaceInputRegionAttrs(
+    OpBuilder &builder, TaskflowTaskOp source, TaskflowTaskOp part,
+    const NeuraTilePlan &plan) {
+  if (!plan.inPlaceSelectedIndex)
+    return success();
+
+  ValueRange reads = part.getWillReads();
+  ValueRange readRoots = source.getOriginalReadMemrefs();
+  ValueRange writeRoots = source.getOriginalWriteMemrefs();
+  if (readRoots.size() != reads.size() || writeRoots.size() != 1)
+    return reject(source,
+                  "in-place tiling cannot pair read roots with the proven "
+                  "output root");
+  Value outputRoot = writeRoots.front();
+  if (llvm::count(readRoots, outputRoot) > 1)
+    return reject(source,
+                  "in-place tiling has an ambiguous read root for its "
+                  "proven output root");
+
+  auto outputLowers = part->getAttrOfType<ArrayAttr>(
+      kTilingOutputRegionLowersAttr);
+  auto outputUppers = part->getAttrOfType<ArrayAttr>(
+      kTilingOutputRegionUppersAttr);
+  if (!outputLowers || !outputUppers || outputLowers.size() != 1 ||
+      outputUppers.size() != 1)
+    return reject(part,
+                  "in-place input footprint requires the proven output "
+                  "region descriptor");
+  auto outputLower = dyn_cast<DenseI64ArrayAttr>(outputLowers[0]);
+  auto outputUpper = dyn_cast<DenseI64ArrayAttr>(outputUppers[0]);
+  if (!outputLower || !outputUpper ||
+      outputLower.size() != outputUpper.size())
+    return reject(part,
+                  "in-place input footprint has a malformed output region");
+
+  ArrayAttr oldLowers = source->getAttrOfType<ArrayAttr>(
+      kTilingInputRegionLowersAttr);
+  ArrayAttr oldUppers = source->getAttrOfType<ArrayAttr>(
+      kTilingInputRegionUppersAttr);
+  ArrayAttr oldReasons = source->getAttrOfType<ArrayAttr>(
+      kTilingInputRegionReasonsAttr);
+  bool hasOldInputContract = source->hasAttr(kTilingInputRegionLowersAttr) ||
+                             source->hasAttr(kTilingInputRegionUppersAttr) ||
+                             source->hasAttr(kTilingInputRegionReasonsAttr);
+  if (hasOldInputContract &&
+      (!oldLowers || !oldUppers || !oldReasons ||
+       oldLowers.size() != reads.size() || oldUppers.size() != reads.size() ||
+       oldReasons.size() != reads.size()))
+    return reject(source,
+                  "in-place tiling cannot preserve incomplete input-region "
+                  "descriptors");
+
+  SmallVector<Attribute> lowers;
+  SmallVector<Attribute> uppers;
+  SmallVector<Attribute> reasons;
+  lowers.reserve(reads.size());
+  uppers.reserve(reads.size());
+  reasons.reserve(reads.size());
+  for (auto indexed : llvm::enumerate(reads)) {
+    if (readRoots[indexed.index()] != outputRoot) {
+      lowers.push_back(hasOldInputContract
+                           ? oldLowers[indexed.index()]
+                           : builder.getUnitAttr());
+      uppers.push_back(hasOldInputContract
+                           ? oldUppers[indexed.index()]
+                           : builder.getUnitAttr());
+      reasons.push_back(hasOldInputContract
+                            ? oldReasons[indexed.index()]
+                            : builder.getStringAttr("unproven"));
+      continue;
+    }
+
+    // The in-place legality proof established that every load and store
+    // through this exact output root uses the corresponding output counters.
+    // Reuse the already-validated child output box for only those read roots
+    // that are the identical storage value; every other input stays unknown.
+    auto readType = dyn_cast<MemRefType>(readRoots[indexed.index()].getType());
+    auto writeType = dyn_cast<MemRefType>(outputRoot.getType());
+    if (!readType || !writeType || readType != writeType ||
+        reads[indexed.index()].getType() != readType ||
+        outputLower.size() != static_cast<size_t>(readType.getRank()))
+      return reject(part,
+                    "in-place input footprint does not match the proven "
+                    "output storage type");
+    SmallVector<int64_t> callerShape;
+    if (!readType.hasStaticShape() &&
+        failed(validateCallerShape(readRoots[indexed.index()], readType,
+                                   callerShape)))
+      return reject(part,
+                    "in-place input footprint lacks a caller-shape proof");
+    for (int64_t dimension = 0; dimension < readType.getRank(); ++dimension) {
+      int64_t extent = readType.isDynamicDim(dimension)
+                           ? callerShape[dimension]
+                           : readType.getDimSize(dimension);
+      int64_t lower = outputLower[dimension];
+      int64_t upper = outputUpper[dimension];
+      if (lower < 0 || upper <= lower || upper > extent)
+        return reject(part,
+                      "in-place input footprint is outside the proved "
+                      "output storage shape");
+    }
+    lowers.push_back(outputLower);
+    uppers.push_back(outputUpper);
+    reasons.push_back(
+        builder.getStringAttr("in_place_output_coordinate_proof"));
+  }
+
+  part->setAttr(kTilingInputRegionLowersAttr, builder.getArrayAttr(lowers));
+  part->setAttr(kTilingInputRegionUppersAttr, builder.getArrayAttr(uppers));
+  part->setAttr(kTilingInputRegionReasonsAttr, builder.getArrayAttr(reasons));
+  return success();
+}
+
 static FailureOr<TaskflowTaskOp>
 createPart(OpBuilder &builder, const NeuraTilePlan &plan, int64_t partIndex,
           int64_t partLower, int64_t partUpper, Value outputStorage) {
@@ -1792,13 +1912,15 @@ createPart(OpBuilder &builder, const NeuraTilePlan &plan, int64_t partIndex,
   part->setAttr(kDerivedRangeAttr,
                 builder.getDenseI64ArrayAttr({partLower, partUpper}));
   part->setAttr(kRewriteAttr, builder.getStringAttr("post-neura-mn-tiling"));
-  auto outputType =
-      dyn_cast<MemRefType>(part.getWillWrites().front().getType());
-  bool publishRankOneInPlaceRegion =
-      plan.inPlaceSelectedIndex && outputType && outputType.getRank() == 1;
-  if ((!plan.inPlaceSelectedIndex || publishRankOneInPlaceRegion) &&
-      failed(setProvenOutputRegionAttrs(builder, part, plan, partLower,
+  // In-place tiling reaches this point only after every read/write was proven
+  // to use the selected output root at the exact output-counter coordinates.
+  // Publish the same counter-derived rectangle for all output ranks, including
+  // rank-2 in-place GEMM outputs; source-owned partition replay requires this
+  // proof metadata before it independently validates the child counter boxes.
+  if (failed(setProvenOutputRegionAttrs(builder, part, plan, partLower,
                                         partUpper)))
+    return failure();
+  if (failed(setProvenInPlaceInputRegionAttrs(builder, source, part, plan)))
     return failure();
   return part;
 }
@@ -1918,6 +2040,7 @@ struct NeuraFusionPlan {
   SmallVector<neura::CounterOp> producerKernelCounters;
   SmallVector<neura::CounterOp> consumerKernelCounters;
   bool forwarded = false;
+  bool shareConsumerLoad = false;
 };
 
 // A sibling fusion has no producer-consumer intermediate.  The two kernels
@@ -2424,6 +2547,252 @@ static bool equivalentAccessIndices(ValueRange lhs, ValueRange rhs,
   return true;
 }
 
+// Sibling kernels are emitted sequentially into one kernel.  A repeated read
+// can be shared only when every memory access in both source bodies is
+// classified and every write is proven disjoint from every read.  Neura DFG
+// arithmetic does not uniformly expose MemoryEffectOpInterface, so keep an
+// explicit allowlist and decline this optional optimization for unknown ops.
+static bool isKnownSiblingDataOnlyOperation(Operation *operation) {
+  if (!operation || operation->getNumRegions() != 0 ||
+      operation->getNumSuccessors() != 0)
+    return false;
+  StringRef name = operation->getName().getStringRef();
+  if (name == "neura.constant" || name == "neura.add" ||
+      name == "neura.sub" || name == "neura.mul" ||
+      name == "neura.div" || name == "neura.rem" ||
+      name == "neura.fadd" || name == "neura.fsub" ||
+      name == "neura.fneg" || name == "neura.fmul" ||
+      name == "neura.fdiv" || name == "neura.fmax" ||
+      name == "neura.fmin" || name == "neura.and" ||
+      name == "neura.or" || name == "neura.icmp" ||
+      name == "neura.fcmp" || name == "neura.gep" ||
+      name == "neura.sel" || name == "neura.not" ||
+      name == "neura.cast" || name == "neura.sext" ||
+      name == "neura.zext" || name == "neura.shl" ||
+      name == "neura.vfmul" || name == "neura.vmul" ||
+      name == "neura.vadd" || name == "neura.vfadd" ||
+      name == "neura.vector.reduce.add" || name == "neura.fadd_fadd" ||
+      name == "neura.fmul_fadd" || name == "neura.mul_add" ||
+      name == "neura.mac" || name == "neura.counter" ||
+      name == "neura.grant_once" || name == "neura.reserve" ||
+      name == "neura.phi_start" || name == "neura.phi" ||
+      name == "neura.grant_predicate" || name == "neura.grant_always" ||
+      name == "neura.loop_control" || name == "neura.data_mov" ||
+      name == "neura.ctrl_mov" || name == "neura.extract_predicate" ||
+      name == "neura.true_steer" || name == "neura.false_steer" ||
+      name == "neura.carry" || name == "neura.merge" ||
+      name == "neura.invariant" || name == "neura.fused_op" ||
+      name == "neura.return_value" || name == "neura.return_void" ||
+      name == "neura.yield")
+    return true;
+  if (name == "memref.cast")
+    return isMemoryEffectFree(operation);
+  return operation->getDialect() &&
+         operation->getDialect()->getNamespace() == "arith" &&
+         isMemoryEffectFree(operation);
+}
+
+static std::optional<Value>
+siblingTaskStorageRoot(TaskflowTaskOp task, neura::KernelOp kernel,
+                       unsigned kernelInput, bool forWrite) {
+  if (!task || !kernel || kernelInput >= kernel.getInputs().size() ||
+      !task.getBody().hasOneBlock())
+    return std::nullopt;
+  Value input = kernel.getInputs()[kernelInput];
+  auto originalForTaskArgument = [&](unsigned argumentIndex)
+      -> std::optional<Value> {
+    unsigned readCount = task.getWillReads().size();
+    unsigned writeCount = task.getWillWrites().size();
+    if (argumentIndex < readCount) {
+      if (forWrite || argumentIndex >= task.getOriginalReadMemrefs().size())
+        return std::nullopt;
+      return task.getOriginalReadMemrefs()[argumentIndex];
+    }
+    argumentIndex -= readCount;
+    if (argumentIndex < writeCount) {
+      if (!forWrite ||
+          argumentIndex >= task.getOriginalWriteMemrefs().size())
+        return std::nullopt;
+      return task.getOriginalWriteMemrefs()[argumentIndex];
+    }
+    return std::nullopt;
+  };
+  if (auto argument = dyn_cast<BlockArgument>(input))
+    if (argument.getOwner() == &task.getBody().front())
+      return originalForTaskArgument(argument.getArgNumber());
+
+  ValueRange taskInputs = forWrite ? task.getWillWrites()
+                                   : task.getWillReads();
+  ValueRange originalRoots = forWrite ? task.getOriginalWriteMemrefs()
+                                      : task.getOriginalReadMemrefs();
+  if (taskInputs.size() != originalRoots.size())
+    return std::nullopt;
+  for (auto [index, taskInput] : llvm::enumerate(taskInputs))
+    if (input == taskInput)
+      return originalRoots[index];
+  for (Value original : originalRoots)
+    if (input == original)
+      return original;
+  return std::nullopt;
+}
+
+static bool siblingReadDedupEffectsAreTracked(
+    const NeuraSiblingFusionPlan &plan) {
+  SmallVector<Value> reads;
+  SmallVector<Value> writes;
+  auto collect = [&](TaskflowTaskOp task, neura::KernelOp kernel) {
+    if (!kernel || !kernel.getBody().hasOneBlock())
+      return false;
+    for (Operation &operation : kernel.getBody().front()) {
+      if (operation.getNumRegions() != 0 ||
+          operation.getNumSuccessors() != 0)
+        return false;
+      if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
+        auto input = traceKernelStorageInput(load.getMemRef(), kernel);
+        if (!input)
+          return false;
+        auto root = siblingTaskStorageRoot(task, kernel, *input,
+                                           /*forWrite=*/false);
+        if (!root)
+          return false;
+        if (!llvm::is_contained(reads, *root))
+          reads.push_back(*root);
+        continue;
+      }
+      if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
+        auto input = traceKernelStorageInput(store.getMemRef(), kernel);
+        if (!input)
+          return false;
+        auto root = siblingTaskStorageRoot(task, kernel, *input,
+                                           /*forWrite=*/true);
+        if (!root)
+          return false;
+        if (!llvm::is_contained(writes, *root))
+          writes.push_back(*root);
+        continue;
+      }
+      if (auto load = dyn_cast<neura::LoadIndexedOp>(&operation)) {
+        auto input = resolveKernelStorageInput(&operation, kernel, "lhs_value",
+                                               load.getBase());
+        if (!input)
+          return false;
+        auto root = siblingTaskStorageRoot(task, kernel, *input,
+                                           /*forWrite=*/false);
+        if (!root)
+          return false;
+        if (!llvm::is_contained(reads, *root))
+          reads.push_back(*root);
+        continue;
+      }
+      if (auto store = dyn_cast<neura::StoreIndexedOp>(&operation)) {
+        auto input = resolveKernelStorageInput(&operation, kernel, "rhs_value",
+                                               store.getBase());
+        if (!input)
+          return false;
+        auto root = siblingTaskStorageRoot(task, kernel, *input,
+                                           /*forWrite=*/true);
+        if (!root)
+          return false;
+        if (!llvm::is_contained(writes, *root))
+          writes.push_back(*root);
+        continue;
+      }
+      if (!isKnownSiblingDataOnlyOperation(&operation) &&
+          !isMemoryEffectFree(&operation))
+        return false;
+    }
+    return true;
+  };
+  if (!collect(plan.first, plan.firstKernel) ||
+      !collect(plan.second, plan.secondKernel))
+    return false;
+  for (Value read : reads)
+    for (Value write : writes)
+      if (!provesDistinctStorage(read, write))
+        return false;
+  return true;
+}
+
+// Compare only the data-only forwarding/predicate wrappers that can change a
+// Neura value's validity.  In particular, two equal payload indices with
+// different grant_predicate inputs are not treated as the same read.
+static bool sameSiblingDataflowValue(Value lhs, Value rhs,
+                                    unsigned depth = 0) {
+  if (lhs == rhs)
+    return static_cast<bool>(lhs);
+  if (!lhs || !rhs || lhs.getType() != rhs.getType() || depth >= 32)
+    return false;
+  Operation *left = lhs.getDefiningOp();
+  Operation *right = rhs.getDefiningOp();
+  StringRef name = left ? left->getName().getStringRef() : StringRef();
+  if (!left || !right || left->getName() != right->getName() ||
+      left->getAttrs() != right->getAttrs() || left->getNumRegions() != 0 ||
+      right->getNumRegions() != 0 || left->getNumSuccessors() != 0 ||
+      right->getNumSuccessors() != 0 ||
+      (left->getNumOperands() == 0 && name != "neura.constant") ||
+      left->getNumOperands() != right->getNumOperands() ||
+      left->getNumResults() != 1 || right->getNumResults() != 1 ||
+      left->getResult(0) != lhs || right->getResult(0) != rhs)
+    return false;
+  if (name != "neura.data_mov" && name != "neura.grant_predicate" &&
+      name != "neura.cast" && name != "neura.constant" &&
+      name != "memref.cast")
+    return false;
+  return llvm::all_of(llvm::zip(left->getOperands(), right->getOperands()),
+                      [&](auto operands) {
+                        return sameSiblingDataflowValue(std::get<0>(operands),
+                                                        std::get<1>(operands),
+                                                        depth + 1);
+                      });
+}
+
+static bool sameSiblingLoad(Operation *lhs, Operation *rhs,
+                            neura::KernelOp fusedKernel) {
+  if (!lhs || !rhs || lhs->getName() != rhs->getName() ||
+      lhs->getAttrs() != rhs->getAttrs() || lhs->getNumRegions() != 0 ||
+      rhs->getNumRegions() != 0 || lhs->getNumResults() != 1 ||
+      rhs->getNumResults() != 1 || lhs->getResult(0).getType() !=
+                                       rhs->getResult(0).getType())
+    return false;
+  if (auto left = dyn_cast<memref::LoadOp>(lhs)) {
+    auto right = dyn_cast<memref::LoadOp>(rhs);
+    return right && sameSiblingDataflowValue(left.getMemRef(),
+                                             right.getMemRef()) &&
+           left.getIndices().size() == right.getIndices().size() &&
+           llvm::all_of(llvm::zip(left.getIndices(), right.getIndices()),
+                        [](auto indices) {
+                          return sameSiblingDataflowValue(
+                              std::get<0>(indices), std::get<1>(indices));
+                        });
+  }
+  auto left = dyn_cast<neura::LoadIndexedOp>(lhs);
+  auto right = dyn_cast<neura::LoadIndexedOp>(rhs);
+  if (!left || !right || lhs->hasAttr("rhs_value"))
+    return false;
+  Attribute leftRoot = lhs->getAttr("lhs_value");
+  Attribute rightRoot = rhs->getAttr("lhs_value");
+  auto leftInput = parseKernelInputReference(leftRoot);
+  auto rightInput = parseKernelInputReference(rightRoot);
+  if ((leftRoot && !leftInput) || (rightRoot && !rightInput) ||
+      leftInput != rightInput ||
+      (leftInput && *leftInput >= fusedKernel.getInputs().size()) ||
+      static_cast<bool>(left.getBase()) != static_cast<bool>(right.getBase()) ||
+      (!left.getBase() && !leftInput) ||
+      (left.getBase() &&
+       !sameSiblingDataflowValue(left.getBase(), right.getBase())) ||
+      left.getIndices().size() != right.getIndices().size())
+    return false;
+  return llvm::all_of(llvm::zip(left.getIndices(), right.getIndices()),
+                      [](auto indices) {
+                        return sameSiblingDataflowValue(
+                            std::get<0>(indices), std::get<1>(indices));
+                      });
+}
+
+static bool isSiblingLoad(Operation *operation) {
+  return isa<memref::LoadOp, neura::LoadIndexedOp>(operation);
+}
+
 static BlockArgument kernelMemrefArgument(neura::KernelOp kernel,
                                           Value taskBodyArgument) {
   for (auto [index, input] : llvm::enumerate(kernel.getInputs()))
@@ -2451,6 +2820,344 @@ static bool hasOnlyAllowedIntermediateUses(neura::KernelOp kernel,
     }
   });
   return valid;
+}
+
+struct CounterProjection {
+  bool hasCounter = false;
+  unsigned counter = 0;
+  int64_t offset = 0;
+};
+
+static std::optional<int64_t> integerAttribute(Attribute attribute) {
+  auto integer = dyn_cast_or_null<IntegerAttr>(attribute);
+  if (!integer || !integer.getValue().isSignedIntN(64))
+    return std::nullopt;
+  return integer.getValue().getSExtValue();
+}
+
+static bool addWithoutOverflow(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+      (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+    return false;
+  result = lhs + rhs;
+  return true;
+}
+
+// Describe only constant or one-counter-plus-constant address expressions.
+// Combining two counters, selecting different counter arms, or following an
+// opaque operation is intentionally unsupported: a rectangular task domain
+// needs a separate address coordinate for every varying firing axis.
+static std::optional<CounterProjection> traceCounterProjection(
+    Value value, ArrayRef<neura::CounterOp> counters, Block *accessBlock,
+    TaskflowTaskOp task, neura::KernelOp kernel, unsigned depth = 0) {
+  if (!value || depth >= 64)
+    return std::nullopt;
+  for (auto [index, counterHandle] : llvm::enumerate(counters))
+    if (value == neura::CounterOp(counterHandle).getCurrentIndex())
+      return CounterProjection{true, static_cast<unsigned>(index), 0};
+  if (auto constant = constantIndex(value))
+    return CounterProjection{false, 0, *constant};
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (argument.getOwner() == &kernel.getBody().front() &&
+        argument.getArgNumber() < kernel.getInputs().size())
+      if (auto constant = compileTimeIndex(
+              kernel.getInputs()[argument.getArgNumber()], task, kernel))
+        return CounterProjection{false, 0, *constant};
+    return std::nullopt;
+  }
+  Operation *operation = value.getDefiningOp();
+  if (!operation || operation->getBlock() != accessBlock ||
+      operation->getNumResults() != 1 || operation->getResult(0) != value ||
+      operation->getNumRegions() != 0 || operation->getNumSuccessors() != 0)
+    return std::nullopt;
+
+  StringRef name = operation->getName().getStringRef();
+  if (name == "neura.data_mov" && operation->getNumOperands() == 1 &&
+      operation->getAttrs().empty() &&
+      operation->getOperand(0).getType() == value.getType())
+    return traceCounterProjection(operation->getOperand(0), counters,
+                                  accessBlock, task, kernel, depth + 1);
+  if (name == "neura.cast" && operation->getNumOperands() == 1) {
+    auto castType = operation->getAttrOfType<StringAttr>("cast_type");
+    Type inputType = operation->getOperand(0).getType();
+    Type resultType = value.getType();
+    if (auto predicated = dyn_cast<neura::PredicatedValue>(inputType))
+      inputType = predicated.getValueType();
+    if (auto predicated = dyn_cast<neura::PredicatedValue>(resultType))
+      resultType = predicated.getValueType();
+    bool identityCast = inputType == resultType;
+    bool wideningToIndex = castType && castType.getValue() == "int_to_index" &&
+                           isa<IntegerType>(inputType) &&
+                           isa<IndexType>(resultType);
+    if (identityCast || wideningToIndex)
+      return traceCounterProjection(operation->getOperand(0), counters,
+                                    accessBlock, task, kernel, depth + 1);
+    return std::nullopt;
+  }
+
+  bool addition = name == "neura.add" || isa<arith::AddIOp>(operation);
+  bool subtraction = name == "neura.sub" || isa<arith::SubIOp>(operation);
+  if (!addition && !subtraction)
+    return std::nullopt;
+
+  CounterProjection lhs;
+  CounterProjection rhs;
+  if (operation->getNumOperands() == 2) {
+    auto lhsProjection = traceCounterProjection(
+        operation->getOperand(0), counters, accessBlock, task, kernel,
+        depth + 1);
+    auto rhsProjection = traceCounterProjection(
+        operation->getOperand(1), counters, accessBlock, task, kernel,
+        depth + 1);
+    if (!lhsProjection || !rhsProjection)
+      return std::nullopt;
+    lhs = *lhsProjection;
+    rhs = *rhsProjection;
+  } else if (operation->getNumOperands() == 1 && addition) {
+    auto lhsProjection = traceCounterProjection(
+        operation->getOperand(0), counters, accessBlock, task, kernel,
+        depth + 1);
+    auto rhsConstant = integerAttribute(operation->getAttr("rhs_value"));
+    if (!lhsProjection || !rhsConstant)
+      return std::nullopt;
+    lhs = *lhsProjection;
+    rhs = CounterProjection{false, 0, *rhsConstant};
+  } else {
+    return std::nullopt;
+  }
+  if ((lhs.hasCounter && rhs.hasCounter) ||
+      (subtraction && !lhs.hasCounter && rhs.hasCounter))
+    return std::nullopt;
+  int64_t offset = 0;
+  if (addition) {
+    if (!addWithoutOverflow(lhs.offset, rhs.offset, offset))
+      return std::nullopt;
+  } else {
+    if (rhs.offset == std::numeric_limits<int64_t>::min() ||
+        !addWithoutOverflow(lhs.offset, -rhs.offset, offset))
+      return std::nullopt;
+  }
+  if (lhs.hasCounter)
+    return CounterProjection{true, lhs.counter, offset};
+  if (rhs.hasCounter)
+    return CounterProjection{true, rhs.counter, offset};
+  return CounterProjection{false, 0, offset};
+}
+
+static bool kernelCountersMatchTaskflow(
+    ArrayRef<TaskflowCounterOp> taskCounters,
+    ArrayRef<neura::CounterOp> kernelCounters, TaskflowTaskOp task,
+    neura::KernelOp kernel) {
+  if (taskCounters.size() != kernelCounters.size())
+    return false;
+  for (size_t index = 0; index < taskCounters.size(); ++index) {
+    auto taskLower = compileTimeIndex(TaskflowCounterOp(taskCounters[index]).getLowerBound(), task);
+    auto taskUpper = compileTimeIndex(TaskflowCounterOp(taskCounters[index]).getUpperBound(), task);
+    auto taskStep = compileTimeIndex(TaskflowCounterOp(taskCounters[index]).getStep(), task);
+    auto kernelLower = compileTimeCounterBound(
+        kernelCounters[index], "lower_bound_value",
+        neura::CounterOp(kernelCounters[index]).getLowerBound(), task, kernel);
+    auto kernelUpper = compileTimeCounterBound(
+        kernelCounters[index], "upper_bound_value",
+        neura::CounterOp(kernelCounters[index]).getUpperBound(), task, kernel);
+    auto kernelStep = compileTimeCounterBound(
+        kernelCounters[index], "step_value", neura::CounterOp(kernelCounters[index]).getStep(),
+        task, kernel);
+    auto taskId = counterId(TaskflowCounterOp(taskCounters[index]).getOperation());
+    auto kernelId = counterId(neura::CounterOp(kernelCounters[index]).getOperation());
+    if (!taskLower || !taskUpper || !taskStep || !kernelLower ||
+        !kernelUpper || !kernelStep || *taskLower != *kernelLower ||
+        *taskUpper != *kernelUpper || *taskStep != *kernelStep ||
+        *taskStep != 1 || (taskId && *taskId != static_cast<int64_t>(index)) ||
+        (kernelId && *kernelId != static_cast<int64_t>(index)))
+      return false;
+  }
+  return true;
+}
+
+static bool injectiveOverTaskflowFirings(
+    ValueRange indices, ArrayRef<TaskflowCounterOp> taskCounters,
+    ArrayRef<neura::CounterOp> kernelCounters, TaskflowTaskOp task,
+    neura::KernelOp kernel, Block *accessBlock) {
+  if (taskCounters.empty() || taskCounters.size() != kernelCounters.size())
+    return false;
+  SmallVector<bool> covered(taskCounters.size(), false);
+  for (Value index : indices) {
+    auto projection = traceCounterProjection(index, kernelCounters,
+                                             accessBlock, task, kernel);
+    if (!projection)
+      return false;
+    if (!projection->hasCounter)
+      continue;
+    if (projection->counter >= covered.size())
+      return false;
+    auto lower = compileTimeIndex(
+        TaskflowCounterOp(taskCounters[projection->counter]).getLowerBound(), task);
+    auto upper = compileTimeIndex(
+        TaskflowCounterOp(taskCounters[projection->counter]).getUpperBound(), task);
+    if (!lower || !upper || *upper < *lower)
+      return false;
+    int64_t last = *upper == *lower ? *lower : *upper - 1;
+    int64_t minAddress = 0, maxAddress = 0;
+    if (!addWithoutOverflow(*lower, projection->offset, minAddress) ||
+        !addWithoutOverflow(last, projection->offset, maxAddress) ||
+        minAddress < 0 || maxAddress < minAddress)
+      return false;
+    covered[projection->counter] = true;
+  }
+  for (size_t index = 0; index < taskCounters.size(); ++index) {
+    auto lower = compileTimeIndex(TaskflowCounterOp(taskCounters[index]).getLowerBound(), task);
+    auto upper = compileTimeIndex(TaskflowCounterOp(taskCounters[index]).getUpperBound(), task);
+    if (!lower || !upper || *upper < *lower)
+      return false;
+    uint64_t extent = static_cast<uint64_t>(*upper) -
+                      static_cast<uint64_t>(*lower);
+    if (extent > 1 && !covered[index])
+      return false;
+  }
+  return true;
+}
+
+static Type unwrapPredicatedType(Type type) {
+  if (auto predicated = dyn_cast<neura::PredicatedValue>(type))
+    return predicated.getValueType();
+  return type;
+}
+
+static bool externalValueIsAlwaysValid(Value value, TaskflowTaskOp task,
+                                       unsigned depth = 0) {
+  if (!value || depth >= 64)
+    return false;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = argument.getOwner()->getParentOp();
+    if (auto function = dyn_cast_or_null<func::FuncOp>(parent))
+      return argument.getOwner() == &function.getBody().front() &&
+             !isa<neura::PredicatedValue>(value.getType());
+    if (auto ownerTask = dyn_cast_or_null<TaskflowTaskOp>(parent)) {
+      unsigned memoryInputs = ownerTask.getWillReads().size() +
+                              ownerTask.getWillWrites().size();
+      if (argument.getArgNumber() < memoryInputs)
+        return isa<MemRefType>(unwrapPredicatedType(value.getType()));
+      unsigned valueIndex = argument.getArgNumber() - memoryInputs;
+      return valueIndex < ownerTask.getValueInputs().size() &&
+             externalValueIsAlwaysValid(ownerTask.getValueInputs()[valueIndex],
+                                        task, depth + 1);
+    }
+    return false;
+  }
+  if (value.getDefiningOp<arith::ConstantOp>() ||
+      value.getDefiningOp<neura::CounterOp>() ||
+      value.getDefiningOp<TaskflowCounterOp>())
+    return true;
+  if (value.getDefiningOp<neura::ConstantOp>())
+    return true;
+  if (compileTimeIndex(value, task))
+    return true;
+  return false;
+}
+
+static bool foldedOperandsAreAlwaysValid(Operation *operation,
+                                         neura::KernelOp kernel,
+                                         TaskflowTaskOp task) {
+  for (StringRef name : {StringRef("lhs_value"), StringRef("rhs_value")}) {
+    Attribute attribute = operation->getAttr(name);
+    if (!attribute || isa<IntegerAttr, FloatAttr>(attribute))
+      continue;
+    auto text = dyn_cast<StringAttr>(attribute);
+    auto input = parseKernelInputReference(attribute);
+    if (!text || !input || *input >= kernel.getInputs().size() ||
+        !externalValueIsAlwaysValid(kernel.getInputs()[*input], task))
+      return false;
+  }
+  return true;
+}
+
+// Require a producer payload that is valid on every firing.  Explicit grants,
+// loop-carried choices, and unknown operations fail closed; otherwise the
+// producer store can be skipped while the later load would read old private
+// memory, which direct SSA forwarding cannot reproduce.
+static bool valueIsAlwaysValidOnEveryFiring(
+    Value value, neura::KernelOp kernel, TaskflowTaskOp task,
+    ArrayRef<neura::CounterOp> counters, llvm::SmallDenseSet<Value, 32> &active,
+    unsigned depth = 0) {
+  if (!value || depth >= 64)
+    return false;
+  for (neura::CounterOp counter : counters)
+    if (value == counter.getCurrentIndex())
+      return true;
+  if (constantIndex(value))
+    return true;
+  if (value.getDefiningOp<neura::ConstantOp>())
+    return true;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (argument.getOwner() != &kernel.getBody().front() ||
+        argument.getArgNumber() >= kernel.getInputs().size())
+      return false;
+    return externalValueIsAlwaysValid(
+        kernel.getInputs()[argument.getArgNumber()], task);
+  }
+  Operation *operation = value.getDefiningOp();
+  if (!operation || !active.insert(value).second ||
+      operation->getBlock() != &kernel.getBody().front() ||
+      operation->getNumResults() != 1 || operation->getResult(0) != value ||
+      operation->getNumRegions() != 0 || operation->getNumSuccessors() != 0)
+    return false;
+  auto finish = [&](bool valid) {
+    active.erase(value);
+    return valid;
+  };
+  if (auto load = dyn_cast<neura::LoadIndexedOp>(operation)) {
+    auto input = resolveKernelStorageInput(operation, kernel, "lhs_value",
+                                           load.getBase());
+    if (!input || *input >= kernel.getInputs().size() ||
+        !isa<MemRefType>(unwrapPredicatedType(kernel.getInputs()[*input].getType())))
+      return finish(false);
+    if (load.getBase() &&
+        !valueIsAlwaysValidOnEveryFiring(load.getBase(), kernel, task,
+                                         counters, active, depth + 1))
+      return finish(false);
+    for (Value index : load.getIndices())
+      if (!valueIsAlwaysValidOnEveryFiring(index, kernel, task, counters,
+                                           active, depth + 1))
+        return finish(false);
+    return finish(true);
+  }
+  if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+    auto input = traceKernelStorageInput(load.getMemRef(), kernel);
+    if (!input || *input >= kernel.getInputs().size())
+      return finish(false);
+    if (!valueIsAlwaysValidOnEveryFiring(load.getMemRef(), kernel, task,
+                                         counters, active, depth + 1))
+      return finish(false);
+    for (Value index : load.getIndices())
+      if (!valueIsAlwaysValidOnEveryFiring(index, kernel, task, counters,
+                                           active, depth + 1))
+        return finish(false);
+    return finish(true);
+  }
+  StringRef name = operation->getName().getStringRef();
+  static constexpr StringLiteral validOps[] = {
+      "neura.data_mov", "neura.add", "neura.sub", "neura.mul",
+      "neura.div", "neura.rem", "neura.fadd", "neura.fsub",
+      "neura.fneg", "neura.fmul", "neura.fdiv", "neura.fmax",
+      "neura.fmin", "neura.and", "neura.or", "neura.icmp",
+      "neura.fcmp", "neura.sel", "neura.cast", "neura.sext",
+      "neura.zext", "neura.shl", "neura.vfmul", "neura.vmul",
+      "neura.vadd", "neura.vfadd", "neura.vector.reduce.add",
+      "neura.fadd_fadd", "neura.fmul_fadd", "neura.mul_add",
+      "neura.mac"};
+  bool allowedNeura = llvm::is_contained(ArrayRef<StringLiteral>(validOps), name);
+  bool allowedArith = operation->getDialect() &&
+                      operation->getDialect()->getNamespace() == "arith" &&
+                      isMemoryEffectFree(operation);
+  if ((!allowedNeura && !allowedArith) ||
+      !foldedOperandsAreAlwaysValid(operation, kernel, task))
+    return finish(false);
+  for (Value operand : operation->getOperands())
+    if (!valueIsAlwaysValidOnEveryFiring(operand, kernel, task, counters,
+                                         active, depth + 1))
+      return finish(false);
+  return finish(true);
 }
 
 static FailureOr<NeuraFusionPlan>
@@ -2582,6 +3289,14 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
       producerKernelCounters.size() != producerTaskCounters.size())
     return reject(consumer, "post-Neura fusion requires matching static Neura "
                             "counter domains");
+  if (!kernelCountersMatchTaskflow(producerTaskCounters,
+                                   producerKernelCounters, producer,
+                                   producerKernel) ||
+      !kernelCountersMatchTaskflow(consumerTaskCounters,
+                                   consumerKernelCounters, consumer,
+                                   consumerKernel))
+    return reject(consumer, "post-Neura fusion requires kernel counters to "
+                            "mirror the complete Taskflow firing domains");
 
   Block &producerBody = producer.getBody().front();
   Block &consumerBody = consumer.getBody().front();
@@ -2722,15 +3437,21 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
   if (!directMemref && !directIndexed)
     return reject(consumer, "post-Neura fusion requires exactly one matching "
                             "intermediate store and load");
+  ValueRange producerAddressIndices;
+  Value producerStoredValue;
+  Value consumerLoadedValue;
+  Block *producerAccessBlock = nullptr;
   if (directIndexed) {
-    // Caller-visible Radar scratch cannot be forwarded: both the write and
-    // the read remain in the fused body.  Matching per-iteration indices
-    // guarantees that interleaving keeps the original RAW order.
-    if (forwarded)
-      return reject(consumer, "post-Neura indexed forwarded fusion requires "
-                              "a separate private-storage proof");
+    // The same exact per-iteration index proof serves retained and forwarded
+    // fusion. Forwarded mode additionally passed the private-root and
+    // exclusive-use checks above; public caller-visible storage therefore
+    // remains retained and observable.
     producerIndexedStore = producerIndexedStores.front();
     consumerIndexedLoad = consumerIndexedLoads.front();
+    producerAddressIndices = producerIndexedStore.getIndices();
+    producerStoredValue = producerIndexedStore.getValue();
+    consumerLoadedValue = consumerIndexedLoad.getResult();
+    producerAccessBlock = producerIndexedStore->getBlock();
     if (producerIndexedStore->getBlock() != &producerKernel.getBody().front() ||
         consumerIndexedLoad->getBlock() != &consumerKernel.getBody().front())
       return reject(consumer, "post-Neura indexed fusion requires direct "
@@ -2783,6 +3504,10 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
   } else {
     producerStore = producerStores.front();
     consumerLoad = consumerLoads.front();
+    producerAddressIndices = producerStore.getIndices();
+    producerStoredValue = producerStore.getValueToStore();
+    consumerLoadedValue = consumerLoad.getResult();
+    producerAccessBlock = producerStore->getBlock();
     // The fused builder skips only direct children of each kernel body.
     if (producerStore->getBlock() != &producerKernel.getBody().front() ||
         consumerLoad->getBlock() != &consumerKernel.getBody().front())
@@ -2805,6 +3530,21 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
       return reject(consumer, "post-Neura fusion rejects mismatched "
                               "producer-store/consumer-load indices");
   }
+  if (producerStoredValue.getType() != consumerLoadedValue.getType())
+    return reject(consumer, "post-Neura fusion requires matching stored and "
+                            "loaded intermediate value types");
+  if (!injectiveOverTaskflowFirings(
+          producerAddressIndices, producerTaskCounters,
+          producerKernelCounters, producer, producerKernel,
+          producerAccessBlock))
+    return reject(consumer, "post-Neura fusion intermediate address is not "
+                            "injective over every Taskflow firing axis");
+  llvm::SmallDenseSet<Value, 32> validityTrace;
+  if (!valueIsAlwaysValidOnEveryFiring(producerStoredValue, producerKernel,
+                                       producer, producerKernelCounters,
+                                       validityTrace))
+    return reject(consumer, "post-Neura fusion producer store value may be "
+                            "invalid on a Taskflow firing");
 
   NeuraFusionPlan plan;
   plan.producer = producer;
@@ -2826,6 +3566,7 @@ analyzePostNeuraFusion(ModuleOp module, StringRef producerName,
   plan.producerKernelCounters = std::move(producerKernelCounters);
   plan.consumerKernelCounters = std::move(consumerKernelCounters);
   plan.forwarded = forwarded;
+  plan.shareConsumerLoad = true;
   return plan;
 }
 
@@ -2860,6 +3601,8 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
   neura::KernelOp consumerKernel = plan.consumerKernel;
   memref::StoreOp producerStore = plan.producerStore;
   memref::LoadOp consumerLoad = plan.consumerLoad;
+  neura::StoreIndexedOp producerIndexedStore = plan.producerIndexedStore;
+  neura::LoadIndexedOp consumerIndexedLoad = plan.consumerIndexedLoad;
   SmallVector<Value> fusedReads;
   for (Value value : producer.getWillReads())
     appendUniqueValue(fusedReads, value);
@@ -3074,7 +3817,8 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
                                 plan.forwarded, true)) ||
       failed(appendKernelInputs(consumerKernel,
                                 plan.consumerKernelIntermediate,
-                                plan.forwarded, false)))
+                                plan.forwarded || plan.shareConsumerLoad,
+                                false)))
     return failure();
   if (!compatibleKernelInputTypes)
     return reject(consumer, "post-Neura fusion kernel inputs have incompatible "
@@ -3113,7 +3857,8 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
                           plan.producerKernelIntermediate, plan.forwarded,
                           true) ||
       !mapKernelBlockArgs(consumerKernel,
-                          plan.consumerKernelIntermediate, plan.forwarded,
+                          plan.consumerKernelIntermediate,
+                          plan.forwarded || plan.shareConsumerLoad,
                           false))
     return reject(consumer, "post-Neura fusion failed to map kernel operands");
 
@@ -3153,6 +3898,9 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
     if (auto store = dyn_cast<memref::StoreOp>(&operation))
       if (plan.forwarded && store == producerStore)
         continue;
+    if (auto store = dyn_cast<neura::StoreIndexedOp>(&operation))
+      if (plan.forwarded && store == producerIndexedStore)
+        continue;
     Operation *cloned = kernelBuilder.clone(operation, kernelMapping);
     if (!remapFoldedInputs(&operation, cloned, producerKernel, true))
       return reject(consumer, "post-Neura fusion cannot remap producer "
@@ -3163,9 +3911,11 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
   if (clonedCounters.size() != plan.producerKernelCounters.size())
     return reject(consumer, "post-Neura fusion lost the producer counter chain");
   Value forwardedValue;
-  if (plan.forwarded)
-    forwardedValue = kernelMapping.lookupOrDefault(
-        producerStore.getValueToStore());
+  if (plan.forwarded || plan.shareConsumerLoad) {
+    Value stored = producerStore ? producerStore.getValueToStore()
+                                 : producerIndexedStore.getValue();
+    forwardedValue = kernelMapping.lookupOrDefault(stored);
+  }
   for (Operation &operation : consumerKernel.getBody().front()) {
     if (isa<neura::YieldOp>(&operation))
       continue;
@@ -3177,11 +3927,18 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
                         clonedCounters[*id].getCurrentIndex());
       continue;
     }
-    if (plan.forwarded) {
+    if (plan.forwarded || plan.shareConsumerLoad) {
       if (auto load = dyn_cast<memref::LoadOp>(&operation))
         if (load == consumerLoad) {
           if (!forwardedValue)
             return reject(consumer, "post-Neura fusion has no forwarded value");
+          kernelMapping.map(load.getResult(), forwardedValue);
+          continue;
+        }
+      if (auto load = dyn_cast<neura::LoadIndexedOp>(&operation))
+        if (load == consumerIndexedLoad) {
+          if (!forwardedValue)
+            return reject(consumer, "post-Neura fusion has no indexed forwarded value");
           kernelMapping.map(load.getResult(), forwardedValue);
           continue;
         }
@@ -3218,7 +3975,7 @@ createPostNeuraFusedTask(const NeuraFusionPlan &plan, OpBuilder &builder,
   fused->setAttr("amoeba.neura.fusion.eliminated_stores",
                  builder.getI64IntegerAttr(plan.forwarded ? 1 : 0));
   fused->setAttr("amoeba.neura.fusion.eliminated_loads",
-                 builder.getI64IntegerAttr(plan.forwarded ? 1 : 0));
+                 builder.getI64IntegerAttr(plan.shareConsumerLoad ? 1 : 0));
   return fused;
 }
 
@@ -3571,6 +4328,10 @@ createPostNeuraSiblingTask(const NeuraSiblingFusionPlan &plan,
 
   SmallVector<Value> firstCounterValues;
   OpBuilder kernelBuilder = OpBuilder::atBlockEnd(kernelBody);
+  const bool canDeduplicateSiblingLoads =
+      siblingReadDedupEffectsAreTracked(plan);
+  SmallVector<Operation *> precedingSiblingLoads;
+  int64_t eliminatedLoads = 0;
   unsigned firstCounterIndex = 0;
   for (Operation &operation : firstKernel.getBody().front()) {
     if (isa<neura::YieldOp>(&operation))
@@ -3595,6 +4356,8 @@ createPostNeuraSiblingTask(const NeuraSiblingFusionPlan &plan,
       fused.erase();
       return reject(second, "post-Neura sibling fusion cannot remap first folded input");
     }
+    if (canDeduplicateSiblingLoads && isSiblingLoad(cloned))
+      precedingSiblingLoads.push_back(cloned);
   }
   if (firstCounterValues.size() != plan.firstKernelCounters.size()) {
     fused.erase();
@@ -3647,6 +4410,25 @@ createPostNeuraSiblingTask(const NeuraSiblingFusionPlan &plan,
                                  firstKernel.getIterArgsInit().size()))) {
       fused.erase();
       return reject(second, "post-Neura sibling fusion cannot remap second folded input");
+    }
+    if (canDeduplicateSiblingLoads && isSiblingLoad(cloned)) {
+      auto equivalent = llvm::find_if(
+          precedingSiblingLoads, [&](Operation *prior) {
+            return sameSiblingLoad(prior, cloned, fusedKernel);
+          });
+      if (equivalent != precedingSiblingLoads.end()) {
+        Value sourceResult = operation.getResult(0);
+        Value clonedResult = cloned->getResult(0);
+        Value sharedResult = (*equivalent)->getResult(0);
+        clonedResult.replaceAllUsesWith(sharedResult);
+        // Later cloned operations and the final yield consult this mapping.
+        // Redirect it before erasing the redundant operation.
+        secondKernelMapping.map(sourceResult, sharedResult);
+        cloned->erase();
+        ++eliminatedLoads;
+      } else {
+        precedingSiblingLoads.push_back(cloned);
+      }
     }
   }
   kernelBuilder.setInsertionPointToEnd(kernelBody);
@@ -3736,7 +4518,7 @@ createPostNeuraSiblingTask(const NeuraSiblingFusionPlan &plan,
   fused->setAttr("amoeba.neura.fusion.eliminated_stores",
                  builder.getI64IntegerAttr(0));
   fused->setAttr("amoeba.neura.fusion.eliminated_loads",
-                 builder.getI64IntegerAttr(0));
+                 builder.getI64IntegerAttr(eliminatedLoads));
   fused->setAttr("amoeba.neura.fusion.sibling_first",
                  builder.getStringAttr(first.getTaskName()));
   fused->setAttr("amoeba.neura.fusion.sibling_second",

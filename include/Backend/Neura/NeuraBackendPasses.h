@@ -79,6 +79,7 @@ std::unique_ptr<Pass> createGlobalStageRankerPass();
 std::unique_ptr<Pass> createLowerJointTaskflowToHostSCFPass();
 std::unique_ptr<Pass> createFuseTaskPass();
 std::unique_ptr<Pass> createFissionTaskPass();
+std::unique_ptr<Pass> createVerifyTaskflowFissionSourceReplayPass();
 std::unique_ptr<Pass> createFissionRayCarriedReductionPass();
 std::unique_ptr<Pass> createTileTaskPass();
 std::unique_ptr<Pass> createResourceAwareTaskOptimizationPass();
