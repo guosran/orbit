@@ -3417,6 +3417,7 @@ public:
                 familyFunnelByRound[round][item.actionFamily];
             bool schedulerPassed = false;
             bool schedulerRejected = false;
+            bool retainInGeneratedBeam = false;
             if (item.kind == ParallelBatchItemKind::Rejected) {
               ++rejectedCount;
               const std::string rejectReason =
@@ -3485,11 +3486,7 @@ public:
               }
               archive.back().round = round;
               ++funnel.archive;
-              if (child.scored) {
-                generated.push_back(std::move(child));
-                generated = selectBeam(std::move(generated), beamWidth,
-                                       diversitySlots);
-              }
+              retainInGeneratedBeam = child.scored;
             }
             const PendingNeighbor &attempt =
                 pending[item.pendingIndex];
@@ -3513,6 +3510,11 @@ public:
             appendFamilyFunnelCandidateEvent(
                 round, item.actionFamily, child.id, child.parentId,
                 attempt.action, child.actionHistory, std::move(eventResult));
+            if (retainInGeneratedBeam) {
+              generated.push_back(std::move(child));
+              generated = selectBeam(std::move(generated), beamWidth,
+                                     diversitySlots);
+            }
             ++actionsSinceCheckpoint;
           }
           parallelCommitMilliseconds +=

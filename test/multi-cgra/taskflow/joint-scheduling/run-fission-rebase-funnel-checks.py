@@ -265,14 +265,46 @@ def main() -> None:
     rows = read_jsonl(funnel_path)
     events = [row for row in rows if row.get("record_type") == "candidate_attempt"]
     positive = [event for event in events if has_disjoint_fission_rebase(event)]
-    if not positive:
-        fail("no disjoint ordinary-history -> fission edge completed production scoring and scheduler pass")
     archive_rows = read_jsonl(archive_path)
     archived_by_id = {
         row.get("candidate_id"): row
         for row in archive_rows
         if row.get("record_type") == "candidate" and row.get("valid") is True
     }
+    for event in events:
+        result = event.get("result")
+        if not isinstance(result, dict) or result.get("scheduler_pass") is not True:
+            continue
+        candidate_id = event.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            fail("successful candidate attempt has no candidate ID")
+        if result.get("materialized") is not True or \
+                result.get("scheduler_calls", 0) <= 0:
+            fail(
+                f"successful candidate attempt {candidate_id} lacks "
+                "materialization or scoring evidence"
+            )
+        archived = archived_by_id.get(candidate_id)
+        if archived is None:
+            fail(
+                f"successful candidate attempt {candidate_id} is absent from "
+                "the authenticated valid archive"
+            )
+        event_history = event.get("typed_action_history")
+        archive_history = archived.get("action_history")
+        if not isinstance(event_history, dict) or \
+                not isinstance(archive_history, dict) or \
+                event_history.get("known") is not True or \
+                archive_history.get("known") is not True:
+            fail(f"successful candidate attempt {candidate_id} lacks authenticated typed history")
+        for field in ("canonicalFactKey", "initialShapes", "fissionActions", "actions"):
+            if event_history.get(field) != archive_history.get(field):
+                fail(
+                    f"successful candidate attempt {candidate_id} disagrees "
+                    f"with archive history field {field}"
+                )
+    if not positive:
+        fail("no disjoint ordinary-history -> fission edge completed production scoring and scheduler pass")
     matched = next(
         (
             event
