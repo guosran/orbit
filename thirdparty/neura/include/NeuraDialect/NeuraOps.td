@@ -394,7 +394,11 @@ def Neura_StoreIndexedOp
     Example:
       neura.store_indexed %value, %base [%arg1, %arg2] : f32
   }];
-  let arguments = (ins AnyType:$value, Optional<AnyType>:$base,
+  // Constant folding moves value/base into lhs_value/rhs_value and sets the
+  // corresponding operand segment to zero. Both must remain optional in the
+  // declarative format, otherwise custom printing/parsing invents a value
+  // operand and silently changes the source-owned DFG.
+  let arguments = (ins Optional<AnyType>:$value, Optional<AnyType>:$base,
       Variadic<AnyType>:$indices);
   let results = (outs);
   let assemblyFormat = "$value `to` $base `[` $indices `:` type($indices) `]` "
