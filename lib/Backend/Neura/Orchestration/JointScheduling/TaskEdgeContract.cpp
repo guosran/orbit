@@ -775,6 +775,29 @@ PayloadFact getProducerPayloadFact(ProducerResult producer, std::string &error) 
     return {elements * *elementBits, PayloadSource::ProvenTiledRegion};
   }
 
+  // The explicit active-transfer contract applies to statically shaped caller
+  // buffers too. Do not silently ignore (including malformed) proof attributes
+  // merely because the same capacity is also encoded in the memref type.
+  DenseSet<Value> visited;
+  FailureOr<Value> root = resolveOriginalMemrefRoot(producer.value, visited);
+  if (succeeded(root)) {
+    if (auto argument = dyn_cast<BlockArgument>(*root)) {
+      auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+      if (function && !function.getBody().empty() &&
+          argument.getOwner() == &function.getBody().front() &&
+          (function.getArgAttr(argument.getArgNumber(),
+                               "amoeba.active_transfer_shape") ||
+           function.getArgAttr(argument.getArgNumber(),
+                               "amoeba.active_transfer_proof"))) {
+        PayloadFact fact = getCallerMemrefShapePayload(producer, shaped, error);
+        if (error.empty() && !fact.bits)
+          error = "static active transfer requires a verified caller capacity "
+                  "and access proof";
+        return fact;
+      }
+    }
+  }
+
   // Without a compiler-proven tiled region, counter bounds say nothing about
   // which output elements are actually transferred.  The only sound static
   // fact is the complete shaped value; a narrower transfer needs an explicit
