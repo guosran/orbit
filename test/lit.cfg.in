@@ -6,7 +6,9 @@ config.test_format = lit.formats.ShTest(True)
 config.suffixes = ['.mlir']
 config.test_source_root = r'@CMAKE_SOURCE_DIR@/test'
 config.test_exec_root = r'@CMAKE_BINARY_DIR@/test'
-config.excludes = ['samples', 'benchmark']
+# These source fixtures are inputs to Python regression runners, not lit tests.
+config.excludes = ['samples', 'benchmark', 'common-parent-profile-retimer.mlir',
+                   'nested-terminal-output-lineage.mlir']
 
 # Tool substitutions from CMake
 config.substitutions.append(('mlir-amoeba-opt', '@MLIR_AMOEBA_OPT@'))
