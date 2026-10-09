@@ -238,13 +238,15 @@ private:
   // tasks and returns whether any assignment changed.
   bool assignAllSrams(TaskMemoryGraph &graph);
 
-  // Searches legal grid positions and returns the best-scoring placement for
-  // one task under the current scheduling mode.
+  // Searches legal origins and start times. Fixed-shape temporal scheduling
+  // ranks equal-start origins by ready-task horizon before proximity; recursive
+  // trial placement disables lookahead and never commits communication.
   TaskPlacement findBestPlacement(TaskNode *task_node, int cgra_count,
                                   TaskMemoryGraph &graph,
                                   int64_t required_start = -1,
                                   bool defer_aggregate_communication = false,
-                                  int64_t *next_communication_ready = nullptr);
+                                  int64_t *next_communication_ready = nullptr,
+                                  bool use_ready_task_lookahead = true);
 
   // Checks dependencies and, when requested, commits the single routed
   // transfer for each producer/consumer task pair. Aggregate parent replicas

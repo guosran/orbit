@@ -1528,7 +1528,8 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
                                                TaskMemoryGraph &graph,
                                                int64_t required_start,
                                                bool defer_aggregate_communication,
-                                               int64_t *next_communication_ready) {
+                                               int64_t *next_communication_ready,
+                                               bool use_ready_task_lookahead) {
   SmallVector<CgraShape> shapes_to_try;
   auto shape_attr = task_node->op->getAttrOfType<StringAttr>("cgra_shape");
   if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
@@ -1595,6 +1596,7 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
     if (t > std::numeric_limits<int64_t>::max() - task_duration)
       continue;
     int best_score = INT_MIN;
+    int64_t best_ready_horizon = std::numeric_limits<int64_t>::max();
     TaskPlacement best_at_t;
     SmallVector<int64_t> discovered_times;
 
@@ -1689,8 +1691,55 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
             discovered_times.push_back(ready_time);
             continue;
           }
+          // Earliest legal start remains the primary objective. At that
+          // start, do not let SRAM proximity strand another ready rectangle:
+          // an interior 2x2 on a 4x4 grid leaves no disjoint 2x2 origin even
+          // though both tasks fit if the first is placed along an edge.
+          // Trial each independently ready task against this candidate's
+          // actual interval. Its ordinary origin/time search includes routed
+          // communication readiness, so a closer but delayed placement is not
+          // treated as equivalent to an earlier legal placement. This is a
+          // bounded one-task lookahead, not a global packing oracle.
+          int64_t ready_horizon = t + task_duration;
+          if (use_ready_task_lookahead && required_start < 0 &&
+              mode_ == SchedulingMode::SpatialTemporal &&
+              shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+            for (const CgraPosition &pos : candidate.cgra_positions)
+              markOccupied(pos.row, pos.col, pos.start_time, pos.duration);
+            for (const auto &node : graph.task_nodes) {
+              TaskNode *other = node.get();
+              if (other == task_node || !other->placement.empty() ||
+                  other->op->hasAttr("amoeba.exact_schedule") ||
+                  other->op->hasAttr("amoeba.aggregate_active_replicas") ||
+                  !llvm::all_of(other->ssa_operands, [](TaskNode *pred) {
+                    return !pred->placement.empty();
+                  }))
+                continue;
+              auto count = other->op->getAttrOfType<IntegerAttr>("cgra_count");
+              std::string saved_error = communication_error_;
+              TaskPlacement trial = findBestPlacement(
+                  other, count ? count.getInt() : 1, graph,
+                  /*required_start=*/-1, /*defer_aggregate_communication=*/true,
+                  /*next_communication_ready=*/nullptr,
+                  /*use_ready_task_lookahead=*/false);
+              communication_error_ = std::move(saved_error);
+              if (trial.cgra_positions.empty()) {
+                ready_horizon = std::numeric_limits<int64_t>::max();
+                break;
+              }
+              const CgraPosition &first = trial.cgra_positions.front();
+              ready_horizon = std::max(ready_horizon,
+                                      first.start_time + first.duration);
+            }
+            for (const CgraPosition &pos : candidate.cgra_positions)
+              cgra_occupancy_[pos.row][pos.col].pop_back();
+          }
           int score = computeScore(task_node, candidate, graph);
-          if (score > best_score) {
+          // Remaining ties retain shape order then row-major origin order.
+          if (best_at_t.cgra_positions.empty() ||
+              ready_horizon < best_ready_horizon ||
+              (ready_horizon == best_ready_horizon && score > best_score)) {
+            best_ready_horizon = ready_horizon;
             best_score = score;
             best_at_t = candidate;
           }
