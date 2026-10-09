@@ -26,6 +26,8 @@ def validate(summary,trace,domain=None):
   graph=signature(graph_actions(anchor['action_history']))
   assert all(signature(graph_actions(x['action_history']))==graph for x in b),'frozen graph changed'
  if domain:
+  quotient=[signature(graph_actions(x['action_history']))+'|'+signature(sorted(x['shapes'],key=lambda s:s['task'])) for x in trace]
+  assert len(set(quotient))==len(quotient),'duplicate finite configuration despite different internal keys'
   legal={signature([a]) for a in domain['graph_actions']};legal.add(signature([]))
   for row in trace:
    assert signature(graph_actions(row['action_history'])) in legal,'graph outside finite domain'

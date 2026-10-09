@@ -12,6 +12,9 @@ class Mutations(unittest.TestCase):
  def test_repeated_debit(self):
   self.t[1]['key']='one'
   with self.assertRaises(AssertionError):m.validate(self.s,self.t,self.d)
+ def test_semantic_repeat_distinct_keys(self):
+  self.t[1]['shapes']=copy.deepcopy(self.t[0]['shapes'])
+  with self.assertRaises(AssertionError):m.validate(self.s,self.t,self.d)
  def test_frozen_graph_change(self):
   self.t[1]['action_history']['actions']=[{'family':'fusion'}]
   with self.assertRaises(AssertionError):m.validate(self.s,self.t,self.d)

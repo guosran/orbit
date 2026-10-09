@@ -3104,7 +3104,14 @@ public:
         } else {
           materialized = true;
           ++funnel.materialized;
-          if (!child.key.empty() && child.rejectReason.empty()) {
+          if (!child.key.empty() && child.rejectReason.empty() &&
+              !claimFiniteConfiguration(child)) {
+            duplicate = true; ++funnel.duplicate; ++duplicateCandidates;
+            ++rejectedCount;
+            outcomeReason = "finite_domain_configuration_duplicate";
+            appendRejected(archive, child, outcomeReason, round);
+            archived = true;
+          } else if (!child.key.empty() && child.rejectReason.empty()) {
             if (!seenKeys.insert(child.key).second) {
               duplicate = true;
               ++funnel.duplicate;
@@ -3337,6 +3344,10 @@ public:
               if (item.state.key.empty()) {
                 item.kind = ParallelBatchItemKind::Rejected;
                 item.state.rejectReason = "graph_facts_unknown";
+              } else if (!claimFiniteConfiguration(item.state)) {
+                item.kind = ParallelBatchItemKind::Rejected;
+                item.duplicate = true; ++funnel.duplicate; ++duplicateCandidates;
+                item.state.rejectReason = "finite_domain_configuration_duplicate";
               } else if (!seenKeys.insert(item.state.key).second) {
                 // A duplicate whose key was reserved by an earlier item in
                 // this batch is committed in order below, after that earlier
@@ -3659,8 +3670,20 @@ public:
   }
 
 private:
+  // The opt-in finite declaration guarantees one deterministic source-owned
+  // graph rewrite followed only by shape assignment. Shape-return histories
+  // can carry different scheduling annotation bytes for the same graph/shape
+  // configuration; authenticate first, then deduplicate this declared quotient.
+  // The general-purpose exact body cache is deliberately unchanged.
+  std::set<std::string> finiteClaimedConfigurations;
+  bool claimFiniteConfiguration(const SearchState &state) {
+    return finiteDomainFile.empty() ||
+        finiteClaimedConfigurations.insert(graphHistorySignature(state.actionHistory) +
+                                            "shapes:" + shapeSignature(state.shapes)).second;
+  }
   std::string objectiveTrace;
   void recordObjectiveDebit(const SearchState &state, uint64_t count) {
+    (void)claimFiniteConfiguration(state); // includes the canonical identity debit
     json::Array shapes;
     for (const auto &shape : state.shapes) shapes.push_back(shapeObject(shape));
     objectiveTrace += jsonText(json::Value(json::Object{
