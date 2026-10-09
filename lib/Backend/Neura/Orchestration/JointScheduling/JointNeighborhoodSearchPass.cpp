@@ -51,6 +51,7 @@
 #include <cmath>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -1573,6 +1574,7 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
     ModuleOp preparedTaskflowSource, uint64_t maxFissionActionsPerTask,
     ArrayRef<NeighborhoodAction> canonicalFissionActions,
     FamilyFunnelRound &roundFunnel,
+    const std::function<std::string(const SearchState &, NeighborhoodAction &)> &filter,
     std::string &enumerationError) {
   enumerationError.clear();
   const bool fissionStage =
@@ -1599,7 +1601,17 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
       ++roundFunnel[action.family].menu;
     std::vector<NeighborhoodAction> admitted;
     admitted.reserve(actions.size());
+    std::set<std::string> projectedSignatures;
     for (NeighborhoodAction &action : actions) {
+      std::string filterReason = filter(indexed.value(), action);
+      if (filterReason.empty() &&
+          !projectedSignatures.insert(actionSignature(action)).second)
+        filterReason = "projected_action_duplicate";
+      if (!filterReason.empty()) {
+        ++roundFunnel[action.family].reject;
+        ++roundFunnel[action.family].rejectReasons["menu:" + filterReason];
+        continue;
+      }
       if (fissionStage && action.family == "fission") {
         const std::string reason =
             fissionHistoryConflictReason(indexed.value().actionHistory,
@@ -2186,6 +2198,10 @@ public:
   Option<std::string> outputDir{*this, "output-dir", llvm::cl::init("")};
   Option<std::string> functionName{*this, "function", llvm::cl::init("")};
   Option<std::string> stage{*this, "stage", llvm::cl::init("")};
+  Option<std::string> decisionFlow{*this, "decision-flow", llvm::cl::init("legacy")};
+  Option<int64_t> graphBudgetPercent{*this, "graph-budget-percent", llvm::cl::init(50)};
+  Option<std::string> finiteDomainFile{*this, "finite-domain-file", llvm::cl::init("")};
+  Option<bool> fairPendingRetention{*this, "fair-pending-retention", llvm::cl::init(false)};
   Option<std::string> parentCostFile{*this, "parent-cost-file",
                                      llvm::cl::init("")};
   Option<std::string> architecturePath{*this, "architecture-path",
@@ -2275,6 +2291,26 @@ public:
       fatal("neighborhood search requires positive budgets, valid beam/diversity limits, and source-contract-file");
       return;
     }
+    if ((decisionFlow != "legacy" && decisionFlow != "joint" &&
+         decisionFlow != "sequential") ||
+        (graphBudgetPercent != 50 && graphBudgetPercent != 75)) {
+      fatal("decision-flow must be legacy/joint/sequential; graph-budget-percent must be50/75"); return;
+    }
+    if (decisionFlow != "legacy" &&
+        (resume || pauseAfterCandidates > 0 || !seedManifest.empty() ||
+         !previousWinner.empty() || !historicalNativeWinner.empty() || stageNumber(stage) < 5)) {
+      fatal("standalone flows require fresh identity-only S5/S6 search, without resume/pause or external seeds"); return;
+    }
+    if (decisionFlow == "sequential" && maxCandidates < 2) {
+      fatal("sequential needs one unique evaluation per phase allowance"); return;
+    }
+    activePhase = decisionFlow == "sequential" ? "A" : decisionFlow.getValue();
+    phaseABudget = decisionFlow == "sequential" ?
+        static_cast<uint64_t>(maxCandidates.getValue() * graphBudgetPercent.getValue() / 100) :
+        static_cast<uint64_t>(maxCandidates.getValue());
+    phaseBBudget = static_cast<uint64_t>(maxCandidates.getValue()) - phaseABudget;
+    phaseLimit = phaseABudget;
+    if (!readFiniteDomain(error)) { fatal(error); return; }
     if (diagnosticIICeiling != 20 && diagnosticIICeiling != 23) {
       fatal("diagnostic-ii-ceiling accepts only 20 (default) or 23");
       return;
@@ -2975,7 +3011,7 @@ public:
       if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
       roundScoredCount = 0;
       roundScoreLimit = perRoundScoreQuota(
-          scoredCount, static_cast<uint64_t>(maxCandidates.getValue()),
+          scoredCount, phaseLimit,
           maxRounds.getValue() - round);
       if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
           canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
@@ -2986,7 +3022,8 @@ public:
     auto began = std::chrono::steady_clock::now();
     const int64_t previousElapsed = elapsedMilliseconds;
     uint64_t actionsSinceCheckpoint = 0;
-    while (round < maxRounds && scoredCount < static_cast<uint64_t>(maxCandidates)) {
+    do {
+    while (round < maxRounds && scoredCount < phaseLimit) {
       if (beam.empty()) { stopReason = "no-new-legal-candidates"; break; }
       if (pending.empty()) {
         generated.clear(); pendingCursor = 0;
@@ -2997,7 +3034,9 @@ public:
             preparedTaskflowSource.get(),
             static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
             canonicalFissionActions, familyFunnelByRound[round],
-            actionEnumerationError);
+            [&](const SearchState &parent, NeighborhoodAction &action) {
+              return filterSearchAction(parent, action);
+            }, actionEnumerationError);
         if (!actionEnumerationError.empty()) {
           fatal(actionEnumerationError);
           return;
@@ -3009,7 +3048,7 @@ public:
           pendingActionFamilyCounts(pending, pendingCursor);
       if (scoringWorkers <= 1) {
       while (pendingCursor < pending.size() &&
-             scoredCount < static_cast<uint64_t>(maxCandidates) &&
+             scoredCount < phaseLimit &&
              roundScoredCount < roundScoreLimit) {
         prioritizeNextPendingActionFamily(pending, pendingCursor,
                                           successfulFamilyScores,
@@ -3221,10 +3260,10 @@ public:
         const DialectRegistry &workerRegistry =
             canonical.getContext()->getDialectRegistry();
         while (pendingCursor < pending.size() &&
-               scoredCount < static_cast<uint64_t>(maxCandidates) &&
+               scoredCount < phaseLimit &&
                roundScoredCount < roundScoreLimit) {
           const uint64_t scoreBudget =
-              static_cast<uint64_t>(maxCandidates) - scoredCount;
+              phaseLimit - scoredCount;
           const uint64_t roundScoreBudget =
               roundScoreLimit - roundScoredCount;
           const uint64_t pauseBudget =
@@ -3447,6 +3486,7 @@ public:
               // Every production invocation consumes one budget unit, even
               // when the unchanged scheduler rejects the candidate.
               ++scoredCount;
+              recordObjectiveDebit(child, scoredCount);
               ++productionSchedulerCalls;
               ++roundScoredCount;
               ++funnel.schedulerCalls;
@@ -3545,8 +3585,16 @@ public:
         }
       }
       if (stopReason == "explicit-pause" ||
-          scoredCount >= static_cast<uint64_t>(maxCandidates))
+          scoredCount >= phaseLimit)
         break;
+      if (fairPendingRetention && pendingCursor < pending.size()) {
+        ++retainedPendingFrontiers;
+        ++round;
+        roundScoredCount = 0;
+        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
+                                            maxRounds.getValue() - round);
+        continue;
+      }
       for (size_t index = static_cast<size_t>(pendingCursor);
            index < pending.size(); ++index) {
         const PendingNeighbor &unattempted = pending[index];
@@ -3569,7 +3617,7 @@ public:
       successfulFamilyScores.clear();
       roundScoredCount = 0;
       roundScoreLimit = perRoundScoreQuota(
-          scoredCount, static_cast<uint64_t>(maxCandidates.getValue()),
+          scoredCount, phaseLimit,
           maxRounds.getValue() - round);
       if (generated.empty()) { stopReason = "no-new-legal-candidates"; break; }
       beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
@@ -3578,6 +3626,25 @@ public:
       if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
           canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
     }
+    if (decisionFlow == "sequential" && activePhase == "A") {
+      phaseAEvaluations = scoredCount;
+      phaseAStopReason = stopReason.empty() ? "phase-budget" : stopReason;
+      if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) {
+        fatal(error); return;
+      }
+      phaseLimit = scoredCount + phaseBBudget; // unused A budget is never reassigned.
+      generated.clear(); pending.clear(); pendingCursor = 0;
+      roundScoredCount = 0; successfulFamilyScores.clear(); stopReason.clear();
+      // The two independently bounded phases share the declared total objective budget.
+      // Preserve monotonically increasing funnel round IDs.
+      phaseStartRound = round;
+      roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
+                                          maxRounds.getValue() - round);
+      if (round >= maxRounds) break;
+      continue;
+    }
+    break;
+    } while (true);
     if (stopReason.empty()) stopReason = round >= maxRounds ? "max-rounds" : "max-unique-candidates";
     elapsedMilliseconds = previousElapsed + std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - began).count();
@@ -3592,6 +3659,139 @@ public:
   }
 
 private:
+  std::string objectiveTrace;
+  void recordObjectiveDebit(const SearchState &state, uint64_t count) {
+    json::Array shapes;
+    for (const auto &shape : state.shapes) shapes.push_back(shapeObject(shape));
+    objectiveTrace += jsonText(json::Value(json::Object{
+        {"candidate_id",state.id}, {"phase",activePhase},
+        {"cumulative_evaluations",int64_t(count)}, {"key",state.key},
+        {"action_history",typedActionHistoryObject(state.actionHistory)},
+        {"shapes",std::move(shapes)}})) + "\n";
+  }
+  uint64_t phaseABudget = 0, phaseBBudget = 0, phaseLimit = 0;
+  uint64_t phaseAEvaluations = 0, retainedPendingFrontiers = 0;
+  int64_t phaseStartRound = 0;
+  std::string activePhase, frozenGraphHistory, phaseAAnchor, phaseAStopReason;
+  std::set<std::string> finiteGraphActions, finiteVariableRoots;
+  std::set<std::pair<int64_t, int64_t>> finiteShapes;
+  std::map<std::string, std::pair<int64_t, int64_t>> finiteFixedShapes;
+
+  static bool resourceAction(const NeighborhoodAction &action) {
+    return action.family == "shape" || action.family == "replica";
+  }
+  static std::string graphHistorySignature(const SearchState::TypedActionHistory &history) {
+    std::string result;
+    for (const auto &action : history.fissionActions)
+      result += actionSignature(action) + "\n";
+    for (const auto &action : history.actions)
+      if (!resourceAction(action)) result += actionSignature(action) + "\n";
+    return result;
+  }
+  bool readFiniteDomain(std::string &error) {
+    if (finiteDomainFile.empty()) return true;
+    if (resume || !seedManifest.empty() || !previousWinner.empty() ||
+        !historicalNativeWinner.empty()) {
+      error = "finite domain requires fresh identity-only search"; return false;
+    }
+    std::string text;
+    if (!readFileBytes(finiteDomainFile, text, error)) return false;
+    auto parsed = json::parse(text);
+    if (!parsed) { llvm::consumeError(parsed.takeError()); error = "malformed finite-domain JSON"; return false; }
+    auto *object = parsed->getAsObject();
+    auto *actions = object ? object->getArray("graph_actions") : nullptr;
+    auto *roots = object ? object->getArray("variable_tasks") : nullptr;
+    auto *shapes = object ? object->getArray("shapes") : nullptr;
+    auto *fixed = object ? object->getObject("fixed_shapes") : nullptr;
+    if (!actions || !roots || !shapes || !fixed) {
+      error = "finite domain needs graph_actions,variable_tasks,shapes,fixed_shapes"; return false;
+    }
+    for (const auto &value : *actions) {
+      NeighborhoodAction action;
+      auto *entry = value.getAsObject();
+      if (!entry || !parseTypedAction(*entry, action) || resourceAction(action) ||
+          action.canonicalReset || !action.shapeTask.empty() || action.primitives.size()!=1 ||
+          !finiteGraphActions.insert(actionSignature(action)).second) {
+        error = "finite graph actions must be unique single graph rewrites"; return false;
+      }
+    }
+    for (const auto &value : *roots) {
+      auto name = value.getAsString();
+      if (!name || name->empty() || !finiteVariableRoots.insert(name->str()).second) {
+        error = "finite variable tasks must be unique names"; return false;
+      }
+    }
+    auto parseShape = [&](const json::Value &value, std::pair<int64_t,int64_t> &shape) {
+      auto *array = value.getAsArray();
+      if (!array || array->size()!=2 || !(*array)[0].getAsInteger() || !(*array)[1].getAsInteger()) return false;
+      shape = {*(*array)[0].getAsInteger(), *(*array)[1].getAsInteger()};
+      return shape.first>0 && shape.second>0;
+    };
+    for (const auto &value : *shapes) {
+      std::pair<int64_t,int64_t> shape;
+      if (!parseShape(value, shape) || !finiteShapes.insert(shape).second) {
+        error = "finite shapes must be unique positive pairs"; return false;
+      }
+    }
+    if (!finiteShapes.count({1,1})) { error = "finite domain must retain identity1x1"; return false; }
+    for (const auto &entry : *fixed) {
+      std::pair<int64_t,int64_t> shape;
+      if (!parseShape(entry.second, shape) || shape != std::make_pair(int64_t(1),int64_t(1)) || finiteVariableRoots.count(entry.first.str())) {
+        error = "fixed unaffected tasks must be disjoint from variable roots and1x1"; return false;
+      }
+      finiteFixedShapes[entry.first.str()] = shape;
+    }
+    return true;
+  }
+  std::string filterSearchAction(const SearchState &parent, NeighborhoodAction &action) const {
+    if (decisionFlow == "sequential" && activePhase == "A") {
+      if (resourceAction(action) || action.family=="lineage-replacement") return "sequential_graph_phase_resource_action";
+      action.primitives.erase(std::remove_if(action.primitives.begin(), action.primitives.end(),
+          [](const NeighborhoodPrimitive &p) { return p.kind=="replica" || p.kind=="replication"; }), action.primitives.end());
+      const bool projected = !action.shapeTask.empty();
+      action.shapeTask.clear(); action.shapeRows=0; action.shapeCols=0;
+      if (action.primitives.empty()) return "sequential_graph_phase_empty_projection";
+      if (projected) action.label = "projected:" + action.label;
+    } else if (decisionFlow == "sequential" && activePhase == "B") {
+      if (!resourceAction(action) || action.canonicalReset) return "sequential_resource_phase_frozen_graph";
+      if (graphHistorySignature(parent.actionHistory)!=frozenGraphHistory) return "sequential_frozen_graph_mismatch";
+    }
+    if (finiteDomainFile.empty()) return {};
+    if (action.family=="shape") {
+      if (action.canonicalReset || !action.primitives.empty() ||
+          !finiteShapes.count({action.shapeRows,action.shapeCols})) return "finite_domain_shape";
+      bool variable=false;
+      for (const auto &root : finiteVariableRoots)
+        variable |= action.shapeTask==root || StringRef(action.shapeTask).starts_with(root+".");
+      if (!variable || finiteFixedShapes.count(action.shapeTask)) return "finite_domain_fixed_task";
+      return {};
+    }
+    if (!graphHistorySignature(parent.actionHistory).empty()) return "finite_domain_one_graph_action";
+    if (!finiteGraphActions.count(actionSignature(action))) return "finite_domain_graph_action";
+    return {};
+  }
+  bool startResourcePhase(ModuleOp canonical, std::vector<ArchiveRecord> &archive,
+                          std::vector<SearchState> &beam, uint64_t &serial,
+                          std::string &error) {
+    const ArchiveRecord *best=nullptr;
+    for (const auto &record : archive)
+      if (record.valid && (!best || archiveLess(record,*best))) best=&record;
+    if (!best || best->candidatePath.empty()) { error="phase A has no retained legal anchor"; return false; }
+    SearchState anchor;
+    anchor.module=parseSourceFile<ModuleOp>(best->candidatePath,&getContext());
+    if (!anchor.module) { error="phase A anchor snapshot cannot parse"; return false; }
+    anchor.id=best->id; anchor.parentId=best->parentId; anchor.key=best->key;
+    anchor.factKey=best->factKey; anchor.path=best->path; anchor.shapes=best->shapes;
+    anchor.actionHistory=portableActionHistory(best->actionHistory);
+    anchor.choices=best->choices; anchor.durations=best->durations; anchor.costs=best->costs;
+    anchor.schedule=best->schedule; anchor.costPath=best->costPath; anchor.score=best->score;
+    anchor.scored=true; anchor.keyReserved=true;
+    if (!authenticateTypedActionHistory(anchor,canonical,functionName,outputDir,serial,error) || !anchor.actionHistory.known) return false;
+    frozenGraphHistory=graphHistorySignature(anchor.actionHistory);
+    phaseAAnchor=anchor.id; activePhase="B";
+    beam.clear(); beam.push_back(std::move(anchor));
+    return true;
+  }
   int64_t perCgraRows = 0;
   int64_t perCgraCols = 0;
   std::string effectiveArchitectureContract;
@@ -5126,6 +5326,7 @@ private:
     bool fixedDispatch = parseStageFixed(stageName);
     std::string scheduleError;
     ++scoredCount;
+    recordObjectiveDebit(state, scoredCount);
     ++productionSchedulerCalls;
     if (chargeRoundQuota)
       ++roundScoredCount;
@@ -5252,6 +5453,7 @@ private:
   bool retainCanonicalBeam(std::vector<SearchState> &beam,
                            ArrayRef<ArchiveRecord> archive,
                            std::string &error) {
+    if (decisionFlow == "sequential" && activePhase == "B") return true;
     const ArchiveRecord *identity = nullptr;
     for (const auto &record : archive)
       if (record.valid && llvm::is_contained(record.controlRoles,
@@ -5413,6 +5615,7 @@ private:
       files[role] = json::Object{{"path", path}, {"exact_bytes", std::move(bytes)}};
       return true;
     };
+    if (!bind("finite_domain", finiteDomainFile, true)) return false;
     if (!bind("protocol", protocolFile) || !bind("source_and_model_contract", sourceContractFile) ||
         !bind("architecture", architecturePath) || !bind("ensemble", modelPath, true) ||
         !bind("parent_costs", parentCostFile, true) ||
@@ -5482,6 +5685,8 @@ private:
     }
     json::Object objectBinding{
         {"schema", "orbit-neighborhood-exact-binding-v1"},
+        {"decision_flow",decisionFlow.getValue()}, {"graph_budget_percent",graphBudgetPercent.getValue()},
+        {"fair_pending_retention",fairPendingRetention.getValue()},
         {"canonical_ir", neighborhoodReplaySourceText(canonical)},
         {"files", std::move(files)}, {"function", functionName.getValue()},
         {"stage", stage.getValue()}, {"source_repository", sourceRepository.getValue()},
@@ -5848,7 +6053,7 @@ private:
         {"record_type", "candidate_attempt"},
         {"schema", kFamilyFunnelSchema},
         {"round", round},
-        {"action_family", family},
+        {"action_family", family}, {"phase",activePhase},
         {"candidate_id", candidateID},
         {"parent_id", parentID},
         {"action", typedActionObject(action)},
@@ -6799,11 +7004,17 @@ private:
       bool previousWinnerRequested, bool historicalWinnerRequested,
       ArrayRef<ArchiveRecord> archive,
       StringRef stopReason, std::string &error) {
+    if (!writeTextAtomically(outputDirectory.str()+"/budget-trace.jsonl", objectiveTrace,error)) return false;
     std::vector<const ArchiveRecord *> ranked;
     json::Object reasons;
     uint64_t validCount = 0;
     for (const auto &record : archive) {
-      if (record.valid) { ranked.push_back(&record); ++validCount; }
+      if (record.valid) {
+        ++validCount;
+        if (decisionFlow != "sequential" || activePhase != "B" ||
+            graphHistorySignature(record.actionHistory) == frozenGraphHistory)
+          ranked.push_back(&record);
+      }
       else {
         StringRef reason = record.rejectReason;
         std::string category = reason.take_front(reason.find(':')).str();
@@ -6852,6 +7063,16 @@ private:
         {"source_binding_witness", bindingPath}, {"max_rounds", maxRoundsValue},
         {"max_candidates", maxCandidatesValue}, {"beam_width", beamWidthValue},
         {"diversity_slots", diversityValue}, {"rounds", round}, {"rounds_completed", round},
+        {"decision_flow", decisionFlow.getValue()},
+        {"graph_budget_percent", graphBudgetPercent.getValue()},
+        {"finite_domain_file", finiteDomainFile.getValue()},
+        {"fair_pending_retention", fairPendingRetention.getValue()},
+        {"retained_pending_frontiers", int64_t(retainedPendingFrontiers)},
+        {"phase_a_budget", int64_t(phaseABudget)}, {"phase_b_budget", int64_t(phaseBBudget)},
+        {"phase_a_evaluations", int64_t(phaseAEvaluations)},
+        {"phase_b_evaluations", int64_t(scoredCount - phaseAEvaluations)},
+        {"phase_a_anchor", phaseAAnchor}, {"phase_a_stop_reason", phaseAStopReason},
+        {"initial_child_shape_policy", "source fission children 1x1; unaffected canonical shapes retained; later child shapes independently searchable"},
         {"unique_complete_candidates_scored", int64_t(scoredCount)},
         {"unique_scored_candidates", int64_t(scoredCount)}, {"unique_valid_candidates", int64_t(validCount)},
         {"rejected_or_duplicate_candidates", int64_t(rejectedCount)},
