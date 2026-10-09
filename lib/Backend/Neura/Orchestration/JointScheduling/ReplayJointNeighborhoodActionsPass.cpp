@@ -289,6 +289,42 @@ static bool actionEqual(const NeighborhoodAction &lhs,
   return true;
 }
 
+// Sequential phase A removes the resource component of a generated
+// fusion-plus-shape action. Authenticate that exact projection against the
+// current menu AND its equivalent standalone fusion; a label prefix alone
+// never grants replay admission.
+static bool isEnumeratedSequentialGraphProjection(
+    const NeighborhoodAction &action,
+    ArrayRef<NeighborhoodAction> available) {
+  if (action.family != "fusion-plus-shape" || action.canonicalReset ||
+      !action.shapeTask.empty() || action.shapeRows != 0 ||
+      action.shapeCols != 0 || action.primitives.size() != 1 ||
+      action.primitives.front().kind != "fusion")
+    return false;
+  bool projectedMenuMatch = llvm::any_of(
+      available, [&](const NeighborhoodAction &candidate) {
+        if (candidate.family != "fusion-plus-shape" ||
+            candidate.shapeTask.empty() || candidate.canonicalReset)
+          return false;
+        NeighborhoodAction projected = candidate;
+        projected.shapeTask.clear();
+        projected.shapeRows = 0;
+        projected.shapeCols = 0;
+        projected.label = "projected:" + candidate.label;
+        return actionEqual(action, projected);
+      });
+  if (!projectedMenuMatch)
+    return false;
+  return llvm::any_of(available, [&](const NeighborhoodAction &candidate) {
+    if (candidate.family != "fusion")
+      return false;
+    NeighborhoodAction graphAction = action;
+    graphAction.family = candidate.family;
+    graphAction.label = candidate.label;
+    return actionEqual(graphAction, candidate);
+  });
+}
+
 static bool readInputs(const json::Object &root, StringRef canonicalInput,
                        StringRef candidateInput, StringRef functionOption,
                        StringRef stageOption, unsigned factorOption,
@@ -1168,7 +1204,7 @@ public:
       }
       if (!llvm::any_of(available, [&](const NeighborhoodAction &candidate) {
             return actionEqual(action, candidate);
-          })) {
+          }) && !isEnumeratedSequentialGraphProjection(action, available)) {
         fail("action_not_enumerated_for_current_source_graph:" + action.label);
         return;
       }
