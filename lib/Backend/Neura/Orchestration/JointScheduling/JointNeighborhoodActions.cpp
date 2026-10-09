@@ -1782,6 +1782,8 @@ enumerateTaskflowFissionNeighborhoodActions(
     }
     diagnostics.push_back(task.getTaskName().str() + ":supported:" +
                           std::to_string(partitions->size()));
+    if (!diagnostic.empty())
+      diagnostics.push_back(task.getTaskName().str() + ":" + diagnostic);
     for (const SmallVector<unsigned> &leftNodes : *partitions) {
       NeighborhoodAction action;
       action.family = "fission";

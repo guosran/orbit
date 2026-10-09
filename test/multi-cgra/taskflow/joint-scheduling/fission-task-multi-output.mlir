@@ -1,6 +1,8 @@
 // RUN: mlir-amoeba-opt %s '--fission-task=task-name=Branches left-nodes=0:1:2' --verify-each | FileCheck %s --check-prefix=INDEPENDENT
 // RUN: mlir-amoeba-opt %s '--fission-task=task-name=Branches left-nodes=0:3' --verify-each | FileCheck %s --check-prefix=MULTICUT
 // RUN: not mlir-amoeba-opt %s '--fission-task=task-name=Branches left-nodes=1' 2>&1 | FileCheck %s --check-prefix=BAD
+// RUN: mlir-amoeba-opt %s '--verify-taskflow-fission-source-replay=enumerate-function=branches max-fission-actions-per-task=1 output=%t.capped.json' -o /dev/null
+// RUN: FileCheck %s --check-prefix=CAP < %t.capped.json
 // Public outputs are disjoint, stores use the same reversed counter indexing
 // as Radar I/Q, and both owned result tokens remain visible to the caller.
 module {
@@ -50,3 +52,6 @@ module {
 // MULTICUT: arith.addi
 // MULTICUT: arith.muli
 // BAD: left-nodes must be predecessor closed
+// CAP: "status":"complete"
+// CAP: "diagnostic":"deterministic-cut-cap: legal cut enumeration truncated at 1"
+// CAP: "legal_cut_count":1

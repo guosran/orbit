@@ -931,8 +931,11 @@ mlir::amoeba::neura::enumerateTaskflowFissionPartitions(TaskflowTaskOp task,
   };
   enumerate(0);
   if (overflow) {
-    error = "legal fission cut-set count exceeds the requested maximum";
-    return failure();
+    // Keep the first maxCuts legal cuts in the deterministic dependency-aware
+    // exclude/include DFS.  This is a bounded candidate domain, not a claim
+    // that every legal partition has been enumerated.  Legality is unchanged.
+    error = "deterministic-cut-cap: legal cut enumeration truncated at " +
+            std::to_string(maxCuts);
   }
   std::sort(
       partitions.begin(), partitions.end(),
