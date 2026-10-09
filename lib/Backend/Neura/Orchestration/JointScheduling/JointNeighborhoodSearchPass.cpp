@@ -3655,17 +3655,21 @@ public:
     }
     if (decisionFlow == "sequential" && activePhase == "A") {
       phaseAEvaluations = scoredCount;
-      phaseAStopReason = stopReason.empty() ? "phase-budget" : stopReason;
+      phaseAStopReason = stopReason.empty() ?
+          (round - phaseStartRound >= maxRounds ? "max-rounds" : "phase-budget") : stopReason;
       if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) {
         fatal(error); return;
       }
       phaseLimit = scoredCount + phaseBBudget; // unused A budget is never reassigned.
+      const int64_t nextPhaseRound = round +
+          ((!pending.empty() || roundScoredCount > 0) ? 1 : 0);
       generated.clear(); pending.clear(); pendingCursor = 0;
       roundScoredCount = 0; successfulFamilyScores.clear(); stopReason.clear();
       // Each stage has its own round allowance; A cannot consume B's expansion
       // opportunity. Objective allowances remain fixed and unused A is discarded.
       // A fresh global round ID keeps funnel events from the two stages separate.
-      phaseStartRound = ++round;
+      phaseStartRound = nextPhaseRound;
+      round = phaseStartRound;
       roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
                                           maxRounds.getValue() - (round - phaseStartRound), roundQuotaScale.getValue());
       if (round - phaseStartRound >= maxRounds) break;
