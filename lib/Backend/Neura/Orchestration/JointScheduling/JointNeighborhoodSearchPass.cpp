@@ -3801,7 +3801,15 @@ private:
   }
   std::string filterSearchAction(const SearchState &parent, NeighborhoodAction &action) const {
     if (featurePolicy == "shape-only" && action.family != "shape") return "feature_policy_shape_only";
-    if (featurePolicy == "structural-off" && !resourceAction(action)) return "feature_policy_structural_off";
+    // The joint ablation disables fusion and source fission only. Keep
+    // tiling, K-tiling, co-tiling, replica, shape and withdrawal actions.
+    // Reject atomic composites containing a disabled primitive as a whole.
+    if (featurePolicy == "structural-off" &&
+        (action.family == "fission" ||
+         llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
+           return StringRef(p.kind).contains("fusion") || p.kind == "fission";
+         })))
+      return "feature_policy_structural_off";
     if (featurePolicy == "fusion-off" && llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
           return StringRef(p.kind).contains("fusion"); })) return "feature_policy_fusion_off";
     if (featurePolicy == "fission-off" && (action.family == "fission" ||
