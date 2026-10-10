@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-family-window-v11";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-unscored-target-v14";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6169,7 +6169,7 @@ private:
     return json::Object{{"directions_per_parent", int64_t(kDirectionalCount)},
         {"parameters_per_direction", int64_t(kDirectionalParameters)},
         {"cost_tier_width", 4}, {"preferred_numerator", 3},
-        {"preferred_denominator", 4},
+        {"preferred_denominator", 4}, {"occupancy_zero_streak_cap", 2},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6442,10 +6442,15 @@ private:
           if ((maxArea == 1 && action.family == "replica") ||
               (maxArea > 1 && action.family == "tiling")) priority *= 1.25;
           if (action.family == "fission") priority *= 0.5;
-          reason = "area-duration and observed occupancy proxy; structural cost unknown";
+          reason = "area-duration proxy; try other targets after two local zero-debit occupancy attempts; original queue intact";
         }
         if (category.empty()) continue;
         const std::string target = actionTargetKey(action);
+        // Exact parent-local observations apply only to preferred occupancy
+        // ranking. Every action remains in the ordinary pending queue.
+        if (category == "occupancy" && directionalFeedback[
+                directionFeedbackKey(parent.key, "__occupancy_zero_streak", target)].attempts >= 2)
+          continue;
         auto addGroup = [&](StringRef groupCategory, StringRef groupReason, double groupPriority) {
           auto &group = groups[{groupCategory.str(), action.family, target}];
           group.category = groupCategory.str(); group.family = action.family; group.target = target;
@@ -6623,6 +6628,12 @@ private:
       const NeighborhoodAction &action, StringRef candidateID, int64_t round,
       uint64_t before, uint64_t after, const DirectionalSelection &selection) {
     const uint64_t debit = after - before;
+    if (action.family == "replica" || action.family == "tiling" ||
+        action.family == "k-tiling" || action.family == "fission") {
+      auto &localZero = directionalFeedback[directionFeedbackKey(
+          parent.key, "__occupancy_zero_streak", actionTargetKey(action))];
+      localZero.attempts = debit ? 0 : localZero.attempts + 1;
+    }
     if (selection.preferred) {
       auto &feedback = directionalFeedback[selection.directionKey];
       ++feedback.attempts; feedback.charged += debit;
