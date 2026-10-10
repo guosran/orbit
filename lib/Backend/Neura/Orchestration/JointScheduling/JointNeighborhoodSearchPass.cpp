@@ -6238,8 +6238,10 @@ private:
     if (failed(graph)) return tasks;
     std::map<std::string, std::set<std::string>> predecessors;
     for (const TaskEdge &edge : graph->getEdges()) {
-      const std::string producer = edge.producer.getTaskName().str();
-      const std::string consumer = edge.consumer.getTaskName().str();
+      auto producerOp = edge.producer;
+      auto consumerOp = edge.consumer;
+      const std::string producer = producerOp.getTaskName().str();
+      const std::string consumer = consumerOp.getTaskName().str();
       if (!tasks.count(producer) || !tasks.count(consumer)) {
         failure = "typed_edge_task_not_in_scored_choices"; return tasks;
       }
