@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-maximum-edge-v20";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-communication-zero-v21";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6170,6 +6170,7 @@ private:
         {"parameters_per_direction", int64_t(kDirectionalParameters)},
         {"cost_tier_width", 4}, {"preferred_numerator", 3},
         {"preferred_denominator", 4}, {"occupancy_zero_streak_cap", 2},
+        {"communication_zero_streak_cap", 2},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6448,6 +6449,9 @@ private:
         }
         if (category.empty()) continue;
         const std::string target = actionTargetKey(action);
+        if (category == "communication" && directionalFeedback[directionFeedbackKey(
+                parent.key, "__communication_zero_streak:" + action.family, target)].attempts >= 2)
+          continue;
         // Exact parent-local observations apply only to preferred occupancy
         // ranking. Every action remains in the ordinary pending queue.
         if (category == "occupancy" && directionalFeedback[
@@ -6460,7 +6464,8 @@ private:
           group.actions.push_back(&action);
         };
         if (priority > 0 && std::isfinite(priority)) addGroup(category, reason, priority);
-        if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0)
+        if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0 &&
+            directionalFeedback[directionFeedbackKey(parent.key, "__communication_zero_streak:shape", target)].attempts < 2)
           addGroup("communication", "largest known incident pair payload on critical endpoint; shape layout benefit unproved",
                    criticalIncidentPayload);
       }
@@ -6630,6 +6635,12 @@ private:
       const NeighborhoodAction &action, StringRef candidateID, int64_t round,
       uint64_t before, uint64_t after, const DirectionalSelection &selection) {
     const uint64_t debit = after - before;
+    if (action.family == "shape" || action.family == "fusion" ||
+        action.family == "fusion-plus-shape" || action.family == "producer-consumer-co-tiling") {
+      auto &localZero = directionalFeedback[directionFeedbackKey(parent.key,
+          "__communication_zero_streak:" + action.family, actionTargetKey(action))];
+      localZero.attempts = debit ? 0 : localZero.attempts + 1;
+    }
     if (action.family == "replica" || action.family == "tiling" ||
         action.family == "k-tiling" || action.family == "fission") {
       auto &localZero = directionalFeedback[directionFeedbackKey(
