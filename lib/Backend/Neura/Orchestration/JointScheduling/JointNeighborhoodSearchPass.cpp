@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-adjacent-shape-v6";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-opportunity-v9";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6334,6 +6334,50 @@ private:
     return penalty;
   }
 
+  std::map<std::string, int64_t> remainingShapeComputeOpportunity(
+      const SearchState &parent, ArrayRef<PendingNeighbor> pending,
+      uint64_t parentIndex, bool &known) {
+    // Only inspect the complete, already generated catalogue. This neither
+    // invokes the predictor nor scores a whole-program candidate.
+    std::map<std::string, int64_t> gains;
+    known = false;
+    auto buffer = llvm::MemoryBuffer::getFile(parent.costPath);
+    if (!buffer) return gains;
+    auto parsed = json::parse((*buffer)->getBuffer());
+    if (!parsed) { llvm::consumeError(parsed.takeError()); return gains; }
+    const auto *root = parsed->getAsObject();
+    const auto *entries = root ? root->getArray("entries") : nullptr;
+    if (!entries) return gains;
+    std::map<CostQueryKey, TaskShapeCost> catalogue;
+    for (const auto &value : *entries) {
+      const auto *entry = value.getAsObject(); if (!entry) continue;
+      auto name = entry->getString("task");
+      auto rows = entry->getInteger("mapper_tile_rows"), cols = entry->getInteger("mapper_tile_cols");
+      auto ii = entry->getNumber("predicted_ii"), startup = entry->getNumber("startup_cycles");
+      if (!name || !rows || !cols || !ii || !startup ||
+          entry->getString("support_status") != "supported" || !std::isfinite(*ii) ||
+          !std::isfinite(*startup) || *ii <= 0 || *ii > diagnosticIICeiling || *startup < 0) continue;
+      TaskShapeCost cost; cost.supported = true; cost.predictedII = *ii; cost.startupCycles = *startup;
+      catalogue[{name->str(), *rows, *cols}] = cost;
+    }
+    known = true;
+    for (const auto &choice : parent.choices) gains[choice.task] = 0;
+    for (const auto &neighbor : pending) {
+      if (neighbor.parent != parentIndex || neighbor.action.family != "shape") continue;
+      const auto &action = neighbor.action;
+      auto choice = llvm::find_if(parent.choices, [&](const TaskShapeChoice &c) { return c.task == action.shapeTask; });
+      if (choice == parent.choices.end()) continue;
+      int64_t rows = 0, cols = 0;
+      if (!cgraShapeToMapperTileShape(action.shapeRows, action.shapeCols, perCgraRows, perCgraCols, rows, cols)) continue;
+      auto cost = catalogue.find({choice->task, rows, cols}); if (cost == catalogue.end()) continue;
+      std::string error; auto duration = durationFromCost(cost->second, choice->tripCount, error);
+      auto index = std::distance(parent.choices.begin(), choice);
+      if (!duration || static_cast<size_t>(index) >= parent.durations.size()) continue;
+      gains[choice->task] = std::max(gains[choice->task], std::max<int64_t>(0, parent.durations[index] - *duration));
+    }
+    return gains;
+  }
+
   void prepareDirectionalRound(ArrayRef<SearchState> beam,
       ArrayRef<PendingNeighbor> pending, int64_t round,
       uint64_t scoredCount, uint64_t limit) {
@@ -6348,6 +6392,8 @@ private:
       std::map<std::pair<std::string, std::string>, uint64_t> payloads;
       bool graphKnown; std::string failure;
       auto tasks = observeDirectionalState(parent, payloads, graphKnown, failure);
+      bool shapeCatalogueKnown;
+      auto shapeGains = remainingShapeComputeOpportunity(parent, pending, indexed.index(), shapeCatalogueKnown);
       // Separate categories have separate units. Their scores are compared
       // only within the category, never by adding payload bits to cycles.
       struct Group {
@@ -6366,7 +6412,7 @@ private:
         for (const auto &name : footprint) {
           auto found = tasks.find(name); if (found == tasks.end()) continue;
           const auto &task = found->second;
-          compute = std::max(compute, static_cast<double>(task.duration) *
+          compute = std::max(compute, static_cast<double>(action.family == "shape" && shapeCatalogueKnown ? shapeGains[name] : task.duration) *
               (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
           criticalEndpoint |= task.criticalChainProxy || task.terminal;
           if (task.criticalChainProxy || task.terminal)
@@ -6382,7 +6428,7 @@ private:
         std::string category, reason; double priority = 0;
         if (action.family == "shape") {
           category = "compute"; priority = compute;
-          reason = "critical-chain duration proxy; adjacent shape with area penalty";
+          reason = "remaining cached shape compute gain proxy; critical-chain weighting";
         } else if ((action.family == "fusion" || action.family == "fusion-plus-shape" ||
                     action.family == "producer-consumer-co-tiling") && graphKnown &&
                    payload > 0 && criticalEndpoint) {
@@ -6398,7 +6444,7 @@ private:
           if (action.family == "fission") priority *= 0.5;
           reason = "area-duration and observed occupancy proxy; structural cost unknown";
         }
-        if (category.empty() || priority <= 0 || !std::isfinite(priority)) continue;
+        if (category.empty()) continue;
         const std::string target = actionTargetKey(action);
         auto addGroup = [&](StringRef groupCategory, StringRef groupReason, double groupPriority) {
           auto &group = groups[{groupCategory.str(), action.family, target}];
@@ -6406,12 +6452,14 @@ private:
           group.reason = groupReason.str(); group.priority = groupPriority;
           group.actions.push_back(&action);
         };
-        addGroup(category, reason, priority);
+        if (priority > 0 && std::isfinite(priority)) addGroup(category, reason, priority);
         if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0)
           addGroup("communication", "known payload on critical-chain endpoint; shape changes layout, payload reduction not assumed",
                    criticalIncidentPayload);
       }
-      json::Array directions, observations;
+      json::Array directions, observations, opportunities;
+      for (const auto &[name, gain] : shapeGains)
+        opportunities.push_back(json::Object{{"task", name}, {"remaining_compute_gain_cycles", gain}});
       auto &selected = parentDirections[parent.key];
       for (StringRef category : {StringRef("compute"), StringRef("communication"), StringRef("occupancy")}) {
         Group *best = nullptr;
@@ -6445,7 +6493,8 @@ private:
           {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key},
           {"makespan", parent.schedule.makespan}, {"actual_wait_causes_known", false},
           {"typed_graph_known", graphKnown}, {"fallback_reason", failure},
-          {"task_observations", std::move(observations)}, {"directions", std::move(directions)}});
+          {"task_observations", std::move(observations)}, {"shape_catalogue_known", shapeCatalogueKnown},
+          {"shape_compute_opportunities", std::move(opportunities)}, {"directions", std::move(directions)}});
     }
     appendDirectionalEvent(json::Object{{"record_type", "round_allowance"}, {"round", round},
         {"evaluations", int64_t(scoredCount)}, {"round_charge_allowance", int64_t(directionalRoundAllowance)},
