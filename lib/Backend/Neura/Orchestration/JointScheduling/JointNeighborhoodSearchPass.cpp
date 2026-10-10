@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-guided-v1";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-guided-v2";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6617,14 +6617,51 @@ private:
       const std::set<std::string> &newKeys, const std::set<std::string> &costKeys,
       int64_t round, uint64_t scoredCount) {
     closeDirectionalWindow(round, "original refresh boundary; unused quota returned");
-    const SearchState *best = nullptr; std::set<std::string> live;
-    json::Array retainedNew, prunedNew, costParents;
+    // Eligibility uses only known typed history and actual parent/current task
+    // names. Actual next-round menu admission remains the ordinary enumerator;
+    // an empty related suffix closes the window without scoring anything.
+    auto relatedFor = [&](const SearchState &parent, std::set<std::string> &related,
+                          std::set<std::string> &families, std::string &trigger) {
+      if (parent.path.empty() || !parent.actionHistory.known) return false;
+      const StringRef signature(parent.path.back());
+      trigger = signature.take_front(signature.find(':')).str();
+      if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
+      else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); }
+      else return false;
+      const ArchiveRecord *before = nullptr;
+      for (const auto &record : archive) if (record.id == parent.parentId) { before = &record; break; }
+      if (!before) return false;
+      std::set<std::string> oldNames, names;
+      for (const auto &choice : before->choices) oldNames.insert(choice.task);
+      for (const auto &choice : parent.choices) {
+        names.insert(choice.task); if (!oldNames.count(choice.task)) related.insert(choice.task);
+      }
+      if (!parent.actionHistory.actions.empty()) {
+        const auto &last = parent.actionHistory.actions.back();
+        if (last.family == trigger)
+          for (const auto &name : directionalFootprint(last)) if (names.count(name)) related.insert(name);
+      }
+      if (trigger == "fission" && !parent.actionHistory.fissionActions.empty())
+        for (const auto &name : directionalFootprint(parent.actionHistory.fissionActions.back()))
+          if (names.count(name)) related.insert(name);
+      return !related.empty();
+    };
+    const SearchState *best = nullptr; std::set<std::string> live, bestRelated, bestFamilies;
+    std::string bestTrigger;
+    json::Array retainedNew, prunedNew, costParents, eligibleNew;
     for (const auto &parent : beam) {
       live.insert(parent.key);
       if (costKeys.count(parent.key)) costParents.push_back(parent.id);
       if (newKeys.count(parent.key)) {
         retainedNew.push_back(parent.id);
-        if (costKeys.count(parent.key) && (!best || stateLess(parent, *best))) best = &parent;
+        std::set<std::string> related, families; std::string trigger;
+        if (costKeys.count(parent.key) && relatedFor(parent, related, families, trigger)) {
+          eligibleNew.push_back(parent.id);
+          if (!best || stateLess(parent, *best)) {
+            best = &parent; bestRelated = std::move(related);
+            bestFamilies = std::move(families); bestTrigger = std::move(trigger);
+          }
+        }
       }
     }
     for (const auto &record : archive)
@@ -6632,6 +6669,8 @@ private:
     appendDirectionalEvent(json::Object{{"record_type", "frontier_decision"}, {"round", round},
         {"evaluations", int64_t(scoredCount)}, {"retained_new", std::move(retainedNew)},
         {"pruned_new", std::move(prunedNew)}, {"original_cost_parents", std::move(costParents)},
+        {"window_eligible_new", std::move(eligibleNew)},
+        {"window_eligibility", "new retained cost-slot structural parent with known history and related current tasks/families; next menu not pre-enumerated"},
         {"beam_policy_changed", false}});
     for (auto it = directionalFeedback.begin(); it != directionalFeedback.end();) {
       auto key = json::parse(it->first); bool present = false;
@@ -6640,36 +6679,14 @@ private:
       if (!key) llvm::consumeError(key.takeError());
       if (!present) it = directionalFeedback.erase(it); else ++it;
     }
-    if (!best || best->path.empty() || !best->actionHistory.known) return;
-    const StringRef signature(best->path.back());
-    const std::string trigger = signature.take_front(signature.find(':')).str();
-    std::set<std::string> families;
-    if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
-    else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); }
-    else return; // Neutral states use ordinary schedule-derived directions.
-    const ArchiveRecord *before = nullptr;
-    for (const auto &record : archive) if (record.id == best->parentId) { before = &record; break; }
-    if (!before) return;
-    std::set<std::string> oldNames, names, related;
-    for (const auto &choice : before->choices) oldNames.insert(choice.task);
-    for (const auto &choice : best->choices) {
-      names.insert(choice.task); if (!oldNames.count(choice.task)) related.insert(choice.task);
-    }
-    if (!best->actionHistory.actions.empty()) {
-      const auto &last = best->actionHistory.actions.back();
-      if (last.family == trigger)
-        for (const auto &name : directionalFootprint(last)) if (names.count(name)) related.insert(name);
-    }
-    if (trigger == "fission" && !best->actionHistory.fissionActions.empty())
-      for (const auto &name : directionalFootprint(best->actionHistory.fissionActions.back()))
-        if (names.count(name)) related.insert(name);
-    if (related.empty()) return;
-    directionalWindow = DirectionalWindow{best->key, best->id, trigger, related, families, 0, 0, true};
-    std::vector<std::string> targetNames(related.begin(), related.end()), familyNames(families.begin(), families.end());
+    if (!best) return;
+    directionalWindow = DirectionalWindow{best->key, best->id, bestTrigger, bestRelated, bestFamilies, 0, 0, true};
+    std::vector<std::string> targetNames(bestRelated.begin(), bestRelated.end()), familyNames(bestFamilies.begin(), bestFamilies.end());
     appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
         {"round", round}, {"parent_id", best->id}, {"parent_key", best->key}, {"cost", best->score},
-        {"source_parent_id", best->parentId}, {"trigger_family", trigger},
+        {"source_parent_id", best->parentId}, {"trigger_family", bestTrigger},
         {"related_targets", stringArray(targetNames)}, {"allowed_families", stringArray(familyNames)},
+        {"parent_selection", "best stateLess after structural-related eligibility filter within original new retained cost slots"},
         {"target_relation", "new task names plus surviving typed action footprint"},
         {"charged_allowance", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
