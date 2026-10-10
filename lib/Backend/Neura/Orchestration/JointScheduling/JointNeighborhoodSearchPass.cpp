@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-guided-v2";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-shape-window-v4";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -3465,6 +3465,11 @@ public:
                 {"pruned", std::move(pruned)}, {"reason", "unchanged cost/diversity generated beam"}});
           }
         }
+        if (directionalSearch && expandCandidate &&
+            directionalSelection.mode == "guided" &&
+            neighbor.action.family == "shape" &&
+            scoredCount > objectiveEvaluationsBefore)
+          openSelectedShapeWindow(parent, neighbor.action, round);
         ++pendingCursor; ++actionsSinceCheckpoint;
         consumePendingActionFamily(remainingPendingFamilies, actionFamily);
         bool pause = pauseAfterCandidates > 0 && scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
@@ -6607,6 +6612,22 @@ private:
     if (directionalWindow.active && (directionalWindow.charged >= kDirectionalWindowCharges ||
         directionalWindow.zeroDebit >= kDirectionalZeroDebitCap))
       closeDirectionalWindow(round, directionalWindow.charged >= kDirectionalWindowCharges ? "charged allowance used" : "window zero-debit cap");
+  }
+
+  void openSelectedShapeWindow(const SearchState &parent,
+      const NeighborhoodAction &action, int64_t round) {
+    if (directionalWindow.active || action.shapeTask.empty()) return;
+    directionalWindow = DirectionalWindow{parent.key, parent.id,
+        "shape-direction", {action.shapeTask}, {"shape"}, 1, 0, true};
+    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
+        {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key}, {"cost", parent.score},
+        {"source_parent_id", parent.parentId}, {"trigger_family", "shape-direction"},
+        {"related_targets", stringArray(std::vector<std::string>{action.shapeTask})},
+        {"allowed_families", stringArray(std::vector<std::string>{"shape"})},
+        {"parent_selection", "selected scored shape direction"},
+        {"target_relation", "same semantic parent and selected shape target"},
+        {"initial_charged", 1}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
   }
 
   void closeDirectionalWindow(int64_t round, StringRef reason) {
