@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-opportunity-v9";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-family-window-v11";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6720,6 +6720,19 @@ private:
       if (trigger == "fission" && !parent.actionHistory.fissionActions.empty())
         for (const auto &name : directionalFootprint(parent.actionHistory.fissionActions.back()))
           if (names.count(name)) related.insert(name);
+      // Histories authenticate the initial task names. A later partition of
+      // one branch may leave already partitioned siblings under the same
+      // initial task; give their remaining resource actions the same bounded
+      // follow-up window rather than only the most recently created names.
+      std::set<std::string> roots;
+      for (const auto &initial : parent.actionHistory.initialShapes)
+        if (llvm::any_of(related, [&](const std::string &name) {
+              return name == initial.task || StringRef(name).starts_with(initial.task + ".");
+            })) roots.insert(initial.task);
+      for (const auto &choice : parent.choices)
+        if (llvm::any_of(roots, [&](const std::string &root) {
+              return choice.task == root || StringRef(choice.task).starts_with(root + ".");
+            })) related.insert(choice.task);
       return !related.empty();
     };
     const SearchState *best = nullptr; std::set<std::string> live, bestRelated, bestFamilies;
@@ -6763,7 +6776,7 @@ private:
         {"source_parent_id", best->parentId}, {"trigger_family", bestTrigger},
         {"related_targets", stringArray(targetNames)}, {"allowed_families", stringArray(familyNames)},
         {"parent_selection", "best stateLess after structural-related eligibility filter within original new retained cost slots"},
-        {"target_relation", "new task names plus surviving typed action footprint"},
+        {"target_relation", "new task names and surviving footprint plus their authenticated initial-task descendants"},
         {"charged_allowance", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
   }
