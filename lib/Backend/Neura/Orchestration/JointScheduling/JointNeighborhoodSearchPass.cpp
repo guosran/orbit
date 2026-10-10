@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-communication-zero-v21";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-near-critical-v23";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6171,6 +6171,7 @@ private:
         {"cost_tier_width", 4}, {"preferred_numerator", 3},
         {"preferred_denominator", 4}, {"occupancy_zero_streak_cap", 2},
         {"communication_zero_streak_cap", 2},
+        {"critical_predecessor_band_denominator", 8},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6270,20 +6271,26 @@ private:
       dest.payloadBits = saturate(dest.payloadBits, bits);
       auto &pair = payloads[{producer, consumer}]; pair = saturate(pair, bits);
     }
-    // Follow the latest-finishing predecessor from each observed terminal task.
-    // Network reservations are absent, so this is a critical-chain proxy.
+    // Include nearby parallel predecessors in the observed critical-chain
+    // proxy. A one-eighth-duration band limits exploration to branches that
+    // can become critical after a modest resource or communication change.
+    // Network reservations remain absent; these flags are heuristic only.
     for (const auto &[name, observation] : tasks) if (observation.terminal) {
-      std::string current = name; std::set<std::string> visited;
-      while (visited.insert(current).second) {
+      std::vector<std::string> worklist{name}; std::set<std::string> visited;
+      while (!worklist.empty()) {
+        std::string current = worklist.back(); worklist.pop_back();
+        if (!visited.insert(current).second) continue;
         tasks[current].criticalChainProxy = true;
-        std::string next; int64_t latest = -1;
+        std::string latestName; int64_t latest = -1;
         for (const std::string &candidate : predecessors[current])
           if (tasks[candidate].end > latest ||
-              (tasks[candidate].end == latest && (next.empty() || candidate < next))) {
-            next = candidate; latest = tasks[candidate].end;
+              (tasks[candidate].end == latest && (latestName.empty() || candidate < latestName))) {
+            latestName = candidate; latest = tasks[candidate].end;
           }
-        if (next.empty()) break;
-        current = next;
+        if (latestName.empty()) continue;
+        const int64_t band = std::max<int64_t>(1, tasks[latestName].duration / 8);
+        for (const std::string &candidate : predecessors[current])
+          if (latest - tasks[candidate].end <= band) worklist.push_back(candidate);
       }
     }
     for (auto &[name, task] : tasks) {
