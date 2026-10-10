@@ -80,6 +80,8 @@ constexpr StringLiteral kFamilyFunnelSchema =
 constexpr StringLiteral kTypedActionHistorySchema =
     "orbit-joint-neighborhood-typed-actions-v1";
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
+constexpr StringLiteral kParentProgressPolicy =
+    "semantic-parent-family-ordered-suffix-v1";
 constexpr StringLiteral kActiveTransferProofSchema =
     "orbit-static-active-transfer-proof-v1";
 constexpr StringLiteral kActiveTransferWitnessEncoding =
@@ -1184,6 +1186,23 @@ struct PendingNeighbor {
   NeighborhoodAction action;
 };
 
+struct ParentFamilyProgress {
+  std::vector<NeighborhoodAction> actions;
+  uint64_t cursor = 0;
+  uint64_t attempts = 0;
+};
+
+struct ParentPendingProgress {
+  std::string parentID;
+  std::map<std::string, ParentFamilyProgress> families;
+};
+
+static std::string parentProgressEdgeKey(StringRef parentKey,
+                                         const NeighborhoodAction &action) {
+  return jsonText(json::Value(json::Array{
+      parentKey, typedActionObject(action)}));
+}
+
 struct FamilyFunnelCounters {
   uint64_t menu = 0;
   uint64_t generated = 0;
@@ -2212,6 +2231,7 @@ public:
   // Opt-in controller experiment: promote candidates at quota boundaries while
   // preserving unattempted edges of parents that remain eligible.
   Option<bool> refreshFrontier{*this, "refresh-frontier", llvm::cl::init(false)};
+  Option<bool> parentProgress{*this, "parent-progress", llvm::cl::init(false)};
   Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
   Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
   Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
@@ -2333,6 +2353,11 @@ public:
     }
     if (refreshFrontier && (scoringWorkers != 1 || decisionFlow != "joint")) {
       fatal("refresh-frontier currently requires Joint with one scoring worker"); return;
+    }
+    if (parentProgress && (!refreshFrontier || !fairPendingRetention ||
+        decisionFlow != "joint" || scoringWorkers != 1 ||
+        !diagnosticPath.empty() || diagnosticContinue)) {
+      fatal("parent-progress requires fresh Joint refresh with fair pending retention, one scorer, and no diagnostic path"); return;
     }
     activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
     phaseABudget = decisionFlow == "sequential" ?
@@ -3140,6 +3165,9 @@ public:
             static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
             canonicalFissionActions, familyFunnelByRound[round], shapeEnumerationOrder == "descending",
             [&](const SearchState &parent, NeighborhoodAction &action) {
+              if (parentProgress && parentProgressAttemptedEdges.count(
+                      parentProgressEdgeKey(parent.key, action)))
+                return std::string("edge_already_attempted");
               if (refreshFrontier && attemptedEdges.count(edgeKey(parent, action)))
                 return std::string("edge_already_attempted");
               return filterSearchAction(parent, action);
@@ -3147,6 +3175,10 @@ public:
         if (!actionEnumerationError.empty()) {
           fatal(actionEnumerationError);
           return;
+        }
+        if (parentProgress && !mergeParentProgressQueues(
+                beam, round, pending, familyFunnelByRound[round], error)) {
+          fatal(error); return;
         }
         if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
             canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
@@ -3166,6 +3198,7 @@ public:
         const std::string actionFamily = neighbor.action.family;
         if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
         SearchState &parent = beam[neighbor.parent];
+        const uint64_t objectiveEvaluationsBefore = scoredCount;
         if (refreshFrontier) attemptedEdges.insert(edgeKey(parent, neighbor.action));
         FamilyFunnelCounters &funnel =
             familyFunnelByRound[round][actionFamily];
@@ -3345,9 +3378,15 @@ public:
             {"scheduler_pass", schedulerPassed},
             {"scheduler_reject", schedulerRejected},
             {"archive", archived}};
+        json::Object progressEvent;
+        if (parentProgress && !commitParentProgress(
+                parent, neighbor.action, objectiveEvaluationsBefore,
+                scoredCount, progressEvent, error)) {
+          fatal(error); return;
+        }
         appendFamilyFunnelCandidateEvent(
             round, actionFamily, child.id, child.parentId, neighbor.action,
-            child.actionHistory, std::move(eventResult));
+            child.actionHistory, std::move(eventResult), std::move(progressEvent));
         if (expandCandidate) {
           generated.push_back(std::move(child));
           // Keep the expansion frontier bounded rather than serializing every
@@ -3719,6 +3758,7 @@ public:
         for (auto &state : beam) generated.push_back(std::move(state));
         beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
         if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
+        if (parentProgress) retireParentProgressQueues(beam, round);
         for (const auto &state : beam) newParents.push_back(json::Object{
             {"id", state.id}, {"key", state.key}, {"cost", state.score},
             {"depth", static_cast<int64_t>(state.path.size())}});
@@ -5924,6 +5964,28 @@ private:
         search->getString("shape_enumeration_order").value_or("ascending") != shapeEnumerationOrder.getValue()) {
       error = "search feature/order/quota options differ from bound protocol"; return false;
     }
+    const auto protocolParentProgress = search->getBoolean("parent_progress");
+    if (search->get("parent_progress") && !protocolParentProgress) {
+      error = "bound parent_progress must be a boolean"; return false;
+    }
+    for (const auto &mode : {
+             std::pair<StringRef, StringRef>{"target_coverage", "target_coverage_policy"},
+             std::pair<StringRef, StringRef>{"diagnostic_incumbent", "diagnostic_incumbent_policy"}}) {
+      const auto enabled = search->getBoolean(mode.first);
+      if ((search->get(mode.first) && (!enabled || *enabled)) ||
+          search->get(mode.second)) {
+        error = "parent progress source cannot enable or bind coverage/incumbent policies";
+        return false;
+      }
+    }
+    if ((parentProgress &&
+         (search->getBoolean("parent_progress") != true ||
+          search->getString("parent_progress_policy") != kParentProgressPolicy)) ||
+        (!parentProgress &&
+         (protocolParentProgress.value_or(false) ||
+          search->get("parent_progress_policy")))) {
+      error = "parent progress differs from the bound protocol"; return false;
+    }
     json::Object objectBinding{
         {"schema", "orbit-neighborhood-exact-binding-v1"},
         {"decision_flow",decisionFlow.getValue()}, {"graph_budget_percent",graphBudgetPercent.getValue()},
@@ -5945,6 +6007,10 @@ private:
         {"family_funnel_contract", kFamilyFunnelSchema},
         {"checkpoint_contract",
          checkpointSchemaForCeiling(diagnosticIICeiling.getValue())}};
+    if (parentProgress) {
+      objectBinding["parent_progress"] = true;
+      objectBinding["parent_progress_policy"] = kParentProgressPolicy.str();
+    }
     if (diagnosticIICeiling == 23)
       objectBinding["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (stageNumber(stage) == 6) {
@@ -5993,6 +6059,334 @@ private:
           std::move(requiredControlRoles);
     }
     text = jsonText(json::Value(std::move(objectBinding))) + "\n";
+    return true;
+  }
+
+  bool mergeParentProgressQueues(
+      ArrayRef<SearchState> beam, int64_t round,
+      std::vector<PendingNeighbor> &pending, FamilyFunnelRound &funnel,
+      std::string &error) {
+    // Re-enumeration validates the current menu and opens post-seed actions.
+    // It never reorders an existing legal suffix. New signatures are appended
+    // in the unchanged cost-guided stream order produced by the old helper.
+    std::map<std::string,
+             std::map<std::string, std::vector<NeighborhoodAction>>> admitted;
+    for (auto &neighbor : pending) {
+      if (neighbor.parent >= beam.size()) {
+        error = "parent progress menu parent outside beam"; return false;
+      }
+      --funnel[neighbor.action.family].generated;
+      admitted[beam[neighbor.parent].key][neighbor.action.family].push_back(
+          std::move(neighbor.action));
+    }
+    std::set<std::string> parentKeys, familyNames;
+    for (const SearchState &parent : beam) {
+      if (parent.key.empty() || !parentKeys.insert(parent.key).second) {
+        error = "parent progress requires unique exact semantic beam keys";
+        return false;
+      }
+      ParentPendingProgress &saved = parentProgressQueues[parent.key];
+      saved.parentID = parent.id;
+      auto &currentFamilies = admitted[parent.key];
+      std::set<std::string> names;
+      for (const auto &[name, stream] : saved.families) names.insert(name);
+      for (const auto &[name, stream] : currentFamilies) names.insert(name);
+      for (const std::string &family : names) {
+        ParentFamilyProgress &stream = saved.families[family];
+        if (stream.cursor > stream.actions.size()) {
+          error = "parent progress cursor exceeds stream"; return false;
+        }
+        auto &current = currentFamilies[family];
+        std::set<std::string> legal, retained;
+        for (const auto &action : current) legal.insert(actionSignature(action));
+        std::vector<std::string> previous, kept, added, removed;
+        std::vector<NeighborhoodAction> updated;
+        updated.reserve(stream.actions.size() + current.size());
+        for (uint64_t i = 0; i < stream.cursor; ++i)
+          updated.push_back(std::move(stream.actions[i]));
+        for (uint64_t i = stream.cursor; i < stream.actions.size(); ++i) {
+          NeighborhoodAction &action = stream.actions[i];
+          const std::string signature = actionSignature(action);
+          previous.push_back(signature);
+          if (legal.count(signature) && !parentProgressAttemptedEdges.count(
+                  parentProgressEdgeKey(parent.key, action))) {
+            if (!retained.insert(signature).second) {
+              error = "duplicate retained parent progress signature"; return false;
+            }
+            kept.push_back(signature);
+            updated.push_back(std::move(action));
+          } else {
+            removed.push_back(signature);
+          }
+        }
+        for (auto &action : current) {
+          const std::string signature = actionSignature(action);
+          if (retained.insert(signature).second &&
+              !parentProgressAttemptedEdges.count(
+                  parentProgressEdgeKey(parent.key, action))) {
+            added.push_back(signature);
+            updated.push_back(std::move(action));
+          }
+        }
+        stream.actions = std::move(updated);
+        if (!added.empty() || !removed.empty()) {
+          parentProgressEvents.push_back(jsonText(json::Value(json::Object{
+              {"record_type", "queue_update"}, {"policy", kParentProgressPolicy},
+              {"round", round}, {"parent_id", parent.id},
+              {"parent_key", parent.key}, {"family", family},
+              {"cursor", static_cast<int64_t>(stream.cursor)},
+              {"stream_attempts", static_cast<int64_t>(stream.attempts)},
+              {"previous_remaining", stringArray(previous)},
+              {"retained_remaining", stringArray(kept)},
+              {"appended_signatures", stringArray(added)},
+              {"removed_signatures", stringArray(removed)}})));
+        }
+        if (stream.cursor < stream.actions.size()) familyNames.insert(family);
+      }
+    }
+    pending.clear();
+    std::map<std::pair<std::string, std::string>, uint64_t> positions;
+    bool emitted = true;
+    while (emitted) {
+      emitted = false;
+      for (const std::string &family : familyNames)
+        for (auto indexed : llvm::enumerate(beam)) {
+          auto &families = parentProgressQueues[indexed.value().key].families;
+          auto found = families.find(family);
+          if (found == families.end()) continue;
+          ParentFamilyProgress &stream = found->second;
+          uint64_t &position = positions[{indexed.value().key, family}];
+          const uint64_t index = stream.cursor + position;
+          if (index >= stream.actions.size()) continue;
+          pending.push_back({indexed.index(), stream.actions[index]});
+          ++position;
+          ++funnel[family].generated;
+          emitted = true;
+        }
+    }
+    return true;
+  }
+
+  bool commitParentProgress(
+      const SearchState &parent, const NeighborhoodAction &action,
+      uint64_t before, uint64_t after, json::Object &event,
+      std::string &error) {
+    auto saved = parentProgressQueues.find(parent.key);
+    if (saved == parentProgressQueues.end()) {
+      error = "committed parent has no progress queue"; return false;
+    }
+    auto family = saved->second.families.find(action.family);
+    if (family == saved->second.families.end() ||
+        family->second.cursor >= family->second.actions.size()) {
+      error = "committed family has no remaining progress action"; return false;
+    }
+    ParentFamilyProgress &stream = family->second;
+    if (parentProgressEdgeKey(parent.key, action) != parentProgressEdgeKey(
+            parent.key, stream.actions[stream.cursor]) || after < before ||
+        after - before > 1 || !parentProgressAttemptedEdges.insert(
+            parentProgressEdgeKey(parent.key, action)).second) {
+      error = "parent progress attempted edge repeated or out of stream order";
+      return false;
+    }
+    event = json::Object{
+        {"policy", kParentProgressPolicy}, {"parent_key", parent.key},
+        {"family", action.family}, {"target", actionTargetKey(action)},
+        {"action_signature", actionSignature(action)},
+        {"cursor_before", static_cast<int64_t>(stream.cursor)},
+        {"cursor_after", static_cast<int64_t>(stream.cursor + 1)},
+        {"stream_attempts", static_cast<int64_t>(stream.attempts + 1)},
+        {"queue_size", static_cast<int64_t>(stream.actions.size())},
+        {"attempt_global_index", static_cast<int64_t>(parentProgressAttemptedEdges.size())},
+        {"objective_evaluations_before", static_cast<int64_t>(before)},
+        {"objective_evaluations_after", static_cast<int64_t>(after)}};
+    ++stream.cursor;
+    ++stream.attempts;
+    return true;
+  }
+
+  void retireParentProgressQueues(ArrayRef<SearchState> beam, int64_t round) {
+    std::set<std::string> keys;
+    for (const SearchState &parent : beam) keys.insert(parent.key);
+    for (auto it = parentProgressQueues.begin(); it != parentProgressQueues.end();) {
+      if (keys.count(it->first)) {
+        for (const SearchState &parent : beam)
+          if (parent.key == it->first) it->second.parentID = parent.id;
+        ++it; continue;
+      }
+      parentProgressEvents.push_back(jsonText(json::Value(json::Object{
+          {"record_type", "parent_retired"}, {"policy", kParentProgressPolicy},
+          {"round", round}, {"parent_id", it->second.parentID},
+          {"parent_key", it->first}})));
+      it = parentProgressQueues.erase(it);
+    }
+  }
+
+  json::Object parentProgressQueuesObject() const {
+    json::Array parents, edges;
+    for (const std::string &edge : parentProgressAttemptedEdges) edges.push_back(edge);
+    for (const auto &[key, saved] : parentProgressQueues) {
+      json::Array families;
+      for (const auto &[family, stream] : saved.families)
+        families.push_back(json::Object{
+            {"family", family}, {"cursor", static_cast<int64_t>(stream.cursor)},
+            {"attempts", static_cast<int64_t>(stream.attempts)},
+            {"actions", typedActionArray(stream.actions)}});
+      parents.push_back(json::Object{{"parent_key", key},
+          {"parent_id", saved.parentID}, {"families", std::move(families)}});
+    }
+    return json::Object{{"policy", kParentProgressPolicy},
+        {"attempted_edges", std::move(edges)}, {"parents", std::move(parents)}};
+  }
+
+  bool restoreParentProgress(
+      const json::Object &root, ArrayRef<ArchiveRecord> archive,
+      ArrayRef<SearchState> beam, std::string &error) {
+    auto fail = [&]() {
+      error = "checkpoint parent progress policy, queues, or committed edges differ";
+      return false;
+    };
+    if (!parentProgress) {
+      if (root.get("parent_progress") || root.get("parent_progress_policy") ||
+          root.get("parent_progress_queues") || root.get("parent_progress_events"))
+        return fail();
+      for (const std::string &text : familyFunnelEvents) {
+        auto parsed = json::parse(text);
+        if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+        auto *event = parsed->getAsObject();
+        if (event && event->get("parent_progress")) return fail();
+      }
+      return true;
+    }
+    const auto *queues = root.getObject("parent_progress_queues");
+    const auto *events = root.getArray("parent_progress_events");
+    const auto *parents = queues ? queues->getArray("parents") : nullptr;
+    const auto *edges = queues ? queues->getArray("attempted_edges") : nullptr;
+    if (root.getBoolean("parent_progress") != true ||
+        root.getString("parent_progress_policy") != kParentProgressPolicy ||
+        !queues || queues->getString("policy") != kParentProgressPolicy ||
+        !events || !parents || !edges) return fail();
+    std::map<std::string, std::string> archivedKeys, eligibleKeys;
+    for (const auto &record : archive)
+      if (record.valid) archivedKeys[record.id] = record.key;
+    for (const auto &parent : beam) eligibleKeys[parent.id] = parent.key;
+    std::set<std::string> committed, savedEdges;
+    std::map<std::pair<std::string, std::string>, uint64_t> latestCursors;
+    std::optional<uint64_t> previousEvaluations;
+    for (const std::string &text : familyFunnelEvents) {
+      auto parsed = json::parse(text);
+      if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+      auto *event = parsed->getAsObject();
+      if (!event) return fail();
+      if (event->getString("record_type") != "candidate_attempt") {
+        if (event->get("parent_progress")) return fail();
+        continue;
+      }
+      const auto *progress = event->getObject("parent_progress");
+      const auto *typed = event->getObject("action");
+      const auto *result = event->getObject("result");
+      NeighborhoodAction action;
+      auto id = event->getString("parent_id");
+      auto key = progress ? progress->getString("parent_key") : std::nullopt;
+      auto before = progress ? progress->getInteger("cursor_before") : std::nullopt;
+      auto after = progress ? progress->getInteger("cursor_after") : std::nullopt;
+      auto attempts = progress ? progress->getInteger("stream_attempts") : std::nullopt;
+      auto size = progress ? progress->getInteger("queue_size") : std::nullopt;
+      auto index = progress ? progress->getInteger("attempt_global_index") : std::nullopt;
+      auto evaluatedBefore = progress ? progress->getInteger("objective_evaluations_before") : std::nullopt;
+      auto evaluatedAfter = progress ? progress->getInteger("objective_evaluations_after") : std::nullopt;
+      if (!progress || !typed || !result || !parseTypedAction(*typed, action) ||
+          !id || !key || !archivedKeys.count(id->str()) || archivedKeys[id->str()] != *key ||
+          progress->getString("policy") != kParentProgressPolicy ||
+          progress->getString("family") != action.family ||
+          progress->getString("target") != actionTargetKey(action) ||
+          progress->getString("action_signature") != actionSignature(action) ||
+          result->getBoolean("attempted") != true ||
+          !before || !after || !attempts || !size || !index || *before < 0 ||
+          *before == std::numeric_limits<int64_t>::max() ||
+          *after != *before + 1 || *attempts != *after || *size < *after ||
+          !evaluatedBefore || !evaluatedAfter || *evaluatedBefore < 0 ||
+          *evaluatedAfter < *evaluatedBefore || *evaluatedAfter - *evaluatedBefore > 1 ||
+          *evaluatedAfter > maxCandidates.getValue() ||
+          result->getInteger("scheduler_calls") != *evaluatedAfter - *evaluatedBefore ||
+          (previousEvaluations && *previousEvaluations != static_cast<uint64_t>(*evaluatedBefore)) ||
+          !committed.insert(parentProgressEdgeKey(*key, action)).second ||
+          *index != static_cast<int64_t>(committed.size())) return fail();
+      previousEvaluations = *evaluatedAfter;
+      latestCursors[{key->str(), action.family}] = *after;
+    }
+    if (previousEvaluations && root.getInteger("scored_candidates") !=
+                                  static_cast<int64_t>(*previousEvaluations)) return fail();
+    for (const auto &value : *edges) {
+      auto edge = value.getAsString();
+      if (!edge || !savedEdges.insert(edge->str()).second) return fail();
+    }
+    if (savedEdges != committed) return fail();
+    std::map<std::string, ParentPendingProgress> restored;
+    for (const auto &value : *parents) {
+      auto *parent = value.getAsObject();
+      auto key = parent ? parent->getString("parent_key") : std::nullopt;
+      auto id = parent ? parent->getString("parent_id") : std::nullopt;
+      const auto *families = parent ? parent->getArray("families") : nullptr;
+      if (!key || key->empty() || !id || !families || !eligibleKeys.count(id->str()) ||
+          eligibleKeys[id->str()] != *key || restored.count(key->str())) return fail();
+      ParentPendingProgress saved;
+      saved.parentID = id->str();
+      for (const auto &entry : *families) {
+        const auto *family = entry.getAsObject();
+        auto name = family ? family->getString("family") : std::nullopt;
+        auto cursor = family ? family->getInteger("cursor") : std::nullopt;
+        auto attempts = family ? family->getInteger("attempts") : std::nullopt;
+        const auto *actions = family ? family->getArray("actions") : nullptr;
+        if (!name || name->empty() || !cursor || !attempts || !actions || *cursor < 0 ||
+            *attempts != *cursor || static_cast<uint64_t>(*cursor) > actions->size() ||
+            saved.families.count(name->str())) return fail();
+        ParentFamilyProgress stream;
+        stream.cursor = *cursor;
+        stream.attempts = *attempts;
+        std::set<std::string> signatures;
+        for (auto indexed : llvm::enumerate(*actions)) {
+          const auto *typed = indexed.value().getAsObject();
+          NeighborhoodAction action;
+          if (!typed || !parseTypedAction(*typed, action) || action.family != *name ||
+              !signatures.insert(actionSignature(action)).second ||
+              committed.count(parentProgressEdgeKey(*key, action)) !=
+                  static_cast<size_t>(indexed.index() < stream.cursor)) return fail();
+          stream.actions.push_back(std::move(action));
+        }
+        if (stream.cursor > 0 && latestCursors[{key->str(), name->str()}] != stream.cursor)
+          return fail();
+        saved.families.emplace(name->str(), std::move(stream));
+      }
+      restored.emplace(key->str(), std::move(saved));
+    }
+    std::vector<std::string> restoredEvents;
+    for (const auto &value : *events) {
+      auto text = value.getAsString();
+      if (!text) return fail();
+      auto parsed = json::parse(*text);
+      if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+      auto *event = parsed->getAsObject();
+      auto type = event ? event->getString("record_type") : std::nullopt;
+      auto id = event ? event->getString("parent_id") : std::nullopt;
+      auto key = event ? event->getString("parent_key") : std::nullopt;
+      auto round = event ? event->getInteger("round") : std::nullopt;
+      if (!event || !type || (*type != "queue_update" && *type != "parent_retired") ||
+          event->getString("policy") != kParentProgressPolicy || !id || !key || !round || *round < 0 ||
+          *round > root.getInteger("round").value_or(-1) || !archivedKeys.count(id->str()) ||
+          archivedKeys[id->str()] != *key) return fail();
+      if (*type == "queue_update") {
+        std::vector<std::string> signatures;
+        for (StringRef name : {"previous_remaining", "retained_remaining",
+                              "appended_signatures", "removed_signatures"})
+          if (!parseStringArray(event->getArray(name), signatures)) return fail();
+        if (!event->getString("family") || event->getInteger("cursor").value_or(-1) < 0 ||
+            event->getInteger("stream_attempts") != event->getInteger("cursor")) return fail();
+      }
+      restoredEvents.push_back(text->str());
+    }
+    parentProgressQueues = std::move(restored);
+    parentProgressAttemptedEdges = std::move(committed);
+    parentProgressEvents = std::move(restoredEvents);
     return true;
   }
 
@@ -6259,7 +6653,7 @@ private:
       int64_t round, StringRef family, StringRef candidateID,
       StringRef parentID, const NeighborhoodAction &action,
       const SearchState::TypedActionHistory &history,
-      json::Object result) {
+      json::Object result, json::Object progress = {}) {
     std::set<std::string> primitiveKinds;
     for (const NeighborhoodPrimitive &primitive : action.primitives)
       primitiveKinds.insert(primitive.kind);
@@ -6304,6 +6698,7 @@ private:
         {"typed_action_history", std::move(typedHistory)},
         {"binding", std::move(binding)},
         {"result", std::move(result)}};
+    if (parentProgress) event["parent_progress"] = std::move(progress);
     familyFunnelEvents.push_back(jsonText(json::Value(std::move(event))));
   }
 
@@ -6838,10 +7233,23 @@ private:
         {"search_scope", kSearchScope}, {"best_found", true}, {"exhaustive", false}};
     if (diagnosticIICeiling == 23)
       root["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
+    if (parentProgress) {
+      root["parent_progress"] = true;
+      root["parent_progress_policy"] = kParentProgressPolicy.str();
+      root["parent_progress_queues"] = parentProgressQueuesObject();
+      root["parent_progress_events"] = stringArray(parentProgressEvents);
+    }
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
     if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
                                    pending, pendingCursor, stopReason, error))
       return false;
+    if (parentProgress) {
+      std::string progressText;
+      for (const std::string &event : parentProgressEvents)
+        progressText += event + "\n";
+      if (!writeTextAtomically(outputDir.getValue() + "/parent-progress.jsonl",
+                               progressText, error)) return false;
+    }
     journalBytes = newJournalBytes; journalArchiveCount = archive.size(); dirtyJournalIndices.clear();
     // Snapshot deletion happens only after a checkpoint binds the amended
     // archive. A failed checkpoint always leaves the previous replay inputs.
@@ -7107,6 +7515,7 @@ private:
       return true;
     };
     if (!validateRestoredStates(beam) || !validateRestoredStates(generated)) return false;
+    if (!restoreParentProgress(*root, archive, beam, error)) return false;
     auto authenticateRestoredStates = [&](std::vector<SearchState> &states) {
       for (SearchState &state : states)
         if (!authenticateTypedActionHistory(state, canonical, functionName,
@@ -7354,6 +7763,11 @@ private:
         {"native_shortlist_count", int64_t(ranked.size())}};
     if (diagnosticIICeiling == 23)
       metadata["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
+    if (parentProgress) {
+      metadata["parent_progress"] = true;
+      metadata["parent_progress_policy"] = kParentProgressPolicy.str();
+      metadata["parent_progress_queues"] = parentProgressQueuesObject();
+    }
     if (stageNumber(stageName) == 6) {
       json::Array support;
       for (const std::string &entry : fissionSupportDiagnostics)
@@ -7504,6 +7918,9 @@ private:
   std::map<std::string, std::unique_ptr<TaskShapeCostCache>> graphCostCaches;
   FamilyFunnelByRound familyFunnelByRound;
   std::vector<std::string> familyFunnelEvents;
+  std::map<std::string, ParentPendingProgress> parentProgressQueues;
+  std::set<std::string> parentProgressAttemptedEdges;
+  std::vector<std::string> parentProgressEvents;
 
 };
 
