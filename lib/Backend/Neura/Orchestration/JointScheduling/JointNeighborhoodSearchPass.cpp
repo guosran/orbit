@@ -2313,9 +2313,9 @@ public:
       fatal("invalid round-quota-scale(1/2), shape-enumeration-order, or feature-policy"); return;
     }
     if ((decisionFlow != "legacy" && decisionFlow != "joint" &&
-         decisionFlow != "sequential") ||
+         decisionFlow != "sequential" && decisionFlow != "alternating") ||
         (graphBudgetPercent != 50 && graphBudgetPercent != 75)) {
-      fatal("decision-flow must be legacy/joint/sequential; graph-budget-percent must be50/75"); return;
+      fatal("decision-flow must be legacy/joint/sequential/alternating; graph-budget-percent must be50/75"); return;
     }
     if (decisionFlow != "legacy" &&
         (resume || pauseAfterCandidates > 0 || !seedManifest.empty() ||
@@ -2328,12 +2328,14 @@ public:
     if (refreshFrontier && (scoringWorkers != 1 || decisionFlow != "joint")) {
       fatal("refresh-frontier currently requires Joint with one scoring worker"); return;
     }
-    activePhase = decisionFlow == "sequential" ? "A" : decisionFlow.getValue();
+    activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
     phaseABudget = decisionFlow == "sequential" ?
         static_cast<uint64_t>(maxCandidates.getValue() * graphBudgetPercent.getValue() / 100) :
         static_cast<uint64_t>(maxCandidates.getValue());
     phaseBBudget = static_cast<uint64_t>(maxCandidates.getValue()) - phaseABudget;
-    phaseLimit = phaseABudget;
+    phaseLimit = decisionFlow == "alternating" ? static_cast<uint64_t>(maxCandidates.getValue()/4) : phaseABudget;
+    uint64_t blockStartEvaluations = 0;
+    unsigned alternatingBlock = 0;
     if (!readFiniteDomain(error)) { fatal(error); return; }
     if (diagnosticIICeiling != 20 && diagnosticIICeiling != 23) {
       fatal("diagnostic-ii-ceiling accepts only 20 (default) or 23");
@@ -3093,6 +3095,7 @@ public:
         beam.clear(); beam.push_back(std::move(child));
       }
       pending.clear(); pendingCursor = 0; generated.clear();
+      if (diagnosticContinue) { round = diagnosticDepth; phaseStartRound = round; }
       roundScoredCount = 0;
       roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds, roundQuotaScale);
       if (!diagnosticContinue) { phaseLimit = scoredCount; stopReason = "diagnostic-path-complete"; }
@@ -3770,6 +3773,26 @@ public:
       if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
           canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
     }
+    if (decisionFlow == "alternating") {
+      alternatingBlocks.push_back(json::Object{
+          {"block", static_cast<int64_t>(alternatingBlock)}, {"phase", activePhase},
+          {"requested_cumulative_limit", static_cast<int64_t>(phaseLimit)},
+          {"charged", static_cast<int64_t>(scoredCount - blockStartEvaluations)},
+          {"stop", stopReason.empty() ? (scoredCount >= phaseLimit ? "block-budget" : "max-rounds") : stopReason});
+      ++alternatingBlock;
+      if (alternatingBlock < 4 && scoredCount < static_cast<uint64_t>(maxCandidates)) {
+        if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) { fatal(error); return; }
+        activePhase = alternatingBlock % 2 ? "B" : "A";
+        phaseLimit = static_cast<uint64_t>(maxCandidates.getValue() * (alternatingBlock + 1) / 4);
+        blockStartEvaluations = scoredCount;
+        phaseStartRound = round + 1; round = phaseStartRound;
+        generated.clear(); pending.clear(); pendingCursor = 0;
+        successfulFamilyScores.clear(); stopReason.clear(); roundScoredCount = 0;
+        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds, roundQuotaScale);
+        continue;
+      }
+      break;
+    }
     if (decisionFlow == "sequential" && activePhase == "A") {
       phaseAEvaluations = scoredCount;
       phaseAStopReason = stopReason.empty() ?
@@ -3931,7 +3954,7 @@ private:
           return StringRef(p.kind).contains("fusion"); })) return "feature_policy_fusion_off";
     if (featurePolicy == "fission-off" && (action.family == "fission" ||
         llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) { return p.kind == "fission"; }))) return "feature_policy_fission_off";
-    if (decisionFlow == "sequential" && activePhase == "A") {
+    if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "A") {
       if (resourceAction(action) || action.family=="lineage-replacement") return "sequential_graph_phase_resource_action";
       action.primitives.erase(std::remove_if(action.primitives.begin(), action.primitives.end(),
           [](const NeighborhoodPrimitive &p) { return p.kind=="replica" || p.kind=="replication"; }), action.primitives.end());
@@ -3939,7 +3962,7 @@ private:
       action.shapeTask.clear(); action.shapeRows=0; action.shapeCols=0;
       if (action.primitives.empty()) return "sequential_graph_phase_empty_projection";
       if (projected) action.label = "projected:" + action.label;
-    } else if (decisionFlow == "sequential" && activePhase == "B") {
+    } else if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "B") {
       if (!resourceAction(action) || action.canonicalReset) return "sequential_resource_phase_frozen_graph";
       if (graphHistorySignature(parent.actionHistory)!=frozenGraphHistory) return "sequential_frozen_graph_mismatch";
     }
@@ -5640,7 +5663,7 @@ private:
   bool retainCanonicalBeam(std::vector<SearchState> &beam,
                            ArrayRef<ArchiveRecord> archive,
                            std::string &error) {
-    if (decisionFlow == "sequential" && activePhase == "B") return true;
+    if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "B") return true;
     const ArchiveRecord *identity = nullptr;
     for (const auto &record : archive)
       if (record.valid && llvm::is_contained(record.controlRoles,
@@ -7257,6 +7280,7 @@ private:
         {"source_binding_witness", bindingPath}, {"max_rounds", maxRoundsValue},
         {"max_candidates", maxCandidatesValue}, {"beam_width", beamWidthValue},
         {"diversity_slots", diversityValue}, {"rounds", round}, {"rounds_completed", round},
+        {"alternating_blocks", alternatingBlocks},
         {"decision_flow", decisionFlow.getValue()},
         {"graph_budget_percent", graphBudgetPercent.getValue()},
         {"finite_domain_file", finiteDomainFile.getValue()},
@@ -7424,6 +7448,7 @@ private:
   std::optional<std::string> interTaskNetworkSpecOverrideBytes;
   uint64_t journalBytes = 0, journalArchiveCount = 0, duplicateCandidates = 0;
   uint64_t productionSchedulerCalls = 0, costCacheHits = 0, costCacheMisses = 0;
+  json::Array alternatingBlocks;
   uint64_t roundScoredCount = 0, roundScoreLimit = 0;
   int64_t elapsedMilliseconds = 0;
   int64_t parallelPreparationMilliseconds = 0;
