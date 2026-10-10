@@ -2208,6 +2208,11 @@ public:
   Option<int64_t> graphBudgetPercent{*this, "graph-budget-percent", llvm::cl::init(50)};
   Option<std::string> finiteDomainFile{*this, "finite-domain-file", llvm::cl::init("")};
   Option<bool> fairPendingRetention{*this, "fair-pending-retention", llvm::cl::init(false)};
+  // Opt-in controller experiment: promote candidates at quota boundaries while
+  // preserving unattempted edges of parents that remain eligible.
+  Option<bool> refreshFrontier{*this, "refresh-frontier", llvm::cl::init(false)};
+  Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
+  Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
   Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
   Option<std::string> featurePolicy{*this, "feature-policy", llvm::cl::init("all")};
   Option<std::string> shapeEnumerationOrder{*this, "shape-enumeration-order", llvm::cl::init("ascending")};
@@ -2319,6 +2324,9 @@ public:
     }
     if (decisionFlow == "sequential" && maxCandidates < 2) {
       fatal("sequential needs one unique evaluation per phase allowance"); return;
+    }
+    if (refreshFrontier && (scoringWorkers != 1 || decisionFlow != "joint")) {
+      fatal("refresh-frontier currently requires Joint with one scoring worker"); return;
     }
     activePhase = decisionFlow == "sequential" ? "A" : decisionFlow.getValue();
     phaseABudget = decisionFlow == "sequential" ?
@@ -3032,6 +3040,76 @@ public:
       if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
           canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
     }
+    // Replay the recorded typed prefix, one generated action at a time. This
+    // diagnostic is oracle-assisted and never used by the deployed controller.
+    if (!diagnosticPath.empty()) {
+      std::string pathText;
+      if (!readFileBytes(diagnosticPath, pathText, error)) { fatal(error); return; }
+      auto parsed = json::parse(pathText);
+      auto *steps = parsed ? parsed->getAsArray() : nullptr;
+      if (!steps) { fatal("diagnostic-path needs an array of typed actions"); return; }
+      for (const auto &entry : *steps) {
+        NeighborhoodAction action;
+        auto *object = entry.getAsObject();
+        if (!object || !parseTypedAction(*object, action)) { fatal("bad diagnostic typed action"); return; }
+        std::string menuError;
+        auto menu = enumerateBalancedPendingNeighbors(beam, functionName, stage, 0,
+            maxPartitionFactor, preparedTaskflowSource.get(), maxFissionActionsPerTask,
+            canonicalFissionActions, familyFunnelByRound[0], false,
+            [&](const SearchState &parent, NeighborhoodAction &candidate) {
+              return filterSearchAction(parent, candidate);
+            }, menuError);
+        if (!menuError.empty()) { fatal(menuError); return; }
+        bool admitted = llvm::any_of(menu, [&](const PendingNeighbor &n) {
+          return n.parent == 0 && actionSignature(n.action) == actionSignature(action);
+        });
+        if (!admitted) { fatal("diagnostic action is absent from the Joint menu: " + actionSignature(action)); return; }
+        if (scoredCount >= static_cast<uint64_t>(maxCandidates)) { fatal("diagnostic prefix exceeds total budget"); return; }
+        SearchState &parent = beam[0];
+        SearchState child;
+        child.id = "neighborhood-" + std::to_string(nextSerial++);
+        child.parentId = parent.id; child.path = parent.path;
+        child.path.push_back(actionSignature(action));
+        child.shapes = parent.shapes; child.module = parent.module->clone();
+        std::string reason, diagnostic;
+        auto outcome = materializeNeighbor(child, parent, canonical, functionName,
+            outputDir, action, canonicalFactKey, nextSerial, reason, diagnostic, error);
+        if (outcome != NeighborMaterialization::Applied) {
+          fatal("diagnostic materialization failed: " + reason + ":" + diagnostic + ":" + error); return;
+        }
+        if (!seenKeys.insert(child.key).second) { fatal("diagnostic repeated state"); return; }
+        child.keyReserved = true;
+        if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
+            candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
+            scoredCount, false, nextSerial, error) ||
+            !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error) || !child.scored) {
+          fatal("diagnostic evaluation failed: " + error + child.rejectReason); return;
+        }
+        // Preserve each prefix for independent source/key checks and resumable
+        // one-prefix intervention; final winners are never algorithm seeds.
+        if (!writeTextAtomically(joinPath(outputDir, child.id + "-prefix.mlir"),
+                           neighborhoodReplaySourceText(child.module.get()), error)) { fatal(error); return; }
+        beam.clear(); beam.push_back(std::move(child));
+      }
+      pending.clear(); pendingCursor = 0; generated.clear();
+      roundScoredCount = 0;
+      roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds, roundQuotaScale);
+      if (!diagnosticContinue) { phaseLimit = scoredCount; stopReason = "diagnostic-path-complete"; }
+    }
+    std::set<std::string> attemptedEdges;
+    for (const auto &eventText : familyFunnelEvents) {
+      auto value = json::parse(eventText);
+      auto *object = value ? value->getAsObject() : nullptr;
+      NeighborhoodAction action;
+      auto *typed = object ? object->getObject("action") : nullptr;
+      if (object && object->getString("record_type").value_or("") == "candidate_attempt" &&
+          typed && parseTypedAction(*typed, action))
+        attemptedEdges.insert(object->getString("parent_id").value_or("").str() +
+                              "\n" + actionSignature(action));
+    }
+    auto edgeKey = [&](const SearchState &parent, const NeighborhoodAction &action) {
+      return parent.id + "\n" + actionSignature(action);
+    };
     std::map<std::string, uint64_t> successfulFamilyScores =
         successfulActionFamilyScores(archive, round);
     const std::map<std::string, uint64_t> noReservedFamilyScores;
@@ -3051,6 +3129,8 @@ public:
             static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
             canonicalFissionActions, familyFunnelByRound[round], shapeEnumerationOrder == "descending",
             [&](const SearchState &parent, NeighborhoodAction &action) {
+              if (refreshFrontier && attemptedEdges.count(edgeKey(parent, action)))
+                return std::string("edge_already_attempted");
               return filterSearchAction(parent, action);
             }, actionEnumerationError);
         if (!actionEnumerationError.empty()) {
@@ -3060,6 +3140,7 @@ public:
         if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
             canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
       }
+      if (refreshFrontier && pending.empty()) { stopReason = "frontier-exhausted"; break; }
       std::map<std::string, uint64_t> remainingPendingFamilies =
           pendingActionFamilyCounts(pending, pendingCursor);
       if (scoringWorkers <= 1) {
@@ -3074,6 +3155,7 @@ public:
         const std::string actionFamily = neighbor.action.family;
         if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
         SearchState &parent = beam[neighbor.parent];
+        if (refreshFrontier) attemptedEdges.insert(edgeKey(parent, neighbor.action));
         FamilyFunnelCounters &funnel =
             familyFunnelByRound[round][actionFamily];
         SearchState child;
@@ -3614,6 +3696,40 @@ public:
       if (stopReason == "explicit-pause" ||
           scoredCount >= phaseLimit)
         break;
+      if (refreshFrontier) {
+        // Rebuild queues by stable parent ID and typed signature. Every still
+        // eligible unattempted edge is regenerated; attempted edges are removed.
+        // New children become eligible after one quota block, without waiting
+        // for thousands of sibling actions on the old frozen parents.
+        ++round;
+        json::Array oldParents, newParents;
+        for (const auto &state : beam) oldParents.push_back(state.id);
+        const uint64_t remaining = pending.size() - pendingCursor;
+        for (auto &state : beam) generated.push_back(std::move(state));
+        beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
+        if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
+        for (const auto &state : beam) newParents.push_back(json::Object{
+            {"id", state.id}, {"key", state.key}, {"cost", state.score},
+            {"depth", static_cast<int64_t>(state.path.size())}});
+        std::error_code ec;
+        llvm::raw_fd_ostream journal(joinPath(outputDir, "frontier-refresh.jsonl"), ec,
+                                     llvm::sys::fs::OF_Append);
+        if (ec) { fatal("cannot write refresh journal"); return; }
+        journal << json::Value(json::Object{{"round", round},
+            {"evaluations", static_cast<int64_t>(scoredCount)},
+            {"old_parents", std::move(oldParents)}, {"beam", std::move(newParents)},
+            {"pending_before", static_cast<int64_t>(remaining)}}) << "\n";
+        pending.clear(); pendingCursor = 0; generated.clear();
+        successfulFamilyScores.clear();
+        roundScoredCount = 0;
+        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
+            maxRounds.getValue() - round, roundQuotaScale);
+        if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
+            canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
+        // Stop only if the eligible frontier has no remaining actions, rather
+        // than mistaking a lack of newly scored children for domain exhaustion.
+        continue;
+      }
       if (fairPendingRetention && pendingCursor < pending.size()) {
         ++retainedPendingFrontiers;
         ++round;
@@ -7143,6 +7259,8 @@ private:
         {"decision_flow", decisionFlow.getValue()},
         {"graph_budget_percent", graphBudgetPercent.getValue()},
         {"finite_domain_file", finiteDomainFile.getValue()},
+        {"refresh_frontier", refreshFrontier.getValue()},
+        {"oracle_assisted_diagnostic", !diagnosticPath.empty()},
         {"fair_pending_retention", fairPendingRetention.getValue()},
         {"round_quota_scale",roundQuotaScale.getValue()}, {"feature_policy",featurePolicy.getValue()},
         {"shape_enumeration_order",shapeEnumerationOrder.getValue()},
