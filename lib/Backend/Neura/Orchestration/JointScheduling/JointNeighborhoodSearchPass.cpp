@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-unscored-target-v14";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-maximum-edge-v20";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6416,8 +6416,10 @@ private:
               (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
           criticalEndpoint |= task.criticalChainProxy || task.terminal;
           if (task.criticalChainProxy || task.terminal)
-            criticalIncidentPayload = std::max(criticalIncidentPayload,
-                static_cast<double>(task.payloadBits));
+            for (const auto &[edge, bits] : payloads)
+              if (edge.first == name || edge.second == name)
+                criticalIncidentPayload = std::max(criticalIncidentPayload,
+                    static_cast<double>(bits));
           const int64_t area = task.rows * task.cols;
           maxArea = std::max(maxArea, area);
           occupancy = std::max(occupancy,
@@ -6459,7 +6461,7 @@ private:
         };
         if (priority > 0 && std::isfinite(priority)) addGroup(category, reason, priority);
         if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0)
-          addGroup("communication", "known payload on critical-chain endpoint; shape changes layout, payload reduction not assumed",
+          addGroup("communication", "largest known incident pair payload on critical endpoint; shape layout benefit unproved",
                    criticalIncidentPayload);
       }
       json::Array directions, observations, opportunities;
