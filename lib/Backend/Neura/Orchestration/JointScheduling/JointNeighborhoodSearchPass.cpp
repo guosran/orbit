@@ -6328,8 +6328,8 @@ private:
       uint64_t scoredCount, uint64_t limit) {
     parentDirections.clear();
     directionalRoundOriginal = directionalRoundPreferred = 0;
-    directionalPreferredStreak = directionalConsecutiveZero = 0;
-    directionalForceOriginal = false;
+    // Streak/cap fallback persists across refresh until an actual original
+    // charge, including partial or exhausted quota boundaries.
     directionalRoundAllowance = std::min(roundScoreLimit, limit - scoredCount);
     directionalRoundReserve = (directionalRoundAllowance + 3) / 4;
     for (auto indexed : llvm::enumerate(beam)) {
