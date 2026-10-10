@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-shape-window-v4";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-adjacent-shape-v6";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6325,8 +6325,8 @@ private:
       const int64_t distance = std::abs(action.shapeRows - task.rows) +
                                std::abs(action.shapeCols - task.cols);
       if (distance == 0) return 1e8; // Leave identity in the ordinary suffix.
-      // Small area increments are preferred; reduction remains available.
-      return (delta < 0 ? 100.0 : 0.0) + std::abs(delta) * 4.0 + distance;
+      // Adjacent rectangle edges first; area reductions remain available.
+      return (delta < 0 ? 100.0 : 0.0) + distance;
     }
     double penalty = 0;
     for (const auto &primitive : action.primitives)
@@ -6526,7 +6526,7 @@ private:
           if (found != parent.choices.end()) {
             const int64_t delta = neighbor.action.shapeRows * neighbor.action.shapeCols - found->shape.cgraCount();
             const int64_t distance = std::abs(neighbor.action.shapeRows - found->shape.rows) + std::abs(neighbor.action.shapeCols - found->shape.cols);
-            penalty = distance == 0 ? 1e8 : (delta < 0 ? 100.0 : 0.0) + std::abs(delta) * 4.0 + distance;
+            penalty = distance == 0 ? 1e8 : (delta < 0 ? 100.0 : 0.0) + distance;
           }
         } else for (const auto &primitive : neighbor.action.primitives) penalty += std::max<int64_t>(0, primitive.factor - 2);
         if (selected == pending.size() || penalty < bestPenalty) { selected = i; bestPenalty = penalty; }
