@@ -2310,7 +2310,12 @@ public:
         (shapeEnumerationOrder != "ascending" && shapeEnumerationOrder != "descending") ||
         (featurePolicy != "all" && featurePolicy != "shape-only" &&
          featurePolicy != "fusion-off" && featurePolicy != "fission-off" &&
-         featurePolicy != "structural-off")) {
+         featurePolicy != "structural-off" &&
+         featurePolicy != "cumulative-fixed" &&
+         featurePolicy != "cumulative-shape" &&
+         featurePolicy != "cumulative-replica" &&
+         featurePolicy != "cumulative-tiling" &&
+         featurePolicy != "cumulative-fusion")) {
       fatal("invalid round-quota-scale(1/2), shape-enumeration-order, or feature-policy"); return;
     }
     if ((decisionFlow != "legacy" && decisionFlow != "joint" &&
@@ -3942,6 +3947,25 @@ private:
     return true;
   }
   std::string filterSearchAction(const SearchState &parent, NeighborhoodAction &action) const {
+    // Cumulative paper ablations share the full source-owned task protocol,
+    // critical-path scheduler and Joint refresh controller. Only the enabled
+    // dimensions change. Composites are accepted only when every primitive
+    // and their shape attachment are enabled by this stage.
+    if (StringRef(featurePolicy.getValue()).starts_with("cumulative-")) {
+      const unsigned level = featurePolicy == "cumulative-fixed" ? 0 :
+          featurePolicy == "cumulative-shape" ? 1 :
+          featurePolicy == "cumulative-replica" ? 2 :
+          featurePolicy == "cumulative-tiling" ? 3 : 4;
+      if (level == 0) return "feature_policy_fixed_1x1";
+      if (action.family == "fission") return "feature_policy_cumulative_fission";
+      for (const auto &primitive : action.primitives) {
+        const StringRef kind = primitive.kind;
+        const unsigned required = kind == "replica" ? 2 :
+            (kind == "tile" || kind == "k-tile") ? 3 :
+            (kind == "fusion" || kind == "sibling-fusion") ? 4 : 5;
+        if (required > level) return "feature_policy_cumulative_primitive";
+      }
+    }
     if (featurePolicy == "shape-only" && action.family != "shape") return "feature_policy_shape_only";
     // The joint ablation disables fusion and source fission only. Keep
     // tiling, K-tiling, co-tiling, replica, shape and withdrawal actions.
