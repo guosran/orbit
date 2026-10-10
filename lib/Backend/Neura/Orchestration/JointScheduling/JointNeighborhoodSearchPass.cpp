@@ -3048,12 +3048,13 @@ public:
       auto parsed = json::parse(pathText);
       auto *steps = parsed ? parsed->getAsArray() : nullptr;
       if (!steps) { fatal("diagnostic-path needs an array of typed actions"); return; }
+      unsigned diagnosticDepth = 0;
       for (const auto &entry : *steps) {
         NeighborhoodAction action;
         auto *object = entry.getAsObject();
         if (!object || !parseTypedAction(*object, action)) { fatal("bad diagnostic typed action"); return; }
         std::string menuError;
-        auto menu = enumerateBalancedPendingNeighbors(beam, functionName, stage, 0,
+        auto menu = enumerateBalancedPendingNeighbors(beam, functionName, stage, diagnosticDepth++,
             maxPartitionFactor, preparedTaskflowSource.get(), maxFissionActionsPerTask,
             canonicalFissionActions, familyFunnelByRound[0], false,
             [&](const SearchState &parent, NeighborhoodAction &candidate) {
