@@ -3087,7 +3087,7 @@ public:
         }
         // Preserve each prefix for independent source/key checks and resumable
         // one-prefix intervention; final winners are never algorithm seeds.
-        if (!writeTextAtomically(joinPath(outputDir, child.id + "-prefix.mlir"),
+        if (!writeTextAtomically(outputDir.getValue() + "/" + child.id + "-prefix.mlir",
                            neighborhoodReplaySourceText(child.module.get()), error)) { fatal(error); return; }
         beam.clear(); beam.push_back(std::move(child));
       }
@@ -3712,7 +3712,7 @@ public:
             {"id", state.id}, {"key", state.key}, {"cost", state.score},
             {"depth", static_cast<int64_t>(state.path.size())}});
         std::error_code ec;
-        llvm::raw_fd_ostream journal(joinPath(outputDir, "frontier-refresh.jsonl"), ec,
+        llvm::raw_fd_ostream journal(outputDir.getValue() + "/frontier-refresh.jsonl", ec,
                                      llvm::sys::fs::OF_Append);
         if (ec) { fatal("cannot write refresh journal"); return; }
         journal << json::Value(json::Object{{"round", round},
