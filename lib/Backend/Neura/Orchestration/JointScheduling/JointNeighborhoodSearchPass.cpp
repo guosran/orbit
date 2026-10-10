@@ -2396,7 +2396,11 @@ public:
         !diagnosticPath.empty() || diagnosticContinue)) {
       fatal("parent-progress requires fresh Joint refresh with fair pending retention, one scorer, and no diagnostic path"); return;
     }
-    if (directionalSearch && (!parentProgress || featurePolicy != "all" ||
+    if (directionalSearch && (!parentProgress ||
+        (featurePolicy != "all" && featurePolicy != "cumulative-shape" &&
+         featurePolicy != "cumulative-replica" &&
+         featurePolicy != "cumulative-tiling" &&
+         featurePolicy != "cumulative-fusion") ||
         shapeEnumerationOrder != "ascending" || roundQuotaScale != 1)) {
       fatal("directional-search requires the fresh parent-progress all-space ascending baseline"); return;
     }
