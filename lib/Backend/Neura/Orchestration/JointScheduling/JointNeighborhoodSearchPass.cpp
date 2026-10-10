@@ -3088,6 +3088,7 @@ public:
             !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error) || !child.scored) {
           fatal("diagnostic evaluation failed: " + error + child.rejectReason); return;
         }
+        if (!persistBestFamilyWitnesses(child, archive, outputDir, error)) { fatal(error); return; }
         // Preserve each prefix for independent source/key checks and resumable
         // one-prefix intervention; final winners are never algorithm seeds.
         if (!writeTextAtomically(outputDir.getValue() + "/" + child.id + "-prefix.mlir",
