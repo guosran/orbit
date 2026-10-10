@@ -3778,7 +3778,7 @@ public:
           {"block", static_cast<int64_t>(alternatingBlock)}, {"phase", activePhase},
           {"requested_cumulative_limit", static_cast<int64_t>(phaseLimit)},
           {"charged", static_cast<int64_t>(scoredCount - blockStartEvaluations)},
-          {"stop", stopReason.empty() ? (scoredCount >= phaseLimit ? "block-budget" : "max-rounds") : stopReason});
+          {"stop", stopReason.empty() ? (scoredCount >= phaseLimit ? "block-budget" : "max-rounds") : stopReason}});
       ++alternatingBlock;
       if (alternatingBlock < 4 && scoredCount < static_cast<uint64_t>(maxCandidates)) {
         if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) { fatal(error); return; }
@@ -7280,7 +7280,7 @@ private:
         {"source_binding_witness", bindingPath}, {"max_rounds", maxRoundsValue},
         {"max_candidates", maxCandidatesValue}, {"beam_width", beamWidthValue},
         {"diversity_slots", diversityValue}, {"rounds", round}, {"rounds_completed", round},
-        {"alternating_blocks", alternatingBlocks},
+        {"alternating_blocks", std::move(alternatingBlocks)},
         {"decision_flow", decisionFlow.getValue()},
         {"graph_budget_percent", graphBudgetPercent.getValue()},
         {"finite_domain_file", finiteDomainFile.getValue()},
