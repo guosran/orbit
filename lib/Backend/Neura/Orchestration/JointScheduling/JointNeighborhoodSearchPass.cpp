@@ -1037,7 +1037,8 @@ static bool fatalStorageError(StringRef text) {
          StringRef(lower).contains("permission denied") ||
          StringRef(lower).contains("disk guard") ||
          StringRef(lower).contains("cannot create temporary output") ||
-         StringRef(lower).contains("cannot publish") ||
+         (StringRef(lower).contains("cannot publish") &&
+          !StringRef(lower).contains("cannot publish an exact output region")) ||
          StringRef(lower).contains("failed while writing") ||
          StringRef(lower).contains("read-only file system") ||
          StringRef(lower).contains("input/output error") ||
