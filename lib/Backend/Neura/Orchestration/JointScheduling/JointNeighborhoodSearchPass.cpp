@@ -26,6 +26,7 @@
 #include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
 #include "TaskflowFissionSourceReplay.h"
 #include "ProductionSchedulerAdapter.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 
 #include "TaskflowDialect/TaskflowOps.h"
@@ -61,6 +62,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -82,6 +84,10 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-guided-v1";
+constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
+constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
+constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
 constexpr StringLiteral kActiveTransferProofSchema =
     "orbit-static-active-transfer-proof-v1";
 constexpr StringLiteral kActiveTransferWitnessEncoding =
@@ -1192,6 +1198,36 @@ struct ParentFamilyProgress {
   uint64_t attempts = 0;
 };
 
+// These facts are observations or explicitly named proxies. The adapter does
+// not return production transfer/dependency traces, so this controller never
+// attributes an unexplained readiness gap to communication or resource wait.
+struct DirectionalTaskObservation {
+  std::string task;
+  int64_t duration = 0, rows = 1, cols = 1, row = 0, col = 0;
+  int64_t start = 0, end = 0, predecessorFinish = 0;
+  int64_t readinessGapProxy = 0, occupiedGapProxy = 0;
+  uint64_t payloadBits = 0, unknownPayloads = 0;
+  bool terminal = false, criticalChainProxy = false;
+};
+struct DirectionalChoice {
+  std::string family, target, reason;
+  double priorityProxy = 0;
+  std::vector<std::string> signatures;
+};
+struct DirectionalFeedback { uint64_t attempts = 0, charged = 0; };
+struct DirectionalWindow {
+  std::string parentKey, parentID, triggerFamily;
+  std::set<std::string> targets, families;
+  uint64_t charged = 0, zeroDebit = 0;
+  bool active = false;
+};
+struct DirectionalSelection {
+  std::string mode = "original", baselineSignature, baselineParentID, baselineParentKey;
+  std::string reason, directionKey;
+  uint64_t selectedPendingOffset = 0;
+  bool preferred = false, window = false;
+};
+
 struct ParentPendingProgress {
   std::string parentID;
   std::map<std::string, ParentFamilyProgress> families;
@@ -2232,6 +2268,7 @@ public:
   // preserving unattempted edges of parents that remain eligible.
   Option<bool> refreshFrontier{*this, "refresh-frontier", llvm::cl::init(false)};
   Option<bool> parentProgress{*this, "parent-progress", llvm::cl::init(false)};
+  Option<bool> directionalSearch{*this, "directional-search", llvm::cl::init(false)};
   Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
   Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
   Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
@@ -2359,6 +2396,11 @@ public:
         !diagnosticPath.empty() || diagnosticContinue)) {
       fatal("parent-progress requires fresh Joint refresh with fair pending retention, one scorer, and no diagnostic path"); return;
     }
+    if (directionalSearch && (!parentProgress || featurePolicy != "all" ||
+        shapeEnumerationOrder != "ascending" || roundQuotaScale != 1)) {
+      fatal("directional-search requires the fresh parent-progress all-space ascending baseline"); return;
+    }
+    if (!validateDirectionalProtocol(error)) { fatal(error); return; }
     activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
     phaseABudget = decisionFlow == "sequential" ?
         static_cast<uint64_t>(maxCandidates.getValue() * graphBudgetPercent.getValue() / 100) :
@@ -3180,6 +3222,8 @@ public:
                 beam, round, pending, familyFunnelByRound[round], error)) {
           fatal(error); return;
         }
+        if (directionalSearch)
+          prepareDirectionalRound(beam, pending, round, scoredCount, phaseLimit);
         if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
             canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
       }
@@ -3194,6 +3238,11 @@ public:
                                           successfulFamilyScores,
                                           noReservedFamilyScores,
                                           remainingPendingFamilies);
+        DirectionalSelection directionalSelection;
+        if (directionalSearch && !selectDirectionalPending(
+                beam, pending, pendingCursor, round, directionalSelection, error)) {
+          fatal(error); return;
+        }
         const auto &neighbor = pending[pendingCursor];
         const std::string actionFamily = neighbor.action.family;
         if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
@@ -3384,16 +3433,33 @@ public:
                 scoredCount, progressEvent, error)) {
           fatal(error); return;
         }
+        if (directionalSearch)
+          commitDirectionalSelection(parent, neighbor.action, child.id, round,
+              objectiveEvaluationsBefore, scoredCount, directionalSelection);
         appendFamilyFunnelCandidateEvent(
             round, actionFamily, child.id, child.parentId, neighbor.action,
             child.actionHistory, std::move(eventResult), std::move(progressEvent));
         if (expandCandidate) {
           generated.push_back(std::move(child));
+          std::map<std::string, int64_t> directionalBeforePruning;
+          if (directionalSearch)
+            for (const auto &state : generated) directionalBeforePruning[state.id] = state.score;
           // Keep the expansion frontier bounded rather than serializing every
           // evaluated program in a round. Four diverse slots remain available
           // independently of the twelve cost-selected slots.
           generated = selectBeam(std::move(generated), beamWidth,
                                  diversitySlots);
+          if (directionalSearch) {
+            json::Array kept, pruned;
+            std::set<std::string> ids;
+            for (const auto &state : generated) { ids.insert(state.id); kept.push_back(state.id); }
+            for (const auto &[id, cost] : directionalBeforePruning)
+              if (!ids.count(id)) pruned.push_back(json::Object{{"id", id}, {"cost", cost}});
+            appendDirectionalEvent(json::Object{{"record_type", "generated_frontier"},
+                {"round", round}, {"evaluations", int64_t(scoredCount)},
+                {"candidate_id", archive.back().id}, {"retained", std::move(kept)},
+                {"pruned", std::move(pruned)}, {"reason", "unchanged cost/diversity generated beam"}});
+          }
         }
         ++pendingCursor; ++actionsSinceCheckpoint;
         consumePendingActionFamily(remainingPendingFamilies, actionFamily);
@@ -3755,10 +3821,26 @@ public:
         json::Array oldParents, newParents;
         for (const auto &state : beam) oldParents.push_back(state.id);
         const uint64_t remaining = pending.size() - pendingCursor;
+        std::set<std::string> directionalNewKeys;
+        if (directionalSearch) {
+          std::set<std::string> oldKeys;
+          for (const auto &state : beam) oldKeys.insert(state.key);
+          for (const auto &state : generated)
+            if (!oldKeys.count(state.key)) directionalNewKeys.insert(state.key);
+        }
         for (auto &state : beam) generated.push_back(std::move(state));
         beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
+        std::set<std::string> directionalCostKeys;
+        if (directionalSearch) {
+          const size_t costSlots = static_cast<size_t>(beamWidth - diversitySlots);
+          for (size_t i = 0; i < std::min(costSlots, beam.size()); ++i)
+            directionalCostKeys.insert(beam[i].key);
+        }
         if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
         if (parentProgress) retireParentProgressQueues(beam, round);
+        if (directionalSearch)
+          openDirectionalWindow(beam, archive, directionalNewKeys,
+                                directionalCostKeys, round, scoredCount);
         for (const auto &state : beam) newParents.push_back(json::Object{
             {"id", state.id}, {"key", state.key}, {"cost", state.score},
             {"depth", static_cast<int64_t>(state.path.size())}});
@@ -3865,6 +3947,13 @@ public:
     break;
     } while (true);
     if (stopReason.empty()) stopReason = round - phaseStartRound >= maxRounds ? "max-rounds" : "max-unique-candidates";
+    if (directionalSearch) {
+      closeDirectionalWindow(round, "search finished; unused quota returned");
+      appendDirectionalEvent(json::Object{{"record_type", "search_finished"}, {"round", round},
+          {"evaluations", int64_t(scoredCount)}, {"stop_reason", stopReason},
+          {"original_charged", int64_t(directionalOriginalCharged)},
+          {"guided_charged", int64_t(directionalGuidedCharged)}});
+    }
     elapsedMilliseconds = previousElapsed + std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - began).count();
     if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
@@ -6011,6 +6100,11 @@ private:
       objectBinding["parent_progress"] = true;
       objectBinding["parent_progress_policy"] = kParentProgressPolicy.str();
     }
+    if (directionalSearch) {
+      objectBinding["directional_search"] = true;
+      objectBinding["directional_policy"] = kDirectionalPolicy.str();
+      objectBinding["directional_constants"] = directionalConstants();
+    }
     if (diagnosticIICeiling == 23)
       objectBinding["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (stageNumber(stage) == 6) {
@@ -6060,6 +6154,548 @@ private:
     }
     text = jsonText(json::Value(std::move(objectBinding))) + "\n";
     return true;
+  }
+
+  static json::Object directionalConstants() {
+    return json::Object{{"directions_per_parent", int64_t(kDirectionalCount)},
+        {"parameters_per_direction", int64_t(kDirectionalParameters)},
+        {"cost_tier_width", 4}, {"preferred_numerator", 3},
+        {"preferred_denominator", 4},
+        {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
+  }
+
+  bool validateDirectionalProtocol(std::string &error) {
+    std::string bytes;
+    if (!readFileBytes(protocolFile, bytes, error)) return false;
+    auto value = json::parse(bytes);
+    if (!value) {
+      error = "directional protocol JSON: " + llvm::toString(value.takeError());
+      return false;
+    }
+    const auto *root = value->getAsObject();
+    const auto *search = root ? root->getObject("search") : nullptr;
+    const auto *flag = search ? search->get("directional_search") : nullptr;
+    if ((flag && !flag->getAsBoolean()) ||
+        (directionalSearch && (!search || search->getBoolean("directional_search") != true ||
+          search->getString("directional_policy") != kDirectionalPolicy ||
+          root->getBoolean("paper_admission") != false ||
+          search->getBoolean("paper_admission") != false ||
+          search->getBoolean("parent_progress") != true)) ||
+        (!directionalSearch && search &&
+          (search->getBoolean("directional_search") == true ||
+           search->get("directional_policy")))) {
+      error = "directional-search option/protocol mismatch or diagnostic paper exclusion absent";
+      return false;
+    }
+    return true;
+  }
+
+  void appendDirectionalEvent(json::Object event) {
+    event["schema"] = kDirectionalSchema;
+    event["policy"] = kDirectionalPolicy;
+    directionalEvents.push_back(jsonText(json::Value(std::move(event))));
+  }
+
+  static std::set<std::string> directionalFootprint(const NeighborhoodAction &action) {
+    std::set<std::string> names;
+    if (!action.shapeTask.empty()) names.insert(action.shapeTask);
+    for (const auto &primitive : action.primitives) {
+      if (!primitive.firstTask.empty()) names.insert(primitive.firstTask);
+      if (!primitive.secondTask.empty()) names.insert(primitive.secondTask);
+    }
+    return names;
+  }
+
+  static std::string directionFeedbackKey(StringRef parentKey, StringRef family,
+                                          StringRef target) {
+    return jsonText(json::Value(json::Array{parentKey, family, target}));
+  }
+
+  std::map<std::string, DirectionalTaskObservation> observeDirectionalState(
+      const SearchState &parent, std::map<std::pair<std::string, std::string>, uint64_t> &payloads,
+      bool &graphKnown, std::string &failure) {
+    std::map<std::string, DirectionalTaskObservation> tasks;
+    graphKnown = false;
+    for (unsigned i = 0; i < parent.choices.size(); ++i) {
+      const auto &choice = parent.choices[i];
+      auto &task = tasks[choice.task];
+      task.task = choice.task;
+      task.rows = choice.shape.rows; task.cols = choice.shape.cols;
+      if (i < parent.durations.size()) task.duration = parent.durations[i];
+    }
+    for (const auto &placement : parent.schedule.placements) {
+      if (placement.task >= parent.choices.size()) { failure = "placement_index_unknown"; return tasks; }
+      auto &task = tasks[parent.choices[placement.task].task];
+      task.row = placement.row; task.col = placement.col;
+      task.start = placement.start; task.end = placement.end;
+      task.terminal = placement.end == parent.schedule.makespan;
+    }
+    auto function = selectTaskFunction(parent.module.get(), functionName, failure);
+    if (failed(function)) return tasks;
+    TaskEdgeGraphOptions options;
+    auto graph = buildTaskEdgeGraph(*function, options, failure);
+    if (failed(graph)) return tasks;
+    std::map<std::string, std::set<std::string>> predecessors;
+    for (const TaskEdge &edge : graph->getEdges()) {
+      const std::string producer = edge.producer.getTaskName().str();
+      const std::string consumer = edge.consumer.getTaskName().str();
+      if (!tasks.count(producer) || !tasks.count(consumer)) {
+        failure = "typed_edge_task_not_in_scored_choices"; return tasks;
+      }
+      predecessors[consumer].insert(producer);
+      auto &source = tasks[producer]; auto &dest = tasks[consumer];
+      dest.predecessorFinish = std::max(dest.predecessorFinish, source.end);
+      if (edge.origin != TaskEdgeOrigin::Taskflow ||
+          (edge.kind != TaskEdgeKind::Value && edge.kind != TaskEdgeKind::Raw)) continue;
+      if (!edge.payload_bits) { ++source.unknownPayloads; ++dest.unknownPayloads; continue; }
+      const uint64_t bits = *edge.payload_bits;
+      auto saturate = [](uint64_t a, uint64_t b) {
+        return b > std::numeric_limits<uint64_t>::max() - a
+            ? std::numeric_limits<uint64_t>::max() : a + b;
+      };
+      source.payloadBits = saturate(source.payloadBits, bits);
+      dest.payloadBits = saturate(dest.payloadBits, bits);
+      auto &pair = payloads[{producer, consumer}]; pair = saturate(pair, bits);
+    }
+    // Follow the latest-finishing predecessor from each observed terminal task.
+    // Network reservations are absent, so this is a critical-chain proxy.
+    for (const auto &[name, observation] : tasks) if (observation.terminal) {
+      std::string current = name; std::set<std::string> visited;
+      while (visited.insert(current).second) {
+        tasks[current].criticalChainProxy = true;
+        std::string next; int64_t latest = -1;
+        for (const std::string &candidate : predecessors[current])
+          if (tasks[candidate].end > latest ||
+              (tasks[candidate].end == latest && (next.empty() || candidate < next))) {
+            next = candidate; latest = tasks[candidate].end;
+          }
+        if (next.empty()) break;
+        current = next;
+      }
+    }
+    for (auto &[name, task] : tasks) {
+      task.readinessGapProxy = std::max<int64_t>(0, task.start - task.predecessorFinish);
+      for (const auto &[otherName, other] : tasks) {
+        if (name == otherName || task.row >= other.row + other.rows ||
+            other.row >= task.row + task.rows || task.col >= other.col + other.cols ||
+            other.col >= task.col + task.cols) continue;
+        // An observed rectangle was occupied during part of this gap. This is
+        // not proof that its occupation caused the production start time.
+        task.occupiedGapProxy = std::max(task.occupiedGapProxy,
+            std::max<int64_t>(0, std::min(task.start, other.end) -
+                                  std::max(task.predecessorFinish, other.start)));
+      }
+    }
+    graphKnown = true;
+    return tasks;
+  }
+
+  static json::Object directionalObservationObject(const DirectionalTaskObservation &task) {
+    return json::Object{{"task", task.task}, {"duration_cycles", task.duration},
+        {"rows", task.rows}, {"cols", task.cols}, {"row", task.row}, {"col", task.col},
+        {"start", task.start}, {"end", task.end}, {"terminal_critical", task.terminal},
+        {"critical_chain_proxy", task.criticalChainProxy},
+        {"predecessor_finish", task.predecessorFinish},
+        {"readiness_gap_proxy", task.readinessGapProxy},
+        {"overlapping_rectangle_occupancy_proxy", task.occupiedGapProxy},
+        {"known_incident_payload_bits", task.payloadBits},
+        {"unknown_edge_payloads", task.unknownPayloads}};
+  }
+
+  static double directionalParameterPenalty(
+      const NeighborhoodAction &action,
+      const std::map<std::string, DirectionalTaskObservation> &tasks) {
+    if (action.family == "shape") {
+      auto found = tasks.find(action.shapeTask);
+      if (found == tasks.end()) return 1e9;
+      const auto &task = found->second;
+      const int64_t delta = action.shapeRows * action.shapeCols - task.rows * task.cols;
+      const int64_t distance = std::abs(action.shapeRows - task.rows) +
+                               std::abs(action.shapeCols - task.cols);
+      if (distance == 0) return 1e8; // Leave identity in the ordinary suffix.
+      // Small area increments are preferred; reduction remains available.
+      return (delta < 0 ? 100.0 : 0.0) + std::abs(delta) * 4.0 + distance;
+    }
+    double penalty = 0;
+    for (const auto &primitive : action.primitives)
+      penalty += std::max<int64_t>(0, primitive.factor - 2);
+    return penalty;
+  }
+
+  void prepareDirectionalRound(ArrayRef<SearchState> beam,
+      ArrayRef<PendingNeighbor> pending, int64_t round,
+      uint64_t scoredCount, uint64_t limit) {
+    parentDirections.clear();
+    directionalRoundOriginal = directionalRoundPreferred = 0;
+    directionalPreferredStreak = directionalConsecutiveZero = 0;
+    directionalForceOriginal = false;
+    directionalRoundAllowance = std::min(roundScoreLimit, limit - scoredCount);
+    directionalRoundReserve = (directionalRoundAllowance + 3) / 4;
+    for (auto indexed : llvm::enumerate(beam)) {
+      const SearchState &parent = indexed.value();
+      std::map<std::pair<std::string, std::string>, uint64_t> payloads;
+      bool graphKnown; std::string failure;
+      auto tasks = observeDirectionalState(parent, payloads, graphKnown, failure);
+      // Separate categories have separate units. Their scores are compared
+      // only within the category, never by adding payload bits to cycles.
+      struct Group {
+        std::string category, family, target, reason;
+        double priority = 0;
+        std::vector<const NeighborhoodAction *> actions;
+      };
+      std::map<std::tuple<std::string, std::string, std::string>, Group> groups;
+      for (const PendingNeighbor &neighbor : pending) {
+        if (neighbor.parent != indexed.index()) continue;
+        const NeighborhoodAction &action = neighbor.action;
+        auto footprint = directionalFootprint(action);
+        double compute = 0, occupancy = 0, payload = 0, criticalIncidentPayload = 0;
+        bool criticalEndpoint = false;
+        int64_t maxArea = 1;
+        for (const auto &name : footprint) {
+          auto found = tasks.find(name); if (found == tasks.end()) continue;
+          const auto &task = found->second;
+          compute = std::max(compute, static_cast<double>(task.duration) *
+              (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
+          criticalEndpoint |= task.criticalChainProxy || task.terminal;
+          if (task.criticalChainProxy || task.terminal)
+            criticalIncidentPayload = std::max(criticalIncidentPayload,
+                static_cast<double>(task.payloadBits));
+          const int64_t area = task.rows * task.cols;
+          maxArea = std::max(maxArea, area);
+          occupancy = std::max(occupancy,
+              static_cast<double>(area) * (task.duration + task.occupiedGapProxy));
+        }
+        for (const auto &[pair, bits] : payloads)
+          if (footprint.count(pair.first) && footprint.count(pair.second)) payload += bits;
+        std::string category, reason; double priority = 0;
+        if (action.family == "shape") {
+          category = "compute"; priority = compute;
+          reason = "critical-chain duration proxy; adjacent shape with area penalty";
+        } else if ((action.family == "fusion" || action.family == "fusion-plus-shape" ||
+                    action.family == "producer-consumer-co-tiling") && graphKnown &&
+                   payload > 0 && criticalEndpoint) {
+          category = "communication"; priority = payload;
+          reason = "known typed producer-consumer payload proxy; mapping benefit unproved";
+        } else if (action.family == "replica" || action.family == "tiling" ||
+                   action.family == "k-tiling" || action.family == "fission") {
+          category = "occupancy"; priority = occupancy;
+          // Replica explores parallel work on small rectangles; partitioning
+          // explores long large rectangles. This is a structural heuristic.
+          if ((maxArea == 1 && action.family == "replica") ||
+              (maxArea > 1 && action.family == "tiling")) priority *= 1.25;
+          if (action.family == "fission") priority *= 0.5;
+          reason = "area-duration and observed occupancy proxy; structural cost unknown";
+        }
+        if (category.empty() || priority <= 0 || !std::isfinite(priority)) continue;
+        const std::string target = actionTargetKey(action);
+        auto addGroup = [&](StringRef groupCategory, StringRef groupReason, double groupPriority) {
+          auto &group = groups[{groupCategory.str(), action.family, target}];
+          group.category = groupCategory.str(); group.family = action.family; group.target = target;
+          group.reason = groupReason.str(); group.priority = groupPriority;
+          group.actions.push_back(&action);
+        };
+        addGroup(category, reason, priority);
+        if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0)
+          addGroup("communication", "known payload on critical-chain endpoint; shape changes layout, payload reduction not assumed",
+                   criticalIncidentPayload);
+      }
+      json::Array directions, observations;
+      auto &selected = parentDirections[parent.key];
+      for (StringRef category : {StringRef("compute"), StringRef("communication"), StringRef("occupancy")}) {
+        Group *best = nullptr;
+        for (auto &[key, group] : groups)
+          if (group.category == category &&
+              !llvm::any_of(selected, [&](const DirectionalChoice &choice) {
+                return choice.family == group.family && choice.target == group.target;
+              }) && (!best || group.priority > best->priority ||
+              (group.priority == best->priority && std::make_pair(group.family, group.target) <
+                                                    std::make_pair(best->family, best->target)))) best = &group;
+        if (!best) continue;
+        llvm::stable_sort(best->actions, [&](const NeighborhoodAction *left, const NeighborhoodAction *right) {
+          const double a = directionalParameterPenalty(*left, tasks), b = directionalParameterPenalty(*right, tasks);
+          return a != b ? a < b : actionSignature(*left) < actionSignature(*right);
+        });
+        DirectionalChoice choice{best->family, best->target, best->reason, best->priority, {}};
+        for (size_t i = 0; i < std::min<size_t>(kDirectionalParameters, best->actions.size()); ++i)
+          choice.signatures.push_back(actionSignature(*best->actions[i]));
+        const std::string feedbackKey = directionFeedbackKey(parent.key, choice.family, choice.target);
+        const auto &feedback = directionalFeedback[feedbackKey];
+        directions.push_back(json::Object{{"category", best->category}, {"family", choice.family},
+            {"target", choice.target}, {"reason", choice.reason},
+            {"priority_proxy", choice.priorityProxy},
+            {"proxy_units", category == "communication" ? "bits" : category == "compute" ? "cycles" : "CGRA-cycles"},
+            {"action_signatures", stringArray(choice.signatures)},
+            {"feedback_attempts", int64_t(feedback.attempts)}, {"feedback_charged", int64_t(feedback.charged)}});
+        selected.push_back(std::move(choice));
+      }
+      for (const auto &[name, task] : tasks) observations.push_back(directionalObservationObject(task));
+      appendDirectionalEvent(json::Object{{"record_type", "parent_directions"},
+          {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key},
+          {"makespan", parent.schedule.makespan}, {"actual_wait_causes_known", false},
+          {"typed_graph_known", graphKnown}, {"fallback_reason", failure},
+          {"task_observations", std::move(observations)}, {"directions", std::move(directions)}});
+    }
+    appendDirectionalEvent(json::Object{{"record_type", "round_allowance"}, {"round", round},
+        {"evaluations", int64_t(scoredCount)}, {"round_charge_allowance", int64_t(directionalRoundAllowance)},
+        {"round_original_reserve", int64_t(directionalRoundReserve)}});
+  }
+
+  bool reorderDirectionalPending(ArrayRef<SearchState> beam,
+      std::vector<PendingNeighbor> &pending, size_t cursor, size_t selected,
+      int64_t round, const DirectionalSelection &selection, std::string &error) {
+    const auto &neighbor = pending[selected];
+    const auto &parent = beam[neighbor.parent];
+    auto foundParent = parentProgressQueues.find(parent.key);
+    if (foundParent == parentProgressQueues.end()) { error = "directional parent queue absent"; return false; }
+    auto foundFamily = foundParent->second.families.find(neighbor.action.family);
+    if (foundFamily == foundParent->second.families.end()) { error = "directional family queue absent"; return false; }
+    auto &stream = foundFamily->second;
+    const std::string signature = actionSignature(neighbor.action);
+    size_t position = stream.cursor;
+    while (position < stream.actions.size() && actionSignature(stream.actions[position]) != signature) ++position;
+    if (position == stream.actions.size()) { error = "directional action not in legal remaining suffix"; return false; }
+    if (position != stream.cursor) {
+      std::vector<std::string> before, after;
+      for (size_t i = stream.cursor; i < stream.actions.size(); ++i) before.push_back(actionSignature(stream.actions[i]));
+      std::rotate(stream.actions.begin() + stream.cursor, stream.actions.begin() + position,
+                  stream.actions.begin() + position + 1);
+      for (size_t i = stream.cursor; i < stream.actions.size(); ++i) after.push_back(actionSignature(stream.actions[i]));
+      parentProgressEvents.push_back(jsonText(json::Value(json::Object{
+          {"record_type", "directional_reorder"}, {"policy", kParentProgressPolicy},
+          {"directional_policy", kDirectionalPolicy}, {"round", round},
+          {"parent_id", parent.id}, {"parent_key", parent.key}, {"family", neighbor.action.family},
+          {"cursor", int64_t(stream.cursor)}, {"selected_offset", int64_t(position - stream.cursor)},
+          {"action_signature", signature}, {"mode", selection.mode}, {"reason", selection.reason},
+          {"attempt_global_index", int64_t(parentProgressAttemptedEdges.size() + 1)},
+          {"before_remaining", stringArray(before)}, {"after_remaining", stringArray(after)}})));
+    }
+    if (selected != cursor)
+      std::rotate(pending.begin() + cursor, pending.begin() + selected, pending.begin() + selected + 1);
+    return true;
+  }
+
+  bool selectDirectionalPending(ArrayRef<SearchState> beam,
+      std::vector<PendingNeighbor> &pending, size_t cursor, int64_t round,
+      DirectionalSelection &selection, std::string &error) {
+    // The caller already put the original B choice at cursor. Preferred
+    // selection is independent of that choice's family and parent.
+    if (pending[cursor].parent >= beam.size()) { error = "directional baseline parent outside beam"; return false; }
+    selection.baselineSignature = actionSignature(pending[cursor].action);
+    selection.baselineParentID = beam[pending[cursor].parent].id;
+    selection.baselineParentKey = beam[pending[cursor].parent].key;
+    const uint64_t charged = directionalRoundOriginal + directionalRoundPreferred;
+    const uint64_t remaining = directionalRoundAllowance > charged ? directionalRoundAllowance - charged : 0;
+    const uint64_t reserve = directionalRoundReserve > directionalRoundOriginal ?
+        directionalRoundReserve - directionalRoundOriginal : 0;
+    const bool original = directionalForceOriginal || directionalPreferredStreak >= 3 || remaining <= reserve;
+    if (original) {
+      selection.reason = directionalForceOriginal ? "zero-debit-cap fallback" :
+          remaining <= reserve ? "remaining original charge reserve" : "three preferred charges then original";
+      if (directionalForceOriginal) selection.mode = "fallback";
+      return true;
+    }
+    std::vector<size_t> ranked;
+    for (size_t i = 0; i < beam.size(); ++i) ranked.push_back(i);
+    llvm::stable_sort(ranked, [&](size_t a, size_t b) { return stateLess(beam[a], beam[b]); });
+    std::vector<size_t> rank(beam.size());
+    for (size_t i = 0; i < ranked.size(); ++i) rank[ranked[i]] = i;
+    size_t selected = pending.size();
+    // A window consumes ordinary preferred slots and never changes the beam.
+    if (directionalWindow.active) {
+      double bestPenalty = std::numeric_limits<double>::infinity();
+      for (size_t i = cursor; i < pending.size(); ++i) {
+        const auto &neighbor = pending[i]; const auto &parent = beam[neighbor.parent];
+        if (parent.key != directionalWindow.parentKey || !directionalWindow.families.count(neighbor.action.family)) continue;
+        auto footprint = directionalFootprint(neighbor.action);
+        if (!llvm::any_of(footprint, [&](const std::string &name) { return directionalWindow.targets.count(name); })) continue;
+        double penalty = 0;
+        if (neighbor.action.family == "shape") {
+          auto found = llvm::find_if(parent.choices, [&](const TaskShapeChoice &choice) { return choice.task == neighbor.action.shapeTask; });
+          if (found != parent.choices.end()) {
+            const int64_t delta = neighbor.action.shapeRows * neighbor.action.shapeCols - found->shape.cgraCount();
+            const int64_t distance = std::abs(neighbor.action.shapeRows - found->shape.rows) + std::abs(neighbor.action.shapeCols - found->shape.cols);
+            penalty = distance == 0 ? 1e8 : (delta < 0 ? 100.0 : 0.0) + std::abs(delta) * 4.0 + distance;
+          }
+        } else for (const auto &primitive : neighbor.action.primitives) penalty += std::max<int64_t>(0, primitive.factor - 2);
+        if (selected == pending.size() || penalty < bestPenalty) { selected = i; bestPenalty = penalty; }
+      }
+      if (selected != pending.size()) {
+        selection.mode = "window"; selection.window = selection.preferred = true;
+        selection.reason = "related successor of best retained new cost-block parent";
+      } else closeDirectionalWindow(round, "related legal suffix exhausted");
+    }
+    if (selected == pending.size()) {
+      std::optional<std::tuple<size_t, uint64_t, uint64_t, size_t, size_t, size_t>> best;
+      for (size_t i = cursor; i < pending.size(); ++i) {
+        const auto &neighbor = pending[i]; const auto &parent = beam[neighbor.parent];
+        auto found = parentDirections.find(parent.key); if (found == parentDirections.end()) continue;
+        for (size_t ordinal = 0; ordinal < found->second.size(); ++ordinal) {
+          const auto &direction = found->second[ordinal];
+          if (neighbor.action.family != direction.family || actionTargetKey(neighbor.action) != direction.target) continue;
+          auto parameter = llvm::find(direction.signatures, actionSignature(neighbor.action));
+          if (parameter == direction.signatures.end()) continue;
+          const auto &feedback = directionalFeedback[directionFeedbackKey(parent.key, direction.family, direction.target)];
+          // Cost tier is primary. Feedback operates only among <=4 current
+          // parents in that tier and is retired with its parent.
+          auto key = std::make_tuple(rank[neighbor.parent] / 4, feedback.charged,
+              feedback.attempts, rank[neighbor.parent], ordinal,
+              static_cast<size_t>(parameter - direction.signatures.begin()));
+          if (!best || key < *best) {
+            best = key; selected = i; selection.mode = "guided";
+            selection.preferred = true; selection.reason = direction.reason;
+          }
+        }
+      }
+    }
+    if (selected == pending.size()) {
+      selection.mode = "fallback"; selection.reason = "no remaining preferred parameter; original B order";
+      return true;
+    }
+    const auto &chosen = pending[selected];
+    selection.selectedPendingOffset = selected - cursor;
+    selection.directionKey = directionFeedbackKey(beam[chosen.parent].key,
+                                                  chosen.action.family, actionTargetKey(chosen.action));
+    return reorderDirectionalPending(beam, pending, cursor, selected, round, selection, error);
+  }
+
+  void commitDirectionalSelection(const SearchState &parent,
+      const NeighborhoodAction &action, StringRef candidateID, int64_t round,
+      uint64_t before, uint64_t after, const DirectionalSelection &selection) {
+    const uint64_t debit = after - before;
+    if (selection.preferred) {
+      auto &feedback = directionalFeedback[selection.directionKey];
+      ++feedback.attempts; feedback.charged += debit;
+      if (debit) { ++directionalGuidedCharged; ++directionalRoundPreferred; ++directionalPreferredStreak; directionalConsecutiveZero = 0; }
+      else { ++directionalGuidedZero; if (++directionalConsecutiveZero >= kDirectionalZeroDebitCap) directionalForceOriginal = true; }
+      if (selection.window) {
+        if (debit) { ++directionalWindowCharged; ++directionalWindow.charged; }
+        else { ++directionalWindowZero; ++directionalWindow.zeroDebit; }
+      }
+    } else {
+      if (debit) {
+        ++directionalOriginalCharged; ++directionalRoundOriginal;
+        directionalPreferredStreak = directionalConsecutiveZero = 0; directionalForceOriginal = false;
+        if (selection.mode == "fallback") ++directionalFallbackCharged;
+      } else {
+        ++directionalOriginalZero;
+        if (selection.mode == "fallback") ++directionalFallbackZero;
+      }
+    }
+    appendDirectionalEvent(json::Object{{"record_type", "candidate_selection"}, {"round", round},
+        {"parent_id", parent.id}, {"parent_key", parent.key}, {"candidate_id", candidateID},
+        {"family", action.family}, {"target", actionTargetKey(action)},
+        {"action", typedActionObject(action)}, {"action_signature", actionSignature(action)},
+        {"baseline_action_signature", selection.baselineSignature},
+        {"baseline_parent_id", selection.baselineParentID}, {"baseline_parent_key", selection.baselineParentKey},
+        {"selected_pending_offset_before_rotation", int64_t(selection.selectedPendingOffset)}, {"mode", selection.mode},
+        {"reason", selection.reason}, {"direction_key", selection.directionKey},
+        {"attempt_global_index", int64_t(parentProgressAttemptedEdges.size())},
+        {"objective_evaluations_before", int64_t(before)}, {"objective_evaluations_after", int64_t(after)},
+        {"debit", int64_t(debit)}, {"round_original_charged", int64_t(directionalRoundOriginal)},
+        {"round_preferred_charged", int64_t(directionalRoundPreferred)},
+        {"round_charge_allowance", int64_t(directionalRoundAllowance)},
+        {"round_original_reserve", int64_t(directionalRoundReserve)},
+        {"window_remaining", int64_t(directionalWindow.active ? kDirectionalWindowCharges - directionalWindow.charged : 0)},
+        {"window_zero_debit", int64_t(directionalWindow.zeroDebit)}});
+    if (directionalWindow.active && (directionalWindow.charged >= kDirectionalWindowCharges ||
+        directionalWindow.zeroDebit >= kDirectionalZeroDebitCap))
+      closeDirectionalWindow(round, directionalWindow.charged >= kDirectionalWindowCharges ? "charged allowance used" : "window zero-debit cap");
+  }
+
+  void closeDirectionalWindow(int64_t round, StringRef reason) {
+    if (!directionalWindow.active) return;
+    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "close"},
+        {"round", round}, {"parent_id", directionalWindow.parentID}, {"parent_key", directionalWindow.parentKey},
+        {"reason", reason}, {"charged", int64_t(directionalWindow.charged)},
+        {"zero_debit", int64_t(directionalWindow.zeroDebit)},
+        {"unused_returned", int64_t(kDirectionalWindowCharges - directionalWindow.charged)}});
+    directionalWindow.active = false;
+  }
+
+  void openDirectionalWindow(ArrayRef<SearchState> beam, ArrayRef<ArchiveRecord> archive,
+      const std::set<std::string> &newKeys, const std::set<std::string> &costKeys,
+      int64_t round, uint64_t scoredCount) {
+    closeDirectionalWindow(round, "original refresh boundary; unused quota returned");
+    const SearchState *best = nullptr; std::set<std::string> live;
+    json::Array retainedNew, prunedNew, costParents;
+    for (const auto &parent : beam) {
+      live.insert(parent.key);
+      if (costKeys.count(parent.key)) costParents.push_back(parent.id);
+      if (newKeys.count(parent.key)) {
+        retainedNew.push_back(parent.id);
+        if (costKeys.count(parent.key) && (!best || stateLess(parent, *best))) best = &parent;
+      }
+    }
+    for (const auto &record : archive)
+      if (newKeys.count(record.key) && !live.count(record.key)) prunedNew.push_back(record.id);
+    appendDirectionalEvent(json::Object{{"record_type", "frontier_decision"}, {"round", round},
+        {"evaluations", int64_t(scoredCount)}, {"retained_new", std::move(retainedNew)},
+        {"pruned_new", std::move(prunedNew)}, {"original_cost_parents", std::move(costParents)},
+        {"beam_policy_changed", false}});
+    for (auto it = directionalFeedback.begin(); it != directionalFeedback.end();) {
+      auto key = json::parse(it->first); bool present = false;
+      if (key) if (const auto *parts = key->getAsArray())
+        if (!parts->empty()) if (auto parentKey = parts->front().getAsString()) present = live.count(parentKey->str());
+      if (!key) llvm::consumeError(key.takeError());
+      if (!present) it = directionalFeedback.erase(it); else ++it;
+    }
+    if (!best || best->path.empty() || !best->actionHistory.known) return;
+    const StringRef signature(best->path.back());
+    const std::string trigger = signature.take_front(signature.find(':')).str();
+    std::set<std::string> families;
+    if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
+    else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); }
+    else return; // Neutral states use ordinary schedule-derived directions.
+    const ArchiveRecord *before = nullptr;
+    for (const auto &record : archive) if (record.id == best->parentId) { before = &record; break; }
+    if (!before) return;
+    std::set<std::string> oldNames, names, related;
+    for (const auto &choice : before->choices) oldNames.insert(choice.task);
+    for (const auto &choice : best->choices) {
+      names.insert(choice.task); if (!oldNames.count(choice.task)) related.insert(choice.task);
+    }
+    if (!best->actionHistory.actions.empty()) {
+      const auto &last = best->actionHistory.actions.back();
+      if (last.family == trigger)
+        for (const auto &name : directionalFootprint(last)) if (names.count(name)) related.insert(name);
+    }
+    if (trigger == "fission" && !best->actionHistory.fissionActions.empty())
+      for (const auto &name : directionalFootprint(best->actionHistory.fissionActions.back()))
+        if (names.count(name)) related.insert(name);
+    if (related.empty()) return;
+    directionalWindow = DirectionalWindow{best->key, best->id, trigger, related, families, 0, 0, true};
+    std::vector<std::string> targetNames(related.begin(), related.end()), familyNames(families.begin(), families.end());
+    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
+        {"round", round}, {"parent_id", best->id}, {"parent_key", best->key}, {"cost", best->score},
+        {"source_parent_id", best->parentId}, {"trigger_family", trigger},
+        {"related_targets", stringArray(targetNames)}, {"allowed_families", stringArray(familyNames)},
+        {"target_relation", "new task names plus surviving typed action footprint"},
+        {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
+  }
+
+  json::Object directionalStateObject() const {
+    std::vector<std::string> windowTargets(directionalWindow.targets.begin(), directionalWindow.targets.end());
+    std::vector<std::string> windowFamilies(directionalWindow.families.begin(), directionalWindow.families.end());
+    json::Array feedback;
+    for (const auto &[key, value] : directionalFeedback)
+      feedback.push_back(json::Object{{"direction_key", key}, {"attempts", int64_t(value.attempts)}, {"charged", int64_t(value.charged)}});
+    return json::Object{{"policy", kDirectionalPolicy}, {"constants", directionalConstants()},
+        {"guided_charged", int64_t(directionalGuidedCharged)}, {"original_charged", int64_t(directionalOriginalCharged)},
+        {"fallback_charged", int64_t(directionalFallbackCharged)}, {"window_charged", int64_t(directionalWindowCharged)},
+        {"guided_zero_debit", int64_t(directionalGuidedZero)}, {"original_zero_debit", int64_t(directionalOriginalZero)},
+        {"fallback_zero_debit", int64_t(directionalFallbackZero)}, {"window_zero_debit", int64_t(directionalWindowZero)},
+        {"round_original_charged", int64_t(directionalRoundOriginal)}, {"round_preferred_charged", int64_t(directionalRoundPreferred)},
+        {"round_charge_allowance", int64_t(directionalRoundAllowance)}, {"round_original_reserve", int64_t(directionalRoundReserve)},
+        {"preferred_streak", int64_t(directionalPreferredStreak)}, {"consecutive_preferred_zero_debit", int64_t(directionalConsecutiveZero)},
+        {"force_original_until_charge", directionalForceOriginal}, {"live_direction_feedback", std::move(feedback)},
+        {"window", json::Object{{"active", directionalWindow.active}, {"parent_id", directionalWindow.parentID},
+          {"parent_key", directionalWindow.parentKey}, {"trigger_family", directionalWindow.triggerFamily},
+          {"related_targets", stringArray(windowTargets)}, {"allowed_families", stringArray(windowFamilies)},
+          {"charged_allowance", int64_t(kDirectionalWindowCharges)}, {"charged", int64_t(directionalWindow.charged)},
+          {"zero_debit", int64_t(directionalWindow.zeroDebit)}}},
+        {"resume_supported", false}, {"paper_admission", false}};
   }
 
   bool mergeParentProgressQueues(
@@ -7239,6 +7875,12 @@ private:
       root["parent_progress_queues"] = parentProgressQueuesObject();
       root["parent_progress_events"] = stringArray(parentProgressEvents);
     }
+    if (directionalSearch) {
+      root["directional_search"] = true;
+      root["directional_policy"] = kDirectionalPolicy.str();
+      root["directional_state"] = directionalStateObject();
+      root["directional_events"] = stringArray(directionalEvents);
+    }
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
     if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
                                    pending, pendingCursor, stopReason, error))
@@ -7249,6 +7891,12 @@ private:
         progressText += event + "\n";
       if (!writeTextAtomically(outputDir.getValue() + "/parent-progress.jsonl",
                                progressText, error)) return false;
+    }
+    if (directionalSearch) {
+      std::string text;
+      for (const std::string &event : directionalEvents) text += event + "\n";
+      if (!writeTextAtomically(outputDir.getValue() + "/directions.jsonl", text, error))
+        return false;
     }
     journalBytes = newJournalBytes; journalArchiveCount = archive.size(); dirtyJournalIndices.clear();
     // Snapshot deletion happens only after a checkpoint binds the amended
@@ -7768,6 +8416,13 @@ private:
       metadata["parent_progress_policy"] = kParentProgressPolicy.str();
       metadata["parent_progress_queues"] = parentProgressQueuesObject();
     }
+    if (directionalSearch) {
+      metadata["directional_search"] = true;
+      metadata["directional_policy"] = kDirectionalPolicy.str();
+      metadata["directional_state"] = directionalStateObject();
+      metadata["directional_path"] = outputDirectory.str() + "/directions.jsonl";
+      metadata["paper_admission"] = false;
+    }
     if (stageNumber(stageName) == 6) {
       json::Array support;
       for (const std::string &entry : fissionSupportDiagnostics)
@@ -7921,6 +8576,18 @@ private:
   std::map<std::string, ParentPendingProgress> parentProgressQueues;
   std::set<std::string> parentProgressAttemptedEdges;
   std::vector<std::string> parentProgressEvents;
+  std::map<std::string, std::vector<DirectionalChoice>> parentDirections;
+  std::map<std::string, DirectionalFeedback> directionalFeedback;
+  std::vector<std::string> directionalEvents;
+  DirectionalWindow directionalWindow;
+  uint64_t directionalGuidedCharged = 0, directionalOriginalCharged = 0;
+  uint64_t directionalFallbackCharged = 0, directionalWindowCharged = 0;
+  uint64_t directionalGuidedZero = 0, directionalOriginalZero = 0;
+  uint64_t directionalFallbackZero = 0, directionalWindowZero = 0;
+  uint64_t directionalRoundOriginal = 0, directionalRoundPreferred = 0;
+  uint64_t directionalRoundAllowance = 0, directionalRoundReserve = 0;
+  uint64_t directionalPreferredStreak = 0, directionalConsecutiveZero = 0;
+  bool directionalForceOriginal = false;
 
 };
 
