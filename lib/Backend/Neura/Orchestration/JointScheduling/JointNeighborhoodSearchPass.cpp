@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-tiling-chain-v31";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-lineage-mask-v33";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -4096,10 +4096,14 @@ private:
           featurePolicy == "cumulative-replica" ? 2 :
           featurePolicy == "cumulative-tiling" ? 3 : 4;
       if (level == 0) return "feature_policy_fixed_1x1";
+      if (!parent.actionHistory.fissionActions.empty())
+        return "feature_policy_cumulative_parent_fission";
       if (action.family == "fission") return "feature_policy_cumulative_fission";
       for (const auto &primitive : action.primitives) {
         const StringRef kind = primitive.kind;
-        const unsigned required = kind == "replica" ? 2 :
+        const unsigned required =
+            (action.family == "lineage-replacement" && kind == "lineage-reset") ? 1 :
+            kind == "replica" ? 2 :
             (kind == "tile" || kind == "k-tile") ? 3 :
             (kind == "fusion" || kind == "sibling-fusion") ? 4 : 5;
         if (required > level) return "feature_policy_cumulative_primitive";
