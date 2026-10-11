@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-lineage-mask-v33";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-communication-secondary-tie-v34";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6416,6 +6416,7 @@ private:
       struct Group {
         std::string category, family, target, reason;
         double priority = 0;
+        uint64_t criticalTaskIncidentPayloadBits = 0;
         std::vector<const NeighborhoodAction *> actions;
       };
       std::map<std::tuple<std::string, std::string, std::string>, Group> groups;
@@ -6424,6 +6425,7 @@ private:
         const NeighborhoodAction &action = neighbor.action;
         auto footprint = directionalFootprint(action);
         double compute = 0, occupancy = 0, payload = 0, criticalIncidentPayload = 0;
+        uint64_t criticalTaskIncidentPayloadBits = 0;
         bool criticalEndpoint = false;
         int64_t maxArea = 1;
         for (const auto &name : footprint) {
@@ -6432,11 +6434,14 @@ private:
           compute = std::max(compute, static_cast<double>(action.family == "shape" && shapeCatalogueKnown ? shapeGains[name] : task.duration) *
               (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
           criticalEndpoint |= task.criticalChainProxy || task.terminal;
-          if (task.criticalChainProxy || task.terminal)
+          if (task.criticalChainProxy || task.terminal) {
+            criticalTaskIncidentPayloadBits = std::max(criticalTaskIncidentPayloadBits,
+                                                       task.payloadBits);
             for (const auto &[edge, bits] : payloads)
               if (edge.first == name || edge.second == name)
                 criticalIncidentPayload = std::max(criticalIncidentPayload,
                     static_cast<double>(bits));
+          }
           const int64_t area = task.rows * task.cols;
           maxArea = std::max(maxArea, area);
           occupancy = std::max(occupancy,
@@ -6477,6 +6482,8 @@ private:
           auto &group = groups[{groupCategory.str(), action.family, target}];
           group.category = groupCategory.str(); group.family = action.family; group.target = target;
           group.reason = groupReason.str(); group.priority = groupPriority;
+          group.criticalTaskIncidentPayloadBits = groupCategory == "communication"
+              ? criticalTaskIncidentPayloadBits : 0;
           group.actions.push_back(&action);
         };
         if (priority > 0 && std::isfinite(priority)) addGroup(category, reason, priority);
@@ -6496,8 +6503,10 @@ private:
               !llvm::any_of(selected, [&](const DirectionalChoice &choice) {
                 return choice.family == group.family && choice.target == group.target;
               }) && (!best || group.priority > best->priority ||
-              (group.priority == best->priority && std::make_pair(group.family, group.target) <
-                                                    std::make_pair(best->family, best->target)))) best = &group;
+              (group.priority == best->priority &&
+               ((category == "communication" && group.criticalTaskIncidentPayloadBits > best->criticalTaskIncidentPayloadBits) ||
+                ((category != "communication" || group.criticalTaskIncidentPayloadBits == best->criticalTaskIncidentPayloadBits) &&
+                 std::make_pair(group.family, group.target) < std::make_pair(best->family, best->target)))))) best = &group;
         if (!best) continue;
         llvm::stable_sort(best->actions, [&](const NeighborhoodAction *left, const NeighborhoodAction *right) {
           const double a = directionalParameterPenalty(*left, tasks), b = directionalParameterPenalty(*right, tasks);
@@ -6511,6 +6520,7 @@ private:
         directions.push_back(json::Object{{"category", best->category}, {"family", choice.family},
             {"target", choice.target}, {"reason", choice.reason},
             {"priority_proxy", choice.priorityProxy},
+            {"communication_secondary_known_incident_bits", std::to_string(best->criticalTaskIncidentPayloadBits)},
             {"proxy_units", category == "communication" ? "bits" : category == "compute" ? "cycles" : "CGRA-cycles"},
             {"action_signatures", stringArray(choice.signatures)},
             {"feedback_attempts", int64_t(feedback.attempts)}, {"feedback_charged", int64_t(feedback.charged)}});
