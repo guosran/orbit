@@ -2378,8 +2378,8 @@ public:
     }
     if ((decisionFlow != "legacy" && decisionFlow != "joint" &&
          decisionFlow != "sequential" && decisionFlow != "alternating") ||
-        (graphBudgetPercent != 50 && graphBudgetPercent != 75)) {
-      fatal("decision-flow must be legacy/joint/sequential/alternating; graph-budget-percent must be50/75"); return;
+        (graphBudgetPercent != 25 && graphBudgetPercent != 50 && graphBudgetPercent != 75)) {
+      fatal("decision-flow must be legacy/joint/sequential/alternating; graph-budget-percent must be25/50/75"); return;
     }
     if (decisionFlow != "legacy" &&
         (resume || pauseAfterCandidates > 0 || !seedManifest.empty() ||
