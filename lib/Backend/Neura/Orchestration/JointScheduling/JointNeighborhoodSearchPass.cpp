@@ -85,6 +85,8 @@ constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
 constexpr StringLiteral kDirectionalPolicy = "schedule-structure-window-axis-tie-v35";
+constexpr StringLiteral kRetainedCommunicationPolicy =
+    "schedule-structure-persistent-communication-window-v36";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -1213,6 +1215,8 @@ struct DirectionalChoice {
   std::string family, target, reason;
   double priorityProxy = 0;
   std::vector<std::string> signatures;
+  std::string category;
+  uint64_t criticalTaskIncidentPayloadBits = 0;
 };
 struct DirectionalFeedback { uint64_t attempts = 0, charged = 0; };
 struct DirectionalWindow {
@@ -1221,6 +1225,7 @@ struct DirectionalWindow {
   uint64_t charged = 0, zeroDebit = 0;
   bool active = false;
   std::map<std::vector<int64_t>, uint64_t> coTilingAxisAttempts;
+  std::vector<std::string> exactParameterSignatures;
 };
 struct DirectionalSelection {
   std::string mode = "original", baselineSignature, baselineParentID, baselineParentKey;
@@ -2270,6 +2275,8 @@ public:
   Option<bool> refreshFrontier{*this, "refresh-frontier", llvm::cl::init(false)};
   Option<bool> parentProgress{*this, "parent-progress", llvm::cl::init(false)};
   Option<bool> directionalSearch{*this, "directional-search", llvm::cl::init(false)};
+  Option<bool> retainedCommunicationWindow{*this, "retained-communication-window",
+                                         llvm::cl::init(false)};
   Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
   Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
   Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
@@ -2404,6 +2411,9 @@ public:
          featurePolicy != "cumulative-fusion") ||
         shapeEnumerationOrder != "ascending" || roundQuotaScale != 1)) {
       fatal("directional-search requires the fresh parent-progress all-space ascending baseline"); return;
+    }
+    if (retainedCommunicationWindow && !directionalSearch) {
+      fatal("retained-communication-window requires fresh directional Joint search"); return;
     }
     if (!validateDirectionalProtocol(error)) { fatal(error); return; }
     activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
@@ -6117,9 +6127,11 @@ private:
     }
     if (directionalSearch) {
       objectBinding["directional_search"] = true;
-      objectBinding["directional_policy"] = kDirectionalPolicy.str();
+      objectBinding["directional_policy"] = activeDirectionalPolicy().str();
       objectBinding["directional_constants"] = directionalConstants();
     }
+    if (retainedCommunicationWindow)
+      objectBinding["retained_communication_window"] = true;
     if (diagnosticIICeiling == 23)
       objectBinding["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (stageNumber(stage) == 6) {
@@ -6187,6 +6199,10 @@ private:
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
 
+  StringRef activeDirectionalPolicy() const {
+    return retainedCommunicationWindow ? kRetainedCommunicationPolicy : kDirectionalPolicy;
+  }
+
   bool validateDirectionalProtocol(std::string &error) {
     std::string bytes;
     if (!readFileBytes(protocolFile, bytes, error)) return false;
@@ -6198,9 +6214,18 @@ private:
     const auto *root = value->getAsObject();
     const auto *search = root ? root->getObject("search") : nullptr;
     const auto *flag = search ? search->get("directional_search") : nullptr;
+    const auto *retainedFlag = search ? search->get("retained_communication_window") : nullptr;
+    if ((retainedFlag && !retainedFlag->getAsBoolean()) ||
+        (retainedCommunicationWindow &&
+         (!search || search->getBoolean("retained_communication_window") != true)) ||
+        (!retainedCommunicationWindow && search &&
+         search->getBoolean("retained_communication_window") == true)) {
+      error = "retained-communication-window option/protocol mismatch";
+      return false;
+    }
     if ((flag && !flag->getAsBoolean()) ||
         (directionalSearch && (!search || search->getBoolean("directional_search") != true ||
-          search->getString("directional_policy") != kDirectionalPolicy ||
+          search->getString("directional_policy") != activeDirectionalPolicy() ||
           root->getBoolean("paper_admission") != false ||
           search->getBoolean("paper_admission") != false ||
           search->getBoolean("parent_progress") != true)) ||
@@ -6215,7 +6240,7 @@ private:
 
   void appendDirectionalEvent(json::Object event) {
     event["schema"] = kDirectionalSchema;
-    event["policy"] = kDirectionalPolicy;
+    event["policy"] = activeDirectionalPolicy();
     directionalEvents.push_back(jsonText(json::Value(std::move(event))));
   }
 
@@ -6515,6 +6540,8 @@ private:
           return a != b ? a < b : actionSignature(*left) < actionSignature(*right);
         });
         DirectionalChoice choice{best->family, best->target, best->reason, best->priority, {}};
+        choice.category = best->category;
+        choice.criticalTaskIncidentPayloadBits = best->criticalTaskIncidentPayloadBits;
         for (size_t i = 0; i < std::min<size_t>(kDirectionalParameters, best->actions.size()); ++i)
           choice.signatures.push_back(actionSignature(*best->actions[i]));
         const std::string feedbackKey = directionFeedbackKey(parent.key, choice.family, choice.target);
@@ -6539,6 +6566,8 @@ private:
     appendDirectionalEvent(json::Object{{"record_type", "round_allowance"}, {"round", round},
         {"evaluations", int64_t(scoredCount)}, {"round_charge_allowance", int64_t(directionalRoundAllowance)},
         {"round_original_reserve", int64_t(directionalRoundReserve)}});
+    if (retainedCommunicationWindow && round > 0)
+      openRetainedCommunicationWindow(beam, pending, round);
   }
 
   bool reorderDirectionalPending(ArrayRef<SearchState> beam,
@@ -6563,7 +6592,7 @@ private:
       for (size_t i = stream.cursor; i < stream.actions.size(); ++i) after.push_back(actionSignature(stream.actions[i]));
       parentProgressEvents.push_back(jsonText(json::Value(json::Object{
           {"record_type", "directional_reorder"}, {"policy", kParentProgressPolicy},
-          {"directional_policy", kDirectionalPolicy}, {"round", round},
+          {"directional_policy", activeDirectionalPolicy()}, {"round", round},
           {"parent_id", parent.id}, {"parent_key", parent.key}, {"family", neighbor.action.family},
           {"cursor", int64_t(stream.cursor)}, {"selected_offset", int64_t(position - stream.cursor)},
           {"action_signature", signature}, {"mode", selection.mode}, {"reason", selection.reason},
@@ -6627,6 +6656,20 @@ private:
     // A window consumes ordinary preferred slots and never changes the beam.
     if (directionalWindow.active) {
       double bestPenalty = std::numeric_limits<double>::infinity();
+      if (!directionalWindow.exactParameterSignatures.empty()) {
+        // The direction already selected and ordered these <=3 legal parameters.
+        // Try only their remaining signatures, in that same order.
+        for (const auto &signature : directionalWindow.exactParameterSignatures) {
+          for (size_t i = cursor; i < pending.size(); ++i) {
+            const auto &neighbor = pending[i];
+            if (beam[neighbor.parent].key == directionalWindow.parentKey &&
+                actionSignature(neighbor.action) == signature) {
+              selected = i; break;
+            }
+          }
+          if (selected != pending.size()) break;
+        }
+      } else {
       for (size_t i = cursor; i < pending.size(); ++i) {
         const auto &neighbor = pending[i]; const auto &parent = beam[neighbor.parent];
         if (parent.key != directionalWindow.parentKey || !directionalWindow.families.count(neighbor.action.family)) continue;
@@ -6643,10 +6686,11 @@ private:
         } else for (const auto &primitive : neighbor.action.primitives) penalty += std::max<int64_t>(0, primitive.factor - 2);
         if (selected == pending.size() || penalty < bestPenalty) { selected = i; bestPenalty = penalty; }
       }
+      }
       // Preserve the legacy minimum penalty and selected action family.
       // Only typed co-tiling ties within this exact active window compare
       // actual window attempts per axis vector, then the old pending offset.
-      if (selected != pending.size() &&
+      if (directionalWindow.exactParameterSignatures.empty() && selected != pending.size() &&
           directionalCoTilingAxisVector(pending[selected].action)) {
         const std::string legacyFamily = pending[selected].action.family;
         auto axes = directionalCoTilingAxisVector(pending[selected].action);
@@ -6678,7 +6722,9 @@ private:
       }
       if (selected != pending.size()) {
         selection.mode = "window"; selection.window = selection.preferred = true;
-        selection.reason = "related successor of best retained new cost-block parent";
+        selection.reason = directionalWindow.exactParameterSignatures.empty()
+            ? "related successor of best retained new cost-block parent"
+            : "existing ordered parameter of retained unserved communication direction";
       } else closeDirectionalWindow(round, "related legal suffix exhausted");
     }
     if (selected == pending.size()) {
@@ -6806,6 +6852,76 @@ private:
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
   }
 
+  void openRetainedCommunicationWindow(ArrayRef<SearchState> beam,
+      ArrayRef<PendingNeighbor> pending, int64_t round) {
+    const SearchState *bestParent = nullptr;
+    const DirectionalChoice *bestDirection = nullptr;
+    size_t bestOrdinal = 0;
+    json::Array eligible;
+    for (const auto &parent : beam) {
+      if (!directionalRetainedOldKeys.count(parent.key)) continue;
+      auto found = parentDirections.find(parent.key);
+      if (found == parentDirections.end()) continue;
+      for (size_t ordinal = 0; ordinal < found->second.size(); ++ordinal) {
+        const auto &direction = found->second[ordinal];
+        if (direction.category != "communication" || direction.signatures.empty()) continue;
+        const auto &feedback = directionalFeedback[directionFeedbackKey(
+            parent.key, direction.family, direction.target)];
+        // This measures preferred service only. Original attempts remain
+        // authenticated by the ordinary semantic-parent progress ledger.
+        if (feedback.attempts != 0) continue;
+        bool legal = llvm::all_of(direction.signatures, [&](const std::string &signature) {
+          return llvm::any_of(pending, [&](const PendingNeighbor &neighbor) {
+            return beam[neighbor.parent].key == parent.key &&
+                   actionSignature(neighbor.action) == signature;
+          });
+        });
+        if (!legal) continue;
+        eligible.push_back(json::Object{{"parent_id", parent.id}, {"parent_key", parent.key},
+            {"family", direction.family}, {"target", direction.target},
+            {"priority_proxy", direction.priorityProxy},
+            {"known_incident_payload_bits", std::to_string(direction.criticalTaskIncidentPayloadBits)},
+            {"preferred_attempts", int64_t(feedback.attempts)},
+            {"preferred_charged", int64_t(feedback.charged)},
+            {"action_signatures", stringArray(direction.signatures)}});
+        const bool better = !bestDirection || direction.priorityProxy > bestDirection->priorityProxy ||
+            (direction.priorityProxy == bestDirection->priorityProxy &&
+             (direction.criticalTaskIncidentPayloadBits > bestDirection->criticalTaskIncidentPayloadBits ||
+              (direction.criticalTaskIncidentPayloadBits == bestDirection->criticalTaskIncidentPayloadBits &&
+               (stateLess(parent, *bestParent) ||
+                (parent.key == bestParent->key && ordinal < bestOrdinal)))));
+        if (better) { bestParent = &parent; bestDirection = &direction; bestOrdinal = ordinal; }
+      }
+    }
+    appendDirectionalEvent(json::Object{{"record_type", "retained_communication_window_decision"},
+        {"round", round}, {"eligible", std::move(eligible)},
+        {"selected_parent_id", bestParent ? bestParent->id : ""},
+        {"selection_rule", "persistent live parent; unserved communication direction; payload, incident bits, stateLess, ordinal"},
+        {"replaces_refresh_structural_window", bool(bestParent)}, {"extra_budget", 0}});
+    if (!bestParent) return;
+    closeDirectionalWindow(round, "retained communication direction replaces refresh structural window; unused quota returned");
+    std::set<std::string> targets;
+    for (const auto &neighbor : pending)
+      if (beam[neighbor.parent].key == bestParent->key &&
+          llvm::is_contained(bestDirection->signatures, actionSignature(neighbor.action)))
+        for (const auto &name : directionalFootprint(neighbor.action)) targets.insert(name);
+    directionalWindow = DirectionalWindow{bestParent->key, bestParent->id,
+        "retained-communication-direction", targets, {bestDirection->family}, 0, 0, true};
+    directionalWindow.exactParameterSignatures = bestDirection->signatures;
+    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
+        {"round", round}, {"parent_id", bestParent->id}, {"parent_key", bestParent->key},
+        {"cost", bestParent->score}, {"source_parent_id", bestParent->parentId},
+        {"trigger_family", "retained-communication-direction"},
+        {"related_targets", stringArray(std::vector<std::string>(targets.begin(), targets.end()))},
+        {"allowed_families", stringArray(std::vector<std::string>{bestDirection->family})},
+        {"direction_target", bestDirection->target}, {"direction_ordinal", int64_t(bestOrdinal)},
+        {"exact_parameter_signatures", stringArray(bestDirection->signatures)},
+        {"parent_selection", "best currently legal unserved communication direction of a persistent retained parent"},
+        {"target_relation", "exact existing direction parameters; original order"},
+        {"initial_charged", 0}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
+  }
+
   void closeDirectionalWindow(int64_t round, StringRef reason) {
     if (!directionalWindow.active) return;
     appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "close"},
@@ -6816,12 +6932,18 @@ private:
         {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}});
     directionalWindow.active = false;
     directionalWindow.coTilingAxisAttempts.clear();
+    directionalWindow.exactParameterSignatures.clear();
   }
 
   void openDirectionalWindow(ArrayRef<SearchState> beam, ArrayRef<ArchiveRecord> archive,
       const std::set<std::string> &newKeys, const std::set<std::string> &costKeys,
       int64_t round, uint64_t scoredCount) {
     closeDirectionalWindow(round, "original refresh boundary; unused quota returned");
+    if (retainedCommunicationWindow) {
+      directionalRetainedOldKeys.clear();
+      for (const auto &parent : beam)
+        if (!newKeys.count(parent.key)) directionalRetainedOldKeys.insert(parent.key);
+    }
     // Eligibility uses only known typed history and actual parent/current task
     // names. Actual next-round menu admission remains the ordinary enumerator;
     // an empty related suffix closes the window without scoring anything.
@@ -6933,7 +7055,7 @@ private:
     json::Array feedback;
     for (const auto &[key, value] : directionalFeedback)
       feedback.push_back(json::Object{{"direction_key", key}, {"attempts", int64_t(value.attempts)}, {"charged", int64_t(value.charged)}});
-    return json::Object{{"policy", kDirectionalPolicy}, {"constants", directionalConstants()},
+    json::Object result{{"policy", activeDirectionalPolicy()}, {"constants", directionalConstants()},
         {"guided_charged", int64_t(directionalGuidedCharged)}, {"original_charged", int64_t(directionalOriginalCharged)},
         {"fallback_charged", int64_t(directionalFallbackCharged)}, {"window_charged", int64_t(directionalWindowCharged)},
         {"guided_zero_debit", int64_t(directionalGuidedZero)}, {"original_zero_debit", int64_t(directionalOriginalZero)},
@@ -6949,6 +7071,14 @@ private:
           {"zero_debit", int64_t(directionalWindow.zeroDebit)},
           {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}}},
         {"resume_supported", false}, {"paper_admission", false}};
+    if (retainedCommunicationWindow) {
+      result["retained_communication_window"] = true;
+      result["retained_previous_beam_keys"] = stringArray(std::vector<std::string>(
+          directionalRetainedOldKeys.begin(), directionalRetainedOldKeys.end()));
+      (*result.getObject("window"))["exact_parameter_signatures"] =
+          stringArray(directionalWindow.exactParameterSignatures);
+    }
+    return result;
   }
 
   bool mergeParentProgressQueues(
@@ -8130,10 +8260,11 @@ private:
     }
     if (directionalSearch) {
       root["directional_search"] = true;
-      root["directional_policy"] = kDirectionalPolicy.str();
+      root["directional_policy"] = activeDirectionalPolicy().str();
       root["directional_state"] = directionalStateObject();
       root["directional_events"] = stringArray(directionalEvents);
     }
+    if (retainedCommunicationWindow) root["retained_communication_window"] = true;
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
     if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
                                    pending, pendingCursor, stopReason, error))
@@ -8178,6 +8309,13 @@ private:
     if (!root || !parseCheckpointHeader(*root, functionName, stage, sourceRepository,
         sourceCommit, architecturePath, protocolFile, diagnosticIICeiling,
         error)) return false;
+    const auto *savedRetainedWindow = root->get("retained_communication_window");
+    if ((savedRetainedWindow && !savedRetainedWindow->getAsBoolean()) ||
+        retainedCommunicationWindow || root->getBoolean("retained_communication_window") == true ||
+        root->getString("directional_policy") == kRetainedCommunicationPolicy) {
+      error = "retained-communication-window requires a fresh Joint run; checkpoint restore is unsupported";
+      return false;
+    }
     if (!restoreFamilyFunnel(*root, error))
       return false;
     auto savedRound = root->getInteger("round"), serial = root->getInteger("next_serial"),
@@ -8671,11 +8809,12 @@ private:
     }
     if (directionalSearch) {
       metadata["directional_search"] = true;
-      metadata["directional_policy"] = kDirectionalPolicy.str();
+      metadata["directional_policy"] = activeDirectionalPolicy().str();
       metadata["directional_state"] = directionalStateObject();
       metadata["directional_path"] = outputDirectory.str() + "/directions.jsonl";
       metadata["paper_admission"] = false;
     }
+    if (retainedCommunicationWindow) metadata["retained_communication_window"] = true;
     if (stageNumber(stageName) == 6) {
       json::Array support;
       for (const std::string &entry : fissionSupportDiagnostics)
@@ -8833,6 +8972,7 @@ private:
   std::map<std::string, DirectionalFeedback> directionalFeedback;
   std::vector<std::string> directionalEvents;
   DirectionalWindow directionalWindow;
+  std::set<std::string> directionalRetainedOldKeys;
   uint64_t directionalGuidedCharged = 0, directionalOriginalCharged = 0;
   uint64_t directionalFallbackCharged = 0, directionalWindowCharged = 0;
   uint64_t directionalGuidedZero = 0, directionalOriginalZero = 0;
