@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-near-critical-v23";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-duplicate-window-v28";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -3465,11 +3465,12 @@ public:
                 {"pruned", std::move(pruned)}, {"reason", "unchanged cost/diversity generated beam"}});
           }
         }
-        if (directionalSearch && expandCandidate &&
-            directionalSelection.mode == "guided" &&
+        if (directionalSearch && directionalSelection.mode == "guided" &&
             neighbor.action.family == "shape" &&
-            scoredCount > objectiveEvaluationsBefore)
-          openSelectedShapeWindow(parent, neighbor.action, round);
+            ((expandCandidate && scoredCount > objectiveEvaluationsBefore) ||
+             outcomeReason == "authenticated_configuration_duplicate"))
+          openSelectedShapeWindow(parent, neighbor.action, round,
+              outcomeReason == "authenticated_configuration_duplicate");
         ++pendingCursor; ++actionsSinceCheckpoint;
         consumePendingActionFamily(remainingPendingFamilies, actionFamily);
         bool pause = pauseAfterCandidates > 0 && scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
@@ -6172,6 +6173,7 @@ private:
         {"preferred_denominator", 4}, {"occupancy_zero_streak_cap", 2},
         {"communication_zero_streak_cap", 2},
         {"critical_predecessor_band_denominator", 8},
+        {"guided_duplicate_shape_window", 1},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6695,18 +6697,21 @@ private:
   }
 
   void openSelectedShapeWindow(const SearchState &parent,
-      const NeighborhoodAction &action, int64_t round) {
+      const NeighborhoodAction &action, int64_t round, bool duplicateShape = false) {
     if (directionalWindow.active || action.shapeTask.empty()) return;
+    std::set<std::string> families{"shape"};
+    if (duplicateShape) families.insert("tiling");
+    const uint64_t initialCharged = duplicateShape ? 0 : 1;
     directionalWindow = DirectionalWindow{parent.key, parent.id,
-        "shape-direction", {action.shapeTask}, {"shape"}, 1, 0, true};
+        "shape-direction", {action.shapeTask}, families, initialCharged, 0, true};
     appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
         {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key}, {"cost", parent.score},
         {"source_parent_id", parent.parentId}, {"trigger_family", "shape-direction"},
         {"related_targets", stringArray(std::vector<std::string>{action.shapeTask})},
-        {"allowed_families", stringArray(std::vector<std::string>{"shape"})},
-        {"parent_selection", "selected scored shape direction"},
+        {"allowed_families", stringArray(std::vector<std::string>(families.begin(), families.end()))},
+        {"parent_selection", duplicateShape ? "selected authenticated duplicate shape direction" : "selected scored shape direction"},
         {"target_relation", "same semantic parent and selected shape target"},
-        {"initial_charged", 1}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+        {"initial_charged", int64_t(initialCharged)}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
   }
 
