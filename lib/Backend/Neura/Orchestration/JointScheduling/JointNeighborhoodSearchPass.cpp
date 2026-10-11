@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-replica-partition-v30";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-tiling-chain-v31";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6176,6 +6176,7 @@ private:
         {"guided_duplicate_shape_window", 1},
         {"scored_shape_incident_co_tiling_window", 1},
         {"replica_partition_continuation_window", 1},
+        {"structural_tiling_continuation_window", 1},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6758,7 +6759,7 @@ private:
         return !related.empty();
       }
       if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
-      else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); }
+      else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); families.insert("tiling"); }
       else return false;
       const ArchiveRecord *before = nullptr;
       for (const auto &record : archive) if (record.id == parent.parentId) { before = &record; break; }
