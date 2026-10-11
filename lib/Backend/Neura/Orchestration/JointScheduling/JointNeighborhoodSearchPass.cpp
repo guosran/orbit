@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-communication-secondary-tie-v34";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-window-axis-tie-v35";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -1220,6 +1220,7 @@ struct DirectionalWindow {
   std::set<std::string> targets, families;
   uint64_t charged = 0, zeroDebit = 0;
   bool active = false;
+  std::map<std::vector<int64_t>, uint64_t> coTilingAxisAttempts;
 };
 struct DirectionalSelection {
   std::string mode = "original", baselineSignature, baselineParentID, baselineParentKey;
@@ -6181,6 +6182,7 @@ private:
         {"scored_shape_incident_co_tiling_window", 1},
         {"replica_partition_continuation_window", 1},
         {"structural_tiling_continuation_window", 1},
+        {"window_co_tiling_axis_attempt_tie", 1},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6573,6 +6575,29 @@ private:
     return true;
   }
 
+  static std::optional<std::vector<int64_t>>
+  directionalCoTilingAxisVector(const NeighborhoodAction &action) {
+    if (action.family != "producer-consumer-co-tiling" ||
+        action.primitives.size() != 2 ||
+        !llvm::all_of(action.primitives, [](const auto &primitive) {
+          return primitive.kind == "tile";
+        })) return std::nullopt;
+    std::vector<int64_t> axes;
+    for (const auto &primitive : action.primitives) axes.push_back(primitive.axis);
+    return axes;
+  }
+
+  json::Array directionalWindowAxisAttemptsObject() const {
+    json::Array records;
+    for (const auto &[axes, attempts] : directionalWindow.coTilingAxisAttempts) {
+      json::Array vector;
+      for (int64_t axis : axes) vector.push_back(axis);
+      records.push_back(json::Object{{"axis_vector", std::move(vector)},
+                                    {"attempts", int64_t(attempts)}});
+    }
+    return records;
+  }
+
   bool selectDirectionalPending(ArrayRef<SearchState> beam,
       std::vector<PendingNeighbor> &pending, size_t cursor, int64_t round,
       DirectionalSelection &selection, std::string &error) {
@@ -6618,6 +6643,39 @@ private:
         } else for (const auto &primitive : neighbor.action.primitives) penalty += std::max<int64_t>(0, primitive.factor - 2);
         if (selected == pending.size() || penalty < bestPenalty) { selected = i; bestPenalty = penalty; }
       }
+      // Preserve the legacy minimum penalty and selected action family.
+      // Only typed co-tiling ties within this exact active window compare
+      // actual window attempts per axis vector, then the old pending offset.
+      if (selected != pending.size() &&
+          directionalCoTilingAxisVector(pending[selected].action)) {
+        const std::string legacyFamily = pending[selected].action.family;
+        auto axes = directionalCoTilingAxisVector(pending[selected].action);
+        auto found = directionalWindow.coTilingAxisAttempts.find(*axes);
+        uint64_t bestAttempts = found == directionalWindow.coTilingAxisAttempts.end()
+            ? 0 : found->second;
+        for (size_t i = cursor; i < pending.size(); ++i) {
+          const auto &neighbor = pending[i];
+          const auto &parent = beam[neighbor.parent];
+          if (parent.key != directionalWindow.parentKey ||
+              neighbor.action.family != legacyFamily) continue;
+          auto footprint = directionalFootprint(neighbor.action);
+          if (!llvm::any_of(footprint, [&](const std::string &name) {
+                return directionalWindow.targets.count(name);
+              })) continue;
+          auto vector = directionalCoTilingAxisVector(neighbor.action);
+          if (!vector) continue;
+          double penalty = 0;
+          for (const auto &primitive : neighbor.action.primitives)
+            penalty += std::max<int64_t>(0, primitive.factor - 2);
+          if (penalty != bestPenalty) continue;
+          auto count = directionalWindow.coTilingAxisAttempts.find(*vector);
+          const uint64_t attempts = count == directionalWindow.coTilingAxisAttempts.end()
+              ? 0 : count->second;
+          if (attempts < bestAttempts || (attempts == bestAttempts && i < selected)) {
+            selected = i; bestAttempts = attempts;
+          }
+        }
+      }
       if (selected != pending.size()) {
         selection.mode = "window"; selection.window = selection.preferred = true;
         selection.reason = "related successor of best retained new cost-block parent";
@@ -6661,6 +6719,13 @@ private:
       const NeighborhoodAction &action, StringRef candidateID, int64_t round,
       uint64_t before, uint64_t after, const DirectionalSelection &selection) {
     const uint64_t debit = after - before;
+    const auto windowAxes = selection.window
+        ? directionalCoTilingAxisVector(action) : std::nullopt;
+    uint64_t axisAttemptsBefore = 0;
+    if (windowAxes) {
+      auto &attempts = directionalWindow.coTilingAxisAttempts[*windowAxes];
+      axisAttemptsBefore = attempts; ++attempts;
+    }
     if (action.family == "shape" || action.family == "fusion" ||
         action.family == "fusion-plus-shape" || action.family == "producer-consumer-co-tiling") {
       auto &localZero = directionalFeedback[directionFeedbackKey(parent.key,
@@ -6692,7 +6757,7 @@ private:
         if (selection.mode == "fallback") ++directionalFallbackZero;
       }
     }
-    appendDirectionalEvent(json::Object{{"record_type", "candidate_selection"}, {"round", round},
+    json::Object event{{"record_type", "candidate_selection"}, {"round", round},
         {"parent_id", parent.id}, {"parent_key", parent.key}, {"candidate_id", candidateID},
         {"family", action.family}, {"target", actionTargetKey(action)},
         {"action", typedActionObject(action)}, {"action_signature", actionSignature(action)},
@@ -6707,7 +6772,15 @@ private:
         {"round_charge_allowance", int64_t(directionalRoundAllowance)},
         {"round_original_reserve", int64_t(directionalRoundReserve)},
         {"window_remaining", int64_t(directionalWindow.active ? kDirectionalWindowCharges - directionalWindow.charged : 0)},
-        {"window_zero_debit", int64_t(directionalWindow.zeroDebit)}});
+        {"window_zero_debit", int64_t(directionalWindow.zeroDebit)}};
+    if (windowAxes) {
+      json::Array axes;
+      for (int64_t axis : *windowAxes) axes.push_back(axis);
+      event["co_tiling_axis_vector"] = std::move(axes);
+      event["co_tiling_axis_attempts_before"] = int64_t(axisAttemptsBefore);
+      event["co_tiling_axis_attempts_after"] = int64_t(axisAttemptsBefore + 1);
+    }
+    appendDirectionalEvent(std::move(event));
     if (directionalWindow.active && (directionalWindow.charged >= kDirectionalWindowCharges ||
         directionalWindow.zeroDebit >= kDirectionalZeroDebitCap))
       closeDirectionalWindow(round, directionalWindow.charged >= kDirectionalWindowCharges ? "charged allowance used" : "window zero-debit cap");
@@ -6739,8 +6812,10 @@ private:
         {"round", round}, {"parent_id", directionalWindow.parentID}, {"parent_key", directionalWindow.parentKey},
         {"reason", reason}, {"charged", int64_t(directionalWindow.charged)},
         {"zero_debit", int64_t(directionalWindow.zeroDebit)},
-        {"unused_returned", int64_t(kDirectionalWindowCharges - directionalWindow.charged)}});
+        {"unused_returned", int64_t(kDirectionalWindowCharges - directionalWindow.charged)},
+        {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}});
     directionalWindow.active = false;
+    directionalWindow.coTilingAxisAttempts.clear();
   }
 
   void openDirectionalWindow(ArrayRef<SearchState> beam, ArrayRef<ArchiveRecord> archive,
@@ -6871,7 +6946,8 @@ private:
           {"parent_key", directionalWindow.parentKey}, {"trigger_family", directionalWindow.triggerFamily},
           {"related_targets", stringArray(windowTargets)}, {"allowed_families", stringArray(windowFamilies)},
           {"charged_allowance", int64_t(kDirectionalWindowCharges)}, {"charged", int64_t(directionalWindow.charged)},
-          {"zero_debit", int64_t(directionalWindow.zeroDebit)}}},
+          {"zero_debit", int64_t(directionalWindow.zeroDebit)},
+          {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}}},
         {"resume_supported", false}, {"paper_admission", false}};
   }
 
