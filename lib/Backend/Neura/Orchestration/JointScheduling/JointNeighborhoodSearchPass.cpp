@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-shape-incident-v29";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-replica-partition-v30";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6175,6 +6175,7 @@ private:
         {"critical_predecessor_band_denominator", 8},
         {"guided_duplicate_shape_window", 1},
         {"scored_shape_incident_co_tiling_window", 1},
+        {"replica_partition_continuation_window", 1},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6739,6 +6740,23 @@ private:
       if (parent.path.empty() || !parent.actionHistory.known) return false;
       const StringRef signature(parent.path.back());
       trigger = signature.take_front(signature.find(':')).str();
+      if (trigger == "replica") {
+        std::set<std::string> partitionFootprint, roots;
+        for (const auto &action : parent.actionHistory.actions)
+          if (StringRef(action.family).contains("tiling") &&
+              llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) { return p.kind == "tile"; }))
+            for (const auto &name : directionalFootprint(action)) partitionFootprint.insert(name);
+        for (const auto &initial : parent.actionHistory.initialShapes)
+          if (llvm::any_of(partitionFootprint, [&](const std::string &name) {
+                return name == initial.task || StringRef(name).starts_with(initial.task + ".");
+              })) roots.insert(initial.task);
+        for (const auto &choice : parent.choices)
+          if (llvm::any_of(roots, [&](const std::string &root) {
+                return choice.task == root || StringRef(choice.task).starts_with(root + ".");
+              })) related.insert(choice.task);
+        families.insert("producer-consumer-co-tiling");
+        return !related.empty();
+      }
       if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
       else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); }
       else return false;
