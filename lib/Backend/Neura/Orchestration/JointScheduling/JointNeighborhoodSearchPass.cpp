@@ -84,7 +84,7 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-duplicate-window-v28";
+constexpr StringLiteral kDirectionalPolicy = "schedule-structure-shape-incident-v29";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6174,6 +6174,7 @@ private:
         {"communication_zero_streak_cap", 2},
         {"critical_predecessor_band_denominator", 8},
         {"guided_duplicate_shape_window", 1},
+        {"scored_shape_incident_co_tiling_window", 1},
         {"followup_window_charged", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}};
   }
@@ -6701,6 +6702,7 @@ private:
     if (directionalWindow.active || action.shapeTask.empty()) return;
     std::set<std::string> families{"shape"};
     if (duplicateShape) families.insert("tiling");
+    else families.insert("producer-consumer-co-tiling");
     const uint64_t initialCharged = duplicateShape ? 0 : 1;
     directionalWindow = DirectionalWindow{parent.key, parent.id,
         "shape-direction", {action.shapeTask}, families, initialCharged, 0, true};
