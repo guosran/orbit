@@ -87,6 +87,8 @@ constexpr StringLiteral kParentProgressPolicy =
 constexpr StringLiteral kDirectionalPolicy = "schedule-structure-window-axis-tie-v35";
 constexpr StringLiteral kRetainedCommunicationPolicy =
     "schedule-structure-retained-communication-shape-window-v37";
+constexpr StringLiteral kCriticalPositiveComputePolicy =
+    "schedule-structure-critical-positive-compute-v38";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -2277,6 +2279,8 @@ public:
   Option<bool> directionalSearch{*this, "directional-search", llvm::cl::init(false)};
   Option<bool> retainedCommunicationWindow{*this, "retained-communication-window",
                                          llvm::cl::init(false)};
+  Option<bool> criticalPositiveCompute{*this, "critical-positive-compute",
+                                      llvm::cl::init(false)};
   Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
   Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
   Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
@@ -2414,6 +2418,9 @@ public:
     }
     if (retainedCommunicationWindow && !directionalSearch) {
       fatal("retained-communication-window requires fresh directional Joint search"); return;
+    }
+    if (criticalPositiveCompute && (!directionalSearch || !retainedCommunicationWindow)) {
+      fatal("critical-positive-compute requires fresh retained-communication-window directional Joint search"); return;
     }
     if (!validateDirectionalProtocol(error)) { fatal(error); return; }
     activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
@@ -6132,6 +6139,7 @@ private:
     }
     if (retainedCommunicationWindow)
       objectBinding["retained_communication_window"] = true;
+    if (criticalPositiveCompute) objectBinding["critical_positive_compute"] = true;
     if (diagnosticIICeiling == 23)
       objectBinding["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (stageNumber(stage) == 6) {
@@ -6200,6 +6208,7 @@ private:
   }
 
   StringRef activeDirectionalPolicy() const {
+    if (criticalPositiveCompute) return kCriticalPositiveComputePolicy;
     return retainedCommunicationWindow ? kRetainedCommunicationPolicy : kDirectionalPolicy;
   }
 
@@ -6214,6 +6223,15 @@ private:
     const auto *root = value->getAsObject();
     const auto *search = root ? root->getObject("search") : nullptr;
     const auto *flag = search ? search->get("directional_search") : nullptr;
+    const auto *criticalFlag = search ? search->get("critical_positive_compute") : nullptr;
+    if ((criticalFlag && !criticalFlag->getAsBoolean()) ||
+        (criticalPositiveCompute &&
+         (!search || search->getBoolean("critical_positive_compute") != true)) ||
+        (!criticalPositiveCompute && search &&
+         search->getBoolean("critical_positive_compute") == true)) {
+      error = "critical-positive-compute option/protocol mismatch";
+      return false;
+    }
     const auto *retainedFlag = search ? search->get("retained_communication_window") : nullptr;
     if ((retainedFlag && !retainedFlag->getAsBoolean()) ||
         (retainedCommunicationWindow &&
@@ -6444,6 +6462,7 @@ private:
       struct Group {
         std::string category, family, target, reason;
         double priority = 0;
+        bool criticalPositiveCompute = false;
         uint64_t criticalTaskIncidentPayloadBits = 0;
         std::vector<const NeighborhoodAction *> actions;
       };
@@ -6510,6 +6529,10 @@ private:
           auto &group = groups[{groupCategory.str(), action.family, target}];
           group.category = groupCategory.str(); group.family = action.family; group.target = target;
           group.reason = groupReason.str(); group.priority = groupPriority;
+          group.criticalPositiveCompute = criticalPositiveCompute &&
+              groupCategory == "compute" && graphKnown &&
+              action.family == "shape" && shapeCatalogueKnown &&
+              shapeGains[action.shapeTask] > 0 && criticalEndpoint;
           group.criticalTaskIncidentPayloadBits = groupCategory == "communication"
               ? criticalTaskIncidentPayloadBits : 0;
           group.actions.push_back(&action);
@@ -6520,7 +6543,13 @@ private:
           addGroup("communication", "largest known incident pair payload on critical endpoint; shape layout benefit unproved",
                    criticalIncidentPayload);
       }
-      json::Array directions, observations, opportunities;
+      json::Array directions, observations, opportunities, computePriorityGroups;
+      if (criticalPositiveCompute)
+        for (const auto &[key, group] : groups)
+          if (group.category == "compute")
+            computePriorityGroups.push_back(json::Object{{"family", group.family},
+                {"target", group.target}, {"compute_priority_proxy_cycles", group.priority},
+                {"critical_positive_compute", group.criticalPositiveCompute}});
       for (const auto &[name, gain] : shapeGains)
         opportunities.push_back(json::Object{{"task", name}, {"remaining_compute_gain_cycles", gain}});
       auto &selected = parentDirections[parent.key];
@@ -6530,11 +6559,15 @@ private:
           if (group.category == category &&
               !llvm::any_of(selected, [&](const DirectionalChoice &choice) {
                 return choice.family == group.family && choice.target == group.target;
-              }) && (!best || group.priority > best->priority ||
+              }) && (!best ||
+              ((criticalPositiveCompute && category == "compute" &&
+                group.criticalPositiveCompute != best->criticalPositiveCompute)
+                   ? group.criticalPositiveCompute
+                   : (group.priority > best->priority ||
               (group.priority == best->priority &&
                ((category == "communication" && group.criticalTaskIncidentPayloadBits > best->criticalTaskIncidentPayloadBits) ||
                 ((category != "communication" || group.criticalTaskIncidentPayloadBits == best->criticalTaskIncidentPayloadBits) &&
-                 std::make_pair(group.family, group.target) < std::make_pair(best->family, best->target)))))) best = &group;
+                 std::make_pair(group.family, group.target) < std::make_pair(best->family, best->target)))))))) best = &group;
         if (!best) continue;
         llvm::stable_sort(best->actions, [&](const NeighborhoodAction *left, const NeighborhoodAction *right) {
           const double a = directionalParameterPenalty(*left, tasks), b = directionalParameterPenalty(*right, tasks);
@@ -6599,12 +6632,17 @@ private:
             {"candidate_pool", "best unserved communication shape group of this persistent live parent; ordinary category heads unchanged"}});
       }
       for (const auto &[name, task] : tasks) observations.push_back(directionalObservationObject(task));
-      appendDirectionalEvent(json::Object{{"record_type", "parent_directions"},
+      json::Object parentEvent{{"record_type", "parent_directions"},
           {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key},
           {"makespan", parent.schedule.makespan}, {"actual_wait_causes_known", false},
           {"typed_graph_known", graphKnown}, {"fallback_reason", failure},
           {"task_observations", std::move(observations)}, {"shape_catalogue_known", shapeCatalogueKnown},
-          {"shape_compute_opportunities", std::move(opportunities)}, {"directions", std::move(directions)}});
+          {"shape_compute_opportunities", std::move(opportunities)}, {"directions", std::move(directions)}};
+      if (criticalPositiveCompute) {
+        parentEvent["critical_positive_compute"] = true;
+        parentEvent["compute_priority_groups"] = std::move(computePriorityGroups);
+      }
+      appendDirectionalEvent(std::move(parentEvent));
     }
     appendDirectionalEvent(json::Object{{"record_type", "round_allowance"}, {"round", round},
         {"evaluations", int64_t(scoredCount)}, {"round_charge_allowance", int64_t(directionalRoundAllowance)},
@@ -7121,6 +7159,7 @@ private:
       (*result.getObject("window"))["exact_parameter_signatures"] =
           stringArray(directionalWindow.exactParameterSignatures);
     }
+    if (criticalPositiveCompute) result["critical_positive_compute"] = true;
     return result;
   }
 
@@ -8308,6 +8347,7 @@ private:
       root["directional_events"] = stringArray(directionalEvents);
     }
     if (retainedCommunicationWindow) root["retained_communication_window"] = true;
+    if (criticalPositiveCompute) root["critical_positive_compute"] = true;
     if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
     if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
                                    pending, pendingCursor, stopReason, error))
@@ -8353,6 +8393,13 @@ private:
         sourceCommit, architecturePath, protocolFile, diagnosticIICeiling,
         error)) return false;
     const auto *savedRetainedWindow = root->get("retained_communication_window");
+    const auto *savedCriticalCompute = root->get("critical_positive_compute");
+    if ((savedCriticalCompute && !savedCriticalCompute->getAsBoolean()) ||
+        criticalPositiveCompute || root->getBoolean("critical_positive_compute") == true ||
+        root->getString("directional_policy") == kCriticalPositiveComputePolicy) {
+      error = "critical-positive-compute requires a fresh Joint run; checkpoint restore is unsupported";
+      return false;
+    }
     if ((savedRetainedWindow && !savedRetainedWindow->getAsBoolean()) ||
         retainedCommunicationWindow || root->getBoolean("retained_communication_window") == true ||
         root->getString("directional_policy") == kRetainedCommunicationPolicy) {
@@ -8858,6 +8905,7 @@ private:
       metadata["paper_admission"] = false;
     }
     if (retainedCommunicationWindow) metadata["retained_communication_window"] = true;
+    if (criticalPositiveCompute) metadata["critical_positive_compute"] = true;
     if (stageNumber(stageName) == 6) {
       json::Array support;
       for (const std::string &entry : fissionSupportDiagnostics)
