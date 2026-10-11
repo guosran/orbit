@@ -86,7 +86,7 @@ constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
 constexpr StringLiteral kDirectionalPolicy = "schedule-structure-window-axis-tie-v35";
 constexpr StringLiteral kRetainedCommunicationPolicy =
-    "schedule-structure-persistent-communication-window-v36";
+    "schedule-structure-retained-communication-shape-window-v37";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -6426,6 +6426,7 @@ private:
       ArrayRef<PendingNeighbor> pending, int64_t round,
       uint64_t scoredCount, uint64_t limit) {
     parentDirections.clear();
+    if (retainedCommunicationWindow) communicationShapeWindowDirections.clear();
     directionalRoundOriginal = directionalRoundPreferred = 0;
     // Streak/cap fallback persists across refresh until an actual original
     // charge, including partial or exhausted quota boundaries.
@@ -6554,6 +6555,48 @@ private:
             {"action_signatures", stringArray(choice.signatures)},
             {"feedback_attempts", int64_t(feedback.attempts)}, {"feedback_charged", int64_t(feedback.charged)}});
         selected.push_back(std::move(choice));
+      }
+      if (retainedCommunicationWindow && round > 0 &&
+          directionalRetainedOldKeys.count(parent.key)) {
+        // This finite window has a separate resource-direction pool. The
+        // ordinary one-head-per-category choices above remain unchanged:
+        // equal payload proxies must not hide every legal shape behind fusion.
+        Group *bestShape = nullptr;
+        for (auto &[key, group] : groups) {
+          if (group.category != "communication" || group.family != "shape" ||
+              group.actions.empty() || directionalFeedback[directionFeedbackKey(
+                  parent.key, group.family, group.target)].attempts != 0) continue;
+          if (!bestShape || group.priority > bestShape->priority ||
+              (group.priority == bestShape->priority &&
+               (group.criticalTaskIncidentPayloadBits > bestShape->criticalTaskIncidentPayloadBits ||
+                (group.criticalTaskIncidentPayloadBits == bestShape->criticalTaskIncidentPayloadBits &&
+                 group.target < bestShape->target)))) bestShape = &group;
+        }
+        json::Array pool;
+        if (bestShape) {
+          llvm::stable_sort(bestShape->actions, [&](const NeighborhoodAction *left,
+                                                    const NeighborhoodAction *right) {
+            const double a = directionalParameterPenalty(*left, tasks);
+            const double b = directionalParameterPenalty(*right, tasks);
+            return a != b ? a < b : actionSignature(*left) < actionSignature(*right);
+          });
+          DirectionalChoice choice{bestShape->family, bestShape->target,
+              bestShape->reason, bestShape->priority, {}};
+          choice.category = bestShape->category;
+          choice.criticalTaskIncidentPayloadBits = bestShape->criticalTaskIncidentPayloadBits;
+          for (size_t i = 0; i < std::min<size_t>(kDirectionalParameters, bestShape->actions.size()); ++i)
+            choice.signatures.push_back(actionSignature(*bestShape->actions[i]));
+          pool.push_back(json::Object{{"category", choice.category}, {"family", choice.family},
+              {"target", choice.target}, {"reason", choice.reason},
+              {"priority_proxy", choice.priorityProxy},
+              {"known_incident_payload_bits", std::to_string(choice.criticalTaskIncidentPayloadBits)},
+              {"preferred_attempts", 0}, {"action_signatures", stringArray(choice.signatures)}});
+          communicationShapeWindowDirections[parent.key].push_back(std::move(choice));
+        }
+        appendDirectionalEvent(json::Object{{"record_type", "retained_communication_shape_pool"},
+            {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key},
+            {"typed_graph_known", graphKnown}, {"window_directions", std::move(pool)},
+            {"candidate_pool", "best unserved communication shape group of this persistent live parent; ordinary category heads unchanged"}});
       }
       for (const auto &[name, task] : tasks) observations.push_back(directionalObservationObject(task));
       appendDirectionalEvent(json::Object{{"record_type", "parent_directions"},
@@ -6860,8 +6903,8 @@ private:
     json::Array eligible;
     for (const auto &parent : beam) {
       if (!directionalRetainedOldKeys.count(parent.key)) continue;
-      auto found = parentDirections.find(parent.key);
-      if (found == parentDirections.end()) continue;
+      auto found = communicationShapeWindowDirections.find(parent.key);
+      if (found == communicationShapeWindowDirections.end()) continue;
       for (size_t ordinal = 0; ordinal < found->second.size(); ++ordinal) {
         const auto &direction = found->second[ordinal];
         if (direction.category != "communication" || direction.signatures.empty()) continue;
@@ -6896,7 +6939,7 @@ private:
     appendDirectionalEvent(json::Object{{"record_type", "retained_communication_window_decision"},
         {"round", round}, {"eligible", std::move(eligible)},
         {"selected_parent_id", bestParent ? bestParent->id : ""},
-        {"selection_rule", "persistent live parent; unserved communication direction; payload, incident bits, stateLess, ordinal"},
+        {"selection_rule", "persistent live parent; unserved communication shape pool; payload, incident bits, stateLess, ordinal"},
         {"replaces_refresh_structural_window", bool(bestParent)}, {"extra_budget", 0}});
     if (!bestParent) return;
     closeDirectionalWindow(round, "retained communication direction replaces refresh structural window; unused quota returned");
@@ -6916,7 +6959,7 @@ private:
         {"allowed_families", stringArray(std::vector<std::string>{bestDirection->family})},
         {"direction_target", bestDirection->target}, {"direction_ordinal", int64_t(bestOrdinal)},
         {"exact_parameter_signatures", stringArray(bestDirection->signatures)},
-        {"parent_selection", "best currently legal unserved communication direction of a persistent retained parent"},
+        {"parent_selection", "best currently legal unserved communication shape of a persistent retained parent"},
         {"target_relation", "exact existing direction parameters; original order"},
         {"initial_charged", 0}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
         {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
@@ -8969,6 +9012,7 @@ private:
   std::set<std::string> parentProgressAttemptedEdges;
   std::vector<std::string> parentProgressEvents;
   std::map<std::string, std::vector<DirectionalChoice>> parentDirections;
+  std::map<std::string, std::vector<DirectionalChoice>> communicationShapeWindowDirections;
   std::map<std::string, DirectionalFeedback> directionalFeedback;
   std::vector<std::string> directionalEvents;
   DirectionalWindow directionalWindow;
