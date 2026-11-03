@@ -28,17 +28,17 @@ include(HandleLLVMOptions)
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 
-# Neura backend headers provided by the submodule.
-include_directories(
-  ${PROJECT_SOURCE_DIR}/thirdparty/neura/include
-  ${PROJECT_BINARY_DIR}/thirdparty/neura/include
-)
-
-add_subdirectory(thirdparty)
+option(ORBIT_ENABLE_NEURA "Build legacy Amoeba/Neura backend" ON)
+if(ORBIT_ENABLE_NEURA)
+  include_directories(${PROJECT_SOURCE_DIR}/thirdparty/neura/include
+                      ${PROJECT_BINARY_DIR}/thirdparty/neura/include)
+  add_subdirectory(thirdparty)
+endif()
 add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(tools)
 
+if(ORBIT_ENABLE_NEURA)
 # ===--------------------------------------------------------------------===#
 # LIT test setup
 # ===--------------------------------------------------------------------===#
@@ -71,3 +71,4 @@ add_custom_target(check-amoeba
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   COMMENT "Running Amoeba Dialect Tests with lit"
 )
+endif()

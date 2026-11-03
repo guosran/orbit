@@ -75,7 +75,7 @@ static bool isSupportedHostOperation(Operation *operation) {
   if (!dialect)
     return false;
   StringRef name = dialect->getNamespace();
-  return name == "arith" || name == "memref";
+  return name == "arith" || name == "memref" || name == "math";
 }
 
 static LogicalResult validateHostRegion(Region &region, Operation *owner,

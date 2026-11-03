@@ -1,6 +1,6 @@
 #include "TaskflowDialect/TaskflowOps.h"
 #include "TaskflowDialect/TaskflowDialect.h"
-#include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
+#include "Taskflow/OutputCoordinateProof.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
@@ -27,8 +27,7 @@ static std::optional<int64_t> constantIndex(Value value) {
 }
 
 static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
-regionFromOutputProof(const mlir::amoeba::neura::joint_scheduling::
-                          ReplicaOutputCoordinateProof &proof,
+regionFromOutputProof(const OutputCoordinateProof &proof,
                       MemRefType baseType) {
   if (!baseType || !baseType.hasStaticShape() ||
       proof.producedLowers.size() != static_cast<size_t>(baseType.getRank()) ||
@@ -51,8 +50,7 @@ regionFromOutputProof(const mlir::amoeba::neura::joint_scheduling::
 
 static LogicalResult verifyReplicaShardMetadata(
     TaskflowTaskOp task,
-    const mlir::amoeba::neura::joint_scheduling::
-        ReplicaOutputCoordinateProof &proof,
+    const OutputCoordinateProof &proof,
     int64_t selectedAxis) {
   if (selectedAxis < 0 ||
       selectedAxis >= static_cast<int64_t>(proof.outputCounterAxes.size()))
@@ -67,8 +65,7 @@ static LogicalResult verifyReplicaShardMetadata(
 
   unsigned shardCounter = proof.outputCounterAxes[selectedAxis];
   if (shardCounter ==
-          mlir::amoeba::neura::joint_scheduling::
-              ReplicaOutputCoordinateProof::kConstantAxis ||
+          OutputCoordinateProof::kConstantAxis ||
       shardCounter >= proof.taskLowers.size() ||
       shardCounter >= proof.taskUppers.size() || !shardAxis ||
       (outputAxis &&
@@ -233,7 +230,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
       "amoeba.tiling.output_region_uppers");
   if (task.getWillWrites().size() > 1) {
     auto proof =
-        mlir::amoeba::neura::joint_scheduling::analyzeReplicaOutputCoordinates(
+        analyzeOutputCoordinates(
             task, selectedAxis, static_cast<unsigned>(writeIndex));
     if (!proof.proven) {
       task.emitError() << "authenticated multi-output coordinate proof failed: "
@@ -275,7 +272,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
     if (!baseType)
       return failure();
     auto proof =
-        mlir::amoeba::neura::joint_scheduling::analyzeReplicaOutputCoordinates(
+        analyzeOutputCoordinates(
             task, selectedAxis);
     if (!proof.proven) {
       task.emitError() << "authenticated output-coordinate proof failed: "

@@ -1,5 +1,17 @@
 # ORBIT
 
+The working tree also includes an independently buildable structured Taskflow
+core and shared-candidate Amoeba/NPU adapters. See
+[implementation, measured results and clean-shell reproduction](docs/taskflow-backends.md).
+The next iteration connects common actions to the original search and measures
+persistent NPU buffers on full-size FFNs; see
+[search integration, evidence and reproduction](docs/taskflow-search-npu-v2.md).
+Static heterogeneous placement, region-based communication, independent plan
+checking and hardware trace/chain evidence are documented in
+[static mapping and reproducible validation](docs/taskflow-static-mapping.md).
+This restricted static subset preserves the existing Neura search and cost
+model; NPU measurements use a separate target plan and millisecond feedback.
+
 ORBIT is a source-owned C++ MLIR compiler workflow for joint task graph rewriting and CGRA orchestration. It builds on AMOEBA and Neura. The companion [orbit-artifact repository](https://github.com/guosran/orbit-artifact) provides the six-program fixed input-0 cumulative ablation, exact experiment inputs and costs, numerical reference code, and reproduction instructions.
 
 This source snapshot includes complete source-iteration-domain capture and partition verification for the corrected input-0 experiments. The required Neura compiler is vendored, including the local fixes used by the experiments. The model weights are included in the companion artifact and evaluated by ORBIT C++. Their upstream origins and revisions are listed in `UPSTREAM_PROVENANCE.json`; the vendored source retains its upstream notices.

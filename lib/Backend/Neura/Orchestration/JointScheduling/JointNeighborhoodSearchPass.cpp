@@ -30,9 +30,11 @@
 #include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 
 #include "TaskflowDialect/TaskflowOps.h"
+#include "Taskflow/Search.h"
 #include "NeuraDialect/NeuraOps.h"
 
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -2346,6 +2348,11 @@ public:
   Option<int64_t> maxFissionActionsPerTask{
       *this, "max-fission-actions-per-task", llvm::cl::init(64)};
 
+  Option<std::string> structuredBackend{*this, "backend", llvm::cl::init("amoeba")};
+  Option<std::string> structuredPlan{*this, "structured-plan", llvm::cl::init("")};
+  Option<std::string> structuredEvaluator{*this, "evaluator", llvm::cl::init("")};
+  Option<std::string> structuredConfig{*this, "target-config", llvm::cl::init("")};
+
   void runOnOperation() override {
     ModuleOp canonical = getOperation();
     std::string error;
@@ -2353,6 +2360,41 @@ public:
       canonical.emitError() << message;
       signalPassFailure();
     };
+    if (decisionFlow == "structured") {
+      auto bytes = llvm::MemoryBuffer::getFile(structuredPlan);
+      if (!bytes) { fatal("cannot read structured-plan"); return; }
+      auto json = llvm::json::parse((*bytes)->getBuffer());
+      if (!json) { fatal(llvm::toString(json.takeError())); return; }
+      orbit::taskflow::Program program;
+      if (!orbit::taskflow::parsePlan(*json, program, error)) { fatal(error); return; }
+      // A supplied source module must agree with the explicit structured source.
+      // Empty modules support the source-plan-only entry point deliberately.
+      if (!canonical.getBody()->empty()) {
+        auto witness = canonical->getAttrOfType<StringAttr>("orbit.plan");
+        if (!witness) { fatal("structured mode requires orbit.plan on nonempty input module"); return; }
+        auto witnessed = llvm::json::parse(witness.getValue());
+        orbit::taskflow::Program witnessedProgram;
+        if (!witnessed) { fatal(llvm::toString(witnessed.takeError())); return; }
+        if (!orbit::taskflow::parsePlan(*witnessed, witnessedProgram, error) ||
+            orbit::taskflow::canonicalSearchIdentity(witnessedProgram) !=
+                orbit::taskflow::canonicalSearchIdentity(program)) {
+          fatal("input module witness differs from structured-plan"); return;
+        }
+        auto expected = parseSourceString<ModuleOp>(orbit::taskflow::emitTaskflow(witnessedProgram), canonical.getContext());
+        OwningOpRef<ModuleOp> actual(canonical.clone());
+        actual->getOperation()->removeAttr("orbit.plan");
+        if (!expected || failed(verify(canonical)) ||
+            !OperationEquivalence::isEquivalentTo(actual->getOperation(), expected->getOperation(),
+                OperationEquivalence::Flags::IgnoreLocations)) {
+          fatal("input Taskflow body differs from structured witness"); return;
+        }
+      }
+      orbit::taskflow::SearchOptions options{structuredBackend, structuredEvaluator,
+          outputDir, structuredConfig, checkpoint, maxRounds, maxCandidates,
+          beamWidth, resume};
+      if (!orbit::taskflow::runStructuredSearch(program, options, error)) fatal(error);
+      return;
+    }
     if (outputDir.empty() || functionName.empty() || stage.empty() ||
         maxRounds <= 0 || maxCandidates <= 0 || beamWidth <= 0 ||
         diversitySlots <= 0 || diversitySlots > beamWidth || checkpointActions <= 0 ||
@@ -5875,38 +5917,13 @@ private:
   static std::vector<SearchState> selectBeam(std::vector<SearchState> candidates,
                                              int64_t width,
                                              int64_t diversity) {
-    std::stable_sort(candidates.begin(), candidates.end(), stateLess);
-    std::vector<SearchState> selected;
-    std::vector<size_t> indices;
-    std::set<std::string> keys, configurations;
-    const size_t costSlots = static_cast<size_t>(std::max<int64_t>(0, width - diversity));
-    auto configuration = [](const SearchState &state) {
-      return (state.path.empty() ? std::string("identity") : state.path.back()) +
-             "|" + shapeSignature(state.shapes);
-    };
-    for (size_t index = 0; index < candidates.size() && indices.size() < costSlots; ++index) {
-      if (!candidates[index].scored || candidates[index].key.empty() ||
-          !keys.insert(candidates[index].key).second) continue;
-      indices.push_back(index); configurations.insert(configuration(candidates[index]));
-    }
-    // Diversity selects complete legal candidates independently of immediate
-    // improvement. Choose distinct action paths or parameter configurations;
-    // this affects expansion only, never the global archive/native ranking.
-    for (size_t index = 0; index < candidates.size() && indices.size() < size_t(width); ++index) {
-      if (!candidates[index].scored || candidates[index].key.empty() ||
-          keys.count(candidates[index].key) ||
-          !configurations.insert(configuration(candidates[index])).second) continue;
-      keys.insert(candidates[index].key); indices.push_back(index);
-    }
-    for (size_t index = 0; index < candidates.size() && indices.size() < size_t(width); ++index) {
-      if (!candidates[index].scored || candidates[index].key.empty() ||
-          !keys.insert(candidates[index].key).second) continue;
-      indices.push_back(index);
-    }
-    // Decide all indices before moving. A moved-from state must never enter
-    // the beam through a second traversal of the same vector.
-    for (size_t index : indices) selected.push_back(std::move(candidates[index]));
-    return selected;
+    return orbit::taskflow::selectSearchBeam(std::move(candidates), width, diversity,
+        stateLess, [](const SearchState &s) { return s.scored; },
+        [](const SearchState &s) { return s.key; },
+        [](const SearchState &s) {
+          return (s.path.empty() ? std::string("identity") : s.path.back()) +
+                 "|" + shapeSignature(s.shapes);
+        });
   }
 
   static int stageNumber(StringRef value) {

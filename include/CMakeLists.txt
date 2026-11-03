@@ -1,3 +1,5 @@
-add_subdirectory(Backend)
-add_subdirectory(Conversion)
 add_subdirectory(TaskflowDialect)
+if(ORBIT_ENABLE_NEURA)
+  add_subdirectory(Backend)
+  add_subdirectory(Conversion)
+endif()

@@ -76,6 +76,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   MLIRPass
   MLIRSupport
   MLIRTaskflow
+  MLIRTaskflowStructured
   ${dialect_libs}
   LLVMSupport
 )

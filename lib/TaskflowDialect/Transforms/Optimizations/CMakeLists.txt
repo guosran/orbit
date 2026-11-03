@@ -1,5 +1,3 @@
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-
 add_mlir_library(MLIRTaskflowTransforms
   AffineLoopTreeSerializationPass.cpp
   AffineLoopPerfectionPass.cpp
@@ -14,6 +12,10 @@ add_mlir_library(MLIRTaskflowTransforms
   MLIRPass
   MLIRSupport
   MLIRTransforms
-  ${dialect_libs}
+  MLIRAffineDialect
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
   LLVMSupport
 )

@@ -116,16 +116,19 @@ find_package(LLVM REQUIRED CONFIG)
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 
-# Configure the same Python development dependencies used by upstream MLIR.
-include(MLIRDetectPythonEnv)
-mlir_configure_python_dev_packages()
+option(NEURA_ENABLE_PYTHON_BINDINGS "Build Neura Python bindings" ON)
+if(NEURA_ENABLE_PYTHON_BINDINGS)
+  # Configure the same Python development dependencies used by upstream MLIR.
+  include(MLIRDetectPythonEnv)
+  mlir_configure_python_dev_packages()
 
-if(NOT TARGET MLIRPythonSources.Core)
-  message(FATAL_ERROR
-    "Neura requires MLIR Python bindings. "
-    "Rebuild LLVM/MLIR with "
-    "-DMLIR_ENABLE_BINDINGS_PYTHON=ON."
-  )
+  if(NOT TARGET MLIRPythonSources.Core)
+    message(FATAL_ERROR
+      "Neura requires MLIR Python bindings. "
+      "Rebuild LLVM/MLIR with "
+      "-DMLIR_ENABLE_BINDINGS_PYTHON=ON."
+    )
+  endif()
 endif()
 
 set(
@@ -146,7 +149,9 @@ include_directories(BEFORE ${PROJECT_BINARY_DIR}/include)
 add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(tools)
-add_subdirectory(python)
+if(NEURA_ENABLE_PYTHON_BINDINGS)
+  add_subdirectory(python)
+endif()
 
 # ===--------------------------------------------------------------------===#
 # LIT test setup

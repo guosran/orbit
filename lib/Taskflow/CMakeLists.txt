@@ -1,0 +1,2 @@
+add_mlir_library(MLIRTaskflowStructured StructuredProgram.cpp Search.cpp PARTIAL_SOURCES_INTENDED
+  LINK_LIBS PUBLIC MLIRTaskflow LLVMSupport)
