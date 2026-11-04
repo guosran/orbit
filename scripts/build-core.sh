@@ -16,6 +16,7 @@ cmake -S "$core_root" -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$build_dir" --target taskflow-opt taskflow-generic-mapping-test \
   taskflow-tiled-mapping-test taskflow-program-mapping-test \
   taskflow-program-partition-test taskflow-data-organization-test \
+  taskflow-direct-air-cost-test \
   -j "${ORBIT_BUILD_JOBS:-4}"
 mkdir -p "$build_dir/test-output"
 run_dir=$(mktemp -d "$build_dir/test-output/core.XXXXXX")

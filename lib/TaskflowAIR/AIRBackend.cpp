@@ -14,6 +14,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Dialect.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
@@ -26,6 +27,32 @@
 #include <set>
 using namespace mlir;
 using namespace orbit::taskflow;
+namespace {
+// Core deliberately does not link AIR. A loaded namespace is nevertheless
+// required for ordinary symbol lookup: MLIR treats an unregistered one-region
+// operation as a possible unknown symbol table and stops before the module.
+// The real AIR hierarchy has no SymbolTable trait. This namespace-only facade
+// lets func.call find module-level compiler-rt declarations without pretending
+// to verify AIR operations; the installed AIR verifier remains mandatory.
+class AIRNamespaceDialect final : public Dialect {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AIRNamespaceDialect)
+  static StringRef getDialectNamespace() { return "air"; }
+  explicit AIRNamespaceDialect(MLIRContext *context)
+      : Dialect(getDialectNamespace(), context,
+                TypeID::get<AIRNamespaceDialect>()) {
+    allowUnknownOperations();
+    allowUnknownTypes();
+  }
+};
+} // namespace
+
+void orbit::taskflow::prepareGenericAIRContext(MLIRContext &context) {
+  // Use the genuine AIR dialect if the caller registered it. Never shadow it.
+  if (!context.getOrLoadDialect("air"))
+    context.getOrLoadDialect<AIRNamespaceDialect>();
+}
+
 namespace {
 Operation *make(OpBuilder &b, StringRef name, ValueRange operands = {},
                 TypeRange types = {}, bool region = false) {
@@ -196,6 +223,82 @@ Value tileDMA(OpBuilder &b, Type token, Value external, Value local,
   return result;
 }
 
+// Use the same scalar compiler-rt operations selected for source scalar f32
+// mul/div on this target. External scalar calls are deliberate barriers: plain
+// extract/mulf/insert sequences can be re-vectorized by LLVM SLP into the
+// unsupported vector fmul, and vector div may become reciprocal multiplication.
+// No installed runtime is changed or new arithmetic implementation introduced.
+bool scalarizeMixedF32Arithmetic(scf::ExecuteRegionOp wrapper,
+                                std::string &error) {
+  auto module=wrapper->getParentOfType<ModuleOp>();
+  SmallVector<Operation *> arithmetic;
+  bool badFastMath=false;
+  wrapper.walk([&](Operation *op) {
+    if(auto flags=op->getAttrOfType<arith::FastMathFlagsAttr>("fastmath"))
+      badFastMath |= flags.getValue()!=arith::FastMathFlags::none;
+    if(isa<arith::MulFOp,arith::DivFOp>(op) && op->getNumResults()==1 &&
+       isa<VectorType>(op->getResult(0).getType())) arithmetic.push_back(op);
+  });
+  if(badFastMath) {error="mixed f32 implementation requires source operations without fast-math flags";return false;}
+  for(Operation *op:arithmetic) {
+    auto type=cast<VectorType>(op->getResult(0).getType());
+    if(type.getRank()!=1 || type.isScalable() || !type.getElementType().isF32()) {
+      error="mixed f32 scalar arithmetic requires a fixed one-dimensional f32 lane vector";return false;
+    }
+    StringRef symbol=isa<arith::MulFOp>(op)?"__mulsf3":"__divsf3";
+    auto f32=Float32Type::get(module.getContext());
+    auto signature=FunctionType::get(module.getContext(),{f32,f32},{f32});
+    auto function=module.lookupSymbol<func::FuncOp>(symbol);
+    if(function && (function.getFunctionType()!=signature || !function.isExternal() ||
+                    !function->hasAttr("orbit.scalar_f32_builtin"))) {
+      error="mixed f32 arithmetic conflicts with an existing target builtin symbol";return false;
+    }
+    if(!function) {
+      OpBuilder declaration=OpBuilder::atBlockBegin(module.getBody());
+      function=declaration.create<func::FuncOp>(op->getLoc(),symbol,signature);
+      function.setPrivate();
+      // These target compiler-rt builtins touch no program memory. Preserve
+      // accumulator promotion while retaining scalar call boundaries through
+      // LLVM optimization (no vector-function ABI mapping is supplied).
+      function->setAttr("llvm.readnone",declaration.getUnitAttr());
+      function->setAttr("passthrough",declaration.getArrayAttr({
+          declaration.getStringAttr("noinline"),declaration.getStringAttr("nounwind")}));
+      function->setAttr("orbit.scalar_f32_builtin",declaration.getStringAttr("compiler-rt; same target scalar f32 operation; no vector approximation"));
+    }
+    OpBuilder scalar(op);
+    Value assembled=scalar.create<arith::ConstantOp>(op->getLoc(),type,scalar.getZeroAttr(type));
+    for(int64_t lane=0;lane<type.getNumElements();++lane) {
+      SmallVector<Value> operands;
+      for(Value operand:op->getOperands()) {
+        if(auto broadcast=operand.getDefiningOp<vector::BroadcastOp>();
+           broadcast && broadcast.getSource().getType().isF32())
+          operands.push_back(broadcast.getSource());
+        else
+          operands.push_back(scalar.create<vector::ExtractOp>(op->getLoc(),operand,ArrayRef<int64_t>{lane}));
+      }
+      auto call=scalar.create<func::CallOp>(op->getLoc(),function,operands);
+      call->setAttr("orbit.scalarized_operation",scalar.getStringAttr(op->getName().getStringRef()));
+      call->setAttr("orbit.scalarized_lane",scalar.getI64IntegerAttr(lane));
+      assembled=scalar.create<vector::InsertOp>(op->getLoc(),call.getResult(0),assembled,ArrayRef<int64_t>{lane});
+    }
+    op->getResult(0).replaceAllUsesWith(assembled);op->erase();
+  }
+  // Keep the first capability small and explicit. In particular a vector
+  // transcendental, comparison/select, conversion or reduction cannot silently
+  // enter the installed target's approximate or unsupported legalization.
+  bool unsupported=false;
+  wrapper.walk([&](Operation *op) {
+    bool vectorF32=llvm::any_of(op->getResultTypes(),[](Type type) {
+      auto vector=dyn_cast<VectorType>(type);return vector && vector.getElementType().isF32();
+    });
+    if(vectorF32 && !isa<arith::ConstantOp,arith::AddFOp,arith::SubFOp,
+        vector::TransferReadOp,vector::BroadcastOp,vector::InsertOp>(op))
+      unsupported=true;
+  });
+  if(unsupported) {error="mixed f32 implementation encountered an unsupported remaining vector operation";return false;}
+  return true;
+}
+
 bool emitVectorTileBody(OpBuilder &b, const GenericAnalysis &a,
                         const GenericTilePhase &phase, ArrayRef<Value> local,
                         ArrayRef<Value> loopShifts,
@@ -220,7 +323,10 @@ bool emitVectorTileBody(OpBuilder &b, const GenericAnalysis &a,
   for(auto &op:body.without_terminator()) b.clone(op,mapping);
   b.create<scf::YieldOp>(wrapper.getLoc());
   SmallVector<affine::AffineForOp> loops;
-  wrapper.walk([&](affine::AffineForOp loop){loops.push_back(loop);});
+  // GenericAnalysis numbers source loops in preorder. The default postorder
+  // walk reverses nested loop identities and would bind tile bounds/shifts to
+  // the wrong axes before vectorization even starts.
+  wrapper.walk<WalkOrder::PreOrder>([&](affine::AffineForOp loop){loops.push_back(loop);});
   if(loops.size()!=task.loops.size() || implementation.parallelLoop<0 || size_t(implementation.parallelLoop)>=loops.size()) {
     return reject("independent-lane implementation requires the checked affine loop nest");
   }
@@ -228,12 +334,45 @@ bool emitVectorTileBody(OpBuilder &b, const GenericAnalysis &a,
     loops[bound.loop].setConstantLowerBound(bound.lower);
     loops[bound.loop].setConstantUpperBound(bound.upper);
   }
+  if(implementation.kind=="scalar-product-vector-add-f32") {
+    auto bound=llvm::find_if(phase.loops,[&](const auto &entry){return entry.loop==size_t(implementation.parallelLoop);});
+    if((implementation.lanes!=4 && implementation.lanes!=8) || bound==phase.loops.end() ||
+       (bound->upper-bound->lower)%implementation.lanes) {
+      return reject("mixed f32 implementation requires four/eight lanes and exact spatial tile coverage");
+    }
+  }
   // Upstream vectorization widens only the explicitly proved spatial loop.
   // Nested reduction loops retain their scalar induction and source order.
+  // The upstream vectorizer replaces loop operations, propagating each
+  // source loop's Location. Track this explicit identity through replacement;
+  // never infer axes from the order or coincident extents of new loops.
+  llvm::DenseMap<Location, size_t> sourceLoopLocations;
+  SmallVector<std::pair<int64_t,int64_t>> sourceBounds;
+  for(size_t i=0;i<loops.size();++i) {
+    auto identity=NameLoc::get(b.getStringAttr("orbit.task."+std::to_string(phase.task)+
+        ".source_loop."+std::to_string(i)),loops[i].getLoc());
+    loops[i]->setLoc(identity);
+    sourceLoopLocations[identity]=i;
+    sourceBounds.push_back({loops[i].getConstantLowerBound(),loops[i].getConstantUpperBound()});
+  }
   llvm::DenseSet<Operation *> selected{loops[implementation.parallelLoop]};
   affine::vectorizeAffineLoops(wrapper,selected,{implementation.lanes},{0});
-  loops.clear();
-  wrapper.walk([&](affine::AffineForOp loop){loops.push_back(loop);});
+  loops.assign(task.loops.size(),affine::AffineForOp{});
+  bool identityLost=false;size_t seenLoops=0;
+  wrapper.walk<WalkOrder::PreOrder>([&](affine::AffineForOp loop) {
+    ++seenLoops;
+    auto found=sourceLoopLocations.find(loop.getLoc());
+    if(found==sourceLoopLocations.end() || loops[found->second]) {identityLost=true;return;}
+    loops[found->second]=loop;
+    loop->setAttr("orbit.source_loop_index",b.getI64IntegerAttr(found->second));
+    auto expected=sourceBounds[found->second];
+    auto step=found->second==size_t(implementation.parallelLoop)?implementation.lanes:1;
+    if(!loop.hasConstantBounds() || loop.getConstantLowerBound()!=expected.first ||
+       loop.getConstantUpperBound()!=expected.second || loop.getStepAsInt()!=step)
+      identityLost=true;
+  });
+  if(identityLost || seenLoops!=task.loops.size())
+    return reject("vectorization lost a unique source loop identity, bounds or reduction order");
   if(loops.size()!=task.loops.size() || loops[implementation.parallelLoop].getStepAsInt()!=implementation.lanes) {
     return reject("standard affine vectorizer cannot materialize the checked independent-lane implementation");
   }
@@ -284,6 +423,10 @@ bool emitVectorTileBody(OpBuilder &b, const GenericAnalysis &a,
       op->erase();
     }
   }
+  if(implementation.kind=="scalar-product-vector-add-f32" &&
+     !scalarizeMixedF32Arithmetic(wrapper,error)) {
+    b.setInsertionPointAfter(wrapper);wrapper.erase();return false;
+  }
   b.setInsertionPointAfter(wrapper);
   while(!isa<scf::YieldOp>(block->front())) block->front().moveBefore(wrapper);
   wrapper.erase();
@@ -296,7 +439,8 @@ void emitTileBody(OpBuilder &b, const GenericAnalysis &a,
                   ArrayRef<std::vector<Value>> regionShifts = {},
                   const GenericTaskImplementation *implementation = nullptr,
                   std::string *error = nullptr) {
-  if(implementation && implementation->kind=="independent-lane-f32") {
+  if(implementation && (implementation->kind=="independent-lane-f32" ||
+                        implementation->kind=="scalar-product-vector-add-f32")) {
     emitVectorTileBody(b,a,phase,local,loopShifts,regionShifts,*implementation,*error);return;
   }
   auto &task = a.tasks[phase.task];
@@ -927,6 +1071,32 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
                                         bool skipCheck) {
   if (!checkGenericMapping(a, plan, error))
     return false;
+  // The validated serial path has two independent tile DMA ports per
+  // direction. The installed packet fan-in cannot yet be relied upon to
+  // preserve independent BO stream boundaries across repeated phases when
+  // more storages share those ports. Single-phase and resident paths are
+  // separate accepted capabilities and must not be rejected by this guard.
+  if(plan.strategy=="serial-tiled") {
+    for(const auto &stage:plan.hardwareStages) {
+      if(stage.endPhase-stage.beginPhase<=1) continue;
+      std::set<size_t> incoming,outgoing;
+      for(const auto &transfer:plan.transfers) {
+        if(transfer.phase<stage.beginPhase || transfer.phase>=stage.endPhase) continue;
+        if(transfer.direction=="host_to_l1") incoming.insert(transfer.storage);
+        if(transfer.direction=="l1_to_host") outgoing.insert(transfer.storage);
+      }
+      if(incoming.size()>2 || outgoing.size()>2) {
+        error="repeated serial-tiled AIR stage exceeds validated independent storage stream capability: at most two input and two output storages; packet fan-in across repeated phases is not validated";
+        return false;
+      }
+    }
+  }
+  if(llvm::any_of(plan.taskImplementations,[](const auto &implementation) {
+       return implementation.kind=="scalar-product-vector-add-f32" && implementation.lanes!=8;
+     })) {
+    error="mixed f32 implementation requires eight lanes on the installed AIR target; four-lane vector register legalization is unavailable";
+    return false;
+  }
   if(llvm::any_of(plan.taskImplementations,[](const auto &implementation){return implementation.kind=="independent-lane-f32";})) {
     error="independent-lane-f32 is unavailable on the validated AIR target: installed Peano cannot legalize strict f32 vector multiplication; BF16 emulation is not enabled";
     return false;
@@ -947,6 +1117,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
             "operations on the MLIR context before running passes";
     return false;
   }
+  prepareGenericAIRContext(*ctx);
   ctx->getOrLoadDialect<memref::MemRefDialect>();
   ctx->getOrLoadDialect<arith::ArithDialect>();
   ctx->getOrLoadDialect<scf::SCFDialect>();
@@ -1405,6 +1576,12 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       b.getStringAttr(plan.choices.dataOrganization=="retain-across-users"
         ? "readonly users within a single execution group; no cross-stage SRAM retention"
         : "phase-local input copies; source output/reduction lifetime preserved"));
+  if(llvm::any_of(plan.taskImplementations,[](const auto &implementation) {
+       return implementation.kind=="scalar-product-vector-add-f32";
+     })) {
+    output->getOperation()->setAttr("orbit.f32_lane_legalization",b.getStringAttr(
+        "scalar-product-vector-add-f32; scalar compiler-rt mul/div; source-ordered vector add/sub; no FMA/BF16"));
+  }
   output->getOperation()->setAttr("orbit.cost_status",
                                   b.getStringAttr("uncalibrated-direct-air"));
   if (approximateExp) {
@@ -1498,7 +1675,7 @@ struct TaskflowToAIRPass
            "mapping to AIR";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
+    registry.insert<AIRNamespaceDialect, affine::AffineDialect, arith::ArithDialect,
                     memref::MemRefDialect, func::FuncDialect, scf::SCFDialect,
                     math::MathDialect, cf::ControlFlowDialect, vector::VectorDialect>();
   }

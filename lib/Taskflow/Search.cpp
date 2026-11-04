@@ -303,6 +303,16 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
               r->getString("evaluator_kind")!="native_cpp") {
             e="native checkpoint score failed independent re-evaluation";return false;
           }
+          if(nativeAir && best->getObject("direct_air_cost")) {
+            const bool observed=best->getString("cost_status")=="measured";
+            const bool predicted=best->getString("cost_status")=="calibrated";
+            if(r->getString("evaluation_kind")!=(observed?"measured_feedback":(predicted?"model_prediction":"static_estimate")) ||
+               score->getString("provenance")!=(observed?"exact-observation-table":(predicted?"calibrated-direct-air-model":"static-plan-estimate")) ||
+               score->getBoolean("physical_hardware_measurement")!=observed ||
+               r->getBoolean("executed")!=false) {
+              e="native checkpoint measurement/prediction provenance mismatch";return false;
+            }
+          }
         }
       }
       if(!seen.insert(s.key).second){e="duplicate checkpoint archive identity";return false;}
@@ -439,9 +449,14 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
           {"executed",false},{"status",value ? "passed" : (!unsupported && nativeAir && best ? "uncalibrated" : "unsupported")},
           {"evidence_path",dir+"/mapping-result.json"}};
       if(value) {
+        const bool observed=nativeAir && best->getString("cost_status")=="measured";
+        const bool predicted=nativeAir && best->getString("cost_status")=="calibrated";
+        feedback["evaluation_kind"]=observed?"measured_feedback":(predicted?"model_prediction":"static_estimate");
         feedback["plan_id"]=best->getString("plan_id").value_or("").str();
         feedback["score"]=j::Object{{"value",*value},{"unit","ms"},
-          {"provenance","static-plan-estimate"},{"physical_hardware_measurement",false}};
+          {"provenance",observed?"exact-observation-table":(predicted?"calibrated-direct-air-model":"static-plan-estimate")},
+          {"physical_hardware_measurement",observed}};
+        if(observed) feedback["measurement_reuse"]="SHA-bound prior complete-command observations; this evaluation does not submit hardware";
       }
       else feedback["diagnostics"]=std::move(result);
       if(!write(response,render(j::Value(std::move(feedback))),e)) return false;

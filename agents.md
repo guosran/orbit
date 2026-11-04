@@ -202,3 +202,38 @@ Core implementation, source semantics, mapping/search/checkers, backend lowering
 Historic raw results, frozen tools and modified v8 source snapshots were physically moved under the companion's ignored local storage. Compatibility aliases preserve old absolute references; original manifests and measurements retain their bytes. Reproduce into fresh directories rather than rebuilding historical CMake caches. New evidence and code-generation tests verify the separation.
 
 Queued next: evidence-first full FP32 FFN profiling. Decompose the original M128/16×M8 timeline, explain the N16 residency comparison, inspect current executed ELF/helper paths, perform controlled stage/full-graph measurements, then choose one or two supported optimizations and validate a frozen direct-AIR model on held-out candidates. Keep CGRA ML unchanged and preserve artifact/compiler versions. The main agent coordinates NPU use; current queued work starts with read-only evidence analysis while repository separation is validated.
+
+## Latest completed stage: whole-program profiling v9
+
+The profiling queue and evidence-driven implementation experiment are complete.
+Original M128 is16 serial full-M8 commands (about581.6s total); recorded wait is
+about99.986% of its program wall. Independent full-size stage mains and executed
+ELF inspection identify three expensive GEMMs on one core. Wait still combines
+runtime, device compute, DMA and stalls. N16 residency reduces planned transfers
+44.4% without demonstrated latency improvement; two/five device stages both use
+one host submission, and static bytes are not physical DDR counters.
+
+Native candidates can select scalar-product/vector-add FP32 lanes8, combined
+with existing tiling and read-only retention. Full M1/M5/M8 pass three seeds with
+observed7.37%/7.89%/6.83% hot-wall reductions; a separate complete M128 single-seed
+profiling run passes in541.8698s. Original three-seed M128 acceptance is unchanged.
+Numerical tolerance, K order, products, payload budget and generated DMA are
+preserved. Failed lane4/r2/vector and four-stream experiments remain explicit;
+target guards reject unsupported cases rather than changing execution silently.
+
+Core provides opt-in native features, checked finite-domain composite prediction
+and exact execution-fingerprint measurement feedback. CGRA ML is unchanged.
+Frozen scalar holdout gives0.474% M3-full error but29–44% tail underprediction;
+configuration guards and unknown/null costs prevent extrapolating to arbitrary
+tiles or mixed implementations. Two native rounds compare structure-enabled
+residency plus implementation, selecting a measured mixed8/B-panel candidate.
+Four cells (144 checked outputs total), parents, model/target identities and checkpoint
+provenance are retained; only observed executions receive measured scores.
+
+Core/Amoeba/search/AIR regressions and real CGRA boundary checks pass. See the
+[v9 report](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-ffn-profiling-v9.md)
+and sibling artifact reproduction entries. Public optimization remains centered
+on entire program candidates and their interacting structure/resource/schedule/
+data decisions; backend-specific code experiments validate those choices and
+their cost feedback. Full FFN device trace, physical DDR counts, arbitrary
+cross-stage sharing and calibrated multicore/mixed predictors remain open.

@@ -21,6 +21,13 @@
 #include <set>
 using namespace orbit::taskflow;
 namespace {
+llvm::json::Value directCostReport(const GenericDirectAIRCost &);
+std::string directCostProvenance(const GenericDirectAIRCost &cost) {
+  const auto *model=cost.model.getAsObject();
+  return model && model->getString("kind")=="observed-table" ?
+      "exact observed whole-command feedback; no prediction or generalization; transfer/runtime included" :
+      "opt-in direct-AIR composite provider; calibration/domain and charge ownership explicit";
+}
 bool fail(std::string &e, const std::string &s) {
   e = s;
   return false;
@@ -1597,13 +1604,30 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
     if (implementation.kind == "scalar") {
       if (implementation.parallelLoop != -1 || implementation.lanes != 1)
         return fail(e, "scalar implementation has vector resource choices");
-    } else if (implementation.kind != "independent-lane-f32" ||
+    } else if ((implementation.kind != "independent-lane-f32" &&
+                implementation.kind != "scalar-product-vector-add-f32") ||
                implementation.parallelLoop != vectorLoop(a, a.tasks[task]) ||
                implementation.parallelLoop < 0 || implementation.lanes < 2 ||
                implementation.lanes > 16 ||
                (implementation.lanes & (implementation.lanes - 1)))
       return fail(e, "vector implementation fails independent-lane source proof");
+    if (implementation.kind == "scalar-product-vector-add-f32") {
+      if ((implementation.lanes != 4 && implementation.lanes != 8) ||
+          a.tasks[task].loops[implementation.parallelLoop].step != 1)
+        return fail(e,"scalar-product-vector-add-f32 requires unit-step spatial loop and lanes 4 or 8");
+      for (const auto &phase:p.phases) if(phase.task==task) {
+        auto bound=llvm::find_if(phase.loops,[&](const auto &b){return b.loop==size_t(implementation.parallelLoop);});
+        if(bound==phase.loops.end() || bound->lower<a.tasks[task].loops[implementation.parallelLoop].lower ||
+           bound->upper>a.tasks[task].loops[implementation.parallelLoop].upper || bound->upper<=bound->lower ||
+           (bound->upper-bound->lower)%implementation.lanes)
+          return fail(e,"scalar-product-vector-add-f32 requires every spatial tile extent divisible by lanes");
+      }
+    }
   }
+  if(auto requested=a.function->getParentOfType<mlir::ModuleOp>()->getAttrOfType<StringAttr>("orbit.implementation"))
+    if(requested.getValue()=="scalar-product-vector-add-f32" &&
+       !llvm::any_of(p.taskImplementations,[](const auto &impl){return impl.kind=="scalar-product-vector-add-f32";}))
+      return fail(e,"scalar-product-vector-add-f32 request has no vectorizable source task");
   if (p.choices.residency == "readonly-panel" && !panelApplied)
     return fail(e, "readonly panel choice matches no proven source task");
   if (p.strategy == "single-herd-resident") {
@@ -1644,6 +1668,17 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
         return fail(e, "invalid tiled phase task");
     if (!checkTileDomains(a, p, e))
       return false;
+    for(const auto &stage:p.hardwareStages)if(stage.endPhase-stage.beginPhase>1) {
+      std::set<size_t> inputs,outputs;
+      auto transfer=std::lower_bound(p.transfers.begin(),p.transfers.end(),stage.beginPhase,
+          [](const auto &t,size_t phase){return t.phase<phase;});
+      for(;transfer!=p.transfers.end() && transfer->phase<stage.endPhase;++transfer) {
+        if(transfer->direction=="host_to_l1")inputs.insert(transfer->storage);
+        else if(transfer->direction=="l1_to_host")outputs.insert(transfer->storage);
+      }
+      if(inputs.size()>2 || outputs.size()>2)
+        return fail(e,"current AIR target does not validate multi-phase stages with more than two distinct input or output streams");
+    }
   } else {
     if (!p.phases.empty() || !p.tileSizes.empty() ||
         !p.retainedRegions.empty() || !p.fusedInitializerTasks.empty() ||
@@ -1673,7 +1708,17 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
       "theoretical direct-AIR source scalar-operation and explicit-transfer "
       "sensitivity; not calibrated; backend local copies and internal "
       "scheduling excluded";
-  if (!p.hasCost) {
+  if(p.directCost.enabled) {
+    GenericCostFeatures features;GenericDirectAIRCost expected;
+    if(!collectGenericCostFeatures(a,p,features,e) ||
+       !evaluateGenericDirectAIRCost(features,p.directCost.model,p.directCost.target,expected,e))return false;
+    if(staticFingerprint(directCostReport(expected))!=staticFingerprint(directCostReport(p.directCost)))
+      return fail(e,"direct-AIR cost features/model identity/estimate mismatch");
+    if(p.hasCost!=expected.valueMs.has_value() || p.estimatedMs!=expected.valueMs.value_or(0) ||
+       p.theoreticalLaunchMs!=0 || p.theoreticalPerOperationMs!=0 || p.theoreticalPerByteMs!=0 ||
+       p.costProvenance!=directCostProvenance(p.directCost))
+      return fail(e,"direct-AIR score must not mix theoretical or separate transfer charges");
+  } else if (!p.hasCost) {
     if (p.estimatedMs != 0 || p.theoreticalLaunchMs != 0 ||
         p.theoreticalPerOperationMs != 0 || p.theoreticalPerByteMs != 0 ||
         p.costProvenance != "unknown: direct AIR path not calibrated")
@@ -1717,6 +1762,253 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
   }
   return true;
 }
+llvm::json::Value orbit::taskflow::serializeGenericCostFeatures(const GenericCostFeatures &f) {
+  llvm::json::Object values,operations;llvm::json::Array sources,implementations;
+  for(const auto &v:f.values)values[v.first]=v.second;
+  for(const auto &v:f.operations)operations[v.first]=v.second;
+  for(const auto &v:f.sourceFingerprints)sources.push_back(v);
+  for(const auto &v:f.implementations)implementations.push_back(v);
+  return llvm::json::Object{{"schema","orbit.direct-air.features.v1"},
+    {"execution_fingerprint",f.executionFingerprint},{"values",std::move(values)},{"source_operations",std::move(operations)},
+    {"source_fingerprints",std::move(sources)},{"implementations",std::move(implementations)},
+    {"scope","native source/checked plan facts; counts are not instruction counts or measured physical traffic"}};
+}
+bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
+    const GenericMappingPlan &p,GenericCostFeatures &f,std::string &error) {
+  f={};f.sourceFingerprints={a.bodyFingerprint};
+  auto add=[&](int64_t &value,int64_t amount) {
+    if(amount<0 || value>INT64_MAX-amount)return false;value+=amount;return true;
+  };
+  auto instances=[&](const GenericTask &task,Operation *op,int64_t &n) {
+    n=1;for(const auto &loop:task.loops)if(loop.operation->isProperAncestor(op)) {
+      int64_t iterations=(loop.upper-loop.lower-1)/loop.step+1;
+      if(iterations<=0 || n>INT64_MAX/iterations)return false;n*=iterations;
+    }return true;
+  };
+  bool valid=true;
+  for(const auto &task:a.tasks) {
+    task.operation->walk([&](Operation *op){
+      auto dialect=op->getName().getDialectNamespace();
+      if((dialect!="arith" && dialect!="math") || op->getName().getStringRef()=="arith.constant")return;
+      int64_t n;if(!instances(task,op,n)){valid=false;return;}
+      bool f32=llvm::any_of(op->getResultTypes(),[](Type t){return t.isF32();}) ||
+               llvm::any_of(op->getOperandTypes(),[](Type t){return t.isF32();});
+      std::string name=op->getName().getStringRef().str();
+      valid&=add(f.operations[name+(f32?":f32":":other")],n);
+      if(f32)valid&=add(f.values["source_scalar_f32_operations"],n);
+      if(f32 && (name=="arith.mulf" || name=="arith.divf"))
+        valid&=add(f.values["source_f32_product_operations"],n);
+      if(f32 && name=="math.exp")valid&=add(f.values["source_math_exp_f32_operations"],n);
+    });
+    for(const auto &access:task.accesses) {
+      int64_t n;if(!instances(task,access.operation,n)){valid=false;continue;}
+      if(access.read)valid&=add(f.values["source_scalar_reads"],n);
+      if(access.write)valid&=add(f.values["source_scalar_writes"],n);
+    }
+  }
+  for(const auto *key:{"source_scalar_f32_operations","source_f32_product_operations",
+      "source_math_exp_f32_operations","source_scalar_reads","source_scalar_writes",
+      "dma_bytes","dma_input_bytes","dma_output_bytes","dma_transfer_count",
+      "active_compute_events","local_initialize_events","local_staging_copy_bytes"})f.values[key]+=0;
+  f.values["command_count"]=1;
+  f.values["hardware_stage_count"]=p.strategy=="serial-tiled"?p.hardwareStages.size():1;
+  f.values["execution_group_count"]=p.executionGroups.size();
+  f.values["source_phase_count"]=p.phases.size();
+  f.values["resident_payload_bytes"]=p.residentBytes;
+  f.values["readonly_retention_scopes"]=p.readOnlyRetentions.size();
+  f.values["serial_tiled"]=p.strategy=="serial-tiled";
+  f.values["capacity_bytes"]=p.capacityBytes;
+  for(size_t axis=0;axis<3;++axis)f.values["max_tile_loop_"+std::to_string(axis)+"_iterations"]=0;
+  for(const auto &phase:p.phases) {
+    if(phase.task>=a.tasks.size())return fail(error,"cost feature source task is invalid");
+    for(const auto &bound:phase.loops)if(bound.loop<3) {
+      if(bound.loop>=a.tasks[phase.task].loops.size())return fail(error,"cost feature source loop is invalid");
+      auto step=a.tasks[phase.task].loops[bound.loop].step;
+      if(step<=0 || bound.lower<0 || bound.upper<=bound.lower)return fail(error,"cost feature source loop bounds are invalid");
+      auto &maximum=f.values["max_tile_loop_"+std::to_string(bound.loop)+"_iterations"];
+      maximum=std::max(maximum,(bound.upper-bound.lower-1)/step+1);
+    }
+  }
+  f.values["core_count_per_stage"]=1; // Current native target realization only.
+  f.values["all_storage_f32"]=llvm::all_of(a.storages,[](const auto &storage){
+    return cast<MemRefType>(storage.root.getType()).getElementType().isF32();});
+  std::set<std::string> implementationSet;
+  for(const auto &implementation:p.taskImplementations)
+    implementationSet.insert(implementation.kind+":"+std::to_string(implementation.lanes));
+  f.implementations.assign(implementationSet.begin(),implementationSet.end());
+  for(const auto &event:p.communication.events) {
+    if(event.kind=="compute")valid&=add(f.values["active_compute_events"],1);
+    if(event.kind=="initialize")valid&=add(f.values["local_initialize_events"],1);
+  }
+  for(const auto &transfer:p.transfers) {
+    valid&=add(f.values["dma_bytes"],transfer.bytes);
+    valid&=add(f.values["dma_transfer_count"],1);
+    valid&=add(f.values[transfer.direction=="host_to_l1"?"dma_input_bytes":"dma_output_bytes"],transfer.bytes);
+    if(p.strategy=="serial-tiled" && transfer.direction=="host_to_l1") {
+      if(transfer.phase>=p.phases.size())return fail(error,"cost feature transfer phase is invalid");
+      for(const auto &region:p.phases[transfer.phase].regions)
+        if(region.storage==transfer.storage && region.read && region.write)
+          valid&=add(f.values["local_staging_copy_bytes"],transfer.bytes);
+    }
+  }
+  if(!valid)return fail(error,"native direct-AIR feature count overflows int64");
+  auto unpriced=p;
+  unpriced.directCost={};unpriced.hasCost=false;unpriced.estimatedMs=0;
+  unpriced.theoreticalLaunchMs=0;unpriced.theoreticalPerOperationMs=0;unpriced.theoreticalPerByteMs=0;
+  unpriced.costProvenance="unknown: direct AIR path not calibrated";unpriced.planId.clear();
+  // Serialization cannot recurse: directCost is disabled on this copy. Schedule,
+  // copies, implementation, grouping and resource bindings remain in the hash.
+  f.executionFingerprint=staticFingerprint(serializeGenericMapping(a,unpriced));
+  return true;
+}
+bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &features,
+    const llvm::json::Value &model,const llvm::json::Value &target,
+    GenericDirectAIRCost &cost,std::string &error) {
+  cost={};cost.enabled=true;cost.features=features;cost.model=llvm::json::Value(model);
+  cost.target=llvm::json::Value(target);cost.featureDigest=staticFingerprint(serializeGenericCostFeatures(features));
+  cost.modelDigest=staticFingerprint(model);cost.status="uncalibrated";
+  if(features.sourceFingerprints.empty() || features.implementations.empty() ||
+     llvm::any_of(features.values,[](const auto &v){return v.second<0;}) ||
+     llvm::any_of(features.operations,[](const auto &v){return v.second<0;}))
+    return fail(error,"direct-AIR features require source/implementation identities and nonnegative native counts");
+  auto unknown=[&](const std::string &status,const std::string &reason){cost.status=status;cost.reason=reason;return true;};
+  const auto *object=model.getAsObject();
+  if(!object || object->getString("schema")!="orbit.direct-air.cost.v1")return fail(error,"direct-AIR cost model requires schema orbit.direct-air.cost.v1");
+  auto digest=[](llvm::StringRef value){return value.size()==64 && llvm::all_of(value,[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');});};
+  if(!digest(features.executionFingerprint))return fail(error,"native execution fingerprint requires lowercase SHA256");
+  auto kind=object->getString("kind");
+  if(kind=="observed-table") {
+    for(auto key:{"model_id","model_version","boundary"})
+      if(!object->getString(key) || object->getString(key)->empty())return fail(error,"observed-table identity/boundary missing");
+    const auto *modelTarget=object->getObject("target");
+    const auto *rows=object->getArray("rows");
+    if(!modelTarget || !rows)return fail(error,"observed-table requires target and rows");
+    for(auto key:{"id","toolchain","runtime"})
+      if(!modelTarget->getString(key) || modelTarget->getString(key)->empty())return fail(error,"observed-table target/toolchain/runtime missing");
+    std::set<std::string> seen;std::optional<double> measured;
+    for(const auto &row:*rows) {
+      const auto *entry=row.getAsObject();
+      auto identity=entry?entry->getString("execution_fingerprint"):std::nullopt;
+      auto raw=entry?entry->getString("raw_manifest_sha256"):std::nullopt;
+      auto median=entry?entry->getNumber("median_ms"):std::nullopt;
+      auto count=entry?entry->getInteger("sample_count"):std::nullopt;
+      if(!identity || !digest(*identity) || !raw || !digest(*raw) || !median ||
+         !std::isfinite(*median) || *median<=0 || !count || *count<=0 ||
+         !seen.insert(identity->str()).second)
+        return fail(error,"observed-table row requires unique execution SHA256, raw manifest SHA256, positive finite median and sample count");
+      const auto *rowTarget=entry->getObject("target");
+      if(entry->getString("boundary")!=object->getString("boundary") || !rowTarget ||
+         staticFingerprint(llvm::json::Value(llvm::json::Object(*rowTarget)))!=staticFingerprint(llvm::json::Value(llvm::json::Object(*modelTarget))))
+        return fail(error,"observed-table row target/boundary differs from table identity");
+      if(*identity==features.executionFingerprint)measured=*median;
+    }
+    const auto *actualTarget=target.getAsObject();
+    if(!actualTarget)return unknown("out_of_domain","observed-table evaluation target is not declared");
+    for(auto key:{"id","toolchain","runtime"})
+      if(actualTarget->getString(key)!=modelTarget->getString(key))return unknown("out_of_domain","observed-table target/toolchain/runtime mismatch");
+    if(object->getString("boundary")!="prepared-command-host-to-host" || actualTarget->getString("boundary")!=object->getString("boundary"))
+      return unknown("out_of_domain","observed-table timing boundary mismatch");
+    if(features.values.find("command_count")==features.values.end() || features.values.at("command_count")!=1)
+      return unknown("out_of_domain","observed-table covers complete single commands only");
+    if(!measured)return unknown("out_of_domain","no observation for exact unpriced execution plan");
+    cost.valueMs=measured;cost.status="measured";cost.reason="exact observed complete-command median; no prediction or generalization";
+    return true;
+  }
+  if(kind=="features-only")return unknown("uncalibrated","native feature collection only; no fitted coefficients");
+  if(kind!="linear-composite")return fail(error,"unsupported direct-AIR cost provider kind");
+  auto calibration=object->getString("calibration");
+  if(calibration=="uncalibrated")return unknown("uncalibrated","direct-AIR composite coefficients are not calibrated");
+  if(calibration!="calibrated")return fail(error,"direct-AIR cost model requires explicit calibration status");
+  for(auto key:{"model_id","model_version","training_manifest_digest","boundary"})
+    if(!object->getString(key) || object->getString(key)->empty())return fail(error,"direct-AIR calibrated model identity/provenance missing");
+  auto training=object->getString("training_manifest_digest");
+  if(training->size()!=64 || !llvm::all_of(*training,[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))
+    return fail(error,"direct-AIR training manifest requires lowercase SHA256 digest");
+  const auto *modelTarget=object->getObject("target");
+  if(!modelTarget)return fail(error,"direct-AIR calibrated model target identity missing");
+  for(auto key:{"id","toolchain","runtime"})
+    if(!modelTarget->getString(key) || modelTarget->getString(key)->empty())return fail(error,"direct-AIR target/toolchain/runtime identity missing");
+  const auto *domain=object->getObject("domain");
+  const auto *terms=object->getArray("terms");
+  if(!domain || !terms || terms->empty() || terms->size()>4)return fail(error,"direct-AIR composite requires domain and one to four frozen terms");
+  auto sources=domain->getArray("source_fingerprints"),implementations=domain->getArray("implementations"),operations=domain->getArray("operations");
+  auto ranges=domain->getObject("feature_ranges");
+  if(!sources || sources->empty() || !implementations || implementations->empty() || !operations || !ranges)
+    return fail(error,"direct-AIR model requires source, implementation, operation and feature coverage");
+  auto covered=[](const llvm::json::Array &values,llvm::StringRef key){return llvm::any_of(values,[&](const auto &v){return v.getAsString()==key;});};
+  std::set<std::string> termsSeen;double total=0;
+  for(const auto &term:*terms) {
+    auto entry=term.getAsObject();auto name=entry?entry->getString("feature"):std::nullopt;
+    auto coefficient=entry?entry->getNumber("coefficient_ms"):std::nullopt;
+    if(!name || !coefficient || !std::isfinite(*coefficient) || *coefficient<0 ||
+       !termsSeen.insert(name->str()).second || !features.values.count(name->str()))
+      return fail(error,"direct-AIR composite term has unknown/duplicate feature or invalid coefficient");
+    double contribution=*coefficient*features.values.at(name->str());
+    if(!std::isfinite(contribution) || !std::isfinite(total+contribution))return fail(error,"direct-AIR composite estimate overflows");
+    total+=contribution;
+  }
+  for(const auto &range:*ranges) {
+    auto limits=range.second.getAsArray();auto actual=features.values.find(range.first.str());
+    if(actual==features.values.end() || !limits || limits->size()!=2 || !(*limits)[0].getAsInteger() || !(*limits)[1].getAsInteger() ||
+       *(*limits)[0].getAsInteger()<0 || *(*limits)[1].getAsInteger()<*(*limits)[0].getAsInteger())
+      return fail(error,"invalid direct-AIR model feature range");
+  }
+  const auto *sourceRanges=domain->getObject("source_feature_ranges");
+  if(domain->get("source_feature_ranges") && (!sourceRanges || sourceRanges->empty()))
+    return fail(error,"source_feature_ranges requires a nonempty source-keyed object");
+  if(sourceRanges)for(const auto &source:*sourceRanges) {
+    const auto *entries=source.second.getAsObject();
+    if(!covered(*sources,source.first.str()) || !entries || entries->empty())
+      return fail(error,"source_feature_ranges requires declared source and nonempty native ranges");
+    for(const auto &range:*entries) {
+      auto limits=range.second.getAsArray();
+      if(!features.values.count(range.first.str()) || !limits || limits->size()!=2 ||
+         !(*limits)[0].getAsInteger() || !(*limits)[1].getAsInteger() ||
+         *(*limits)[0].getAsInteger()<0 || *(*limits)[1].getAsInteger()<*(*limits)[0].getAsInteger())
+        return fail(error,"invalid per-source native feature range");
+    }
+  }
+  const auto *actualTarget=target.getAsObject();
+  if(!actualTarget)return unknown("out_of_domain","evaluation target identity is not declared");
+  for(auto key:{"id","toolchain","runtime"})
+    if(actualTarget->getString(key)!=modelTarget->getString(key))return unknown("out_of_domain","target/toolchain/runtime differs from frozen calibration");
+  if(object->getString("boundary")!="prepared-command-host-to-host" || actualTarget->getString("boundary")!=object->getString("boundary"))
+    return unknown("out_of_domain","composite timing boundary is not the supported prepared single-command boundary");
+  if(features.values.find("command_count")==features.values.end() || features.values.at("command_count")!=1)
+    return unknown("out_of_domain","partitioned complete-program overhead is not calibrated by this single-command provider");
+  if(features.values.find("all_storage_f32")==features.values.end() || features.values.at("all_storage_f32")!=1)
+    return unknown("out_of_domain","calibrated direct-AIR provider currently requires f32 storage");
+  for(const auto &source:features.sourceFingerprints)if(!covered(*sources,source))return unknown("out_of_domain","source fingerprint outside frozen source groups");
+  for(const auto &implementation:features.implementations)if(!covered(*implementations,implementation))return unknown("out_of_domain","compute implementation outside calibrated domain");
+  for(const auto &operation:features.operations)if(!covered(*operations,operation.first))return unknown("out_of_domain","source operation outside calibrated coverage");
+  for(const auto &range:*ranges) {
+    auto limits=range.second.getAsArray();int64_t actual=features.values.at(range.first.str());
+    if(actual<*(*limits)[0].getAsInteger() || actual>*(*limits)[1].getAsInteger())return unknown("out_of_domain","native feature outside calibrated range");
+  }
+  if(sourceRanges)for(const auto &source:features.sourceFingerprints) {
+    const auto *entries=sourceRanges->getObject(source);
+    if(!entries)return unknown("out_of_domain","source has no frozen configuration range");
+    for(const auto &range:*entries) {
+      auto limits=range.second.getAsArray();int64_t actual=features.values.at(range.first.str());
+      if(actual<*(*limits)[0].getAsInteger() || actual>*(*limits)[1].getAsInteger())
+        return unknown("out_of_domain","source configuration outside frozen native feature range");
+    }
+  }
+  if(total<=0)return unknown("uncalibrated","composite model has no positive estimate for this candidate");
+  cost.valueMs=total;cost.status="calibrated";cost.reason="composite full-call estimate; terms are not independently measured physical components";
+  return true;
+}
+namespace {
+llvm::json::Value directCostReport(const GenericDirectAIRCost &cost) {
+  return llvm::json::Object{{"status",cost.status},{"reason",cost.reason},
+    {"value_ms",cost.valueMs?llvm::json::Value(*cost.valueMs):llvm::json::Value(nullptr)},
+    {"feature_digest",cost.featureDigest},{"model_digest",cost.modelDigest},
+    {"features",serializeGenericCostFeatures(cost.features)},
+    {"model",llvm::json::Value(cost.model)},{"evaluation_target",llvm::json::Value(cost.target)},
+    {"charge_scope","whole-command prepared host arrays through returned output; includes transfer/runtime effects; never add separate DMA charges"}};
+}
+}
+
 bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
                                          const llvm::json::Value &config,
                                          GenericMappingPlan &p,
@@ -1726,16 +2018,21 @@ bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
   auto module = a.function->getParentOfType<mlir::ModuleOp>();
   if(!readNativeMappingChoice(module,p.choices,e)) return false;
   int64_t lanes = 1;
+  std::string requestedImplementation="scalar";
   if (auto implementation = module->getAttrOfType<StringAttr>("orbit.implementation")) {
     if (implementation.getValue() != "scalar" &&
-        implementation.getValue() != "independent-lane-f32")
+        implementation.getValue() != "independent-lane-f32" &&
+        implementation.getValue() != "scalar-product-vector-add-f32")
       return fail(e, "unsupported program implementation choice");
-    if (implementation.getValue() == "independent-lane-f32") {
+    requestedImplementation=implementation.getValue().str();
+    if (implementation.getValue() != "scalar") {
       auto attr = module->getAttrOfType<IntegerAttr>("orbit.vector_lanes");
       if (!attr || attr.getInt() < 2 || attr.getInt() > 16 ||
           (attr.getInt() & (attr.getInt() - 1)))
         return fail(e, "independent-lane-f32 requires power-of-two lanes in [2,16]");
       lanes = attr.getInt();
+      if(requestedImplementation=="scalar-product-vector-add-f32" && lanes!=4 && lanes!=8)
+        return fail(e,"scalar-product-vector-add-f32 requires lanes 4 or 8");
     }
   }
   for (size_t task = 0; task < a.tasks.size(); ++task) {
@@ -1749,14 +2046,20 @@ bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
     GenericTaskImplementation implementation;
     implementation.task = task;
     int64_t loop = lanes > 1 ? vectorLoop(a, a.tasks[task]) : -1;
+    if(loop>=0 && requestedImplementation=="scalar-product-vector-add-f32" && a.tasks[task].loops[loop].step!=1)loop=-1;
     if (loop >= 0) {
-      implementation.kind = "independent-lane-f32";
+      implementation.kind = requestedImplementation;
       implementation.parallelLoop = loop; implementation.lanes = lanes;
     }
     p.taskImplementations.push_back(std::move(implementation));
   }
+  if(requestedImplementation=="scalar-product-vector-add-f32" &&
+     !llvm::any_of(p.taskImplementations,[](const auto &impl){return impl.kind=="scalar-product-vector-add-f32";}))
+    return fail(e,"scalar-product-vector-add-f32 request has no vectorizable source task");
   auto object = config.getAsObject();
   auto cfg = object ? object->getObject("generic_air") : nullptr;
+  if(cfg && cfg->get("cost_model") && cfg->get("theoretical"))
+    return fail(e,"direct-AIR composite and legacy theoretical providers are mutually exclusive");
   if (cfg)
     if (auto capacity = cfg->getInteger("capacity_bytes"))
       p.capacityBytes = *capacity;
@@ -1857,6 +2160,14 @@ bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
     }
   if (!buildProgramCommunication(a,p,e))
     return false;
+  if(cfg && cfg->get("cost_model")) {
+    GenericCostFeatures features;
+    const auto *target=cfg->get("cost_target");llvm::json::Value unknownTarget=nullptr;
+    if(!collectGenericCostFeatures(a,p,features,e) ||
+       !evaluateGenericDirectAIRCost(features,*cfg->get("cost_model"),target?*target:unknownTarget,p.directCost,e))return false;
+    p.hasCost=p.directCost.valueMs.has_value();p.estimatedMs=p.directCost.valueMs.value_or(0);
+    p.costProvenance=directCostProvenance(p.directCost);
+  }
   if (!checkGenericMapping(a, p, e))
     return false;
   p.planId = staticFingerprint(serializeGenericMapping(a, p));
@@ -2244,7 +2555,7 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
         stagingCopyBytes += transfer.bytes;
     }
   }
-  return llvm::json::Object{
+  llvm::json::Object report{
       {"schema", "orbit.generic.mapping.v1"},
       {"logical_boundary_bytes", logicalBytes},
       {"logical_scalar_reads", accessCountsValid
@@ -2335,6 +2646,12 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
       {"backend_internal_transport",
        "AIR compiler may add shim/L2 staging; final IR ledger required; not "
        "measured traffic"}};
+  if(p.directCost.enabled) {
+    report["direct_air_cost"]=directCostReport(p.directCost);
+    report["cost_status"]=p.directCost.status;
+    report["theoretical_coefficients"]=nullptr;
+  }
+  return report;
 }
 bool orbit::taskflow::importNativeInterface(mlir::ModuleOp module,
                                             const Program &program,
@@ -2389,11 +2706,12 @@ llvm::json::Value orbit::taskflow::evaluateGenericMLIR(
       !planGenericMapping(a, cfg, p, e))
     return llvm::json::Object{{"status", "unsupported"}, {"reason", e}};
   if (llvm::any_of(p.taskImplementations, [](const auto &implementation) {
-        return implementation.kind == "independent-lane-f32";
+        return implementation.kind == "independent-lane-f32" ||
+            (implementation.kind=="scalar-product-vector-add-f32" && implementation.lanes!=8);
       }))
     return llvm::json::Object{
         {"status","unsupported"},
-        {"reason","installed Peano target cannot select strict FP32 vector multiply; independent-lane-f32 source proof is not an executable target capability"},
+        {"reason","installed AIR target requires mixed f32 eight-lane realization; strict vector multiply and four-lane mixed legalization are unavailable"},
         {"analysis",serializeGenericAnalysis(a)},
         {"best_plan",serializeGenericMapping(a,p)}};
   return llvm::json::Object{{"status", p.hasCost ? "passed" : "uncalibrated"},

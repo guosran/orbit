@@ -54,6 +54,7 @@ def main():
     checker('taskflow-program-mapping-test', fixtures / 'gemm.mlir')
     checker('taskflow-program-partition-test')
     checker('taskflow-data-organization-test')
+    checker('taskflow-direct-air-cost-test', CORE_ROOT / 'test/TaskflowGeneric/add.mlir')
     python('static-mapping', 'TaskflowMapping/cpp_differential.py')
     python('static-regions', 'TaskflowMapping/regions.py')
     python('search-preferences', 'TaskflowMapping/search_preferences.py')
@@ -73,6 +74,8 @@ def main():
         python('air-joint-data-search', 'TaskflowAIR/joint_data_search_v8.py', air, '--air')
         python('air-unsupported', 'TaskflowGeneric/unsupported_v6.py', air)
         python('air-pool-names', 'TaskflowGeneric/pool_names_v6.py', air)
+        python('air-mixed-f32', 'TaskflowAIR/mixed_f32_v9.py', air, '--air-opt', args.air_opt)
+        python('air-stream-capacity', 'TaskflowAIR/stream_capacity_v9.py', air)
         def shaped_source(template, m, k, n):
             import re
             text = (fixtures / template).read_text()

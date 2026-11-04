@@ -37,3 +37,15 @@ Core implementation, source semantics, mapping/search/checkers, backend lowering
 Historic raw results, frozen tools and modified v8 source snapshots were physically moved under the companion's ignored local storage. Compatibility aliases preserve old absolute references; original manifests and measurements retain their bytes. Reproduce into fresh directories rather than rebuilding historical CMake caches. New evidence and code-generation tests verify the separation.
 
 Queued next: evidence-first full FP32 FFN profiling. Decompose the original M128/16×M8 timeline, explain the N16 residency comparison, inspect current executed ELF/helper paths, perform controlled stage/full-graph measurements, then choose one or two supported optimizations and validate a frozen direct-AIR model on held-out candidates. Keep CGRA ML unchanged and preserve artifact/compiler versions. The main agent coordinates NPU use; current queued work starts with read-only evidence analysis while repository separation is validated.
+
+## 阶段进展：整程序 profiling 与联合搜索反馈 v9
+
+已完成原 M128 时间审计、完整 D2048/I11008 的 M1/M5/M8 分阶段与完整图实测、N16 驻留交错对照和实际执行 ELF 热点检查。原581.6秒由16次约36.35秒完整M8调用构成，记录的wait占完整wall约99.986%；三个同core串行GEMM解释主要时间，wait内计算/搬运/停顿仍为组合项。N16计划搬运减少44.4%未产生可证明加速，2/5个设备stage均仍是一次host提交，不能将静态字节量或额外stage直接当成实测DDR或已隔离配置成本。
+
+公共候选新增可执行的 `scalar-product-vector-add-f32`、lanes8 实现选择，与原 tiling、只读副本驻留和两轮 native 搜索组合。实际body保持FP32产品、每输出K顺序和原1e-5 finite契约；initializer/math明确保留scalar。M1/M5/M8完整图三seed通过，交错热中位延迟下降7.37%/7.89%/6.83%。新版完整M128单seed profiling通过，541.8698秒、最大绝对误差2.14e-8；原版三seed长验收独立保留，没有冒称新版三seed。实际full M8两版分别绑定ELF43cf…/9ce0…，payload20480B、计划搬运306176000B均未增加或改变。
+
+生产C++新增 native cost features、有限域 composite prediction 和 execution-fingerprint 精确实测反馈；原CGRA ML未重训。冻结scalar模型M3完整图留出误差0.474%，17×80尾块低估29–44%，原结果未改；新增逐source配置守卫，未标定/不匹配候选返回null。原搜索对N32两种驻留×两种实现进行真实四候选比较，完整144输出通过；原理论不能区分实现，实测反馈选择mixed8→Bpanel。原13合法proposal中4实测、7原生null、2未再访问，父链、checkpoint、缓存/模型/目标身份均有证据，不将静态重验当额外硬件执行。
+
+已修复vector lowering前后循环遍历轴不一致，保留r2 timeout/错误AIR；lane4目标支持不足明确拒绝。独立SSA/K/lane检查、非整除K及超容量generic add→scale真实执行通过。另保留四input多phase后端stream次序失败并用窄目标能力守卫拒绝；未声称通用四stream修复。Core/Amoeba/搜索/AIR31组、C++成本47项、真实CGRA模型8合约及相关checkpoint/fitter/编排检查通过，独立Core不链接AIR/AIE/XRT/Neura。
+
+报告与复现位于伴随仓库 [FFN profiling v9](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-ffn-profiling-v9.md)。源码仍以整个program的结构、资源、调度和数据组织候选为中心；此次NPU实现/驻留实验为公共搜索提供可执行策略、适用域和完整command成本反馈。没有全FFN设备trace、硬件DDR计数或任意多core预测；single-core trace仅用于其有界窗口。复现入口支持新目录的CPU、训练/冻结/留出及优化分阶段；原始大产物继续保存在伴随仓库的本机ignored results/builds，reviewable证据单独发布。

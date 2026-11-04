@@ -6,10 +6,15 @@
 #include <string>
 namespace mlir {
 class Pass;
+class MLIRContext;
 }
 namespace orbit::taskflow {
 std::unique_ptr<mlir::Pass> createTaskflowToAIRPass();
 void registerTaskflowToAIRPass();
+// Call before parsing generic AIR containing symbol references. Loads a
+// namespace-only facade when real AIR is not registered; installed AIR still
+// owns AIR operation verification. It does not mutate source IR.
+void prepareGenericAIRContext(mlir::MLIRContext &);
 struct GenericAnalysis;
 struct GenericMappingPlan;
 bool checkGenericAIRMapping(const GenericAnalysis &, const GenericMappingPlan &,

@@ -218,7 +218,7 @@ j::Value orbit::taskflow::evaluatePartitionedGenericMLIR(ModuleOp module,
      !planProgramPartition(a,chunk.getInt(),p,e))
     return j::Object{{"status","unsupported"},{"reason",e}};
   auto manifest=serializeProgramPartition(a,p);auto &root=*manifest.getAsObject();
-  double total=0;bool calibrated=true;int64_t transfers=0,peak=0,hostPeak=0;
+  double total=0;bool calibrated=true;bool compositeChildCost=false;int64_t transfers=0,peak=0,hostPeak=0;
   j::Array templatePlans,templateMemories;
   std::set<std::string> accountedTemplates;
   std::string mappingIdentity="orbit.program.mapping.v1:"+p.planId;
@@ -233,7 +233,7 @@ j::Value orbit::taskflow::evaluatePartitionedGenericMLIR(ModuleOp module,
       return j::Object{{"status","unsupported"},{"reason",e}};
     }
     auto report=serializeGenericMapping(facts,mapping);
-    if(llvm::any_of(mapping.taskImplementations,[](const auto &impl){return impl.kind=="independent-lane-f32";}))
+    if(llvm::any_of(mapping.taskImplementations,[](const auto &impl){return impl.kind=="independent-lane-f32" || (impl.kind=="scalar-product-vector-add-f32" && impl.lanes!=8);}))
       return j::Object{{"status","unsupported"},{"reason","installed strict FP32 vector implementation unavailable"}};
     int64_t count=0;for(auto &inv:*root.getArray("invocations"))
       count+=inv.getAsObject()->getString("template_id")==t.getAsObject()->getString("id");
@@ -255,6 +255,7 @@ j::Value orbit::taskflow::evaluatePartitionedGenericMLIR(ModuleOp module,
       {"system_memory_peak_bytes",*templateHost},{"invocation_count",count},
       {"lifetime","one retained template runner and its BOs through the complete seed/program execution; repeated invocations reuse these allocations"}});
     auto cost=object->getNumber("estimated_ms");calibrated&=bool(cost);
+    compositeChildCost |= mapping.directCost.enabled;
     auto childTransfers=object->getInteger("actual_dma_bytes");
     if(!childTransfers || !accumulateProgramPartitionMetrics(*childTransfers,count,
         cost.value_or(0),transfers,total,e))
@@ -268,7 +269,12 @@ j::Value orbit::taskflow::evaluatePartitionedGenericMLIR(ModuleOp module,
   root["partition_witness_id"]=p.planId;
   root["plan_id"]=hash(mappingIdentity);
   root["identity_scope"]="partition witness plus each unique template extent, invocation count and checked child mapping plan ID";
-  root["estimated_ms"]=calibrated?j::Value(total):j::Value(nullptr);
+  root["estimated_ms"]=(calibrated && !compositeChildCost)?j::Value(total):j::Value(nullptr);
+  if(compositeChildCost) {
+    root["template_execution_estimated_ms"]=calibrated?j::Value(total):j::Value(nullptr);
+    root["cost_status"]="uncalibrated-complete-program-host-boundary";
+    root["complete_program_missing_costs"]="partition slicing, assembly and invocation control are not calibrated by the prepared single-command provider";
+  }
   root["actual_dma_bytes"]=transfers;root["resident_bytes"]=peak;
   root["system_memory_peak_bytes"]=hostPeak;
   root["template_system_memories"]=std::move(templateMemories);

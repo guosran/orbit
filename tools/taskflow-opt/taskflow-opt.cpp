@@ -73,7 +73,7 @@ static cl::opt<std::string> residency("residency",
     dataOrganization("data-organization",
     cl::desc("Public data organization: phase-local or retain-across-users")),
     implementation("implementation",
-    cl::desc("Explicit target implementation: scalar or independent-lane-f32"));
+    cl::desc("Explicit target implementation: scalar, independent-lane-f32, or scalar-product-vector-add-f32 (installed AIR: 8 lanes)"));
 static cl::opt<int64_t> residentStorage("resident-storage", cl::init(-1)),
     reuseLoop("reuse-loop", cl::init(-1)), panelLoop("panel-loop", cl::init(-1)),
     vectorLanes("vector-lanes", cl::init(1));
@@ -93,8 +93,10 @@ int main(int argc, char **argv) {
   registry.insert<mlir::vector::VectorDialect>();
   context.appendDialectRegistry(registry);
   if (lowerAIR || !lowerProgram.empty() || airPassPipeline || !checkAIR.empty() ||
-      !legalizeAIRChannels.empty() || !checkAIRChannels.empty())
+      !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
     context.allowUnregisteredDialects();
+    prepareGenericAIRContext(context);
+  }
 #endif
   auto bytes = llvm::MemoryBuffer::getFile(input);
   if (!bytes) {

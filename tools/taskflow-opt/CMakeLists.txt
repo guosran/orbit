@@ -30,3 +30,7 @@ target_link_libraries(taskflow-program-partition-test PRIVATE MLIRTaskflowStruct
 add_executable(taskflow-data-organization-test EXCLUDE_FROM_ALL
   ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/data-organization.cpp)
 target_link_libraries(taskflow-data-organization-test PRIVATE MLIRTaskflowStructured)
+
+add_executable(taskflow-direct-air-cost-test EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/direct-air-cost.cpp)
+target_link_libraries(taskflow-direct-air-cost-test PRIVATE MLIRTaskflowStructured)

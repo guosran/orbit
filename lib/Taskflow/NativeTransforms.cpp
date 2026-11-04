@@ -163,9 +163,11 @@ bool orbit::taskflow::normalizeNativeMappingChoice(ModuleOp module,
 
 bool orbit::taskflow::setNativeImplementation(ModuleOp module,
     const std::string &kind, int64_t lanes, std::string &error) {
-  if ((kind != "scalar" && kind != "independent-lane-f32") || lanes < 1 ||
-      (kind == "scalar" && lanes != 1)) {
-    error = "implementation requires scalar/1 or independent-lane-f32/positive lanes";
+  if ((kind != "scalar" && kind != "independent-lane-f32" &&
+       kind != "scalar-product-vector-add-f32") || lanes < 1 ||
+      (kind == "scalar" && lanes != 1) ||
+      (kind == "scalar-product-vector-add-f32" && lanes != 4 && lanes != 8)) {
+    error = "implementation requires scalar/1, independent-lane-f32/positive lanes, or scalar-product-vector-add-f32/four-or-eight lanes";
     return false;
   }
   Builder b(module.getContext());

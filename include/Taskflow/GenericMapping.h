@@ -72,6 +72,21 @@ struct GenericAIRChannelAllocation {
   std::string logicalFifo;
   int64_t transferCount = 0, bytes = 0;
 };
+// Optional direct-AIR cost facts and provider. These do not alter compute
+// semantics or the existing CGRA model. Operation keys are "name:dtype".
+struct GenericCostFeatures {
+  // Hash of the complete checked execution plan with all price metadata removed.
+  std::string executionFingerprint;
+  std::map<std::string,int64_t> values, operations;
+  std::vector<std::string> sourceFingerprints, implementations;
+};
+struct GenericDirectAIRCost {
+  bool enabled = false;
+  GenericCostFeatures features;
+  llvm::json::Value model = nullptr, target = nullptr;
+  std::string status = "disabled", reason, modelDigest, featureDigest;
+  std::optional<double> valueMs;
+};
 struct GenericMappingPlan {
   std::string strategy = "single-herd-resident", bodyFingerprint, planId;
   int64_t capacityBytes = 24576, residentBytes = 0;
@@ -92,6 +107,7 @@ struct GenericMappingPlan {
       "single-logical-fifo-per-stage-storage-direction";
   // Requested maximum iterations per loop; empty means automatic sizing.
   std::vector<int64_t> tileSizes;
+  GenericDirectAIRCost directCost;
   bool hasCost = false;
   double estimatedMs = 0;
   double theoreticalLaunchMs = 0, theoreticalPerOperationMs = 0,
@@ -105,6 +121,14 @@ bool checkGenericMapping(const GenericAnalysis &, const GenericMappingPlan &,
                          std::string &error);
 llvm::json::Value serializeGenericMapping(const GenericAnalysis &,
                                           const GenericMappingPlan &);
+// Native facts only; no fitting and no target queries. Full-call composite
+// estimates must never be added to separately charged compute/link estimates.
+bool collectGenericCostFeatures(const GenericAnalysis &, const GenericMappingPlan &,
+                                GenericCostFeatures &, std::string &error);
+llvm::json::Value serializeGenericCostFeatures(const GenericCostFeatures &);
+bool evaluateGenericDirectAIRCost(const GenericCostFeatures &,
+    const llvm::json::Value &model, const llvm::json::Value &target,
+    GenericDirectAIRCost &, std::string &error);
 // Native adapters for the shared version/copy model; no operator recognition.
 bool deriveGenericPhaseRegions(const GenericAnalysis &, GenericTilePhase &,
                                int64_t &bytes, std::string &error);
