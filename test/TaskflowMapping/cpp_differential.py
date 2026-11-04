@@ -9,9 +9,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 
 ROOT=Path(__file__).resolve().parents[2]
-sys.path.insert(0,str(ROOT/'python'))
 
 
 def fingerprint(obj):
@@ -45,7 +48,7 @@ def run(command,log):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--tool',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--tool',type=Path,default=taskflow_tool('core'));parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
     tool=args.tool.resolve();out=args.output.resolve()
     if out.exists():raise ValueError('use a new evidence directory')
     out.mkdir(parents=True)

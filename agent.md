@@ -10,7 +10,7 @@
 
 已确认 M128 原单命令路径遭遇约60秒驱动 watchdog；独立阶段和 M 扩展诊断支持标量工作量过大的解释。完整 M16 通过两次 M8 程序命令在72.74秒得到正确输出。M128 三 seed 完整长验收现已全部通过：各完整 Y[128,2048] 由16次完整M8 NPU命令产生，约581.6秒/seed，原FP32容差未变。分块/驻留搜索已有8合法候选及1容量拒绝，readonly-panel 的实际 DMA 缺生产者问题已修复并通过小型完整程序真实执行。
 
-最终状态、失败证据、测量边界与复现以 [本机 v7 报告](build/direct-air-v7/RESULTS.md) 为准；统一新目录入口是 [run_taskflow_program_mapping_v7.sh](scripts/run_taskflow_program_mapping_v7.sh)。独立审计边界见 [mapping review](docs/taskflow-program-mapping-review-v7.md)。
+最终状态、失败证据、测量边界与复现以 [本机 v7 报告](build/direct-air-v7/RESULTS.md) 为准；统一新目录入口是 [run_taskflow_program_mapping_v7.sh](https://github.com/guosran/orbit-artifact/blob/main/taskflow/scripts/run_taskflow_program_mapping_v7.sh)。独立审计边界见 [mapping review](docs/taskflow-program-mapping-review-v7.md)。
 
 ## 原 v7 冻结收尾（2026-11-04）
 
@@ -25,6 +25,15 @@
 
 新版本两个驻留候选在NPU上3seed共30完整输出通过；计划DMA由221184B降至122880B，热中位数18.658558/18.650719ms，差异不足以宣称加速。新M5完整FFN15输出通过；原M128完整FFN3seed长验收已全部通过，约581.6秒/完整program，原包/工具/ELF分别绑定。最后checker-only保护经完整CPU复跑，5候选与M5生成的语义产物逐字节等于已上机包，未将等价检查冒称额外NPU执行。
 
-设计和范围见 `docs/taskflow-data-organization-v8.md`；验收、计时/模型边界和复现见 `docs/taskflow-data-organization-v8-validation.md`。入口 `scripts/run_taskflow_data_organization_v8.sh cpu|all NEW_DIRECTORY`。隔离构建和全部原始证据位于 `/home/shiran/project/orbit-data-v8/build/data-organization-v8`，旧v6/v7证据保持原状。有限whole-task共享方案先在CPU合成目标验证，AIR保留仍限单execution group内已证明的只读panel；任意跨stage SRAM共享、自动异构放置、Exact/profile公共provider仍是后续扩展。
+设计和范围见 `docs/taskflow-data-organization-v8.md`；验收、计时/模型边界和复现见 `docs/taskflow-data-organization-v8-validation.md`。入口 `../orbit-artifact/taskflow/scripts/run_taskflow_data_organization_v8.sh cpu|all NEW_DIRECTORY`。隔离构建和全部原始证据位于 `/home/shiran/project/orbit-data-v8/build/data-organization-v8`，旧v6/v7证据保持原状。有限whole-task共享方案先在CPU合成目标验证，AIR保留仍限单execution group内已证明的只读panel；任意跨stage SRAM共享、自动异构放置、Exact/profile公共provider仍是后续扩展。
 
 用户已授权验收完成后提交并push；提交范围为相关源码、测试和文档，生成产物继续本地保留。
+
+
+## Repository separation and queued FFN profiling
+
+Core implementation, source semantics, mapping/search/checkers, backend lowering and compiler-only regression fixtures remain in this repository. Experiment orchestration, numerical input/reference generation, hardware execution/audits, model regression and validation reports now live in the sibling `guosran/orbit-artifact` repository under `taskflow/`. New build/output defaults are `orbit-artifact/builds/taskflow/{core,air,amoeba}` and `orbit-artifact/results/taskflow`; shared helpers accept ORBIT_SRC, ORBIT_BUILD_ROOT and ORBIT_RESULTS_ROOT. Core-only tests use standard-library test/Support and do not import artifact runtime code. See `docs/repository-layout.md` and `scripts/build-core.sh`.
+
+Historic raw results, frozen tools and modified v8 source snapshots were physically moved under the companion's ignored local storage. Compatibility aliases preserve old absolute references; original manifests and measurements retain their bytes. Reproduce into fresh directories rather than rebuilding historical CMake caches. New evidence and code-generation tests verify the separation.
+
+Queued next: evidence-first full FP32 FFN profiling. Decompose the original M128/16×M8 timeline, explain the N16 residency comparison, inspect current executed ELF/helper paths, perform controlled stage/full-graph measurements, then choose one or two supported optimizations and validate a frozen direct-AIR model on held-out candidates. Keep CGRA ML unchanged and preserve artifact/compiler versions. The main agent coordinates NPU use; current queued work starts with read-only evidence analysis while repository separation is validated.

@@ -81,7 +81,7 @@ From a clean shell, using new output directories:
 
 ```bash
 cd /home/shiran/project/orbit
-bash scripts/run_taskflow_static_cpp.sh "$PWD/build/repro-static-v4"
+bash ../orbit-artifact/taskflow/scripts/run_taskflow_static_cpp.sh "$PWD/build/repro-static-v4"
 /home/shiran/project/aie-toy/.venv/bin/python test/TaskflowMapping/regions.py \
   --output build/repro-regions-v4
 python3 test/TaskflowMapping/calibrated_original_search_v4.py \
@@ -90,8 +90,8 @@ python3 test/TaskflowMapping/calibrated_original_search_v4.py \
 
 The measured search command uses retained frozen calibration assets. Their
 reconstruction and hardware replay commands are in
-[calibration and execution](taskflow-region-calibration-v4.md).
-[Trace documentation](taskflow-trace-v4.md) describes the separately checked
+[calibration and execution](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-region-calibration-v4.md).
+[Trace documentation](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-trace-v4.md) describes the separately checked
 hardware-event evidence. The complete local result index is
 `build/static-mapping-v4/COMPLETED-RESULTS.md`.
 

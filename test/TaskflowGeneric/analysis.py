@@ -4,12 +4,17 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--tool', type=Path, default=ROOT/'build-core/tools/taskflow-opt/taskflow-opt')
+    ap.add_argument('--tool', type=Path, default=taskflow_tool('core'))
     ap.add_argument('--output', type=Path, required=True)
     args = ap.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)

@@ -1,6 +1,6 @@
 # 静态异构 mapping、通信与执行证据
 
-> 历史 v3 说明：Python 规划器/检查器现已退出活动代码，旧差分仅为历史证据。默认生产与检查均为 C++/MLIR；复现入口为 `bash scripts/run_taskflow_static_cpp.sh NEW_OUTPUT_DIRECTORY`。v5 审计保留了退出前代码快照和全部旧结果。
+> 历史 v3 说明：Python 规划器/检查器现已退出活动代码，旧差分仅为历史证据。默认生产与检查均为 C++/MLIR；复现入口为 `bash ../orbit-artifact/taskflow/scripts/run_taskflow_static_cpp.sh NEW_OUTPUT_DIRECTORY`。v5 审计保留了退出前代码快照和全部旧结果。
 
 
 本轮静态结果在 `build/static-mapping-v3/STATIC-RESULTS.md`，完整计划与搜索索引
@@ -67,14 +67,14 @@ partial 必须显式映射到支持累加的 CPU 实现。不存在 NPU ReLU/Swi
 22项合成正例、28项重新签名的非法计划负例通过；两任务小图还与独立穷举
 解析 oracle 比对。原 Core、Amoeba35项、搜索协议16项和缓存6项回归通过。
 新静态搜索接入11项、目标推荐粒度4项通过。详见
-[静态验证](taskflow-static-validation.md)。
+[静态验证](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-static-validation.md)。
 
 以下完整静态入口已经从 shell 执行成功，重建、测试、四工作负载、两轮搜索、
 缓存/恢复测试和报告都包含在内。输出目录必须不存在。
 
 ```bash
 cd /home/shiran/project/orbit
-bash scripts/run_taskflow_static_v3.sh "$PWD/build/my-static-v3-run"
+bash ../orbit-artifact/taskflow/scripts/run_taskflow_static_v3.sh "$PWD/build/my-static-v3-run"
 ```
 
 若只重审已有结果，不访问设备：
@@ -82,7 +82,7 @@ bash scripts/run_taskflow_static_v3.sh "$PWD/build/my-static-v3-run"
 ```bash
 source /home/shiran/project/aie-toy/scripts/env.sh
 cd /home/shiran/project/orbit
-python scripts/taskflow_static_report.py --output build/static-mapping-v3
+python ../orbit-artifact/taskflow/scripts/taskflow_static_report.py --output build/static-mapping-v3
 ```
 
 硬件追加入口均复用已安装工具链和现有执行器。脚本自行持 `/tmp/npu.lock`，
@@ -91,9 +91,9 @@ python scripts/taskflow_static_report.py --output build/static-mapping-v3
 ```bash
 source /home/shiran/project/aie-toy/scripts/env.sh
 cd /home/shiran/project/orbit
-python scripts/taskflow_aie_trace_minimal_v3.py --output-dir /tmp/orbit-minimal-trace-new
-python scripts/taskflow_npu_trace_v3.py --case all --iterations 7 --output-dir /tmp/orbit-graph-trace-new
-python scripts/taskflow_npu_chain_v3.py --case all --iterations 7 --output-dir /tmp/orbit-chain-new
+python ../orbit-artifact/taskflow/scripts/taskflow_aie_trace_minimal_v3.py --output-dir /tmp/orbit-minimal-trace-new
+python ../orbit-artifact/taskflow/scripts/taskflow_npu_trace_v3.py --case all --iterations 7 --output-dir /tmp/orbit-graph-trace-new
+python ../orbit-artifact/taskflow/scripts/taskflow_npu_chain_v3.py --case all --iterations 7 --output-dir /tmp/orbit-chain-new
 ```
 
 ORBIT trace 命令读取本机上一轮保存的原始 AIR 与输入，以同一 source 编译
@@ -103,8 +103,8 @@ trace-off/on；它不等于执行静态规划器输出的任意映射。原始tr
 完整性无法证明的trace一律标partial，不能把stall区间相加或把端口活动称DDR流量。
 
 NPUChain 对照、精度、失败尝试和计时边界见
-[chain说明](taskflow-chain-v3.md)，独立硬件证据检查见
-[硬件审计](taskflow-hardware-evidence-validation.md)。
+[chain说明](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-chain-v3.md)，独立硬件证据检查见
+[硬件审计](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-hardware-evidence-validation.md)。
 
 当前限制还包括：全图保守分配可能拒绝可通过复杂复用实现的方案；有界放置
 与list scheduling不保证全局最优；仅同dtype布局转换，dtype转换、别名、动态形状、

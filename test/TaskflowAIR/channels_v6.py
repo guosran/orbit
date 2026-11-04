@@ -2,7 +2,12 @@
 """Check native physical-port legalization after trusted installed conversion."""
 import argparse,json,re,subprocess
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,required=True);p.add_argument('--air-opt',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool, air_opt
+
+p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,default=taskflow_tool('air'));p.add_argument('--air-opt',type=Path,default=air_opt());p.add_argument('--output',type=Path,required=True);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
 root=Path(__file__).resolve().parents[2]
 source=a.output/'source.mlir';source.write_text((root/'test/TaskflowAIR/fixtures/gemm.mlir').read_text().replace('4x8xf32','4x4xf32').replace('8x4xf32','4x4xf32').replace('0 to 8','0 to 4'))
 config=a.output/'target.json';config.write_text(json.dumps({'generic_air':{'tile_sizes':[3,3,3]}}))

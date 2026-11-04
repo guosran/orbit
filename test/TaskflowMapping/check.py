@@ -7,7 +7,10 @@ import json
 from pathlib import Path
 import sys
 import hashlib
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'python'))
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 # The native regression harness injects the C++ tool adapters.
 def map_program(*args):
     raise RuntimeError('Run cpp_differential.py with --tool and --output')
@@ -175,5 +178,5 @@ def main():
 if __name__=='__main__':
     from cpp_differential import main as native_main
     if '--tool' not in sys.argv:
-        sys.argv += ['--tool', str(Path(__file__).resolve().parents[2]/'build-core/tools/taskflow-opt/taskflow-opt')]
+        sys.argv += ['--tool', str(taskflow_tool('core'))]
     native_main()

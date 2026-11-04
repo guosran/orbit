@@ -5,11 +5,16 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tool', type=Path, required=True)
+    parser.add_argument('--tool', type=Path, default=taskflow_tool('core'))
     args = parser.parse_args()
     tool = str(args.tool.resolve())
     with tempfile.TemporaryDirectory(prefix='orbit-core-') as directory:

@@ -74,7 +74,7 @@ operation arith.constant`。随后补齐原完整 preparation pipeline，通过 
 
 ## 干净 shell 复现
 
-先按 [公共后端说明](taskflow-backends.md) 构建独立 core 并生成 manifest。
+先按 [公共后端说明](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-backends.md) 构建独立 core 并生成 manifest。
 LLVM 必须为 `6146a88f60492b520a36f8f8f3231e15f3cc6082`。此机器 LLVM 的
 C++ 标准库 ABI 对应 `/home/shiran/bin/g++`（GCC 15.2）；应使用同一编译器。
 
@@ -96,7 +96,7 @@ ninja -C "$LLVM_BUILD" not
 "$LLVM_BUILD/bin/llvm-lit" -sv -j2 build-amoeba/test
 python3 -m venv build-amoeba/.venv
 build-amoeba/.venv/bin/pip install numpy==2.5.4
-build-amoeba/.venv/bin/python scripts/taskflow_amoeba.py \
+build-amoeba/.venv/bin/python ../orbit-artifact/taskflow/scripts/taskflow_amoeba.py \
   --plan build/backend-decoupling/gemm/base/plan.json \
   --mlir build/backend-decoupling/gemm/base/candidate.mlir \
   --source-plan build/backend-decoupling/gemm/source.json \

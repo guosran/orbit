@@ -1,42 +1,55 @@
 # ORBIT
 
-The working tree also includes an independently buildable structured Taskflow
-core and shared-candidate Amoeba/NPU adapters. See
-[implementation, measured results and clean-shell reproduction](docs/taskflow-backends.md).
-The next iteration connects common actions to the original search and measures
-persistent NPU buffers on full-size FFNs; see
-[search integration, evidence and reproduction](docs/taskflow-search-npu-v2.md).
-Static heterogeneous placement, region-based communication, independent plan
-checking and hardware trace/chain evidence are documented in
-[static mapping and reproducible validation](docs/taskflow-static-mapping.md).
-This restricted static subset preserves the existing Neura search and cost
-model; NPU measurements use a separate target plan and millisecond feedback.
+ORBIT is a C++/MLIR framework for joint optimization of an entire program's task graph and execution plan. Search combines structural transformations, resource configuration, temporal scheduling and data organization. Amoeba/Neura and direct AIR/NPU backends provide target constraints, implementation choices and cost feedback.
 
-ORBIT is a source-owned C++ MLIR compiler workflow for joint task graph rewriting and CGRA orchestration. It builds on AMOEBA and Neura. The companion [orbit-artifact repository](https://github.com/guosran/orbit-artifact) provides the six-program fixed input-0 cumulative ablation, exact experiment inputs and costs, numerical reference code, and reproduction instructions.
+This repository contains the compiler and its correctness tests. The companion [orbit-artifact repository](https://github.com/guosran/orbit-artifact) contains experimental workloads, models, execution/measurement tools, results and reproduction instructions, including the [Taskflow/AIR experiments](https://github.com/guosran/orbit-artifact/tree/main/taskflow).
 
-This source snapshot includes complete source-iteration-domain capture and partition verification for the corrected input-0 experiments. The required Neura compiler is vendored, including the local fixes used by the experiments. The model weights are included in the companion artifact and evaluated by ORBIT C++. Their upstream origins and revisions are listed in `UPSTREAM_PROVENANCE.json`; the vendored source retains its upstream notices.
+## Repository boundary
 
-The `search-joint-neighborhood` MLIR pass owns complete-program local actions, materialization, legality, canonical deduplication, beam/archive state, production scheduling with explicit communication, checkpoint recovery, and global predicted top five selection. The artifact Python tools launch and validate those C++ results.
+| ORBIT compiler | Companion artifact |
+|---|---|
+| `include/`, `lib/`, `tools/`: dialects, analysis, transformations, mapping, checkers, search and backends | `taskflow/scripts/`, `taskflow/python/`: fixture generation, execution, measurement and reporting |
+| `test/`: compiler semantics, plan legality, search recovery and small code-generation fixtures | `taskflow/test/`: hardware audits and experiment/model checks |
+| `docs/`: compiler interfaces, supported semantics and design | `taskflow/docs/`: validation reports, timing boundaries and reproduction |
+| Vendored Neura compiler source and upstream notices | `reference/`, `config/`, `diagnostics/`: model bundles and historical experiment material |
 
-The paper-aligned experiment uses the AMOEBA-Test 4×4 CGRA fabric with 2×2 PEs per CGRA and the `orbit-2x2-predictor` four-member direct model. Physical mapper shapes are derived from the architecture's per-CGRA dimensions. The legacy 4×4-PE model remains a separate schema and namespace. The new model's candidate-only status and explicit out-of-domain queries are preserved.
+Builds, generated IR, raw arrays, logs and full hardware archives live outside the compiler checkout. See [the layout and migration contract](docs/repository-layout.md). Historical result files retain their exact bytes and original version identities.
 
-For original Ray, every permitted Task_13 shape has an II lower bound above the new model ceiling. The artifact reports that program as out of model domain in the main table and runs source-owned fission as a separate supplement. Communication is supplied through an exact-bound `--joint-inter-task-network-spec` file so the original physical architecture YAML remains unchanged.
+## Independent Core build and tests
 
-## Build
-
-Use LLVM/MLIR revision `6146a88f60492b520a36f8f8f3231e15f3cc6082`, built with MLIR, RTTI and MLIR Python bindings enabled. The CMake configuration also needs Python, NumPy, pybind11 and nanobind. The companion artifact's [build instructions](https://github.com/guosran/orbit-artifact/blob/main/docs/INPUT0_NEIGHBORHOOD_REPRODUCIBILITY.md) include the LLVM configuration and runner tools.
+Use LLVM/MLIR revision `6146a88f60492b520a36f8f8f3231e15f3cc6082` or the compatible pinned installation described in the artifact's [build instructions](https://github.com/guosran/orbit-artifact/blob/main/docs/INPUT0_NEIGHBORHOOD_REPRODUCIBILITY.md). The build helper reuses the compiler recorded in that LLVM CMake cache.
 
 ```sh
-export ORBIT_SRC="$PWD"
-export LLVM_BUILD="${LLVM_BUILD:?set LLVM_BUILD to the pinned LLVM/MLIR build}"
-export ORBIT_BUILD="${ORBIT_BUILD:-$ORBIT_SRC/build}"
-python3 -m pip install numpy pybind11==3.0.1 nanobind==2.4.0
-cmake -S "$ORBIT_SRC" -B "$ORBIT_BUILD" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DMLIR_DIR="$LLVM_BUILD/lib/cmake/mlir" \
-  -DLLVM_DIR="$LLVM_BUILD/lib/cmake/llvm"
-ninja -C "$ORBIT_BUILD" tools/mlir-amoeba-opt/mlir-amoeba-opt -j1
-export ORBIT_OPTIMIZER="$ORBIT_BUILD/tools/mlir-amoeba-opt/mlir-amoeba-opt"
+export LLVM_BUILD=/path/to/llvm-project/build
+bash scripts/build-core.sh /path/outside/orbit/core-build
 ```
 
-Use the companion artifact's input-0 reproduction instructions to configure the model, costs, static input programs and native reference libraries. The official cumulative stages are shape with fixed dispatch, shape with critical-path dispatch, then replica, tiling and fusion. Results are budgeted best-found scheduler cycles with real mapper II, independent trace and numeric evidence; they do not claim exhaustive optimality or RTL measurements.
+This builds with `ORBIT_ENABLE_NEURA=OFF` and `ORBIT_ENABLE_AIR=OFF`, then runs the compiler-only suite with Python's standard library. It does not import the artifact runtime, NumPy, AIR, AIE or XRT. Without a build-directory argument, the default is `../orbit-artifact/builds/taskflow/core`; `ORBIT_BUILD_ROOT` overrides the parent containing `core/`, `air/` and `amoeba/`.
+
+To test an already built compiler:
+
+```sh
+python3 test/run_core_regressions.py \
+  --tool /path/to/core-build/tools/taskflow-opt/taskflow-opt \
+  --output /path/outside/orbit/NEW_TEST_OUTPUT
+```
+
+`--amoeba-tool` and `--air-tool` opt into their compiler/code-generation tests. Runtime experiments and real-model regression belong to the companion artifact.
+
+## Backends and experiments
+
+```sh
+# Keep the two source repositories beside each other.
+git clone https://github.com/guosran/orbit.git
+git clone https://github.com/guosran/orbit-artifact.git
+export ORBIT_SRC="$PWD/orbit"
+export ORBIT_BUILD_ROOT="$PWD/orbit-artifact/builds/taskflow"
+bash orbit-artifact/taskflow/scripts/run_taskflow_data_organization_v8.sh \
+  cpu "$PWD/orbit-artifact/results/taskflow/NEW_CPU_RUN"
+```
+
+The `all` mode also runs the documented NPU comparison and full M5 FFN regression. Output directories must be new. LLVM/AIR/AIE/XRT and model prerequisites, original M128 acceptance, numerical contracts and timing scopes are recorded in the [artifact validation report](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-data-organization-v8-validation.md).
+
+The original `search-joint-neighborhood` pass retains source-owned graph actions, legality, canonical deduplication, archive/beam state, production scheduling and checkpoint recovery. Common Taskflow analysis and mapping add regions, data versions, storage copies, lifetimes and transfers; direct AIR consumes the checked decisions. See [public data organization](docs/taskflow-data-organization-v8.md), [mapping](docs/taskflow-program-mapping.md), [AIR lowering](docs/taskflow-direct-air-lowering.md), and [the CGRA model boundary](docs/taskflow-cgra-model-boundary-v8.md).
+
+Model weights remain in the artifact and are evaluated by the existing C++ implementation. The legacy 4×4-PE and per-CGRA-2×2 models retain distinct contracts and namespaces. Upstream revisions and notices are recorded in [UPSTREAM_PROVENANCE.json](UPSTREAM_PROVENANCE.json).

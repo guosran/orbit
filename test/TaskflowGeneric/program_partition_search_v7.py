@@ -2,7 +2,12 @@
 """Exercise whole-program fission in the original native search, not a new tuner."""
 import argparse,json,subprocess,hashlib
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,required=True);p.add_argument('--source',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
+p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,default=taskflow_tool('air'));p.add_argument('--source',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
 out=a.output.resolve();out.mkdir(parents=True,exist_ok=False);tool=a.tool.resolve()
 config=out/'config.json';config.write_text(json.dumps({'generic_air':{'theoretical':{'launch_ms':.1,'per_scalar_operation_ms':1e-6,'per_transfer_byte_ms':1e-7}},'native_program_partition_candidates':[8,16],'native_implementation_candidates':[{'kind':'independent-lane-f32','lanes':8}]}))
 def run(name,args):

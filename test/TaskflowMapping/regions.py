@@ -2,15 +2,20 @@
 """Independent exact-cover oracle and re-signed opaque-plan adversarial checks."""
 import argparse,copy,json,subprocess,sys
 from pathlib import Path
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 ROOT=Path(__file__).resolve().parents[2]
-sys.path[:0]=[str(ROOT/'scripts'),str(Path(__file__).parent)]
-from taskflow_npu_chain_v3 import source
+sys.path[:0]=[str(ROOT/'test/Support'),str(Path(__file__).parent)]
+from structured_fixtures import chain_source as source
 from cpp_differential import native_fingerprint
 
 def save(p,x):p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(x,indent=2)+'\n')
 def main():
- ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True);args=ap.parse_args();out=args.output.resolve();out.mkdir(parents=True,exist_ok=False)
- tool=ROOT/'build-core/tools/taskflow-opt/taskflow-opt';program=source(4,4,8,4);save(out/'source.json',program)
+ ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True);ap.add_argument('--tool',type=Path,default=taskflow_tool());args=ap.parse_args();out=args.output.resolve();out.mkdir(parents=True,exist_ok=False)
+ tool=args.tool.resolve();program=source(4,4,8,4);save(out/'source.json',program)
  subprocess.run([str(tool),str(out/'source.json'),'--emit-mlir='+str(out/'source.mlir'),'--emit-plan='+str(out/'program.json')],check=True)
  program=json.loads((out/'program.json').read_text())
  def impl(name,pattern,mode,cost,axis='h'):

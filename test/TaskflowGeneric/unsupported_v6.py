@@ -4,10 +4,16 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 
 p = argparse.ArgumentParser()
-p.add_argument('--tool', type=Path, required=True)
+p.add_argument('--tool', type=Path, default=taskflow_tool('air'))
 p.add_argument('--output', type=Path, required=True)
+p.add_argument('--skip-air',action='store_true',help='run generic-only diagnostics without the AIR emitter')
 a = p.parse_args()
 a.output.mkdir(parents=True, exist_ok=False)
 root = Path(__file__).resolve().parents[2]
@@ -43,6 +49,7 @@ feedback = '''module {
 }
 '''
 cases['unvalidated_host_feedback'] = (feedback, ['--lower-to-air', '--tile-m=2', '--tile-n=1', '--tile-k=1'], 'read/write tile requires a proved local source initializer')
+if a.skip_air:cases.pop('unvalidated_host_feedback')
 checks = []
 for name, (source, flags, diagnostic) in cases.items():
     path = a.output / (name + '.mlir')

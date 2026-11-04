@@ -2,7 +2,12 @@
 """Verify copy-bound readonly panels, actual body cloning, and target limits."""
 import argparse,json,re,subprocess
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--tool',required=True,type=Path);p.add_argument('--air-opt',required=True,type=Path);p.add_argument('--output',required=True,type=Path);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool, air_opt
+
+p=argparse.ArgumentParser();p.add_argument('--tool',default=taskflow_tool('air'),type=Path);p.add_argument('--air-opt',default=air_opt(),type=Path);p.add_argument('--output',required=True,type=Path);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
 root=Path(__file__).resolve().parents[2];source=root/'test/TaskflowAIR/fixtures/gemm.mlir'
 def run(args,name,ok=True):
  r=subprocess.run(list(map(str,args)),capture_output=True,text=True)

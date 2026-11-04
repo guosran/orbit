@@ -96,10 +96,10 @@ physical buffer addresses/sizes and the 4096-byte stack reservation. Code,
 compiler routing resources and any later physical traffic remain separate
 verification boundaries.
 
-See [v6 evidence](taskflow-direct-air-v6-validation.md) for actual hardware
+See [v6 evidence](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-direct-air-v6-validation.md) for actual hardware
 statuses and retained failures. A successful plan or AIR verifier result alone
 does not establish device correctness. Reproduce in a fresh directory with
-`bash scripts/run_taskflow_tiled_air.sh cpu NEW_DIR` or `all NEW_DIR`.
+`bash ../orbit-artifact/taskflow/scripts/run_taskflow_tiled_air.sh cpu NEW_DIR` or `all NEW_DIR`.
 
 ### Original resident strategy
 
@@ -196,15 +196,15 @@ LLVM/MLIR installation as Core and `-DORBIT_ENABLE_AIR=ON`:
 
 ```bash
 cmake --build build-air --target taskflow-opt -j2
-mkdir -p build/direct-air-local
+mkdir -p ../orbit-artifact/results/taskflow/direct-air-local-NEW
 build-air/tools/taskflow-opt/taskflow-opt \
   test/TaskflowAIR/fixtures/add-scale.mlir --lower-to-air \
-  --analysis-output=build/direct-air-local/facts.json \
-  --mapping-output=build/direct-air-local/plan.json \
-  --air-output=build/direct-air-local/program.air.mlir
+  --analysis-output=../orbit-artifact/results/taskflow/direct-air-local-NEW/facts.json \
+  --mapping-output=../orbit-artifact/results/taskflow/direct-air-local-NEW/plan.json \
+  --air-output=../orbit-artifact/results/taskflow/direct-air-local-NEW/program.air.mlir
 source /home/shiran/project/aie-toy/scripts/env.sh
-air-opt build/direct-air-local/program.air.mlir --air-dependency \
-  -o build/direct-air-local/dependencies.air.mlir
+air-opt ../orbit-artifact/results/taskflow/direct-air-local-NEW/program.air.mlir --air-dependency \
+  -o ../orbit-artifact/results/taskflow/direct-air-local-NEW/dependencies.air.mlir
 ```
 
 The backend also provides an actual `taskflow-to-air` MLIR `OperationPass`;

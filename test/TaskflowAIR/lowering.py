@@ -2,7 +2,12 @@
 """Independent structural/negative AIR checks; no mapping decisions or hardware."""
 import argparse,json,re,subprocess
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--air-opt',type=Path,default=Path('/home/shiran/project/aie-toy/.venv/lib/python3.12/site-packages/mlir_air/bin/air-opt'));a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool, air_opt
+
+p=argparse.ArgumentParser();p.add_argument('--tool',type=Path,default=taskflow_tool('air'));p.add_argument('--output',type=Path,required=True);p.add_argument('--air-opt',type=Path,default=air_opt());a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
 root=Path(__file__).resolve().parents[2];fixture=root/'test/TaskflowAIR/fixtures/add-scale.mlir';checks=[]
 def run(args,ok=True):
  r=subprocess.run(list(map(str,args)),capture_output=True,text=True)

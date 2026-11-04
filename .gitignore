@@ -1,8 +1,8 @@
 # build output
-build/
-build-core/
-build-amoeba/
-build-air/
+/build
+/build-core
+/build-amoeba
+/build-air
 __pycache__/
 
 # intermediate output
@@ -28,9 +28,7 @@ lit.cfg
 
 # misc
 
-# Checked-in golden provenance for the existing CGRA compute contract test.
-!/test/TaskflowMapping/fixtures/compute-contract-baseline-v8.provenance.json
 
 # Local AIR/XRT tool output (preserve on disk, omit from source commits).
-/air_project/
+/air_project
 /params.txt

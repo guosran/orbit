@@ -28,7 +28,7 @@ configuration. Hardware cost measurements use milliseconds and never overwrite
 Neura II/cycle estimates. CPU diagnostic interpretation is labeled CPU; only
 successful XRT execution plus numerical verification is device success.
 
-The independent oracle in `scripts/taskflow_common.py` computes whole-matrix
+The independent oracle in `../orbit-artifact/taskflow/scripts/taskflow_common.py` computes whole-matrix
 float64 equations from seeded inputs without consulting candidate slices or
 task boundaries. The separate CPU diagnostic executes candidate slices and
 checks against that oracle. NPU precision tolerances must additionally account

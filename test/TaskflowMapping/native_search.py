@@ -2,15 +2,44 @@
 """Native compiler/search acceptance; Python only launches and audits evidence."""
 import argparse, copy, json, subprocess
 from pathlib import Path
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool, amoeba_tool
+from structured_fixtures import source_plan
+from check import fixture
+
 ROOT=Path(__file__).resolve().parents[2]
 def write(p,v):
     p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(v,indent=2)+'\n')
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True)
-    ap.add_argument('--workloads',type=Path,default=ROOT/'build/static-mapping-v3/workloads')
+    ap.add_argument('--workloads',type=Path)
+    ap.add_argument('--tool',type=Path,default=taskflow_tool())
+    ap.add_argument('--amoeba-tool',type=Path,default=amoeba_tool())
     a=ap.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    tool=ROOT/'build-core/tools/taskflow-opt/taskflow-opt'
-    original=ROOT/'build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt'
+    tool=a.tool.resolve()
+    original=a.amoeba_tool.resolve()
+    if not a.workloads:
+        a.workloads=out/'workloads'
+        cases={'gemm_relu':source_plan('gemm_relu'),
+            'ffn':source_plan('ffn',m=2,d=8,i=16),
+            'ffn_m5':source_plan('ffn',m=5,d=2048,i=11008),
+            'ffn_m128':source_plan('ffn',m=128,d=2048,i=11008)}
+        for name,program in cases.items():
+            folder=a.workloads/name;write(folder/'source.json',program)
+            _,config=fixture()
+            for memory in config['hardware']['memories']:memory['capacity_bytes']=1 << 40
+            config['assumptions']['initial_locations']={b['id']:'cpu' for b in program['buffers'] if b['role']=='input'}
+            config['assumptions']['output_locations']={b:'cpu' for b in program['outputs']}
+            write(folder/'config.json',config)
+            (folder/'base').mkdir()
+            materialized=subprocess.run([str(tool),str(folder/'source.json'),
+                '--emit-mlir='+str(folder/'base/taskflow.mlir'),
+                '--emit-plan='+str(folder/'base/plan.json')],capture_output=True,text=True)
+            (folder/'base').mkdir(exist_ok=True)
+            (folder/'materialize.log').write_text(materialized.stdout+materialized.stderr)
+            assert materialized.returncode==0,materialized.stderr
     checks=[]
     def run(name,cmd,expected=0,trace=False):
         full=['strace','-f','-e','trace=process','-o',str(out/(name+'.process.log')),*cmd] if trace else cmd

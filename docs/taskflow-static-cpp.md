@@ -38,7 +38,7 @@ MLIR 后重新分析和规划。原 Neura legacy 搜索不改变；显式外部�
 
 ```bash
 cd /home/shiran/project/orbit
-bash scripts/run_taskflow_static_cpp.sh "$PWD/build/my-static-cpp-run"
+bash ../orbit-artifact/taskflow/scripts/run_taskflow_static_cpp.sh "$PWD/build/my-static-cpp-run"
 ```
 
 已有静态夹具时，也可直接调用 C++：
@@ -90,7 +90,7 @@ Python 仅负责实验编排、独立数值参考、工具链调用与测试。
 敏感性假设。新增 `StaticRegion.cpp` 与独立 `StaticRegionChecker.cpp` 支持整段实现
 精确覆盖及热执行 host-to-host 实测 wall 成本；内部通信不重复收费。
 详见 [整段契约](taskflow-static-regions-v4.md) 和
-[标定、留出与真实执行](taskflow-region-calibration-v4.md)。
+[标定、留出与真实执行](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-region-calibration-v4.md)。
 标定范围外（包括当前 CPU 激活和真实 FFN 整图成本）明确返回 unknown/unsupported。
 
 迁移证据在 `build/static-mapping-v4/cpp-migration`，最终回归在

@@ -5,9 +5,14 @@ import json
 import re
 import subprocess
 from pathlib import Path
+import sys
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
 
 p = argparse.ArgumentParser()
-p.add_argument('--tool', type=Path, required=True)
+p.add_argument('--tool', type=Path, default=taskflow_tool('air'))
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--air', action='store_true', help='also lower/check actual AIR with an AIR-enabled tool')
 a = p.parse_args()

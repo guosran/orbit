@@ -5,8 +5,12 @@ import json
 import pathlib
 import subprocess
 import sys
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'scripts'))
-from taskflow_common import source_plan
+from pathlib import Path as _TestPath
+sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / 'Support'))
+from orbit_test_paths import taskflow_tool
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'Support'))
+from structured_fixtures import source_plan
 
 EVALUATOR = '''#!/usr/bin/env python3
 import json,sys,pathlib
@@ -34,7 +38,7 @@ if mode=='interrupt':
 '''
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--tool',type=pathlib.Path,required=True);p.add_argument('--output',type=pathlib.Path,required=True);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--tool',type=pathlib.Path,default=taskflow_tool('core'));p.add_argument('--output',type=pathlib.Path,required=True);a=p.parse_args()
  root=a.output.resolve();root.mkdir(parents=True,exist_ok=True)
  evaluator=root/'fixture_evaluator.py';evaluator.write_text(EVALUATOR);evaluator.chmod(0o755)
  source=root/'source.json';source.write_text(json.dumps(source_plan('gemm_relu')))
