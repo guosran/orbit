@@ -31,6 +31,7 @@
 
 #include "TaskflowDialect/TaskflowOps.h"
 #include "Taskflow/Search.h"
+#include "Taskflow/StaticMapping.h"
 #include "NeuraDialect/NeuraOps.h"
 
 #include "mlir/IR/Diagnostics.h"
@@ -2360,6 +2361,12 @@ public:
       canonical.emitError() << message;
       signalPassFailure();
     };
+    if (decisionFlow == "structured" && structuredBackend == "air" && !canonical.getBody()->empty()) {
+      orbit::taskflow::SearchOptions options{structuredBackend,structuredEvaluator,outputDir,structuredConfig,checkpoint,maxRounds,maxCandidates,beamWidth,resume};
+      llvm::raw_string_ostream stream(options.nativeSourceMLIR);canonical.print(stream);
+      if (!orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},options,error)) fatal(error);
+      return;
+    }
     if (decisionFlow == "structured") {
       auto bytes = llvm::MemoryBuffer::getFile(structuredPlan);
       if (!bytes) { fatal("cannot read structured-plan"); return; }
@@ -2388,6 +2395,15 @@ public:
                 OperationEquivalence::Flags::IgnoreLocations)) {
           fatal("input Taskflow body differs from structured witness"); return;
         }
+      }
+      if (structuredBackend == "static" &&
+          (structuredEvaluator.empty() || structuredEvaluator == "native") &&
+          !canonical.getBody()->empty()) {
+        orbit::taskflow::StaticAnalysis analysis;
+        if (!orbit::taskflow::analyzeStaticProgram(canonical, analysis, error)) {
+          fatal(error); return;
+        }
+        program = std::move(analysis.program);
       }
       orbit::taskflow::SearchOptions options{structuredBackend, structuredEvaluator,
           outputDir, structuredConfig, checkpoint, maxRounds, maxCandidates,

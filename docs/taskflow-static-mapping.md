@@ -1,5 +1,8 @@
 # 静态异构 mapping、通信与执行证据
 
+> 历史 v3 说明：Python 规划器/检查器现已退出活动代码，旧差分仅为历史证据。默认生产与检查均为 C++/MLIR；复现入口为 `bash scripts/run_taskflow_static_cpp.sh NEW_OUTPUT_DIRECTORY`。v5 审计保留了退出前代码快照和全部旧结果。
+
+
 本轮静态结果在 `build/static-mapping-v3/STATIC-RESULTS.md`，完整计划与搜索索引
 在 `static-report.json`；硬件追加实验在
 `../aie-toy/results/orbit-static-v3-hardware`。前两轮原始证据没有覆盖。

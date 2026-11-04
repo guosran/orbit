@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 import statistics
-from taskflow_static_evaluate import load,write,digest
+from taskflow_static_io import load,write,digest
 
 
 def main():

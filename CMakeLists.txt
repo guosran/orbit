@@ -28,6 +28,7 @@ include(HandleLLVMOptions)
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 
+option(ORBIT_ENABLE_AIR "Build standalone direct Taskflow-to-AIR backend" OFF)
 option(ORBIT_ENABLE_NEURA "Build legacy Amoeba/Neura backend" ON)
 if(ORBIT_ENABLE_NEURA)
   include_directories(${PROJECT_SOURCE_DIR}/thirdparty/neura/include

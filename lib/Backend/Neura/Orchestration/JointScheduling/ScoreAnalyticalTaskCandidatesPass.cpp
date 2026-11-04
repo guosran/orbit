@@ -13,6 +13,7 @@
 #include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 
 #include "TaskflowDialect/TaskflowOps.h"
+#include "Taskflow/ComputeEstimate.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -436,6 +437,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       func.emitError() << error;
       return signalPassFailure();
     }
+    // This digest comes from the same buffer used by the catalogue parser.
+    const std::string catalogueVersion = costs.contentDigest().str();
     if (factoredInput &&
         costs.candidateCountDecimal() != factoredDescriptor.candidateCount) {
       func.emitError()
@@ -637,8 +640,45 @@ struct ScoreAnalyticalTaskCandidatesPass
                       choice.task;
                   return false;
                 }
-                schedulerDurations.push_back(std::max<int64_t>(
-                    1, static_cast<int64_t>(scheduledDuration)));
+                const int64_t scheduledCycles = std::max<int64_t>(
+                    1, static_cast<int64_t>(scheduledDuration));
+                schedulerDurations.push_back(scheduledCycles);
+                // Publish the duration already used by the production
+                // scheduler. The public interface never recomputes ML II.
+                orbit::taskflow::MappingComputeEstimate estimate;
+                estimate.task = taskCosts.size();
+                estimate.resource = "cgra";
+                estimate.implementation = "amoeba-analytical-mapped-task";
+                estimate.model = costs.nameSpace().str();
+                estimate.modelVersion = catalogueVersion;
+                estimate.provenance = "TaskShapeCostCache:" + costFile.getValue();
+                estimate.boundary = "production scheduler task occupancy: ceil(startup+II*(trip-1))";
+                estimate.duration = scheduledCycles;
+                estimate.unit = "cycles";
+                estimate.resourceCount = choice.shape.cgraCount();
+                estimate.resourceCountUnit = "cgra_block";
+                estimate.resourceShape = {choice.shape.rows, choice.shape.cols};
+                estimate.resourceShapeUnit = "cgra_block";
+                estimate.implementationShape = {choice.shape.mapperRows,
+                                               choice.shape.mapperCols};
+                estimate.implementationShapeUnit = "processing_element";
+                estimate.predictedII = cost->predictedII;
+                estimate.startupCycles = cost->startupCycles;
+                estimate.iterations = choice.tripCount;
+                estimate.includedCosts = {"DFG compute and load/store operations",
+                    "predictor mapped-resource/routing effects", "startup depth"};
+                estimate.excludedCosts = {"explicit inter-task data movement",
+                    "host preparation and submission", "scheduler queue waits"};
+                estimate.requiredDataSupply = {
+                    "load/store operands supplied under predictor training conditions",
+                    "external memory bandwidth and port availability require target validation"};
+                // Existing catalogues do not certify a new residency scheme.
+                // A public evaluator must verify this before using the value.
+                estimate.supplyConditionsVerified = false;
+                estimate.transportScope = orbit::taskflow::
+                    MappingComputeTransportScope::ExcludesInterTaskTransfers;
+                taskCost["compute_contract"] =
+                    orbit::taskflow::serializeMappingComputeEstimate(estimate);
               }
               taskCosts.push_back(std::move(taskCost));
             }

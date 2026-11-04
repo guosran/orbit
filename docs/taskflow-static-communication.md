@@ -1,5 +1,8 @@
 # Static communication derivation
 
+> 历史 v3 说明：Python 规划器/检查器现已退出活动代码，旧差分仅为历史证据。默认生产与检查均为 C++/MLIR；复现入口为 `bash scripts/run_taskflow_static_cpp.sh NEW_OUTPUT_DIRECTORY`。v5 审计保留了退出前代码快照和全部旧结果。
+
+
 `python/orbit_mapping/communication.py` consumes the existing
 `orbit.taskflow.plan.v1` operations and the static configuration owned by
 `orbit_mapping.contract`. It does not introduce another computation language

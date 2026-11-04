@@ -93,6 +93,9 @@ public:
             llvm::StringRef expectedCanonicalModuleWitness = {});
   const TaskShapeCost *get(const TaskShapeChoice &choice, std::string &error);
 
+  // Provenance of the exact bytes parsed by load; does not change the
+  // existing semantic catalogue acceptance contract.
+  llvm::StringRef contentDigest() const { return contentDigest_; }
   llvm::StringRef nameSpace() const { return namespace_; }
   llvm::StringRef sourceRepository() const { return sourceRepository_; }
   llvm::StringRef sourceCommit() const { return sourceCommit_; }
@@ -120,6 +123,7 @@ public:
   uint64_t catalogQueries() const { return catalog_.size(); }
 
 private:
+  std::string contentDigest_;
   std::string namespace_;
   std::string sourceRepository_;
   std::string sourceCommit_;

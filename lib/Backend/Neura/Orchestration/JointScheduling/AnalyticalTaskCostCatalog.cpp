@@ -14,6 +14,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SHA256.h"
 
 #include <cmath>
 #include <array>
@@ -166,6 +167,14 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     error = "cannot read cost catalogue " + path.str() + ": " +
             buffer.getError().message();
     return false;
+  }
+  auto digest = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t *>((*buffer)->getBufferStart()),
+      (*buffer)->getBufferSize()));
+  contentDigest_.clear();
+  for (auto byte : digest) {
+    contentDigest_ += "0123456789abcdef"[byte >> 4];
+    contentDigest_ += "0123456789abcdef"[byte & 15];
   }
   llvm::Expected<llvm::json::Value> parsed =
       llvm::json::parse((*buffer)->getBuffer());

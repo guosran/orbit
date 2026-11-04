@@ -11,7 +11,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
 from taskflow_common import source_plan
-from taskflow_static_evaluate import load, write, identity, digest, implementation_files
+from taskflow_static_io import load, write, identity, digest
 
 THEORY = dict(kind='theoretical', source='Explicit sensitivity assumptions, not fitted to whole-graph NPU measurements; no hardware performance claim')
 
@@ -93,30 +93,47 @@ def prepare(out):
 
 
 def plan(out):
-    from orbit_mapping.mapper import map_program
-    from orbit_mapping.checker import check_plan
+    def check_plan(program, config, plan, mlir_path):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg=Path(temporary)/"config.json"; candidate=Path(temporary)/"plan.json"
+            write(cfg,config);write(candidate,plan)
+            run=subprocess.run([str(ROOT/"build-core/tools/taskflow-opt/taskflow-opt"),str(mlir_path),"--target-config="+str(cfg),"--check-mapping="+str(candidate)],capture_output=True,text=True)
+            if not run.stdout: raise RuntimeError(run.stderr)
+            return json.loads(run.stdout)
+    def map_program(program, config, mlir_path):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg=Path(temporary)/'config.json'; output=Path(temporary)/'mapping.json'
+            write(cfg,config)
+            command=[str(ROOT/'build-core/tools/taskflow-opt/taskflow-opt'),str(mlir_path),
+                '--static-map','--target-config='+str(cfg),'--mapping-output='+str(output)]
+            run=subprocess.run(command,capture_output=True,text=True)
+            if not output.exists(): raise RuntimeError(run.stderr)
+            return load(output)
     for directory in sorted((out/'workloads').iterdir()):
         config=load(directory/'config.json')
         for variant in ('base','n','k','fused'):
             dest=directory/variant
             if not (dest/'plan.json').exists(): continue
-            p=load(dest/'plan.json');result=map_program(p,config)
+            p=load(dest/'plan.json');result=map_program(p,config,dest/'taskflow.mlir')
             write(dest/'mapping.json',result)
             if result['status']!='passed': raise RuntimeError(str(result.get('reasons')))
-            checked=check_plan(p,config,result['best_plan']);write(dest/'check.json',checked)
+            checked=check_plan(p,config,result['best_plan'],dest/'taskflow.mlir');write(dest/'check.json',checked)
             if not checked['passed']: raise RuntimeError(str(checked))
             print(directory.name,variant,result['best_plan']['makespan_ms'],flush=True)
         # Isolate the effect of communication while keeping every compute cost.
         slow=copy.deepcopy(config)
         for link in slow['hardware']['links']: link['bandwidth_bytes_per_ms']=1_000_000
         write(directory/'slow-link-config.json',slow)
-        write(directory/'slow-link-mapping.json',map_program(load(directory/'base/plan.json'),slow))
+        write(directory/'slow-link-mapping.json',map_program(load(directory/'base/plan.json'),slow,directory/'base/taskflow.mlir'))
 
 
 def search(out, case, resume=False):
     directory=out/'search'/case;directory.mkdir(parents=True,exist_ok=True)
     workload=out/'workloads'/case
-    files=implementation_files();code={p:digest(p) for p in files}
+    files=[str(ROOT/'build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt')]
+    code={p:digest(p) for p in files}
     target=dict(mapping_config=str(workload/'config.json'),cache_dir=str(out/'cache'),
         implementation_files=files,implementation_sha256=identity(code),
         search_preferences=dict(m_alignment=64,n_alignment=256,k_alignment=64))
@@ -124,7 +141,7 @@ def search(out, case, resume=False):
     if target_path.exists() and load(target_path)!=target: raise ValueError('implementation/config changed; use new output')
     write(target_path,target)
     args=dict(**{'decision-flow':'structured','backend':'static','structured-plan':str(workload/'source.json'),
-        'evaluator':str(ROOT/'scripts/taskflow_static_evaluate.py'),'target-config':str(target_path),
+        'evaluator':'native','target-config':str(target_path),
         'output-dir':str(directory),'max-rounds':2,'max-candidates':9,'beam-width':2})
     if resume: args['resume']='true'
     elif (directory/'checkpoint.json').exists(): raise ValueError('existing search; pass --resume')

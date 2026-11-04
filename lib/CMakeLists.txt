@@ -1,5 +1,8 @@
 add_subdirectory(TaskflowDialect)
 add_subdirectory(Taskflow)
+if(ORBIT_ENABLE_AIR)
+  add_subdirectory(TaskflowAIR)
+endif()
 if(ORBIT_ENABLE_NEURA)
   add_subdirectory(Conversion)
   add_subdirectory(Backend)

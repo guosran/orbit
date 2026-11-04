@@ -1,0 +1,2421 @@
+#include "Taskflow/GenericMapping.h"
+#include "Taskflow/NativeTransforms.h"
+#include "Taskflow/ProgramPartition.h"
+#include "Taskflow/StaticMapping.h"
+#include "Taskflow/StructuredProgram.h"
+#include "TaskflowDialect/TaskflowDialect.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/MD5.h"
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <map>
+#include <set>
+using namespace orbit::taskflow;
+namespace {
+bool fail(std::string &e, const std::string &s) {
+  e = s;
+  return false;
+}
+int64_t storageBytes(const GenericStorage &s) {
+  auto type = mlir::cast<mlir::MemRefType>(s.root.getType());
+  auto element = type.getElementType();
+  if (!element.isIntOrFloat())
+    return -1;
+  int64_t bytes = (element.getIntOrFloatBitWidth() + 7) / 8;
+  for (auto n : s.shape) {
+    if (n <= 0 || bytes > INT64_MAX / n)
+      return -1;
+    bytes *= n;
+  }
+  return bytes;
+}
+using namespace mlir;
+using Interval = GenericInterval;
+bool constant(Value v, int64_t &n) {
+  llvm::APInt x;
+  if (!matchPattern(v, m_ConstantInt(&x)))
+    return false;
+  n = x.getSExtValue();
+  return true;
+}
+bool expr(AffineExpr e, ArrayRef<Interval> dims, ArrayRef<Interval> symbols,
+          Interval &r) {
+  if (auto c = dyn_cast<AffineConstantExpr>(e)) {
+    if (c.getValue() == INT64_MAX)
+      return false;
+    r = {c.getValue(), c.getValue() + 1};
+    return true;
+  }
+  if (auto d = dyn_cast<AffineDimExpr>(e)) {
+    if (d.getPosition() >= dims.size())
+      return false;
+    r = dims[d.getPosition()];
+    return true;
+  }
+  if (auto s = dyn_cast<AffineSymbolExpr>(e)) {
+    if (s.getPosition() >= symbols.size())
+      return false;
+    r = symbols[s.getPosition()];
+    return true;
+  }
+  auto b = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!b)
+    return false;
+  Interval x, y;
+  if (!expr(b.getLHS(), dims, symbols, x) ||
+      !expr(b.getRHS(), dims, symbols, y))
+    return false;
+  if (e.getKind() == AffineExprKind::Add) {
+    __int128 lo = __int128(x.lower) + y.lower,
+             hi = __int128(x.upper) + y.upper - 1;
+    if (lo < INT64_MIN || hi > INT64_MAX)
+      return false;
+    r = {int64_t(lo), int64_t(hi)};
+    return true;
+  }
+  if (e.getKind() == AffineExprKind::Mul && y.upper == y.lower + 1) {
+    __int128 a = __int128(x.lower) * y.lower,
+             b = __int128(x.upper - 1) * y.lower;
+    if (std::min(a, b) < INT64_MIN || std::max(a, b) >= INT64_MAX)
+      return false;
+    r = {int64_t(std::min(a, b)), int64_t(std::max(a, b) + 1)};
+    return true;
+  }
+  return false; // reject mod/div rather than claim an exact region
+}
+bool valueRange(Value v, const llvm::DenseMap<Value, Interval> &ivs,
+                Interval &r) {
+  auto i = ivs.find(v);
+  if (i != ivs.end()) {
+    r = i->second;
+    return true;
+  }
+  int64_t c;
+  if (constant(v, c)) {
+    if (c == INT64_MAX)
+      return false;
+    r = {c, c + 1};
+    return true;
+  }
+  if (auto a = v.getDefiningOp<affine::AffineApplyOp>()) {
+    SmallVector<Interval> operands;
+    for (Value x : a.getMapOperands()) {
+      Interval t;
+      if (!valueRange(x, ivs, t))
+        return false;
+      operands.push_back(t);
+    }
+    auto map = a.getAffineMap();
+    return expr(map.getResult(0),
+                ArrayRef<Interval>(operands).take_front(map.getNumDims()),
+                ArrayRef<Interval>(operands).drop_front(map.getNumDims()), r);
+  }
+  return false;
+}
+
+bool covered(const std::vector<Interval> &,
+             const std::vector<std::vector<Interval>> &);
+// Re-evaluate the actual affine accesses for each restricted source loop
+// domain.
+bool phaseRegions(const GenericAnalysis &a, GenericTilePhase &phase,
+                  int64_t &bytes, std::string &error) {
+  const auto &task = a.tasks[phase.task];
+  llvm::DenseMap<Value, Interval> ivs;
+  for (auto b : phase.loops) {
+    const auto &loop = task.loops[b.loop];
+    ivs[loop.induction] = {
+        b.lower, b.upper - 1 - (b.upper - b.lower - 1) % loop.step + 1};
+  }
+  std::map<size_t, GenericTileRegion> regions;
+  std::map<size_t, std::vector<std::vector<Interval>>> writes;
+  for (const auto &access : task.accesses) {
+    SmallVector<Value> indices;
+    AffineMap map;
+    auto *op = access.operation;
+    if (auto l = dyn_cast<affine::AffineLoadOp>(op)) {
+      indices.append(l.getMapOperands().begin(), l.getMapOperands().end());
+      map = l.getAffineMap();
+    } else if (auto st = dyn_cast<affine::AffineStoreOp>(op)) {
+      indices.append(st.getMapOperands().begin(), st.getMapOperands().end());
+      map = st.getAffineMap();
+    } else if (auto l = dyn_cast<memref::LoadOp>(op))
+      indices.append(l.getIndices().begin(), l.getIndices().end());
+    else if (auto st = dyn_cast<memref::StoreOp>(op))
+      indices.append(st.getIndices().begin(), st.getIndices().end());
+    SmallVector<Interval> operands, bounds;
+    for (auto v : indices) {
+      Interval r;
+      if (!valueRange(v, ivs, r))
+        return fail(error, "tile has unsupported affine index");
+      operands.push_back(r);
+    }
+    if (map) {
+      for (auto result : map.getResults()) {
+        Interval r;
+        if (!expr(result,
+                  ArrayRef<Interval>(operands).take_front(map.getNumDims()),
+                  ArrayRef<Interval>(operands).drop_front(map.getNumDims()), r))
+          return fail(error, "tile has unsupported affine expression");
+        bounds.push_back(r);
+      }
+    } else
+      bounds = operands;
+    if (access.write && access.exactRegion)
+      writes[access.storage].emplace_back(bounds.begin(), bounds.end());
+    auto found = regions.find(access.storage);
+    if (found == regions.end()) {
+      GenericTileRegion r;
+      r.storage = access.storage;
+      for (auto b : bounds) {
+        r.offsets.push_back(b.lower);
+        r.sizes.push_back(b.upper - b.lower);
+      }
+      found = regions.emplace(access.storage, std::move(r)).first;
+    } else {
+      auto &r = found->second;
+      for (size_t d = 0; d < bounds.size(); ++d) {
+        int64_t hi = std::max(r.offsets[d] + r.sizes[d], bounds[d].upper);
+        r.offsets[d] = std::min(r.offsets[d], bounds[d].lower);
+        r.sizes[d] = hi - r.offsets[d];
+      }
+    }
+    auto &r = found->second;
+    // Analysis records concrete reaching source writes. A read satisfied only
+    // by writes in this task needs no uninitialized host-buffer import.
+    if (access.read) {
+      bool external = access.readVersions.empty();
+      for (const auto &version : access.readVersions)
+        external |= version.rfind(task.id + ":write:", 0) != 0;
+      r.read |= external;
+    }
+    r.write |= access.write;
+  }
+  bytes = 0;
+  for (auto &entry : regions) {
+    auto &r = entry.second;
+    if (r.write && !r.read) {
+      std::vector<Interval> box;
+      for (size_t d = 0; d < r.sizes.size(); ++d)
+        box.push_back({r.offsets[d], r.offsets[d] + r.sizes[d]});
+      if (!covered(box, writes[r.storage]))
+        return fail(
+            error,
+            "tile output rectangle contains uninitialized unwritten elements");
+    }
+    auto type = cast<MemRefType>(a.storages[r.storage].root.getType());
+    int64_t n = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+    for (auto size : r.sizes) {
+      if (size <= 0 || n > INT64_MAX / size)
+        return fail(error, "tile byte overflow");
+      n *= size;
+    }
+    if (bytes > INT64_MAX - n)
+      return fail(error, "tile byte overflow");
+    bytes += n;
+    phase.regions.push_back(r);
+  }
+  return true;
+}
+// Prove different outer iterations touch disjoint written storage slices.
+// Every access to a written storage must project that IV on the same axis.
+bool disjointSlices(const GenericTask &task, size_t loop) {
+  std::set<size_t> written;
+  for (auto &access : task.accesses)
+    if (access.write)
+      written.insert(access.storage);
+  for (size_t storage : written) {
+    int axis = -1;
+    for (auto &access : task.accesses) {
+      if (access.storage != storage)
+        continue;
+      SmallVector<Value> indices;
+      AffineMap map;
+      if (auto op = dyn_cast<affine::AffineLoadOp>(access.operation)) {
+        indices.append(op.getMapOperands().begin(), op.getMapOperands().end());
+        map = op.getAffineMap();
+      } else if (auto op = dyn_cast<affine::AffineStoreOp>(access.operation)) {
+        indices.append(op.getMapOperands().begin(), op.getMapOperands().end());
+        map = op.getAffineMap();
+      } else if (auto op = dyn_cast<memref::LoadOp>(access.operation))
+        indices.append(op.getIndices().begin(), op.getIndices().end());
+      else if (auto op = dyn_cast<memref::StoreOp>(access.operation))
+        indices.append(op.getIndices().begin(), op.getIndices().end());
+      int projected = -1;
+      if (map) {
+        for (auto item : llvm::enumerate(map.getResults()))
+          if (auto dim = dyn_cast<AffineDimExpr>(item.value()))
+            if (indices[dim.getPosition()] == task.loops[loop].induction)
+              projected = item.index();
+      } else {
+        for (auto item : llvm::enumerate(indices))
+          if (item.value() == task.loops[loop].induction)
+            projected = item.index();
+      }
+      if (projected < 0 || (axis >= 0 && projected != axis))
+        return false;
+      axis = projected;
+    }
+  }
+  return true;
+}
+bool independentInput(const GenericAnalysis &a, const GenericTask &task,
+                      size_t storage, size_t loop) {
+  if (storage >= a.storages.size() || loop >= task.loops.size() ||
+      a.storages[storage].role != "input")
+    return false;
+  bool found = false;
+  for (const auto &access : task.accesses) {
+    if (access.storage != storage)
+      continue;
+    if (access.write)
+      return false;
+    found = true;
+    // Do not infer independence from equal bounding boxes: inspect the real
+    // affine SSA operands, including expressions derived by affine.apply.
+    std::function<bool(Value)> depends = [&](Value value) {
+      if (value == task.loops[loop].induction)
+        return true;
+      if (auto apply = value.getDefiningOp<affine::AffineApplyOp>())
+        return llvm::any_of(apply.getMapOperands(), depends);
+      return false;
+    };
+    SmallVector<Value> indices;
+    if (auto load = dyn_cast<affine::AffineLoadOp>(access.operation))
+      indices.append(load.getMapOperands().begin(), load.getMapOperands().end());
+    else if (auto load = dyn_cast<memref::LoadOp>(access.operation))
+      indices.append(load.getIndices().begin(), load.getIndices().end());
+    else
+      return false;
+    if (llvm::any_of(indices, depends))
+      return false;
+  }
+  return found;
+}
+bool panelTask(const GenericAnalysis &a, size_t task,
+               const ProgramMappingChoice &choice) {
+  const auto &t = a.tasks[task];
+  if (choice.storage < 0 || choice.reuseLoop < 0 || choice.panelLoop < 0 ||
+      choice.reuseLoop == choice.panelLoop ||
+      size_t(choice.panelLoop) >= t.loops.size() ||
+      !independentInput(a, t, choice.storage, choice.reuseLoop) ||
+      !disjointSlices(t, choice.reuseLoop) ||
+      !disjointSlices(t, choice.panelLoop))
+    return false;
+  for (const auto &loop : t.loops)
+    for (const auto &access : t.accesses)
+      if (!loop.operation->isProperAncestor(access.operation))
+        return false;
+  // This finite strategy only permutes the first two independent outer axes.
+  // Other loop permutations need a separate dependence/accumulator proof.
+  return std::min(choice.reuseLoop, choice.panelLoop) == 0 &&
+         std::max(choice.reuseLoop, choice.panelLoop) == 1;
+}
+int64_t vectorLoop(const GenericAnalysis &a, const GenericTask &task) {
+  if (!llvm::any_of(task.accesses, [](const auto &access) { return access.read; }))
+    return -1; // Installed affine vectorizer does not rewrite pure fills.
+  for (const auto &loop : task.loops)
+    if (!isa<affine::AffineForOp>(loop.operation))
+      return -1;
+  bool scalarMath = false;
+  task.operation->walk([&](Operation *op) {
+    if (op->getName().getDialectNamespace() == "math")
+      scalarMath = true;
+  });
+  if (scalarMath)
+    return -1;
+  for (size_t l = task.loops.size(); l > 0; --l) {
+    size_t candidate = l - 1;
+    std::function<bool(Value)> depends = [&](Value value) {
+      if (value == task.loops[candidate].induction) return true;
+      if (auto apply = value.getDefiningOp<affine::AffineApplyOp>())
+        return llvm::any_of(apply.getMapOperands(),depends);
+      return false;
+    };
+    bool legal = disjointSlices(task, candidate), written = false;
+    for (const auto &access : task.accesses) {
+      auto type = cast<MemRefType>(a.storages[access.storage].root.getType());
+      if (!type.getElementType().isF32()) { legal = false; break; }
+      AffineMap map;
+      ValueRange operands;
+      if (auto load = dyn_cast<affine::AffineLoadOp>(access.operation)) {
+        map = load.getAffineMap(); operands = load.getMapOperands();
+      } else if (auto store = dyn_cast<affine::AffineStoreOp>(access.operation)) {
+        map = store.getAffineMap(); operands = store.getMapOperands();
+        written = true;
+      } else { legal = false; break; }
+      bool varying = false;
+      for (size_t d = 0; d < operands.size(); ++d) {
+        if (operands[d] != task.loops[candidate].induction) {
+          // A derived index is not an invariant broadcast. Keep the current
+          // direct identity-last-dimension proof conservative; a future
+          // vector implementation may separately prove composed affine maps.
+          if (depends(operands[d])) legal = false;
+          continue;
+        }
+        varying = true;
+        if (d >= map.getNumDims()) { legal = false; break; }
+        for (size_t axis = 0; axis < map.getNumResults(); ++axis) {
+          AffineExpr expression = map.getResult(axis);
+          if (!expression.isFunctionOfDim(d)) continue;
+          auto dim = dyn_cast<AffineDimExpr>(expression);
+          if (axis + 1 != map.getNumResults() || !dim ||
+              dim.getPosition() != d) legal = false;
+        }
+      }
+      if (access.write && !varying) legal = false;
+    }
+    if (legal && written) return candidate;
+  }
+  return -1;
+}
+void inferReadOnlyRetentions(const GenericAnalysis &a, GenericMappingPlan &p) {
+  p.readOnlyRetentions.clear();
+  if (p.choices.residency != "readonly-panel") return;
+  for (const auto &stage : p.hardwareStages) {
+    size_t begin = stage.beginPhase;
+    while (begin < stage.endPhase) {
+      const auto &first = p.phases[begin];
+      if (!panelTask(a, first.task, p.choices)) break;
+      auto bound = first.loops[p.choices.panelLoop];
+      size_t end = begin + 1;
+      while (end < stage.endPhase &&
+             p.phases[end].loops[p.choices.panelLoop].lower == bound.lower &&
+             p.phases[end].loops[p.choices.panelLoop].upper == bound.upper)
+        ++end;
+      GenericReadOnlyRetention scope;
+      scope.beginPhase = begin; scope.endPhase = end;
+      scope.storage = p.choices.storage;
+      for (size_t index = begin; index < end; ++index)
+        for (const auto &region : p.phases[index].regions)
+          if (region.storage == scope.storage) {
+            if (scope.sizes.empty()) {
+              scope.offsets = region.offsets; scope.sizes = region.sizes;
+            } else for (size_t d = 0; d < region.sizes.size(); ++d) {
+              int64_t hi = std::max(scope.offsets[d] + scope.sizes[d],
+                                    region.offsets[d] + region.sizes[d]);
+              scope.offsets[d] = std::min(scope.offsets[d], region.offsets[d]);
+              scope.sizes[d] = hi - scope.offsets[d];
+            }
+          }
+      p.readOnlyRetentions.push_back(std::move(scope));
+      begin = end;
+    }
+  }
+  std::map<size_t, const GenericReadOnlyRetention *> begins;
+  for (const auto &scope : p.readOnlyRetentions) begins[scope.beginPhase] = &scope;
+  p.transfers.erase(std::remove_if(p.transfers.begin(), p.transfers.end(),
+      [&](GenericTransfer &transfer) {
+        if (transfer.storage != size_t(p.choices.storage) ||
+            transfer.direction != "host_to_l1") return false;
+        auto found = begins.upper_bound(transfer.phase);
+        if (found == begins.begin()) return false;
+        const auto &scope = *std::prev(found)->second;
+        if (transfer.phase >= scope.endPhase) return false;
+        if (transfer.phase != scope.beginPhase) return true;
+        transfer.offsets = scope.offsets; transfer.sizes = scope.sizes;
+        auto type = cast<MemRefType>(a.storages[transfer.storage].root.getType());
+        transfer.bytes = (type.getElementType().getIntOrFloatBitWidth()+7)/8;
+        for (auto size : scope.sizes) transfer.bytes *= size;
+        return false;
+      }), p.transfers.end());
+}
+bool covered(const std::vector<Interval> &box,
+             const std::vector<std::vector<Interval>> &writes) {
+  std::vector<std::vector<Interval>> holes = {box};
+  for (const auto &w : writes) {
+    std::vector<std::vector<Interval>> next;
+    for (auto h : holes) {
+      bool disjoint = false;
+      for (size_t i = 0; i < h.size(); ++i)
+        if (h[i].upper <= w[i].lower || w[i].upper <= h[i].lower)
+          disjoint = true;
+      if (disjoint) {
+        next.push_back(h);
+        continue;
+      }
+      for (size_t i = 0; i < h.size(); ++i) {
+        if (h[i].lower < w[i].lower) {
+          auto fragment = h;
+          fragment[i].upper = w[i].lower;
+          next.push_back(fragment);
+          h[i].lower = w[i].lower;
+        }
+        if (h[i].upper > w[i].upper) {
+          auto fragment = h;
+          fragment[i].lower = w[i].upper;
+          next.push_back(fragment);
+          h[i].upper = w[i].upper;
+        }
+      }
+    }
+    holes = std::move(next);
+    if (holes.empty())
+      return true;
+    if (holes.size() > 10000)
+      return false;
+  }
+  return holes.empty();
+}
+bool sameRegion(const GenericTileRegion &x, const GenericTileRegion &y) {
+  return x.storage == y.storage && x.offsets == y.offsets && x.sizes == y.sizes;
+}
+const GenericReadOnlyRetention *readOnlyScope(const GenericMappingPlan &p,
+                                             size_t phase, size_t storage) {
+  auto found = std::upper_bound(p.readOnlyRetentions.begin(),
+      p.readOnlyRetentions.end(), phase,
+      [](size_t index, const auto &scope) { return index < scope.beginPhase; });
+  if (found == p.readOnlyRetentions.begin()) return nullptr;
+  --found;
+  return found->storage == storage && phase < found->endPhase ? &*found : nullptr;
+}
+// Prove fusion from source accesses, without recognizing an arithmetic kernel.
+bool initializerPair(const GenericAnalysis &a, size_t producer, size_t consumer,
+                     size_t storage) {
+  if (producer >= a.tasks.size() || consumer >= a.tasks.size() ||
+      producer >= consumer || storage >= a.storages.size())
+    return false;
+  const auto &init = a.tasks[producer];
+  const auto &update = a.tasks[consumer];
+  size_t rank = a.storages[storage].shape.size();
+  if (init.loops.size() != rank || update.loops.size() < rank ||
+      init.accesses.empty())
+    return false;
+  size_t successors = 0;
+  for (size_t task = 0; task < a.tasks.size(); ++task)
+    if (llvm::is_contained(a.tasks[task].dependencies, producer)) {
+      ++successors;
+      if (task != consumer)
+        return false;
+    }
+  if (successors != 1)
+    return false;
+  for (size_t axis = 0; axis < rank; ++axis) {
+    const auto &x = init.loops[axis];
+    const auto &y = update.loops[axis];
+    if (x.lower != 0 || x.upper != a.storages[storage].shape[axis] ||
+        x.step != 1 || x.lower != y.lower || x.upper != y.upper ||
+        x.step != y.step)
+      return false;
+  }
+  auto projection = [&](const GenericTask &task, const GenericAccess &access) {
+    SmallVector<Value> indices;
+    AffineMap map;
+    if (auto op = dyn_cast<affine::AffineLoadOp>(access.operation)) {
+      indices.append(op.getMapOperands().begin(), op.getMapOperands().end());
+      map = op.getAffineMap();
+    } else if (auto op = dyn_cast<affine::AffineStoreOp>(access.operation)) {
+      indices.append(op.getMapOperands().begin(), op.getMapOperands().end());
+      map = op.getAffineMap();
+    } else if (auto op = dyn_cast<memref::LoadOp>(access.operation))
+      indices.append(op.getIndices().begin(), op.getIndices().end());
+    else if (auto op = dyn_cast<memref::StoreOp>(access.operation))
+      indices.append(op.getIndices().begin(), op.getIndices().end());
+    else
+      return false;
+    if (map && !map.isIdentity())
+      return false;
+    if (indices.size() != rank)
+      return false;
+    for (size_t axis = 0; axis < rank; ++axis)
+      if (indices[axis] != task.loops[axis].induction)
+        return false;
+    return access.exactRegion;
+  };
+  for (const auto &access : init.accesses)
+    if (access.read || !access.write || access.storage != storage ||
+        !projection(init, access))
+      return false;
+  bool reads = false, writes = false;
+  for (const auto &access : update.accesses)
+    if (access.storage == storage) {
+      reads |= access.read;
+      writes |= access.write;
+      if (!projection(update, access))
+        return false;
+    }
+  if (!reads || !writes)
+    return false;
+  // No intervening observation or modification can be moved past the local
+  // initializer. Later tasks see the consumer's complete projected writes.
+  for (size_t task = producer + 1; task < consumer; ++task)
+    for (const auto &access : a.tasks[task].accesses)
+      if (access.storage == storage)
+        return false;
+  return true;
+}
+std::map<std::pair<size_t, size_t>, size_t>
+initializerCandidates(const GenericAnalysis &a) {
+  std::map<std::pair<size_t, size_t>, size_t> result;
+  for (size_t producer = 0; producer < a.tasks.size(); ++producer) {
+    if (a.tasks[producer].accesses.empty())
+      continue;
+    size_t storage = a.tasks[producer].accesses.front().storage;
+    for (size_t consumer = producer + 1; consumer < a.tasks.size(); ++consumer)
+      if (initializerPair(a, producer, consumer, storage)) {
+        result[{consumer, storage}] = producer;
+        break;
+      }
+  }
+  return result;
+}
+void inferRetentions(const GenericAnalysis &a, GenericMappingPlan &p) {
+  struct Run {
+    size_t begin, last, task;
+    GenericTileRegion region;
+  };
+  std::map<size_t, Run> active;
+  auto candidates = initializerCandidates(a);
+  auto finish = [&](const Run &run) {
+    auto candidate = candidates.find({run.task, run.region.storage});
+    if (run.last > run.begin || candidate != candidates.end()) {
+      int64_t initializer =
+          candidate == candidates.end() ? -1 : int64_t(candidate->second);
+      p.retainedRegions.push_back(
+          {run.begin, run.last + 1, run.region.storage, initializer});
+      if (initializer >= 0 &&
+          !llvm::is_contained(p.fusedInitializerTasks, size_t(initializer)))
+        p.fusedInitializerTasks.push_back(initializer);
+    }
+  };
+  p.retainedRegions.clear();
+  p.fusedInitializerTasks.clear();
+  for (size_t index = 0; index < p.phases.size(); ++index) {
+    const auto &phase = p.phases[index];
+    for (const auto &region : phase.regions) {
+      if (!region.read || !region.write)
+        continue;
+      auto previous = active.find(region.storage);
+      if (previous != active.end() && previous->second.last + 1 == index &&
+          previous->second.task == phase.task &&
+          sameRegion(previous->second.region, region))
+        previous->second.last = index;
+      else {
+        if (previous != active.end())
+          finish(previous->second);
+        active[region.storage] = {index, index, phase.task, region};
+      }
+    }
+  }
+  for (const auto &run : active)
+    finish(run.second);
+  std::sort(p.retainedRegions.begin(), p.retainedRegions.end(),
+            [](const auto &x, const auto &y) {
+              return std::tie(x.beginPhase, x.storage) <
+                     std::tie(y.beginPhase, y.storage);
+            });
+  std::map<size_t, std::vector<const GenericTileRetention *>> scopes;
+  for (const auto &scope : p.retainedRegions)
+    scopes[scope.storage].push_back(&scope);
+  std::map<size_t, size_t> cursor;
+  auto remove = [&](const GenericTransfer &transfer) {
+    if (llvm::is_contained(p.fusedInitializerTasks,
+                           p.phases[transfer.phase].task))
+      return true;
+    auto &list = scopes[transfer.storage];
+    auto &index = cursor[transfer.storage];
+    while (index < list.size() && list[index]->endPhase <= transfer.phase)
+      ++index;
+    if (index >= list.size() || transfer.phase < list[index]->beginPhase)
+      return false;
+    return transfer.direction == "host_to_l1"
+               ? list[index]->initializerTask >= 0 ||
+                     transfer.phase != list[index]->beginPhase
+               : transfer.phase + 1 != list[index]->endPhase;
+  };
+  p.transfers.erase(
+      std::remove_if(p.transfers.begin(), p.transfers.end(), remove),
+      p.transfers.end());
+}
+std::vector<int64_t> hardwareShapeSignature(const GenericMappingPlan &p,
+                                            size_t phaseIndex) {
+  const auto &phase = p.phases[phaseIndex];
+  bool retained = llvm::any_of(phase.regions, [](const auto &region) {
+    return region.read && region.write;
+  });
+  std::vector<int64_t> signature;
+  if (retained) {
+    for (const auto &region : phase.regions)
+      if (region.write) {
+        signature.push_back(region.storage);
+        signature.push_back(region.sizes.size());
+        signature.insert(signature.end(), region.sizes.begin(),
+                         region.sizes.end());
+      }
+  } else
+    for (auto bound : phase.loops)
+      signature.push_back(bound.upper - bound.lower);
+  return signature;
+}
+void inferHardwareStages(GenericMappingPlan &p) {
+  p.hardwareStages.clear();
+  std::map<size_t, size_t> protectedEnd;
+  for (const auto &scope : p.retainedRegions)
+    protectedEnd[scope.beginPhase] =
+        std::max(protectedEnd[scope.beginPhase], scope.endPhase);
+  size_t begin = 0;
+  while (begin < p.phases.size()) {
+    size_t task = p.phases[begin].task, end = begin + 1;
+    while (end < p.phases.size() && p.phases[end].task == task)
+      ++end;
+    if (!llvm::is_contained(p.fusedInitializerTasks, task)) {
+      size_t stageBegin = begin, openEnd = begin;
+      auto signature = hardwareShapeSignature(p, begin);
+      for (size_t phase = begin; phase < end; ++phase) {
+        auto next = hardwareShapeSignature(p, phase);
+        if (phase > stageBegin && next != signature && phase >= openEnd) {
+          p.hardwareStages.push_back({stageBegin, phase});
+          stageBegin = phase;
+          signature = std::move(next);
+        }
+        auto found = protectedEnd.find(phase);
+        if (found != protectedEnd.end())
+          openEnd = std::max(openEnd, found->second);
+      }
+      p.hardwareStages.push_back({stageBegin, end});
+    }
+    begin = end;
+  }
+}
+// The installed single-core target exposes two tile ports per direction.
+// Only shape/rate conflicts require explicit legalization; all templates of
+// one storage share its planned port, preserving the serial source order.
+bool deriveChannelAllocations(
+    const GenericAnalysis &a, const GenericMappingPlan &p,
+    std::vector<bool> &required,
+    std::vector<GenericAIRChannelAllocation> &allocations, std::string &error) {
+  required.clear();
+  allocations.clear();
+  for (size_t stageIndex = 0; stageIndex < p.hardwareStages.size();
+       ++stageIndex) {
+    const auto &stage = p.hardwareStages[stageIndex];
+    std::set<size_t> readonlyStorages;
+    std::set<std::vector<int64_t>> templates;
+    for (size_t index = stage.beginPhase; index < stage.endPhase; ++index) {
+      const auto &phase = p.phases[index];
+      for (const auto &region : phase.regions)
+        if (region.read && !region.write) {
+          readonlyStorages.insert(region.storage);
+          std::vector<int64_t> key{int64_t(region.storage),
+                                   int64_t(region.sizes.size())};
+          key.insert(key.end(), region.sizes.begin(), region.sizes.end());
+          for (auto bound : phase.loops)
+            key.push_back(bound.upper - bound.lower);
+          templates.insert(std::move(key));
+        }
+    }
+    bool needed = templates.size() > readonlyStorages.size();
+    required.push_back(needed);
+    if (!needed)
+      continue;
+    std::set<size_t> inputs, outputs;
+    std::map<std::pair<size_t, std::string>, std::pair<int64_t, int64_t>>
+        traffic;
+    auto transfer = std::lower_bound(p.transfers.begin(), p.transfers.end(),
+                                     stage.beginPhase,
+                                     [](const auto &transfer, size_t phase) {
+                                       return transfer.phase < phase;
+                                     });
+    for (; transfer != p.transfers.end() && transfer->phase < stage.endPhase;
+         ++transfer) {
+      (transfer->direction == "host_to_l1" ? inputs : outputs)
+          .insert(transfer->storage);
+      auto &totals = traffic[{transfer->storage, transfer->direction}];
+      ++totals.first;
+      totals.second += transfer->bytes;
+    }
+    if (inputs.size() > 2 || outputs.size() > 2)
+      return fail(error, "planned DMA channel legalization exceeds two tile "
+                         "ports per direction");
+    auto allocate = [&](size_t storage, llvm::StringRef direction,
+                        int64_t port) {
+      GenericAIRChannelAllocation allocation{stageIndex, storage,
+                                             direction.str(), port};
+      allocation.logicalFifo = "__orbit_fifo_stage" +
+                               std::to_string(stageIndex) + "_storage" +
+                               std::to_string(storage) +
+                               (direction == "host_to_l1" ? "_in" : "_out");
+      if (allocation.logicalFifo == mlir::func::FuncOp(a.function).getName())
+        allocation.logicalFifo += "_channel";
+      auto totals = traffic[{storage, direction.str()}];
+      allocation.transferCount = totals.first;
+      allocation.bytes = totals.second;
+      allocations.push_back(std::move(allocation));
+    };
+    int64_t port = 0;
+    for (auto storage : inputs)
+      allocate(storage, "host_to_l1", port++);
+    port = 0;
+    for (auto storage : outputs)
+      allocate(storage, "l1_to_host", port++);
+  }
+  return true;
+}
+constexpr size_t maxHardwareStageExpansion = 128;
+bool isolateConflictingChannelScopes(const GenericAnalysis &a,
+                                     GenericMappingPlan &p,
+                                     std::string &error) {
+  std::vector<bool> required;
+  std::vector<GenericAIRChannelAllocation> ignored;
+  if (!deriveChannelAllocations(a, p, required, ignored, error))
+    return false;
+  std::vector<GenericHardwareStage> stages;
+  for (size_t index = 0; index < p.hardwareStages.size(); ++index) {
+    const auto &stage = p.hardwareStages[index];
+    if (!required[index])
+      stages.push_back(stage);
+    else {
+      size_t cursor = stage.beginPhase;
+      while (cursor < stage.endPhase) {
+        size_t end = cursor;
+        for (const auto &scope : p.retainedRegions)
+          if (scope.beginPhase == cursor && scope.endPhase <= stage.endPhase) {
+            if (end != cursor && end != scope.endPhase)
+              return fail(error, "channel-conflict source output scopes have "
+                                 "incompatible lifetimes");
+            end = scope.endPhase;
+          }
+        if (end == cursor)
+          return fail(error, "channel-conflict stage requires complete "
+                             "retained-output scope boundaries");
+        for (const auto &scope : p.retainedRegions)
+          if (scope.beginPhase < end && scope.endPhase > cursor &&
+              (scope.beginPhase != cursor || scope.endPhase != end))
+            return fail(error, "channel-conflict hardware stage would split a "
+                               "retained source lifetime");
+        stages.push_back({cursor, end, true});
+        cursor = end;
+        if (stages.size() > maxHardwareStageExpansion)
+          return fail(error,
+                      "hardware-stage expansion exceeds 128 stages; "
+                      "host/codegen complexity bound, not SRAM capacity");
+      }
+    }
+    if (stages.size() > maxHardwareStageExpansion)
+      return fail(error, "hardware-stage expansion exceeds 128 stages; "
+                         "host/codegen complexity bound, not SRAM capacity");
+  }
+  p.hardwareStages = std::move(stages);
+  return true;
+}
+// Distinct hardware stages configure local storage separately. Read-only DMA
+// templates have independent pools for each actual shape and loop-rate shape.
+int64_t stagePoolBytes(const GenericAnalysis &a, const GenericMappingPlan &p,
+                       int64_t *phasePeak = nullptr,
+                       std::vector<int64_t> *stageBytes = nullptr,
+                       std::vector<llvm::json::Array> *stagePools = nullptr,
+                       std::vector<MappingAllocation> *allocations = nullptr) {
+  std::set<std::pair<size_t, size_t>> localInitializers;
+  for (const auto &scope : p.retainedRegions)
+    if (scope.initializerTask >= 0)
+      localInitializers.insert(
+          {p.phases[scope.beginPhase].task, scope.storage});
+  int64_t allocated = 0, peakLive = 0;
+  for (const auto &stage : p.hardwareStages) {
+    std::map<std::vector<int64_t>, int64_t> readonlyPools;
+    std::map<size_t, int64_t> panelPools;
+    std::map<size_t, int64_t> writtenPools;
+    std::set<size_t> staging;
+    for (size_t index = stage.beginPhase; index < stage.endPhase; ++index) {
+      const auto &phase = p.phases[index];
+      int64_t live = 0;
+      for (const auto &region : phase.regions) {
+        auto type = cast<MemRefType>(a.storages[region.storage].root.getType());
+        int64_t bytes = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+        for (auto n : region.sizes)
+          bytes *= n;
+        if (auto scope = readOnlyScope(p, index, region.storage)) {
+          int64_t panelBytes = (type.getElementType().getIntOrFloatBitWidth()+7)/8;
+          for (auto n : scope->sizes) panelBytes *= n;
+          panelPools[region.storage] = std::max(panelPools[region.storage], panelBytes);
+        } else if (region.read && !region.write) {
+          std::vector<int64_t> key{int64_t(region.storage),
+                                   int64_t(region.sizes.size())};
+          key.insert(key.end(), region.sizes.begin(), region.sizes.end());
+          for (auto bound : phase.loops)
+            key.push_back(bound.upper - bound.lower);
+          readonlyPools[key] = bytes;
+        } else
+          writtenPools[region.storage] =
+              std::max(writtenPools[region.storage], bytes);
+        if (region.read && region.write &&
+            !localInitializers.count({phase.task, region.storage}))
+          staging.insert(region.storage);
+        live += bytes;
+      }
+      peakLive = std::max(peakLive, live);
+    }
+    int64_t bytes = 0;
+    llvm::json::Array poolReport;
+    auto reportPool = [&](size_t storage, int64_t allocatedBytes,
+                          llvm::StringRef kind,
+                          const std::vector<int64_t> *templateKey = nullptr) {
+      if (allocations) {
+        std::string key = "storage-"+std::to_string(storage)+".data";
+        if (kind == "readonly_template") {
+          key += ".input";
+          size_t rank = (*templateKey)[1];
+          for (size_t d = 0; d < rank; ++d)
+            key += "."+std::to_string((*templateKey)[2+d]);
+          key += ".loops";
+          for (size_t d = 2+rank; d < templateKey->size(); ++d)
+            key += "."+std::to_string((*templateKey)[d]);
+        } else if (kind == "readonly_panel") key += ".readonly-panel";
+        else if (kind == "incoming_staging") key += ".incoming";
+        allocations->push_back({storage,"aie_l1",key,allocatedBytes,
+                                stage.beginPhase,stage.endPhase});
+      }
+      if (!stagePools) return;
+      auto type = cast<MemRefType>(a.storages[storage].root.getType());
+      int64_t width = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+      llvm::json::Array shape, loopExtents;
+      if (templateKey) {
+        size_t rank = (*templateKey)[1];
+        for (size_t d = 0; d < rank; ++d)
+          shape.push_back((*templateKey)[2 + d]);
+        for (size_t d = 2 + rank; d < templateKey->size(); ++d)
+          loopExtents.push_back((*templateKey)[d]);
+      }
+      poolReport.push_back(llvm::json::Object{
+          {"storage_index", int64_t(storage)},
+          {"storage", a.storages[storage].id},
+          {"dtype", a.storages[storage].dtype},
+          {"kind", kind.str()},
+          {"memory", "aie_l1"},
+          {"allocated_bytes", allocatedBytes},
+          {"flat_elements", allocatedBytes / width},
+          {"template_shape", std::move(shape)},
+          {"template_loop_extents", std::move(loopExtents)},
+          {"begin_phase", int64_t(stage.beginPhase)},
+          {"end_phase_exclusive", int64_t(stage.endPhase)},
+          {"lifetime",
+           "whole hardware stage; reused after serial completion"}});
+    };
+    for (const auto &pool : readonlyPools) {
+      bytes += pool.second;
+      reportPool(pool.first[0], pool.second, "readonly_template", &pool.first);
+    }
+    for (const auto &pool : panelPools) {
+      bytes += pool.second;
+      reportPool(pool.first, pool.second, "readonly_panel");
+    }
+    for (const auto &pool : writtenPools) {
+      bytes += pool.second * (staging.count(pool.first) ? 2 : 1);
+      reportPool(pool.first, pool.second, "writable");
+      if (staging.count(pool.first))
+        reportPool(pool.first, pool.second, "incoming_staging");
+    }
+    if (stagePools)
+      stagePools->push_back(std::move(poolReport));
+    allocated = std::max(allocated, bytes);
+    if (stageBytes)
+      stageBytes->push_back(bytes);
+  }
+  if (phasePeak)
+    *phasePeak = peakLive;
+  return allocated;
+}
+bool checkTileDomains(const GenericAnalysis &a, const GenericMappingPlan &p,
+                      std::string &error) {
+  struct DomainState {
+    bool begun = false, complete = false;
+    std::vector<int64_t> chunk, next;
+  };
+  std::vector<DomainState> domains(a.tasks.size());
+  std::vector<std::vector<std::vector<Interval>>> initialized(
+      a.storages.size());
+  for (size_t storage = 0; storage < a.storages.size(); ++storage)
+    if (a.storages[storage].role == "input") {
+      std::vector<Interval> box;
+      for (auto extent : a.storages[storage].shape)
+        box.push_back({0, extent});
+      initialized[storage].push_back(box);
+    }
+  auto finishTask = [&](size_t ti) {
+    // A completed source iteration domain initializes exactly the proven
+    // rectangular source writes, without accumulating one box per tile.
+    for (const auto &access : a.tasks[ti].accesses)
+      if (access.write && access.exactRegion)
+        initialized[access.storage].push_back(access.region);
+  };
+  std::map<size_t, std::vector<const GenericTileRetention *>> scopes;
+  std::map<size_t, size_t> scopeCursor;
+  std::set<size_t> fusedSources;
+  for (const auto &scope : p.retainedRegions) {
+    if (scope.storage >= a.storages.size() ||
+        scope.endPhase > p.phases.size() ||
+        scope.beginPhase >= scope.endPhase ||
+        (scope.endPhase - scope.beginPhase < 2 && scope.initializerTask < 0) ||
+        scope.initializerTask < -1)
+      return fail(error, "invalid retained local region scope");
+    auto &list = scopes[scope.storage];
+    if (!list.empty() && list.back()->endPhase > scope.beginPhase)
+      return fail(error,
+                  "overlapping or unordered retained local region scopes");
+    const auto &first = p.phases[scope.beginPhase];
+    if (scope.initializerTask >= 0) {
+      if (!initializerPair(a, scope.initializerTask, first.task, scope.storage))
+        return fail(error, "local initializer fails actual source "
+                           "projection/dependence proof");
+      fusedSources.insert(scope.initializerTask);
+    }
+    auto base = llvm::find_if(first.regions, [&](const auto &region) {
+      return region.storage == scope.storage;
+    });
+    if (base == first.regions.end() || !base->read || !base->write)
+      return fail(error, "retained scope requires read/write source storage");
+    for (size_t i = scope.beginPhase; i < scope.endPhase; ++i) {
+      const auto &phase = p.phases[i];
+      auto region = llvm::find_if(phase.regions, [&](const auto &region) {
+        return region.storage == scope.storage;
+      });
+      if (phase.task != first.task || region == phase.regions.end() ||
+          !region->read || !region->write || !sameRegion(*base, *region))
+        return fail(
+            error,
+            "retained local scope crosses changed task, offsets or extents");
+    }
+    if (scope.initializerTask >= 0) {
+      auto sameNeighbor = [&](size_t index) {
+        const auto &neighbor = p.phases[index];
+        auto region = llvm::find_if(neighbor.regions, [&](const auto &r) {
+          return r.storage == scope.storage;
+        });
+        return neighbor.task == first.task &&
+               region != neighbor.regions.end() && sameRegion(*base, *region);
+      };
+      if ((scope.beginPhase > 0 && sameNeighbor(scope.beginPhase - 1)) ||
+          (scope.endPhase < p.phases.size() && sameNeighbor(scope.endPhase)))
+        return fail(error, "local initializer must cover full invariant "
+                           "accumulation scope exactly once");
+    }
+    list.push_back(&scope);
+  }
+  std::map<std::pair<size_t, size_t>, size_t> fusedConsumers;
+  for (const auto &scope : p.retainedRegions)
+    if (scope.initializerTask >= 0) {
+      auto key = std::make_pair(p.phases[scope.beginPhase].task, scope.storage);
+      auto previous = fusedConsumers.find(key);
+      if (previous != fusedConsumers.end() &&
+          previous->second != size_t(scope.initializerTask))
+        return fail(error,
+                    "conflicting source initializers for consumer storage");
+      fusedConsumers[key] = scope.initializerTask;
+    }
+  std::set<size_t> declaredFused(p.fusedInitializerTasks.begin(),
+                                 p.fusedInitializerTasks.end());
+  if (declaredFused.size() != p.fusedInitializerTasks.size() ||
+      declaredFused != fusedSources)
+    return fail(error,
+                "fused initializer stage coverage disagrees with local scopes");
+  size_t previousEnd = 0;
+  for (const auto &scope : p.readOnlyRetentions) {
+    if (p.choices.residency != "readonly-panel" ||
+        scope.storage != size_t(p.choices.storage) ||
+        scope.beginPhase < previousEnd || scope.beginPhase >= scope.endPhase ||
+        scope.endPhase > p.phases.size() || scope.storage >= a.storages.size())
+      return fail(error, "invalid readonly panel lifetime/choice");
+    previousEnd = scope.endPhase;
+    const auto &first = p.phases[scope.beginPhase];
+    if (!panelTask(a, first.task, p.choices))
+      return fail(error, "readonly panel lacks source read-only/independence proof");
+    auto panelBound = first.loops[p.choices.panelLoop];
+    std::vector<int64_t> offsets, sizes;
+    for (size_t index = scope.beginPhase; index < scope.endPhase; ++index) {
+      const auto &phase = p.phases[index];
+      if (phase.task != first.task ||
+          phase.loops[p.choices.panelLoop].lower != panelBound.lower ||
+          phase.loops[p.choices.panelLoop].upper != panelBound.upper)
+        return fail(error, "readonly panel crosses a source panel subtree");
+      auto found = llvm::find_if(phase.regions, [&](const auto &r) {
+        return r.storage == scope.storage;
+      });
+      if (found == phase.regions.end() || !found->read || found->write)
+        return fail(error, "readonly panel contains missing or mutable source input");
+      if (offsets.empty()) { offsets = found->offsets; sizes = found->sizes; }
+      else for (size_t d = 0; d < sizes.size(); ++d) {
+        int64_t hi = std::max(offsets[d]+sizes[d], found->offsets[d]+found->sizes[d]);
+        offsets[d] = std::min(offsets[d], found->offsets[d]);
+        sizes[d] = hi - offsets[d];
+      }
+    }
+    if (offsets != scope.offsets || sizes != scope.sizes)
+      return fail(error, "readonly panel differs from actual source demand union");
+    auto stage = llvm::find_if(p.hardwareStages, [&](const auto &stage) {
+      return stage.beginPhase <= scope.beginPhase && scope.endPhase <= stage.endPhase;
+    });
+    if (stage == p.hardwareStages.end())
+      return fail(error, "readonly panel outlives its execution group allocation");
+    if (stage->beginPhase != scope.beginPhase || stage->endPhase != scope.endPhase)
+      return fail(error, "readonly-panel-scope grouping must bind one complete panel per execution group");
+    auto samePanel = [&](size_t index) {
+      const auto &phase = p.phases[index];
+      return phase.task == first.task &&
+             phase.loops[p.choices.panelLoop].lower == panelBound.lower &&
+             phase.loops[p.choices.panelLoop].upper == panelBound.upper;
+    };
+    if ((scope.beginPhase > stage->beginPhase && samePanel(scope.beginPhase-1)) ||
+        (scope.endPhase < stage->endPhase && samePanel(scope.endPhase)))
+      return fail(error, "readonly panel does not cover its complete chosen subtree");
+  }
+  size_t taskPosition = 0, transferPosition = 0;
+  for (size_t index = 0; index < p.phases.size(); ++index) {
+    const auto &phase = p.phases[index];
+    if (phase.task >= a.tasks.size())
+      return fail(error, "invalid phase task");
+    if (taskPosition >= p.orderedTasks.size())
+      return fail(error, "unexpected phase task");
+    if (p.orderedTasks[taskPosition] != phase.task) {
+      size_t previous = p.orderedTasks[taskPosition];
+      if (!domains[previous].complete)
+        return fail(error, "incomplete producer before next task");
+      finishTask(previous);
+      ++taskPosition;
+      if (taskPosition >= p.orderedTasks.size() ||
+          p.orderedTasks[taskPosition] != phase.task)
+        return fail(error, "phase task dependency/order violation");
+    }
+    if (index == 0 ? !phase.dependencies.empty()
+                   : phase.dependencies != std::vector<size_t>{index - 1})
+      return fail(error,
+                  "missing serial completion dependency before local reuse");
+    const auto &task = a.tasks[phase.task];
+    auto &state = domains[phase.task];
+    if (state.complete || phase.loops.size() != task.loops.size())
+      return fail(error, "duplicate or incomplete iteration domain");
+    if (!state.begun) {
+      for (const auto &loop : task.loops)
+        state.next.push_back(loop.lower);
+      for (const auto &bound : phase.loops)
+        state.chunk.push_back(bound.upper - bound.lower);
+      state.begun = true;
+      for (size_t l = 0; l < task.loops.size(); ++l) {
+        const auto &loop = task.loops[l];
+        int64_t iterations = (loop.upper - loop.lower - 1) / loop.step + 1;
+        int64_t chunkIterations = (state.chunk[l] - 1) / loop.step + 1;
+        if (l < p.tileSizes.size() &&
+            chunkIterations != std::min(iterations, p.tileSizes[l]))
+          return fail(error,
+                      "loop tile domain disagrees with explicit selection");
+        if (chunkIterations < iterations) {
+          for (const auto &access : task.accesses)
+            if (!loop.operation->isProperAncestor(access.operation))
+              return fail(
+                  error,
+                  "tile repeats source operations outside restricted loop");
+          for (size_t outer = 0; outer < l; ++outer)
+            if (state.chunk[outer] > task.loops[outer].step &&
+                !disjointSlices(task, outer))
+              return fail(
+                  error,
+                  "unproven iteration dependence across rectangular tiles");
+        }
+      }
+    }
+    // Check a Cartesian tile grid using an independent lexical cursor. This
+    // proves exact coverage and disjointness in O(phases * loop depth).
+    for (size_t l = 0; l < task.loops.size(); ++l) {
+      auto b = phase.loops[l];
+      const auto &loop = task.loops[l];
+      if (b.loop != l || b.lower != state.next[l] || b.lower < loop.lower ||
+          b.upper > loop.upper || b.lower >= b.upper ||
+          (b.lower - loop.lower) % loop.step ||
+          (b.upper != loop.upper && (b.upper - loop.lower) % loop.step) ||
+          b.upper != std::min(loop.upper, b.lower + state.chunk[l]))
+        return fail(error,
+                    "missing, overlapping or invalid source tile loop domain");
+    }
+    bool carry = true;
+    for (size_t l = task.loops.size(); l > 0 && carry; --l) {
+      size_t d = p.taskLoopOrders[phase.task][l - 1];
+      const auto &loop = task.loops[d];
+      if (state.next[d] + state.chunk[d] >= loop.upper)
+        state.next[d] = loop.lower;
+      else {
+        state.next[d] += state.chunk[d];
+        carry = false;
+      }
+    }
+    state.complete = carry;
+    GenericTilePhase derived;
+    derived.task = phase.task;
+    derived.loops = phase.loops;
+    int64_t derivedBytes;
+    if (!phaseRegions(a, derived, derivedBytes, error))
+      return false;
+    if (derived.regions.size() != phase.regions.size())
+      return fail(error, "missing source access storage region");
+    for (size_t r = 0; r < derived.regions.size(); ++r) {
+      const auto &x = derived.regions[r];
+      const auto &y = phase.regions[r];
+      if (x.storage != y.storage || x.offsets != y.offsets ||
+          x.sizes != y.sizes || x.read != y.read || x.write != y.write)
+        return fail(error,
+                    "tile region disagrees with actual source affine accesses");
+    }
+    int64_t live = 0;
+    std::set<size_t> storages;
+    for (const auto &region : phase.regions) {
+      if (region.storage >= a.storages.size() ||
+          !storages.insert(region.storage).second)
+        return fail(error, "duplicate or invalid local storage region");
+      const auto &storage = a.storages[region.storage];
+      if (region.offsets.size() != storage.shape.size() ||
+          region.sizes.size() != storage.shape.size())
+        return fail(error, "tile region rank mismatch");
+      auto type = cast<MemRefType>(storage.root.getType());
+      int64_t bytes = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+      std::vector<Interval> bounds;
+      for (size_t d = 0; d < storage.shape.size(); ++d) {
+        if (region.offsets[d] < 0 || region.sizes[d] <= 0 ||
+            region.sizes[d] > storage.shape[d] - region.offsets[d] ||
+            bytes > INT64_MAX / region.sizes[d])
+          return fail(error, "invalid tile region extent");
+        bytes *= region.sizes[d];
+        bounds.push_back(
+            {region.offsets[d], region.offsets[d] + region.sizes[d]});
+      }
+      bool import = region.read, exportRegion = region.write;
+      auto &list = scopes[region.storage];
+      auto &scopeIndex = scopeCursor[region.storage];
+      while (scopeIndex < list.size() && list[scopeIndex]->endPhase <= index)
+        ++scopeIndex;
+      auto fused = fusedConsumers.find({phase.task, region.storage});
+      if (fused != fusedConsumers.end() &&
+          (scopeIndex >= list.size() || list[scopeIndex]->beginPhase > index ||
+           list[scopeIndex]->initializerTask != int64_t(fused->second)))
+        return fail(
+            error,
+            "fused source initializer missing from consumer storage phase");
+      if (scopeIndex < list.size() && list[scopeIndex]->beginPhase <= index) {
+        import &= list[scopeIndex]->initializerTask < 0 &&
+                  index == list[scopeIndex]->beginPhase;
+        exportRegion &= index + 1 == list[scopeIndex]->endPhase;
+      }
+      if (declaredFused.count(phase.task)) {
+        import = false;
+        exportRegion = false;
+      }
+      auto panel = readOnlyScope(p, index, region.storage);
+      if (p.choices.residency == "readonly-panel" &&
+          region.storage == size_t(p.choices.storage) &&
+          panelTask(a, phase.task, p.choices) && !panel)
+        return fail(error, "missing readonly panel source demand coverage");
+      if (panel) import &= index == panel->beginPhase;
+      for (const char *direction : {"host_to_l1", "l1_to_host"}) {
+        if ((std::string(direction) == "host_to_l1" && !import) ||
+            (std::string(direction) == "l1_to_host" && !exportRegion))
+          continue;
+        if (transferPosition >= p.transfers.size())
+          return fail(error, "missing source tile transfer");
+        const auto &transfer = p.transfers[transferPosition++];
+        auto offsets = panel ? panel->offsets : region.offsets;
+        auto sizes = panel ? panel->sizes : region.sizes;
+        int64_t transferBytes = bytes;
+        if (panel) {
+          auto type = cast<MemRefType>(a.storages[region.storage].root.getType());
+          transferBytes = (type.getElementType().getIntOrFloatBitWidth()+7)/8;
+          for (auto size : sizes) transferBytes *= size;
+        }
+        if (transfer.storage != region.storage ||
+            transfer.direction != direction || transfer.phase != index ||
+            transfer.bytes != transferBytes || transfer.offsets != offsets ||
+            transfer.sizes != sizes)
+          return fail(error, "transfer differs from source tile extent, "
+                             "direction, phase or byte count");
+      }
+      if (region.read && !covered(bounds, initialized[region.storage]))
+        return fail(error, "tile reload before producing storage region");
+      if (live > INT64_MAX - bytes)
+        return fail(error, "local residency overflow");
+      live += bytes;
+    }
+    if (live > p.capacityBytes)
+      return fail(error, "phase exceeds local capacity");
+  }
+  if (transferPosition != p.transfers.size())
+    return fail(error, "unexpected or duplicate tile transfer");
+  for (const auto &state : domains)
+    if (!state.begun || !state.complete)
+      return fail(error, "missing source iteration coverage");
+  size_t phaseCursor = 0;
+  std::set<size_t> boundaries;
+  if (p.executionGroups.size() != p.hardwareStages.size())
+    return fail(error, "hardware binding lacks public execution group coverage");
+  size_t groupIndex = 0;
+  for (const auto &stage : p.hardwareStages) {
+    const auto &group = p.executionGroups[groupIndex];
+    std::vector<size_t> dependencies;
+    if (groupIndex) dependencies.push_back(groupIndex - 1);
+    if (stage.groupIndex != groupIndex || group.beginPhase != stage.beginPhase ||
+        group.endPhase != stage.endPhase || group.resource != "npu.compute" ||
+        group.memory != "aie_l1" || group.dependencies != dependencies)
+      return fail(error, "execution group schedule/resource binding mismatch");
+    ++groupIndex;
+    while (phaseCursor < p.phases.size() &&
+           declaredFused.count(p.phases[phaseCursor].task))
+      ++phaseCursor;
+    if (stage.beginPhase != phaseCursor || stage.beginPhase >= stage.endPhase ||
+        stage.endPhase > p.phases.size())
+      return fail(error,
+                  "hardware stages do not partition actual consumer phases");
+    const auto &first = p.phases[stage.beginPhase];
+    auto signature = hardwareShapeSignature(p, stage.beginPhase);
+    for (size_t phase = stage.beginPhase; phase < stage.endPhase; ++phase)
+      if (p.phases[phase].task != first.task ||
+          hardwareShapeSignature(p, phase) != signature)
+        return fail(
+            error,
+            "hardware stage mixes source tasks or output/loop-rate shapes");
+    boundaries.insert(stage.beginPhase);
+    boundaries.insert(stage.endPhase);
+    phaseCursor = stage.endPhase;
+  }
+  while (phaseCursor < p.phases.size() &&
+         declaredFused.count(p.phases[phaseCursor].task))
+    ++phaseCursor;
+  if (phaseCursor != p.phases.size())
+    return fail(error, "missing hardware stage coverage");
+  for (const auto &scope : p.retainedRegions) {
+    auto next = boundaries.upper_bound(scope.beginPhase);
+    if (next == boundaries.end() || *next < scope.endPhase)
+      return fail(error, "hardware stage ends before retained region export");
+  }
+  if (p.hardwareStages.size() > maxHardwareStageExpansion)
+    return fail(error, "hardware-stage expansion exceeds checked host/codegen "
+                       "complexity bound");
+  for (const auto &stage : p.hardwareStages)
+    if (stage.legalizeChannels) {
+      bool scopePresent = false;
+      for (const auto &scope : p.retainedRegions)
+        if (scope.beginPhase < stage.endPhase &&
+            scope.endPhase > stage.beginPhase) {
+          if (scope.beginPhase != stage.beginPhase ||
+              scope.endPhase != stage.endPhase)
+            return fail(error, "channel-conflict stage aggregates multiple "
+                               "retained-output scopes");
+          scopePresent = true;
+        }
+      if (!scopePresent)
+        return fail(error,
+                    "channel-conflict stage lacks a retained-output scope");
+    }
+  std::vector<bool> channelsRequired;
+  std::vector<GenericAIRChannelAllocation> channelPlan;
+  if (!deriveChannelAllocations(a, p, channelsRequired, channelPlan, error))
+    return false;
+  for (size_t stage = 0; stage < p.hardwareStages.size(); ++stage)
+    if (p.hardwareStages[stage].legalizeChannels != channelsRequired[stage])
+      return fail(error, "DMA channel legalization flag disagrees with actual "
+                         "source template conflicts");
+  if (p.channelAllocations.size() != channelPlan.size())
+    return fail(error, "missing or duplicate planned DMA channel allocation");
+  for (size_t i = 0; i < channelPlan.size(); ++i) {
+    const auto &x = p.channelAllocations[i];
+    const auto &y = channelPlan[i];
+    if (x.stage != y.stage || x.storage != y.storage ||
+        x.direction != y.direction || x.tileChannel != y.tileChannel ||
+        x.logicalFifo != y.logicalFifo || x.transferCount != y.transferCount ||
+        x.bytes != y.bytes)
+      return fail(error, "DMA channel allocation disagrees with source "
+                         "transfer groups or tile port capacity");
+  }
+  int64_t allocated = stagePoolBytes(a, p);
+  if (allocated != p.residentBytes || allocated > p.capacityBytes)
+    return fail(error, "physical per-stage storage pools exceed declared "
+                       "residency or local capacity");
+  return true;
+}
+bool buildTiled(const GenericAnalysis &a, GenericMappingPlan &p,
+                std::string &error) {
+  p.phases.clear();
+  p.retainedRegions.clear();
+  p.transfers.clear();
+  p.residentBytes = 0;
+  auto localInitializers = initializerCandidates(a);
+  for (size_t ti : p.orderedTasks) {
+    const auto &task = a.tasks[ti];
+    std::vector<int64_t> chunks;
+    std::vector<bool> eligible;
+    for (size_t l = 0; l < task.loops.size(); ++l) {
+      const auto &loop = task.loops[l];
+      bool safe = true;
+      for (const auto &access : task.accesses)
+        safe &= loop.operation->isProperAncestor(access.operation);
+      eligible.push_back(safe);
+      int64_t count = (loop.upper - loop.lower - 1) / loop.step + 1;
+      if (l < p.tileSizes.size()) {
+        if (!safe && p.tileSizes[l] < count)
+          return fail(error, "requested loop tile would repeat source "
+                             "initialization; distribute initialization first");
+        if (safe)
+          count = std::min(count, p.tileSizes[l]);
+      }
+      chunks.push_back(count);
+    }
+    auto make = [&](const std::vector<int64_t> &starts) {
+      GenericTilePhase phase;
+      phase.task = ti;
+      for (size_t l = 0; l < task.loops.size(); ++l) {
+        auto &loop = task.loops[l];
+        phase.loops.push_back(
+            {l, starts[l],
+             std::min(loop.upper, starts[l] + chunks[l] * loop.step)});
+      }
+      return phase;
+    };
+    std::vector<int64_t> first;
+    for (auto &loop : task.loops)
+      first.push_back(loop.lower);
+    while (true) {
+      auto phase = make(first);
+      int64_t bytes;
+      if (!phaseRegions(a, phase, bytes, error))
+        return false;
+      for (const auto &region : phase.regions)
+        if (region.read && region.write &&
+            !localInitializers.count({ti, region.storage})) {
+          auto type =
+              cast<MemRefType>(a.storages[region.storage].root.getType());
+          int64_t n = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+          for (auto size : region.sizes)
+            n *= size;
+          bytes += n;
+        }
+      if (bytes <= p.capacityBytes)
+        break;
+      if (!p.tileSizes.empty())
+        return fail(error, "explicit tile selection exceeds local capacity");
+      size_t chosen = chunks.size();
+      int64_t best = 1;
+      for (size_t l = 0; l < chunks.size(); ++l)
+        if (eligible[l] && chunks[l] > best) {
+          best = chunks[l];
+          chosen = l;
+        }
+      if (chosen == chunks.size())
+        return fail(
+            error,
+            "no legal source-preserving tile fits 24576-byte local capacity");
+      chunks[chosen] = (chunks[chosen] + 1) / 2;
+    }
+    // Rectangular blocking permutes outer iterations across inner chunks.
+    // Permit it only with an actual access projection proof. Otherwise unit
+    // outer chunks retain the source's lexical execution order exactly.
+    for (size_t inner = 0; inner < chunks.size(); ++inner) {
+      auto &loop = task.loops[inner];
+      int64_t count = (loop.upper - loop.lower - 1) / loop.step + 1;
+      if (chunks[inner] < count)
+        for (size_t outer = 0; outer < inner; ++outer)
+          if (!disjointSlices(task, outer)) {
+            if (!p.tileSizes.empty() && chunks[outer] > 1)
+              return fail(error, "explicit tile selection reorders unproven "
+                                 "dependent source iterations");
+            chunks[outer] = 1;
+          }
+    }
+    std::function<bool(size_t, std::vector<int64_t> &)> emit;
+    emit = [&](size_t l, std::vector<int64_t> &starts) {
+      if (l < task.loops.size()) {
+        size_t sourceLoop = p.taskLoopOrders[ti][l];
+        auto &loop = task.loops[sourceLoop];
+        for (int64_t lo = loop.lower; lo < loop.upper;
+             lo += chunks[sourceLoop] * loop.step) {
+          starts[sourceLoop] = lo;
+          if (!emit(l + 1, starts))
+            return false;
+        }
+        return true;
+      }
+      if (p.phases.size() >= 1048576)
+        return fail(error, "serial tile expansion exceeds 1048576 phases; "
+                           "compact loop lowering required");
+      auto phase = make(starts);
+      int64_t bytes;
+      if (!phaseRegions(a, phase, bytes, error))
+        return false;
+      if (bytes > p.capacityBytes)
+        return fail(error, "tail tile exceeds local capacity");
+      p.residentBytes = std::max(p.residentBytes, bytes);
+      for (auto &r : phase.regions) {
+        auto type = cast<MemRefType>(a.storages[r.storage].root.getType());
+        int64_t n = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+        for (auto size : r.sizes)
+          n *= size;
+        if (r.read)
+          p.transfers.push_back({r.storage, "host_to_l1", n, p.phases.size(),
+                                 r.offsets, r.sizes});
+        if (r.write)
+          p.transfers.push_back({r.storage, "l1_to_host", n, p.phases.size(),
+                                 r.offsets, r.sizes});
+      }
+      if (!p.phases.empty())
+        phase.dependencies.push_back(p.phases.size() - 1);
+      p.phases.push_back(std::move(phase));
+      return true;
+    };
+    if (!emit(0, first))
+      return false;
+  }
+  inferRetentions(a, p);
+  inferHardwareStages(p);
+  if (p.choices.residency == "readonly-panel") {
+    std::vector<GenericHardwareStage> groups;
+    for (const auto &stage : p.hardwareStages) {
+      size_t begin = stage.beginPhase;
+      while (begin < stage.endPhase) {
+        size_t end = stage.endPhase;
+        if (panelTask(a,p.phases[begin].task,p.choices)) {
+          const auto &bound = p.phases[begin].loops[p.choices.panelLoop];
+          end = begin+1;
+          while (end < stage.endPhase &&
+                 p.phases[end].loops[p.choices.panelLoop].lower == bound.lower &&
+                 p.phases[end].loops[p.choices.panelLoop].upper == bound.upper) ++end;
+        }
+        groups.push_back({begin,end}); begin = end;
+      }
+    }
+    p.hardwareStages = std::move(groups);
+  }
+  if (!isolateConflictingChannelScopes(a, p, error))
+    return false;
+  inferReadOnlyRetentions(a, p);
+  std::vector<bool> channelsRequired;
+  if (!deriveChannelAllocations(a, p, channelsRequired, p.channelAllocations,
+                                error))
+    return false;
+  for (size_t stage = 0; stage < p.hardwareStages.size(); ++stage)
+    p.hardwareStages[stage].legalizeChannels = channelsRequired[stage];
+  p.executionGroups.clear();
+  for (size_t index = 0; index < p.hardwareStages.size(); ++index) {
+    auto &stage = p.hardwareStages[index];
+    stage.groupIndex = index;
+    ProgramExecutionGroup group;
+    group.resource = "npu.compute"; group.memory = "aie_l1";
+    group.beginPhase = stage.beginPhase; group.endPhase = stage.endPhase;
+    if (index) group.dependencies.push_back(index - 1);
+    p.executionGroups.push_back(std::move(group));
+  }
+  p.residentBytes = stagePoolBytes(a, p);
+  if (p.residentBytes > p.capacityBytes)
+    return fail(error,
+                "physical per-stage storage pools exceed local capacity");
+  return true;
+}
+} // namespace
+bool orbit::taskflow::deriveGenericPhaseRegions(const GenericAnalysis &a,
+    GenericTilePhase &phase, int64_t &bytes, std::string &error) {
+  return phaseRegions(a,phase,bytes,error);
+}
+void orbit::taskflow::collectGenericAllocations(const GenericAnalysis &a,
+    const GenericMappingPlan &p, std::vector<MappingAllocation> &allocations) {
+  size_t end = p.strategy == "serial-tiled" ? p.phases.size() : p.orderedTasks.size();
+  for (size_t storage = 0; storage < a.storages.size(); ++storage) {
+    bool external = isa<BlockArgument>(a.storages[storage].root);
+    if (p.strategy == "serial-tiled" || external)
+      allocations.push_back({storage,"system_memory_bo","host-"+std::to_string(storage),
+                             storageBytes(a.storages[storage]),0,end});
+    if (p.strategy != "serial-tiled")
+      allocations.push_back({storage,"aie_l1","storage-"+std::to_string(storage)+".data",
+                             storageBytes(a.storages[storage]),0,end});
+  }
+  if (p.strategy == "serial-tiled")
+    stagePoolBytes(a,p,nullptr,nullptr,nullptr,&allocations);
+}
+std::vector<ProgramMappingChoice>
+orbit::taskflow::discoverGenericMappingChoices(const GenericAnalysis &a) {
+  ProgramMappingChoice baseline;
+  baseline.residency="phase-local";baseline.grouping="task-shape-stages";
+  baseline.dataOrganization="phase-local";
+  std::vector<ProgramMappingChoice> choices{baseline};
+  for (size_t storage = 0; storage < a.storages.size(); ++storage)
+    for (int64_t reuse = 0; reuse < 2; ++reuse) {
+      ProgramMappingChoice choice{"readonly-panel", int64_t(storage), reuse,
+                                   1 - reuse};
+      choice.grouping = "readonly-panel-scope";
+      choice.dataOrganization = "retain-across-users";
+      bool matched = false;
+      for (size_t task = 0; task < a.tasks.size(); ++task)
+        matched |= panelTask(a, task, choice);
+      if (matched)
+        choices.push_back(choice);
+    }
+  return choices;
+}
+bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
+                                          const GenericMappingPlan &p,
+                                          std::string &e) {
+  if ((p.strategy != "single-herd-resident" && p.strategy != "serial-tiled") ||
+      p.bodyFingerprint != a.bodyFingerprint)
+    return fail(e, "generic plan strategy/body identity mismatch");
+  if (p.channelMergePolicy != "single-logical-fifo-per-stage-storage-direction")
+    return fail(e, "unsupported generic AIR channel merge policy");
+  if (p.capacityBytes <= 0 || p.capacityBytes > 24576)
+    return fail(e, "single-herd validated capacity must be in (0,24576] bytes");
+  if (p.taskLoopOrders.size() != a.tasks.size() ||
+      p.taskImplementations.size() != a.tasks.size())
+    return fail(e, "missing program task scheduling/implementation coverage");
+  ProgramDataPolicy policy;
+  if(!parseProgramDataPolicy(p.choices.dataOrganization,policy,e)) return false;
+  if((policy==ProgramDataPolicy::RetainAcrossUsers)!=(p.choices.residency=="readonly-panel"))
+    return fail(e,"public data organization differs from its checked target realization");
+  bool panelApplied = false;
+  if (p.choices.residency != "phase-local" &&
+      p.choices.residency != "readonly-panel")
+    return fail(e, "unsupported program residency choice");
+  if (p.choices.grouping != (p.choices.residency == "readonly-panel"
+                            ? "readonly-panel-scope" : "task-shape-stages"))
+    return fail(e, "unsupported program execution grouping choice");
+  if (p.choices.residency == "phase-local" &&
+      (p.choices.storage != -1 || p.choices.reuseLoop != -1 ||
+       p.choices.panelLoop != -1))
+    return fail(e, "phase-local choice carries an undeclared panel strategy");
+  for (size_t task = 0; task < a.tasks.size(); ++task) {
+    std::vector<size_t> expected;
+    bool panel = p.choices.residency == "readonly-panel" &&
+                 panelTask(a, task, p.choices);
+    panelApplied |= panel;
+    if (panel) {
+      expected.push_back(p.choices.panelLoop);
+      expected.push_back(p.choices.reuseLoop);
+    }
+    for (size_t loop = 0; loop < a.tasks[task].loops.size(); ++loop)
+      if (!llvm::is_contained(expected, loop)) expected.push_back(loop);
+    if (p.taskLoopOrders[task] != expected)
+      return fail(e, "program loop schedule lacks actual source independence proof");
+    const auto &implementation = p.taskImplementations[task];
+    if (implementation.task != task)
+      return fail(e, "missing or duplicated source task implementation");
+    if (implementation.kind == "scalar") {
+      if (implementation.parallelLoop != -1 || implementation.lanes != 1)
+        return fail(e, "scalar implementation has vector resource choices");
+    } else if (implementation.kind != "independent-lane-f32" ||
+               implementation.parallelLoop != vectorLoop(a, a.tasks[task]) ||
+               implementation.parallelLoop < 0 || implementation.lanes < 2 ||
+               implementation.lanes > 16 ||
+               (implementation.lanes & (implementation.lanes - 1)))
+      return fail(e, "vector implementation fails independent-lane source proof");
+  }
+  if (p.choices.residency == "readonly-panel" && !panelApplied)
+    return fail(e, "readonly panel choice matches no proven source task");
+  if (p.strategy == "single-herd-resident") {
+    int64_t bytes = 0;
+    for (auto &s : a.storages) {
+      int64_t n = storageBytes(s);
+      if (n < 0 || bytes > INT64_MAX - n)
+        return fail(e, "unsupported storage extent/type or byte overflow");
+      bytes += n;
+    }
+    if (bytes != p.residentBytes)
+      return fail(e, "declared residency disagrees with actual storage bytes");
+    if (bytes > p.capacityBytes)
+      return fail(e, "single-herd resident capacity exceeded: " +
+                         std::to_string(bytes) + " > " +
+                         std::to_string(p.capacityBytes));
+  }
+  std::set<size_t> done;
+  for (size_t t : p.orderedTasks) {
+    if (t >= a.tasks.size() || done.count(t))
+      return fail(e, "duplicate/invalid task coverage");
+    for (size_t d : a.tasks[t].dependencies)
+      if (!done.count(d))
+        return fail(e, "task scheduled before dependency");
+    done.insert(t);
+  }
+  if (done.size() != a.tasks.size())
+    return fail(e, "missing task coverage");
+  if (p.strategy == "serial-tiled") {
+    for (auto size : p.tileSizes)
+      if (size <= 0)
+        return fail(e, "tile sizes must be positive");
+    for (const auto &transfer : p.transfers)
+      if (transfer.storage >= a.storages.size())
+        return fail(e, "invalid tiled transfer storage");
+    for (const auto &phase : p.phases)
+      if (phase.task >= a.tasks.size())
+        return fail(e, "invalid tiled phase task");
+    if (!checkTileDomains(a, p, e))
+      return false;
+  } else {
+    if (!p.phases.empty() || !p.tileSizes.empty() ||
+        !p.retainedRegions.empty() || !p.fusedInitializerTasks.empty() ||
+        !p.hardwareStages.empty() || !p.channelAllocations.empty())
+      return fail(e, "resident strategy carries unexpected tile phases");
+    std::set<std::pair<size_t, std::string>> transfers;
+    for (auto &t : p.transfers) {
+      if (t.storage >= a.storages.size() ||
+          t.bytes != storageBytes(a.storages[t.storage]) ||
+          !transfers.emplace(t.storage, t.direction).second)
+        return fail(e, "invalid/duplicate transfer or byte extent");
+      auto &s = a.storages[t.storage];
+      if (!((s.role == "input" && t.direction == "host_to_l1") ||
+            (s.role == "output" && t.direction == "l1_to_host")))
+        return fail(e, "transfer boundary/role mismatch");
+    }
+    for (size_t i = 0; i < a.storages.size(); ++i) {
+      auto &s = a.storages[i];
+      if (s.role == "input" && !transfers.count({i, "host_to_l1"}))
+        return fail(e, "missing input transfer");
+      if (s.role == "output" && !transfers.count({i, "l1_to_host"}))
+        return fail(e, "missing output transfer");
+    }
+  }
+  if (!checkProgramCommunication(a,p,e)) return false;
+  const std::string theoryProvenance =
+      "theoretical direct-AIR source scalar-operation and explicit-transfer "
+      "sensitivity; not calibrated; backend local copies and internal "
+      "scheduling excluded";
+  if (!p.hasCost) {
+    if (p.estimatedMs != 0 || p.theoreticalLaunchMs != 0 ||
+        p.theoreticalPerOperationMs != 0 || p.theoreticalPerByteMs != 0 ||
+        p.costProvenance != "unknown: direct AIR path not calibrated")
+      return fail(e, "unscored plan must not carry a fabricated cost or "
+                     "theoretical coefficients");
+  } else {
+    if (!std::isfinite(p.estimatedMs) || p.estimatedMs <= 0 ||
+        p.costProvenance != theoryProvenance)
+      return fail(e, "invalid direct-path theoretical cost/provenance");
+    for (double coefficient :
+         {p.theoreticalLaunchMs, p.theoreticalPerOperationMs,
+          p.theoreticalPerByteMs})
+      if (!std::isfinite(coefficient) || coefficient < 0)
+        return fail(e, "invalid theoretical coefficient");
+    // Independently evaluate the declared model from actual operations and
+    // the transfer plan. This proves internal consistency, never calibration.
+    double scalarOperations = 0;
+    for (const auto &task : a.tasks)
+      task.operation->walk([&](mlir::Operation *operation) {
+        auto dialect = operation->getName().getDialectNamespace();
+        if ((dialect != "arith" && dialect != "math") ||
+            operation->getName().getStringRef() == "arith.constant")
+          return;
+        double instances = 1;
+        for (const auto &loop : task.loops)
+          if (loop.operation->isProperAncestor(operation))
+            instances *= double((loop.upper - loop.lower - 1) / loop.step + 1);
+        scalarOperations += instances;
+      });
+    double transferred = 0;
+    for (const auto &transfer : p.transfers)
+      transferred += transfer.bytes;
+    double expected = p.theoreticalLaunchMs +
+                      p.theoreticalPerOperationMs * scalarOperations +
+                      p.theoreticalPerByteMs * transferred;
+    if (!std::isfinite(expected) ||
+        std::abs(expected - p.estimatedMs) >
+            1e-12 * std::max(1.0, std::abs(expected)))
+      return fail(e, "theoretical cost disagrees with actual "
+                     "operation/transfer accounting");
+  }
+  return true;
+}
+bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
+                                         const llvm::json::Value &config,
+                                         GenericMappingPlan &p,
+                                         std::string &e) {
+  p = GenericMappingPlan{};
+  p.bodyFingerprint = a.bodyFingerprint;
+  auto module = a.function->getParentOfType<mlir::ModuleOp>();
+  if(!readNativeMappingChoice(module,p.choices,e)) return false;
+  int64_t lanes = 1;
+  if (auto implementation = module->getAttrOfType<StringAttr>("orbit.implementation")) {
+    if (implementation.getValue() != "scalar" &&
+        implementation.getValue() != "independent-lane-f32")
+      return fail(e, "unsupported program implementation choice");
+    if (implementation.getValue() == "independent-lane-f32") {
+      auto attr = module->getAttrOfType<IntegerAttr>("orbit.vector_lanes");
+      if (!attr || attr.getInt() < 2 || attr.getInt() > 16 ||
+          (attr.getInt() & (attr.getInt() - 1)))
+        return fail(e, "independent-lane-f32 requires power-of-two lanes in [2,16]");
+      lanes = attr.getInt();
+    }
+  }
+  for (size_t task = 0; task < a.tasks.size(); ++task) {
+    std::vector<size_t> order;
+    if (p.choices.residency == "readonly-panel" && panelTask(a, task, p.choices)) {
+      order.push_back(p.choices.panelLoop); order.push_back(p.choices.reuseLoop);
+    }
+    for (size_t loop = 0; loop < a.tasks[task].loops.size(); ++loop)
+      if (!llvm::is_contained(order, loop)) order.push_back(loop);
+    p.taskLoopOrders.push_back(std::move(order));
+    GenericTaskImplementation implementation;
+    implementation.task = task;
+    int64_t loop = lanes > 1 ? vectorLoop(a, a.tasks[task]) : -1;
+    if (loop >= 0) {
+      implementation.kind = "independent-lane-f32";
+      implementation.parallelLoop = loop; implementation.lanes = lanes;
+    }
+    p.taskImplementations.push_back(std::move(implementation));
+  }
+  auto object = config.getAsObject();
+  auto cfg = object ? object->getObject("generic_air") : nullptr;
+  if (cfg)
+    if (auto capacity = cfg->getInteger("capacity_bytes"))
+      p.capacityBytes = *capacity;
+  for (size_t i = 0; i < a.storages.size(); ++i) {
+    int64_t n = storageBytes(a.storages[i]);
+    if (n < 0 || p.residentBytes > INT64_MAX - n)
+      return fail(e, "invalid static storage byte size");
+    p.residentBytes += n;
+    auto role = a.storages[i].role;
+    if (role == "input" || role == "output")
+      p.transfers.push_back(
+          {i, role == "input" ? "host_to_l1" : "l1_to_host", n});
+  }
+  std::set<size_t> scheduled;
+  while (scheduled.size() < a.tasks.size()) {
+    bool progress = false;
+    for (size_t i = 0; i < a.tasks.size(); ++i) {
+      if (scheduled.count(i))
+        continue;
+      bool ready = true;
+      for (auto d : a.tasks[i].dependencies)
+        ready &= scheduled.count(d) != 0;
+      if (ready) {
+        p.orderedTasks.push_back(i);
+        scheduled.insert(i);
+        progress = true;
+      }
+    }
+    if (!progress)
+      return fail(e, "cyclic task dependencies");
+  }
+  bool requestTiling = p.residentBytes > p.capacityBytes ||
+                       p.choices.residency != "phase-local" || lanes > 1;
+  if (auto attr = a.function->getParentOfType<mlir::ModuleOp>()
+                      ->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                          "orbit.air_tile_sizes")) {
+    p.tileSizes.assign(attr.asArrayRef().begin(), attr.asArrayRef().end());
+    requestTiling = true;
+  }
+  if (cfg) {
+    if (auto sizes = cfg->getArray("tile_sizes")) {
+      p.tileSizes.clear();
+      for (const auto &size : *sizes) {
+        auto n = size.getAsInteger();
+        if (!n || *n <= 0)
+          return fail(e, "tile_sizes requires positive integers");
+        p.tileSizes.push_back(*n);
+      }
+      requestTiling = true;
+    }
+    if (auto tiled = cfg->getBoolean("tiled"))
+      requestTiling |= *tiled;
+  }
+  if (p.capacityBytes <= 0 || p.capacityBytes > 24576)
+    return fail(e, "single-herd validated capacity must be in (0,24576] bytes");
+  if (requestTiling) {
+    p.strategy = "serial-tiled";
+    for (auto size : p.tileSizes)
+      if (size <= 0)
+        return fail(e, "tile sizes must be positive");
+    if (!buildTiled(a, p, e))
+      return false;
+  }
+  if (cfg)
+    if (auto theory = cfg->getObject("theoretical")) {
+      auto launch = theory->getNumber("launch_ms"),
+           op = theory->getNumber("per_scalar_operation_ms"),
+           dma = theory->getNumber("per_transfer_byte_ms");
+      if (!launch || !op || !dma || *launch < 0 || *op < 0 || *dma < 0)
+        return fail(e,
+                    "explicit nonnegative theoretical coefficients required");
+      double count = 0;
+      for (auto &task : a.tasks)
+        task.operation->walk([&](mlir::Operation *operation) {
+          if ((operation->getName().getDialectNamespace() != "arith" &&
+               operation->getName().getDialectNamespace() != "math") ||
+              operation->getName().getStringRef() == "arith.constant")
+            return;
+          double multiplicity = 1;
+          for (auto &loop : task.loops)
+            if (loop.operation->isProperAncestor(operation))
+              multiplicity *=
+                  double((loop.upper - loop.lower + loop.step - 1) / loop.step);
+          count += multiplicity;
+        });
+      double transferBytes = 0;
+      for (auto &t : p.transfers)
+        transferBytes += t.bytes;
+      p.theoreticalLaunchMs = *launch;
+      p.theoreticalPerOperationMs = *op;
+      p.theoreticalPerByteMs = *dma;
+      p.hasCost = true;
+      p.estimatedMs = *launch + *op * count + *dma * transferBytes;
+      p.costProvenance = "theoretical direct-AIR source scalar-operation and "
+                         "explicit-transfer "
+                         "sensitivity; not calibrated; backend local copies "
+                         "and internal scheduling excluded";
+    }
+  if (!buildProgramCommunication(a,p,e))
+    return false;
+  if (!checkGenericMapping(a, p, e))
+    return false;
+  p.planId = staticFingerprint(serializeGenericMapping(a, p));
+  return true;
+}
+llvm::json::Value
+orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
+                                         const GenericMappingPlan &p) {
+  llvm::json::Array tasks, transfers, residency, phases, tileSizes,
+      phaseDomains, transferSummary, retentions, fusedInitializers,
+      hardwareStages, channelAllocations, hostBuffers, loopOrders, opportunities,
+      implementations, readonlyRetentions, executionGroups;
+  for (const auto &choice : discoverGenericMappingChoices(a)) {
+    if (choice.residency == "phase-local") continue;
+    llvm::json::Array tasks;
+    for (size_t task = 0; task < a.tasks.size(); ++task)
+      if (panelTask(a,task,choice)) tasks.push_back(int64_t(task));
+    opportunities.push_back(llvm::json::Object{
+      {"storage_index",choice.storage},{"invariant_source_loop",choice.reuseLoop},
+      {"panel_source_loop",choice.panelLoop},{"tasks",std::move(tasks)},
+      {"fact_proof","immutable input; real affine SSA indices independent of reuse loop; every access to written storage projects both outer IVs onto disjoint slices"},
+      {"data_organization",choice.dataOrganization},
+      {"realization","readonly-panel"},
+      {"realization_scope","one execution group; no retention across AIR stages"},
+      {"proposal","retain-across-users from actual reuse; readonly rectangular panel with source-independent outer-loop permutation; capacity/target feasibility checked after selection"}});
+  }
+  for (size_t task = 0; task < p.taskLoopOrders.size(); ++task) {
+    llvm::json::Array order;
+    for (size_t loop : p.taskLoopOrders[task]) order.push_back(int64_t(loop));
+    loopOrders.push_back(llvm::json::Object{{"task", int64_t(task)},
+                                           {"loop_order", std::move(order)}});
+  }
+  for (const auto &implementation : p.taskImplementations)
+    implementations.push_back(llvm::json::Object{
+        {"task", int64_t(implementation.task)}, {"kind", implementation.kind},
+        {"parallel_loop", implementation.parallelLoop}, {"lanes", implementation.lanes}});
+  for (const auto &scope : p.readOnlyRetentions) {
+    llvm::json::Array offsets, sizes;
+    for (auto n : scope.offsets) offsets.push_back(n);
+    for (auto n : scope.sizes) sizes.push_back(n);
+    readonlyRetentions.push_back(llvm::json::Object{
+        {"begin_phase", int64_t(scope.beginPhase)},
+        {"end_phase_exclusive", int64_t(scope.endPhase)},
+        {"storage_index", int64_t(scope.storage)},
+        {"offsets", std::move(offsets)}, {"sizes", std::move(sizes)}});
+  }
+  for (const auto &group : p.executionGroups) {
+    llvm::json::Array dependencies;
+    for (auto dependency : group.dependencies) dependencies.push_back(int64_t(dependency));
+    executionGroups.push_back(llvm::json::Object{
+        {"begin_phase", int64_t(group.beginPhase)},
+        {"end_phase_exclusive", int64_t(group.endPhase)},
+        {"resource", group.resource}, {"memory", group.memory},
+        {"depends_on", std::move(dependencies)}});
+  }
+  bool compact = p.phases.size() > 16384;
+  std::vector<int64_t> stageAllocationBytes;
+  std::vector<llvm::json::Array> stageBufferPools;
+  if (p.strategy == "serial-tiled")
+    stagePoolBytes(a, p, nullptr, &stageAllocationBytes, &stageBufferPools);
+  int64_t systemMemoryPeak = 0;
+  for (size_t i = 0; i < a.storages.size(); ++i) {
+    const auto &storage = a.storages[i];
+    if (p.strategy != "serial-tiled" && !isa<BlockArgument>(storage.root))
+      continue;
+    int64_t bytes = storageBytes(storage);
+    systemMemoryPeak += bytes;
+    llvm::json::Array shape;
+    for (auto n : storage.shape)
+      shape.push_back(n);
+    hostBuffers.push_back(
+        llvm::json::Object{{"storage_index", int64_t(i)},
+                           {"storage", storage.id},
+                           {"role", storage.role},
+                           {"dtype", storage.dtype},
+                           {"shape", std::move(shape)},
+                           {"bytes", bytes},
+                           {"memory", "system_memory_bo"},
+                           {"lifetime", "whole_graph_lifetime"}});
+  }
+  for (auto task : p.fusedInitializerTasks)
+    fusedInitializers.push_back(int64_t(task));
+  std::set<std::pair<size_t, size_t>> initializedLocally;
+  for (const auto &scope : p.retainedRegions)
+    if (scope.initializerTask >= 0)
+      initializedLocally.insert(
+          {p.phases[scope.beginPhase].task, scope.storage});
+  llvm::MD5 scheduleHash;
+  auto hashInteger = [&](int64_t value) {
+    scheduleHash.update(std::to_string(value));
+    scheduleHash.update(",");
+  };
+  auto hashIntegers = [&](const auto &values) {
+    hashInteger(values.size());
+    for (auto value : values)
+      hashInteger(value);
+  };
+  hashInteger(p.phases.size());
+  for (const auto &phase : p.phases) {
+    hashInteger(phase.task);
+    hashInteger(phase.loops.size());
+    for (auto bound : phase.loops) {
+      hashInteger(bound.loop);
+      hashInteger(bound.lower);
+      hashInteger(bound.upper);
+    }
+    hashIntegers(phase.dependencies);
+    hashInteger(phase.regions.size());
+    for (const auto &region : phase.regions) {
+      hashInteger(region.storage);
+      hashIntegers(region.offsets);
+      hashIntegers(region.sizes);
+      hashInteger(region.read);
+      hashInteger(region.write);
+    }
+  }
+  hashInteger(p.retainedRegions.size());
+  for (const auto &scope : p.retainedRegions) {
+    hashInteger(scope.beginPhase);
+    hashInteger(scope.endPhase);
+    hashInteger(scope.storage);
+    hashInteger(scope.initializerTask);
+    retentions.push_back(llvm::json::Object{
+        {"begin_phase", int64_t(scope.beginPhase)},
+        {"end_phase_exclusive", int64_t(scope.endPhase)},
+        {"storage_index", int64_t(scope.storage)},
+        {"initializer_task", scope.initializerTask},
+        {"lifetime",
+         "on-chip across invariant region scope; import first, export last"}});
+  }
+  hashIntegers(p.fusedInitializerTasks);
+  hashInteger(p.hardwareStages.size());
+  size_t stageIndex = 0;
+  for (const auto &stage : p.hardwareStages) {
+    hashInteger(stage.beginPhase);
+    hashInteger(stage.endPhase);
+    hashInteger(stage.legalizeChannels);
+    std::map<std::pair<size_t,std::string>,std::pair<int64_t,int64_t>> stageTraffic;
+    auto transfer = std::lower_bound(p.transfers.begin(),p.transfers.end(),stage.beginPhase,
+        [](const auto &t,size_t phase) { return t.phase < phase; });
+    for (; transfer != p.transfers.end() && transfer->phase < stage.endPhase; ++transfer) {
+      auto &traffic = stageTraffic[{transfer->storage,transfer->direction}];
+      ++traffic.first; traffic.second += transfer->bytes;
+    }
+    llvm::json::Array stageTransfers;
+    for (const auto &traffic : stageTraffic)
+      stageTransfers.push_back(llvm::json::Object{
+        {"storage_index",int64_t(traffic.first.first)},
+        {"storage",a.storages[traffic.first.first].id},
+        {"direction",traffic.first.second},{"count",traffic.second.first},
+        {"bytes",traffic.second.second}});
+    hardwareStages.push_back(llvm::json::Object{
+        {"group_index",int64_t(stage.groupIndex)},
+        {"begin_phase", int64_t(stage.beginPhase)},
+        {"end_phase_exclusive", int64_t(stage.endPhase)},
+        {"allocated_bytes", stageAllocationBytes[stageIndex]},
+        {"buffer_pools", std::move(stageBufferPools[stageIndex++])},
+        {"legalize_channels", stage.legalizeChannels},
+        {"transfer_summary",std::move(stageTransfers)},
+        {"pool_key", "read-only: storage+region shape+loop extent signature; "
+                     "writable: storage"}});
+  }
+  hashInteger(p.channelMergePolicy.size());
+  scheduleHash.update(p.channelMergePolicy);
+  hashInteger(p.channelAllocations.size());
+  for (const auto &allocation : p.channelAllocations) {
+    hashInteger(allocation.stage);
+    hashInteger(allocation.storage);
+    hashInteger(allocation.tileChannel);
+    hashInteger(allocation.transferCount);
+    hashInteger(allocation.bytes);
+    hashInteger(allocation.logicalFifo.size());
+    scheduleHash.update(allocation.logicalFifo);
+    hashInteger(allocation.direction.size());
+    scheduleHash.update(allocation.direction);
+    channelAllocations.push_back(llvm::json::Object{
+        {"stage", int64_t(allocation.stage)},
+        {"storage_index", int64_t(allocation.storage)},
+        {"storage", a.storages[allocation.storage].id},
+        {"direction", allocation.direction},
+        {"tile_channel", allocation.tileChannel},
+        {"logical_fifo", allocation.logicalFifo},
+        {"transfer_count", allocation.transferCount},
+        {"bytes", allocation.bytes},
+        {"stream_order", "checked source phase order"},
+        {"tile_direction",
+         allocation.direction == "host_to_l1" ? "S2MM" : "MM2S"}});
+  }
+  hashInteger(p.transfers.size());
+  std::map<std::pair<size_t, std::string>, std::pair<int64_t, int64_t>>
+      summaries;
+  for (const auto &transfer : p.transfers) {
+    hashInteger(transfer.storage);
+    hashInteger(transfer.phase);
+    hashInteger(transfer.bytes);
+    hashInteger(transfer.direction.size());
+    scheduleHash.update(transfer.direction);
+    hashIntegers(transfer.offsets);
+    hashIntegers(transfer.sizes);
+    auto &summary = summaries[{transfer.storage, transfer.direction}];
+    ++summary.first;
+    summary.second += transfer.bytes;
+  }
+  llvm::MD5::MD5Result hashResult;
+  scheduleHash.final(hashResult);
+  llvm::SmallString<32> scheduleDigest;
+  llvm::MD5::stringifyResult(hashResult, scheduleDigest);
+  for (const auto &summary : summaries)
+    transferSummary.push_back(
+        llvm::json::Object{{"storage_index", int64_t(summary.first.first)},
+                           {"storage", a.storages[summary.first.first].id},
+                           {"direction", summary.first.second},
+                           {"count", summary.second.first},
+                           {"bytes", summary.second.second}});
+  for (size_t begin = 0; begin < p.phases.size();) {
+    size_t end = begin + 1;
+    while (end < p.phases.size() && p.phases[end].task == p.phases[begin].task)
+      ++end;
+    const auto &phase = p.phases[begin];
+    const auto &task = a.tasks[phase.task];
+    llvm::json::Array loopDomains;
+    for (size_t l = 0; l < phase.loops.size(); ++l) {
+      const auto &loop = task.loops[l];
+      const auto &tile = phase.loops[l];
+      loopDomains.push_back(llvm::json::Object{
+          {"loop", int64_t(l)},
+          {"lower", loop.lower},
+          {"upper", loop.upper},
+          {"step", loop.step},
+          {"tile_iterations", (tile.upper - tile.lower - 1) / loop.step + 1}});
+    }
+    phaseDomains.push_back(llvm::json::Object{
+        {"task", int64_t(phase.task)},
+        {"first_phase", int64_t(begin)},
+        {"phase_count", int64_t(end - begin)},
+        {"loop_domains", std::move(loopDomains)},
+        {"order",
+         "Cartesian tile grid in task_loop_orders; each phase depends on its predecessor"},
+        {"region_derivation",
+         "actual source affine accesses restricted to each tile domain"}});
+    if (llvm::is_contained(p.fusedInitializerTasks, phase.task)) {
+      begin = end;
+      continue;
+    }
+    std::map<size_t, int64_t> storagePools;
+    std::set<size_t> stagingPools;
+    for (size_t i = begin; i < end; ++i)
+      for (const auto &region : p.phases[i].regions) {
+        auto type = cast<MemRefType>(a.storages[region.storage].root.getType());
+        int64_t bytes = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+        for (auto n : region.sizes)
+          bytes *= n;
+        storagePools[region.storage] =
+            std::max(storagePools[region.storage], bytes);
+        if (region.read && region.write &&
+            !initializedLocally.count({phase.task, region.storage}))
+          stagingPools.insert(region.storage);
+      }
+    for (const auto &pool : storagePools)
+      residency.push_back(llvm::json::Object{
+          {"task", int64_t(phase.task)},
+          {"storage", a.storages[pool.first].id},
+          {"source_region_and_staging_bytes",
+           pool.second * (stagingPools.count(pool.first) ? 2 : 1)},
+          {"import_staging_bytes",
+           stagingPools.count(pool.first) ? pool.second : 0},
+          {"memory", "aie_l1"},
+          {"lifetime", "task source region; actual shape-specific hardware "
+                       "pool totals listed in hardware_stages"}});
+    begin = end;
+  }
+  auto ints = [](const std::vector<int64_t> &values) {
+    llvm::json::Array out;
+    for (auto v : values)
+      out.push_back(v);
+    return out;
+  };
+  for (auto size : p.tileSizes)
+    tileSizes.push_back(size);
+  for (size_t i = 0; !compact && i < p.phases.size(); ++i) {
+    const auto &phase = p.phases[i];
+    llvm::json::Array loops, regions, deps;
+    for (auto dependency : phase.dependencies)
+      deps.push_back(int64_t(dependency));
+    for (auto b : phase.loops)
+      loops.push_back(llvm::json::Object{
+          {"loop", int64_t(b.loop)}, {"lower", b.lower}, {"upper", b.upper}});
+    for (auto &r : phase.regions)
+      regions.push_back(
+          llvm::json::Object{{"storage_index", int64_t(r.storage)},
+                             {"offsets", ints(r.offsets)},
+                             {"sizes", ints(r.sizes)},
+                             {"read", r.read},
+                             {"write", r.write}});
+    phases.push_back(llvm::json::Object{
+        {"phase", int64_t(i)},
+        {"task", int64_t(phase.task)},
+        {"dependencies", std::move(deps)},
+        {"loops", std::move(loops)},
+        {"regions", std::move(regions)},
+        {"lifetime",
+         "phase live region; backing pool allocated for task stage"}});
+  }
+  for (auto i : p.orderedTasks)
+    tasks.push_back(llvm::json::Object{{"task", a.tasks[i].id},
+                                       {"index", int64_t(i)},
+                                       {"device", "npu"},
+                                       {"herd", 0},
+                                       {"core", 0}});
+  if (!compact)
+    for (auto &t : p.transfers)
+      transfers.push_back(llvm::json::Object{
+          {"storage", a.storages[t.storage].id},
+          {"storage_index", int64_t(t.storage)},
+          {"direction", t.direction},
+          {"bytes", t.bytes},
+          {"phase", int64_t(t.phase)},
+          {"offsets", ints(t.offsets)},
+          {"sizes", ints(t.sizes)},
+          {"extent", p.strategy == "serial-tiled" ? "rectangular_tile"
+                                                  : "full_static_buffer"},
+          {"source", t.direction == "host_to_l1" ? "host_system_bo" : "aie_l1"},
+          {"target",
+           t.direction == "host_to_l1" ? "aie_l1" : "host_system_bo"}});
+  if (p.strategy == "single-herd-resident")
+    for (size_t i = 0; i < a.storages.size(); ++i)
+      residency.push_back(
+          llvm::json::Object{{"storage", a.storages[i].id},
+                             {"memory", "aie_l1"},
+                             {"lifetime", "whole_herd"},
+                             {"bytes", storageBytes(a.storages[i])}});
+  int64_t logicalReadBytes = 0, logicalWriteBytes = 0, scalarReads = 0,
+          scalarWrites = 0;
+  bool accessCountsValid = true;
+  auto addCount = [&](int64_t &total, int64_t count) {
+    if (count < 0 || total > INT64_MAX - count)
+      accessCountsValid = false;
+    else
+      total += count;
+  };
+  for (const auto &task : a.tasks)
+    for (const auto &access : task.accesses) {
+      int64_t count = 1;
+      for (const auto &loop : task.loops)
+        if (loop.operation->isProperAncestor(access.operation)) {
+          int64_t iterations = (loop.upper - loop.lower - 1) / loop.step + 1;
+          if (count > INT64_MAX / iterations) {
+            accessCountsValid = false;
+            count = 0;
+            break;
+          }
+          count *= iterations;
+        }
+      auto type = cast<MemRefType>(a.storages[access.storage].root.getType());
+      int64_t width = (type.getElementType().getIntOrFloatBitWidth() + 7) / 8;
+      if (count > INT64_MAX / width) {
+        accessCountsValid = false;
+        continue;
+      }
+      if (access.read) {
+        addCount(scalarReads, count);
+        addCount(logicalReadBytes, count * width);
+      }
+      if (access.write) {
+        addCount(scalarWrites, count);
+        addCount(logicalWriteBytes, count * width);
+      }
+    }
+  int64_t phasePeak = p.residentBytes;
+  if (p.strategy == "serial-tiled")
+    stagePoolBytes(a, p, &phasePeak);
+  int64_t logicalBytes = 0, actualBytes = 0;
+  for (const auto &storage : a.storages)
+    if (storage.role == "input" || storage.role == "output")
+      logicalBytes += storageBytes(storage);
+  int64_t stagingCopyBytes = 0;
+  for (const auto &transfer : p.transfers) {
+    actualBytes += transfer.bytes;
+    if (p.strategy == "serial-tiled" && transfer.direction == "host_to_l1") {
+      const auto &phase = p.phases[transfer.phase];
+      auto region = llvm::find_if(phase.regions, [&](const auto &region) {
+        return region.storage == transfer.storage;
+      });
+      if (region != phase.regions.end() && region->read && region->write)
+        stagingCopyBytes += transfer.bytes;
+    }
+  }
+  return llvm::json::Object{
+      {"schema", "orbit.generic.mapping.v1"},
+      {"logical_boundary_bytes", logicalBytes},
+      {"logical_scalar_reads", accessCountsValid
+                                   ? llvm::json::Value(scalarReads)
+                                   : llvm::json::Value(nullptr)},
+      {"logical_scalar_writes", accessCountsValid
+                                    ? llvm::json::Value(scalarWrites)
+                                    : llvm::json::Value(nullptr)},
+      {"logical_read_bytes", accessCountsValid
+                                 ? llvm::json::Value(logicalReadBytes)
+                                 : llvm::json::Value(nullptr)},
+      {"logical_write_bytes", accessCountsValid
+                                  ? llvm::json::Value(logicalWriteBytes)
+                                  : llvm::json::Value(nullptr)},
+      {"actual_dma_bytes", actualBytes},
+      {"discovered_mapping_opportunities",std::move(opportunities)},
+      {"program_mapping_choices", llvm::json::Object{
+          {"data_organization",p.choices.dataOrganization},
+          {"residency", p.choices.residency}, {"storage", p.choices.storage},
+          {"reuse_loop", p.choices.reuseLoop}, {"panel_loop", p.choices.panelLoop},
+          {"grouping",p.choices.grouping}}},
+      {"data_organization_scope",p.choices.dataOrganization=="retain-across-users"
+          ? "readonly source-instance users within one execution group; AIR stage-local"
+          : "phase-local input copies; source reduction/output retention remains required"},
+      {"program_communication",serializeProgramCommunication(p)},
+      {"task_loop_orders", std::move(loopOrders)},
+      {"task_implementations", std::move(implementations)},
+      {"readonly_retentions", std::move(readonlyRetentions)},
+      {"execution_groups", std::move(executionGroups)},
+      {"local_staging_copy_bytes", stagingCopyBytes},
+      {"retained_regions", std::move(retentions)},
+      {"fused_initializer_tasks", std::move(fusedInitializers)},
+      {"hardware_stages", std::move(hardwareStages)},
+      {"channel_allocations", std::move(channelAllocations)},
+      {"channel_merge_policy", p.channelMergePolicy},
+      {"tile_dma_ports_per_direction", 2},
+      {"max_hardware_stage_expansion", int64_t(maxHardwareStageExpansion)},
+      {"hardware_stage_expansion_scope",
+       "bounded host/codegen expansion; not a measured silicon or local memory "
+       "resource limit"},
+      {"host_buffers", std::move(hostBuffers)},
+      {"system_memory_peak_bytes", systemMemoryPeak},
+      {"system_memory_accounting_scope",
+       "system-memory BO tensor payload; excludes runner host array mirrors, "
+       "references, runtime and compiler allocations"},
+      {"backend_tensor_padding_bytes", 0},
+      {"local_allocation_lifetime",
+       p.strategy == "serial-tiled"
+           ? "per-task stage; reuse only after serial completion dependency"
+           : "whole_herd"},
+      {"plan_id", p.planId},
+      {"body_fingerprint", p.bodyFingerprint},
+      {"strategy", p.strategy},
+      {"placement", "npu_single_core_serial"},
+      {"capacity_bytes", p.capacityBytes},
+      {"resident_bytes", p.residentBytes},
+      {"phase_peak_live_bytes", phasePeak},
+      {"allocation_lifetime",
+       p.strategy == "serial-tiled"
+           ? "per-task device stage; storage pools reused across serial tiles"
+           : "whole_herd"},
+      {"tile_sizes", std::move(tileSizes)},
+      {"phases", std::move(phases)},
+      {"phase_count", int64_t(p.phases.size())},
+      {"transfer_count", int64_t(p.transfers.size())},
+      {"phase_schedule_digest", scheduleDigest.str().str()},
+      {"expanded_phase_details_omitted", compact},
+      {"phase_domains", std::move(phaseDomains)},
+      {"transfer_summary", std::move(transferSummary)},
+      {"host_plan_representation", "explicit phases; compact JSON domains and "
+                                   "compact generated AIR for large schedules"},
+      {"tasks", std::move(tasks)},
+      {"transfers", std::move(transfers)},
+      {"residency", std::move(residency)},
+      {"analysis_status", "supported"},
+      {"codegen_status", "requires_backend_verification"},
+      {"cost_status", p.hasCost ? "theoretical" : "uncalibrated"},
+      {"estimated_ms", p.hasCost ? llvm::json::Value(p.estimatedMs)
+                                 : llvm::json::Value(nullptr)},
+      {"cost_provenance", p.costProvenance},
+      {"theoretical_coefficients",
+       p.hasCost ? llvm::json::Value(llvm::json::Object{
+                       {"launch_ms", p.theoreticalLaunchMs},
+                       {"per_scalar_operation_ms", p.theoreticalPerOperationMs},
+                       {"per_transfer_byte_ms", p.theoreticalPerByteMs}})
+                 : llvm::json::Value(nullptr)},
+      {"physical_execution", false},
+      {"backend_internal_transport",
+       "AIR compiler may add shim/L2 staging; final IR ledger required; not "
+       "measured traffic"}};
+}
+bool orbit::taskflow::importNativeInterface(mlir::ModuleOp module,
+                                            const Program &program,
+                                            std::string &e) {
+  auto fs = module.getOps<mlir::func::FuncOp>();
+  if (fs.empty())
+    return fail(e, "import missing function");
+  auto fn = *fs.begin();
+  std::vector<mlir::memref::AllocOp> allocs;
+  for (auto alloc : fn.getOps<mlir::memref::AllocOp>())
+    allocs.push_back(alloc);
+  if (allocs.size() != program.buffers.size())
+    return fail(e, "compatibility interface allocation count mismatch");
+  mlir::Builder b(module.getContext());
+  for (size_t i = 0; i < allocs.size(); ++i) {
+    auto &buffer = program.buffers[i];
+    auto alloc = allocs[i];
+    if (buffer.role == "temporary") {
+      alloc->setAttr("orbit.name", b.getStringAttr(buffer.id));
+      continue;
+    }
+    unsigned index = fn.getNumArguments();
+    auto arg =
+        fn.getBody().front().addArgument(alloc.getType(), alloc.getLoc());
+    llvm::SmallVector<mlir::Type> inputs(fn.getArgumentTypes());
+    inputs.push_back(arg.getType());
+    fn.setType(b.getFunctionType(inputs, {}));
+    fn.setArgAttr(index, "orbit.role", b.getStringAttr(buffer.role));
+    fn.setArgAttr(index, "orbit.name", b.getStringAttr(buffer.id));
+    alloc.replaceAllUsesWith(arg);
+    alloc.erase();
+  }
+  fn->setAttr("orbit.noalias", b.getUnitAttr());
+  module->removeAttr("orbit.plan");
+  return true;
+}
+llvm::json::Value orbit::taskflow::evaluateGenericMLIR(
+    llvm::StringRef text, const llvm::json::Value &cfg, std::string &e) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::taskflow::TaskflowDialect, mlir::affine::AffineDialect,
+                  mlir::arith::ArithDialect, mlir::math::MathDialect,
+                  mlir::memref::MemRefDialect, mlir::func::FuncDialect,
+                  mlir::scf::SCFDialect>();
+  mlir::MLIRContext context(registry);
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
+  if (module && module->getOperation()->hasAttr("orbit.program_partition_extent"))
+    return evaluatePartitionedGenericMLIR(*module,cfg,e);
+  GenericAnalysis a;
+  GenericMappingPlan p;
+  if (!module || mlir::failed(mlir::verify(*module)) ||
+      !analyzeGenericProgram(*module, a, e) ||
+      !planGenericMapping(a, cfg, p, e))
+    return llvm::json::Object{{"status", "unsupported"}, {"reason", e}};
+  if (llvm::any_of(p.taskImplementations, [](const auto &implementation) {
+        return implementation.kind == "independent-lane-f32";
+      }))
+    return llvm::json::Object{
+        {"status","unsupported"},
+        {"reason","installed Peano target cannot select strict FP32 vector multiply; independent-lane-f32 source proof is not an executable target capability"},
+        {"analysis",serializeGenericAnalysis(a)},
+        {"best_plan",serializeGenericMapping(a,p)}};
+  return llvm::json::Object{{"status", p.hasCost ? "passed" : "uncalibrated"},
+                            {"analysis", serializeGenericAnalysis(a)},
+                            {"best_plan", serializeGenericMapping(a, p)}};
+}
+
+std::string orbit::taskflow::emitNativeTaskflow(const Program &program,
+                                                std::string &e) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::taskflow::TaskflowDialect, mlir::affine::AffineDialect,
+                  mlir::arith::ArithDialect, mlir::math::MathDialect,
+                  mlir::memref::MemRefDialect, mlir::func::FuncDialect,
+                  mlir::scf::SCFDialect>();
+  mlir::MLIRContext context(registry);
+  auto module =
+      mlir::parseSourceString<mlir::ModuleOp>(emitTaskflow(program), &context);
+  if (!module || !importNativeInterface(*module, program, e) ||
+      mlir::failed(mlir::verify(*module)))
+    return {};
+  std::string out;
+  llvm::raw_string_ostream stream(out);
+  module->print(stream);
+  return out;
+}

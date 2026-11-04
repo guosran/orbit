@@ -8,8 +8,11 @@ from pathlib import Path
 import sys
 import hashlib
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'python'))
-from orbit_mapping.mapper import map_program
-from orbit_mapping.checker import check_plan
+# The native regression harness injects the C++ tool adapters.
+def map_program(*args):
+    raise RuntimeError('Run cpp_differential.py with --tool and --output')
+def check_plan(*args):
+    raise RuntimeError('Run cpp_differential.py with --tool and --output')
 
 
 PROVENANCE = {'kind':'synthetic','source':'constructed algorithm fixture, not hardware timing'}
@@ -169,4 +172,8 @@ def main():
     print(json.dumps(dict(passed=True,positive_checks=len(checks),negative_checks=len(negatives))))
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    from cpp_differential import main as native_main
+    if '--tool' not in sys.argv:
+        sys.argv += ['--tool', str(Path(__file__).resolve().parents[2]/'build-core/tools/taskflow-opt/taskflow-opt')]
+    native_main()

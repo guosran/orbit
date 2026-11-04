@@ -1,0 +1,58 @@
+{
+  "schema": "orbit.compute-contract-baseline-provenance.v1",
+  "scope": "Actual pre-adapter CPU original-model production Score output; no model training or device submission",
+  "golden_file": "compute-contract-baseline-v8.jsonl",
+  "golden_sha256": "1aabdab58b730ff3eb016c1336489e2a76e4653c5621e23025a1f0795fd6e287",
+  "original_score_file": "/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/scores.jsonl",
+  "original_tool_identity": {
+    "path": "/home/shiran/project/orbit/build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt",
+    "sha256": "149618b33985f59b10fd02251e649285104314a3d5cada60c0b32a767e611ff2",
+    "scope": "CPU-only original-model baseline; no training or hardware run"
+  },
+  "commands": {
+    "enumerate": [
+      "/home/shiran/project/orbit/build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt",
+      "--neura-architecture-spec=/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/mapper-arch-4x4.yaml",
+      "/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/map-joint-scheduling-all-unit-cache.mlir",
+      "--pass-pipeline=builtin.module(bind-source-iteration-domain,enumerate-analytical-task-candidates{function=all_unit_mapper output=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/candidates.jsonl max-cgras-per-task=4 graph-variant-id=identity})",
+      "-o",
+      "/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/enumerate.mlir"
+    ],
+    "predict": [
+      "/home/shiran/project/orbit/build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt",
+      "--neura-architecture-spec=/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/mapper-arch-4x4.yaml",
+      "/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/map-joint-scheduling-all-unit-cache.mlir",
+      "--pass-pipeline=builtin.module(bind-source-iteration-domain,predict-analytical-task-cost-catalog{function=all_unit_mapper space-file=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/candidates.jsonl ensemble-file=/home/shiran/project/aie-toy/vendor/orbit-artifact/reference/input0-neighborhood/models/ensemble.json checkpoint-dir=/home/shiran/project/aie-toy/vendor/orbit-artifact/reference/input0-neighborhood/models architecture-contract=neura-architecture-v1:amoeba-static-rectangles-up-to-four-cgras-formal architecture-path=/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/mapper-arch-4x4.yaml source-git-repository=git@github.com:guosran/amoeba.git source-git-commit=a57376e7043b1681e64e7169c5a8cb02eb192331 graph-variant-id=identity output=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/costs.json})",
+      "-o",
+      "/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/predict.mlir"
+    ],
+    "score": [
+      "/home/shiran/project/orbit/build-amoeba/tools/mlir-amoeba-opt/mlir-amoeba-opt",
+      "--neura-architecture-spec=/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/mapper-arch-4x4.yaml",
+      "/home/shiran/project/orbit-data-v8/test/multi-cgra/taskflow/joint-scheduling/map-joint-scheduling-all-unit-cache.mlir",
+      "--pass-pipeline=builtin.module(bind-source-iteration-domain,score-analytical-task-candidates{function=all_unit_mapper candidates=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/candidates.jsonl cost-file=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/costs.json source-git-repository=git@github.com:guosran/amoeba.git source-git-commit=a57376e7043b1681e64e7169c5a8cb02eb192331 graph-variant-id=identity output=/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/scores.jsonl top-k=0})",
+      "-o",
+      "/home/shiran/project/orbit-data-v8/build/cgra-cost-fixture-baseline-r1/score.mlir"
+    ]
+  },
+  "original_artifact_sha256": {
+    "candidates.jsonl": "36fd9ab91d5f711b222e342e8c9625412da2759bb07965d663e114ae5236490f",
+    "costs.json": "3f241f130a4c35d661458ebb704bc734d5c1b90c0f9e218e6515b99ed28dca72",
+    "scores.jsonl": "1aabdab58b730ff3eb016c1336489e2a76e4653c5621e23025a1f0795fd6e287",
+    "enumerate.log": "edee6d2f899a95eb83d2d395fc176c716b4da3a682146ece890bde28bb677713",
+    "predict.log": "6715354deea8d9cc000d080d776abf5304e9d63d1687d356c7c088231fd64a77",
+    "score.log": "b9b36152544315f4e6817d33ef3a9d1a8b59c81a34759e2a2eaa942898691f06"
+  },
+  "source_inputs": {
+    "test/multi-cgra/taskflow/joint-scheduling/map-joint-scheduling-all-unit-cache.mlir": "221c26d7d38da12ad4eab58aa83d3b549de972f45b0f2a3e714a9a6d34175547",
+    "test/multi-cgra/taskflow/joint-scheduling/mapper-arch-4x4.yaml": "6c00dccbd321bf238747e9b54b24279a89ef21497e66923bddaf2bbe62efedc5"
+  },
+  "external_model_directory": "/home/shiran/project/aie-toy/vendor/orbit-artifact/reference/input0-neighborhood/models",
+  "model_sha256": {
+    "ensemble.json": "ef38a5d356dd5d7029a7eef719f3b4952cf932ee52d932e30f714bdbe7e692bd",
+    "baseline.json": "4ff7de9e0e51ea9b66691d8323afdf59ca4e8581ea5520ce6aa2d1c89df55f87",
+    "large-operation.json": "8ae4d2c532277b63d47ee1ce1104831ab0f25656fc057a01de41c2568e4ae3ec",
+    "ranking.json": "7878b54af2aa440ae954be470def190f04508070e564189903e78583137a04ed"
+  },
+  "comparison_policy": "Compare complete score rows exactly after removing only new compute_contract, plus footer shortlist/valid_count. Golden is original output, not recomputed expectations."
+}
