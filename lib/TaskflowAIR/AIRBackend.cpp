@@ -122,7 +122,7 @@ bool bindDMACopies(OpBuilder &b, const GenericAnalysis &a,
   if(transfer.event<0 || size_t(transfer.event)>=communication.events.size())
     return reject("AIR DMA has no checked public transfer event");
   const auto &event=communication.events[transfer.event];
-  if(event.kind!="transfer" || event.link!=transfer.direction || event.reads!=transfer.sourceCopies || event.writes!=transfer.targetCopies)
+  if(event.kind!="transfer" || event.link!=(transfer.direction=="host_to_l1"?plan.memoryBinding.inputLink:plan.memoryBinding.outputLink) || event.reads!=transfer.sourceCopies || event.writes!=transfer.targetCopies)
     return reject("AIR DMA source/target copy IDs differ from the checked transfer event");
   Operation *allocation=local.getDefiningOp();
   while(allocation && isa<memref::CastOp,memref::ReinterpretCastOp>(allocation)) allocation=allocation->getOperand(0).getDefiningOp();
@@ -144,7 +144,7 @@ bool bindDMACopies(OpBuilder &b, const GenericAnalysis &a,
       const auto &version=communication.versions[copy.version];
       if(version.region>=communication.regions.size()) return false;
       const auto &cell=communication.regions[version.region];
-      if(place.storage!=transfer.storage || cell.storage!=transfer.storage || place.memory!=(onHost?"system_memory_bo":"aie_l1") || place.bytes!=bytes || (!onHost && place.key!=key)) return false;
+      if(place.storage!=transfer.storage || cell.storage!=transfer.storage || place.memory!=(onHost?plan.memoryBinding.hostMemory:plan.memoryBinding.localMemory) || place.bytes!=bytes || (!onHost && place.key!=key)) return false;
       if(place.beginPhase>transfer.phase || transfer.phase>=place.endPhase) return false;
       auto offsets=transfer.offsets;auto sizes=transfer.sizes;
       if(sizes.empty()) {offsets.assign(a.storages[transfer.storage].shape.size(),0);sizes=a.storages[transfer.storage].shape;}
@@ -1110,6 +1110,13 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
           error="direct AIR read/write tile requires a proved local source initializer; host feedback accumulation is not validated by this toolchain";
           return false;
         }
+  // The installed DMA-to-channel pass converts the complete module, even
+  // though only a subset of stages needs explicit FIFO/port legalization.
+  // Every herd it hoists must therefore yield an async token: otherwise its
+  // generated scf.parallel has no init/reduce token while a nested compact
+  // scf.for carries one, and reconnecting that token is invalid. This changes
+  // transport representation, not the checked source phases or stage order.
+  const bool moduleChannelConversion=plan.moduleWideChannelConversion;
   auto function = a.function;
   auto *ctx = function.getContext();
   if (!ctx->allowsUnregisteredDialects()) {
@@ -1143,6 +1150,11 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
         }
   }
   output = ModuleOp::create(loc);
+  if(moduleChannelConversion) {
+    output->getOperation()->setAttr("orbit.channel_conversion_scope",b.getStringAttr("module"));
+    output->getOperation()->setAttr("orbit.async_herd_scope",b.getStringAttr("module"));
+    output->getOperation()->setAttr("orbit.local_release_scope",b.getStringAttr("static-hardware-stage"));
+  }
   b.setInsertionPointToEnd(output->getBody());
   SmallVector<Type> abiTypes(function.getArgumentTypes());
   if (plan.strategy == "serial-tiled")
@@ -1163,7 +1175,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
   auto one = b.create<arith::ConstantIndexOp>(loc, 1);
   auto *herd = hierarchy(b, "air.herd", "orbit_herd", {one, one},
                          segment->getRegion(0).front().getArguments(),
-                         plan.strategy=="serial-tiled" && !plan.hardwareStages.empty() && plan.hardwareStages.front().legalizeChannels);
+                         moduleChannelConversion);
   herd->setAttr("orbit.mapping_strategy",
                 b.getStringAttr(plan.strategy));
   b.setInsertionPointToStart(&herd->getRegion(0).front());
@@ -1239,7 +1251,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       auto alloc = b.create<memref::AllocOp>(loc, type);
       alloc->setAttr("orbit.tile_pool", b.getStringAttr(dtype));
       alloc->setAttr("orbit.storage_index", b.getI64IntegerAttr(poolStorages[dtype]));
-      if (plan.hardwareStages[stageIndex].legalizeChannels)
+      if (moduleChannelConversion)
         alloc->setAttr("orbit.lifetime", b.getStringAttr("static-hardware-stage-region"));
       pools[dtype] = alloc;
     }
@@ -1462,8 +1474,9 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     // The target allocates these L1 pools statically for the whole stage.
     // Its channel dependency importer cannot reconnect an end-of-stage
     // deallocation through already channelized nested tile loops. On that
-    // explicitly planned path, region exit owns the lifetime instead.
-    if (!plan.hardwareStages[stageIndex].legalizeChannels)
+    // complete-module conversion path, every stage exits its static local
+    // allocation lifetime here, including stages without port-pinning needs.
+    if (!moduleChannelConversion)
       for (auto &[dtype, pool] : pools) b.create<memref::DeallocOp>(loc, pool);
     if (stageIndex + 1 < plan.hardwareStages.size()) {
       make(b, "air.herd_terminator");
@@ -1479,7 +1492,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       segment = hierarchy(b, "air.segment", "orbit_segment_" + suffix, {}, stageArgs);
       b.setInsertionPointToStart(&segment->getRegion(0).front());
       Value stageOne = b.create<arith::ConstantIndexOp>(loc, 1);
-      herd = hierarchy(b, "air.herd", "orbit_herd_" + suffix, {stageOne,stageOne}, segment->getRegion(0).front().getArguments(), plan.hardwareStages[stageIndex+1].legalizeChannels);
+      herd = hierarchy(b, "air.herd", "orbit_herd_" + suffix, {stageOne,stageOne}, segment->getRegion(0).front().getArguments(), moduleChannelConversion);
       herd->setAttr("orbit.mapping_strategy", b.getStringAttr(plan.strategy));
       b.setInsertionPointToStart(&herd->getRegion(0).front());
       ha = herd->getRegion(0).front().getArguments().drop_front(4);

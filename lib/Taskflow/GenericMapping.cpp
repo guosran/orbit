@@ -877,7 +877,7 @@ int64_t stagePoolBytes(const GenericAnalysis &a, const GenericMappingPlan &p,
             key += "."+std::to_string((*templateKey)[d]);
         } else if (kind == "readonly_panel") key += ".readonly-panel";
         else if (kind == "incoming_staging") key += ".incoming";
-        allocations->push_back({storage,"aie_l1",key,allocatedBytes,
+        allocations->push_back({storage,p.memoryBinding.localMemory,key,allocatedBytes,
                                 stage.beginPhase,stage.endPhase});
       }
       if (!stagePools) return;
@@ -896,7 +896,7 @@ int64_t stagePoolBytes(const GenericAnalysis &a, const GenericMappingPlan &p,
           {"storage", a.storages[storage].id},
           {"dtype", a.storages[storage].dtype},
           {"kind", kind.str()},
-          {"memory", "aie_l1"},
+          {"memory", p.memoryBinding.localMemory},
           {"allocated_bytes", allocatedBytes},
           {"flat_elements", allocatedBytes / width},
           {"template_shape", std::move(shape)},
@@ -1263,8 +1263,8 @@ bool checkTileDomains(const GenericAnalysis &a, const GenericMappingPlan &p,
     std::vector<size_t> dependencies;
     if (groupIndex) dependencies.push_back(groupIndex - 1);
     if (stage.groupIndex != groupIndex || group.beginPhase != stage.beginPhase ||
-        group.endPhase != stage.endPhase || group.resource != "npu.compute" ||
-        group.memory != "aie_l1" || group.dependencies != dependencies)
+        group.endPhase != stage.endPhase || group.resource != p.memoryBinding.computeResource ||
+        group.memory != p.memoryBinding.localMemory || group.dependencies != dependencies)
       return fail(error, "execution group schedule/resource binding mismatch");
     ++groupIndex;
     while (phaseCursor < p.phases.size() &&
@@ -1501,12 +1501,13 @@ bool buildTiled(const GenericAnalysis &a, GenericMappingPlan &p,
     return false;
   for (size_t stage = 0; stage < p.hardwareStages.size(); ++stage)
     p.hardwareStages[stage].legalizeChannels = channelsRequired[stage];
+  p.moduleWideChannelConversion=llvm::any_of(p.hardwareStages,[](const auto &s){return s.legalizeChannels;});
   p.executionGroups.clear();
   for (size_t index = 0; index < p.hardwareStages.size(); ++index) {
     auto &stage = p.hardwareStages[index];
     stage.groupIndex = index;
     ProgramExecutionGroup group;
-    group.resource = "npu.compute"; group.memory = "aie_l1";
+    group.resource = p.memoryBinding.computeResource; group.memory = p.memoryBinding.localMemory;
     group.beginPhase = stage.beginPhase; group.endPhase = stage.endPhase;
     if (index) group.dependencies.push_back(index - 1);
     p.executionGroups.push_back(std::move(group));
@@ -1528,10 +1529,10 @@ void orbit::taskflow::collectGenericAllocations(const GenericAnalysis &a,
   for (size_t storage = 0; storage < a.storages.size(); ++storage) {
     bool external = isa<BlockArgument>(a.storages[storage].root);
     if (p.strategy == "serial-tiled" || external)
-      allocations.push_back({storage,"system_memory_bo","host-"+std::to_string(storage),
+      allocations.push_back({storage,p.memoryBinding.hostMemory,"host-"+std::to_string(storage),
                              storageBytes(a.storages[storage]),0,end});
     if (p.strategy != "serial-tiled")
-      allocations.push_back({storage,"aie_l1","storage-"+std::to_string(storage)+".data",
+      allocations.push_back({storage,p.memoryBinding.localMemory,"storage-"+std::to_string(storage)+".data",
                              storageBytes(a.storages[storage]),0,end});
   }
   if (p.strategy == "serial-tiled")
@@ -1563,6 +1564,16 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
   if ((p.strategy != "single-herd-resident" && p.strategy != "serial-tiled") ||
       p.bodyFingerprint != a.bodyFingerprint)
     return fail(e, "generic plan strategy/body identity mismatch");
+  if (!checkGenericMemory(p.memoryBinding,p.capacityBytes,e)) return false;
+  if (p.targetCapabilities.capacityBytes!=p.capacityBytes ||
+      !checkGenericCapabilities(p.memoryBinding,p.targetCapabilities,e)) return false;
+  for(const auto &impl:p.taskImplementations)
+    if(!llvm::any_of(p.targetCapabilities.implementations,[&](const auto &allowed){return impl.kind==allowed.kind && impl.lanes==allowed.lanes;}))
+      return fail(e,impl.kind=="independent-lane-f32"
+        ? "implementation unavailable: strict f32 vector multiplication is not supported by target capabilities"
+        : "implementation unavailable: requested kind/lanes are not supported by target capabilities");
+  if(p.moduleWideChannelConversion!=llvm::any_of(p.hardwareStages,[](const auto &s){return s.legalizeChannels;}))
+    return fail(e,"module-wide channel conversion differs from checked stages");
   if (p.channelMergePolicy != "single-logical-fifo-per-stage-storage-direction")
     return fail(e, "unsupported generic AIR channel merge policy");
   if (p.capacityBytes <= 0 || p.capacityBytes > 24576)
@@ -1762,6 +1773,77 @@ bool orbit::taskflow::checkGenericMapping(const GenericAnalysis &a,
   }
   return true;
 }
+namespace {
+std::string costTypeIdentity(Type type) {
+  std::string text;llvm::raw_string_ostream os(text);
+  if(auto memory=dyn_cast<MemRefType>(type)) {
+    os<<"memref-rank-"<<memory.getRank()<<":"<<memory.getElementType()<<":";
+    if(memory.getLayout().isIdentity())os<<"identity";else memory.getLayout().print(os);
+    os<<":";if(memory.getMemorySpace())memory.getMemorySpace().print(os);else os<<"default";
+  } else type.print(os);
+  return text;
+}
+std::string costRegionFamily(const GenericAnalysis &a) {
+  llvm::json::Array storageFacts,tasks;
+  for(const auto &storage:a.storages)storageFacts.push_back(llvm::json::Object{
+    {"role",storage.role},{"type",costTypeIdentity(storage.root.getType())}});
+  std::string alias;llvm::raw_string_ostream aliasStream(alias);
+  if(auto attr=func::FuncOp(a.function)->getAttr("orbit.noalias"))attr.print(aliasStream);
+  for(const auto &task:a.tasks) {
+    std::map<Operation *,size_t> ids;
+    task.operation->walk([&](Operation *op){ids.emplace(op,ids.size());});
+    auto valueIdentity=[&](Value value) {
+      for(size_t i=0;i<task.loops.size();++i)if(value==task.loops[i].induction)
+        return "iv:"+std::to_string(i);
+      for(size_t i=0;i<a.storages.size();++i)if(value==a.storages[i].root)
+        return "storage:"+std::to_string(i)+":"+costTypeIdentity(value.getType());
+      if(auto result=dyn_cast<OpResult>(value)) {
+        auto found=ids.find(result.getOwner());
+        if(found!=ids.end())return "op:"+std::to_string(found->second)+":"+std::to_string(result.getResultNumber());
+        for(size_t i=0;i<a.tasks.size();++i)if(result.getOwner()==a.tasks[i].operation)
+          return "task:"+std::to_string(i)+":"+std::to_string(result.getResultNumber());
+        std::string external;llvm::raw_string_ostream os(external);
+        os<<result.getOwner()->getName()<<":"<<result.getOwner()->getAttrDictionary();
+        if(auto properties=result.getOwner()->getPropertiesAsAttribute())properties.print(os);
+        return external;
+      }
+      if(auto argument=dyn_cast<BlockArgument>(value))return "arg:"+std::to_string(argument.getArgNumber())+":"+costTypeIdentity(value.getType());
+      return std::string("unknown-value");
+    };
+    llvm::json::Array operations,dependencies,arguments;
+    for(auto dependency:task.dependencies)dependencies.push_back(int64_t(dependency));
+    for(auto storage:task.argumentStorages)arguments.push_back(int64_t(storage));
+    task.operation->walk([&](Operation *op){
+      if(op==task.operation)return;
+      llvm::json::Array operands,types;
+      for(Value value:op->getOperands())operands.push_back(valueIdentity(value));
+      for(Type type:op->getResultTypes())types.push_back(costTypeIdentity(type));
+      llvm::json::Object fact{{"operation",op->getName().getStringRef()},
+        {"parent",int64_t(ids.at(op->getParentOp()))},{"operands",std::move(operands)},
+        {"types",std::move(types)}};
+      if(auto loop=dyn_cast<affine::AffineForOp>(op)) {
+        fact["lower_origin"]=loop.getConstantLowerBound();fact["step"]=loop.getStepAsInt();
+        std::string extra;llvm::raw_string_ostream os(extra);
+        for(auto attr:op->getAttrs())if(attr.getName()!="lowerBoundMap" && attr.getName()!="upperBoundMap" && attr.getName()!="step")
+          os<<attr.getName()<<"="<<attr.getValue()<<";";
+        fact["extra_attributes"]=extra;
+        // Only the static extent is erased. Parent/source IV and all access
+        // expressions keep nesting and reduction axes bound to the family.
+      } else {
+        std::string attributes;llvm::raw_string_ostream os(attributes);
+        op->getAttrDictionary().print(os);
+        if(auto properties=op->getPropertiesAsAttribute())properties.print(os);
+        fact["attributes"]=attributes;
+      }
+      operations.push_back(std::move(fact));
+    });
+    tasks.push_back(llvm::json::Object{{"dependencies",std::move(dependencies)},
+      {"argument_storages",std::move(arguments)},{"operations",std::move(operations)}});
+  }
+  return staticFingerprint(llvm::json::Object{{"schema","orbit.direct-air.region-family.v1"},
+    {"noalias",alias},{"storages",std::move(storageFacts)},{"tasks",std::move(tasks)}});
+}
+}
 llvm::json::Value orbit::taskflow::serializeGenericCostFeatures(const GenericCostFeatures &f) {
   llvm::json::Object values,operations;llvm::json::Array sources,implementations;
   for(const auto &v:f.values)values[v.first]=v.second;
@@ -1769,13 +1851,15 @@ llvm::json::Value orbit::taskflow::serializeGenericCostFeatures(const GenericCos
   for(const auto &v:f.sourceFingerprints)sources.push_back(v);
   for(const auto &v:f.implementations)implementations.push_back(v);
   return llvm::json::Object{{"schema","orbit.direct-air.features.v1"},
-    {"execution_fingerprint",f.executionFingerprint},{"values",std::move(values)},{"source_operations",std::move(operations)},
+    {"execution_fingerprint",f.executionFingerprint},{"region_family_fingerprint",f.regionFamilyFingerprint},{"architecture_fingerprint",f.architectureFingerprint},{"values",std::move(values)},{"source_operations",std::move(operations)},
     {"source_fingerprints",std::move(sources)},{"implementations",std::move(implementations)},
     {"scope","native source/checked plan facts; counts are not instruction counts or measured physical traffic"}};
 }
 bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
     const GenericMappingPlan &p,GenericCostFeatures &f,std::string &error) {
   f={};f.sourceFingerprints={a.bodyFingerprint};
+  f.regionFamilyFingerprint=costRegionFamily(a);
+  f.architectureFingerprint=staticFingerprint(serializeGenericMemory(p.memoryBinding));
   auto add=[&](int64_t &value,int64_t amount) {
     if(amount<0 || value>INT64_MAX-amount)return false;value+=amount;return true;
   };
@@ -1786,7 +1870,10 @@ bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
     }return true;
   };
   bool valid=true;
-  for(const auto &task:a.tasks) {
+  for(size_t taskIndex=0;taskIndex<a.tasks.size();++taskIndex) {
+    const auto &task=a.tasks[taskIndex];
+    const auto implementation=llvm::find_if(p.taskImplementations,[&](const auto &i){return i.task==taskIndex;});
+    const bool mixed=implementation!=p.taskImplementations.end() && implementation->kind=="scalar-product-vector-add-f32" && implementation->lanes==8;
     task.operation->walk([&](Operation *op){
       auto dialect=op->getName().getDialectNamespace();
       if((dialect!="arith" && dialect!="math") || op->getName().getStringRef()=="arith.constant")return;
@@ -1796,8 +1883,18 @@ bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
       std::string name=op->getName().getStringRef().str();
       valid&=add(f.operations[name+(f32?":f32":":other")],n);
       if(f32)valid&=add(f.values["source_scalar_f32_operations"],n);
-      if(f32 && (name=="arith.mulf" || name=="arith.divf"))
+      bool mixedOperation=mixed && implementation->parallelLoop>=0 &&
+          size_t(implementation->parallelLoop)<task.loops.size() &&
+          task.loops[implementation->parallelLoop].operation->isProperAncestor(op);
+      if(f32 && (name=="arith.mulf" || name=="arith.divf")) {
         valid&=add(f.values["source_f32_product_operations"],n);
+        valid&=add(f.values[mixedOperation?"implemented_mixed8_f32_product_operations":"implemented_scalar_f32_product_operations"],n);
+      }
+      if(f32 && (name=="arith.addf" || name=="arith.subf")) {
+        if(mixedOperation) {
+          if(n%8)valid=false;else valid&=add(f.values["implemented_mixed8_f32_addsub_packs"],n/8);
+        } else valid&=add(f.values["implemented_scalar_f32_addsub_operations"],n);
+      }
       if(f32 && name=="math.exp")valid&=add(f.values["source_math_exp_f32_operations"],n);
     });
     for(const auto &access:task.accesses) {
@@ -1809,8 +1906,15 @@ bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
   for(const auto *key:{"source_scalar_f32_operations","source_f32_product_operations",
       "source_math_exp_f32_operations","source_scalar_reads","source_scalar_writes",
       "dma_bytes","dma_input_bytes","dma_output_bytes","dma_transfer_count",
-      "active_compute_events","local_initialize_events","local_staging_copy_bytes"})f.values[key]+=0;
-  f.values["command_count"]=1;
+      "active_compute_events","local_initialize_events","local_staging_copy_bytes",
+      "implemented_scalar_f32_product_operations","implemented_mixed8_f32_product_operations",
+      "implemented_scalar_f32_addsub_operations","implemented_mixed8_f32_addsub_packs"})f.values[key]+=0;
+  f.values["module_wide_channel_conversion"]=p.moduleWideChannelConversion?1:0;
+  f.values["command_count"]=0;
+  f.values["execution_region_count"]=p.communication.executionRegions.size();
+  for(const auto &region:p.communication.executionRegions)
+    if(region.submissionCount<=0 || !add(f.values["command_count"],region.submissionCount))
+      return fail(error,"cost execution region submission count is invalid or overflows");
   f.values["hardware_stage_count"]=p.strategy=="serial-tiled"?p.hardwareStages.size():1;
   f.values["execution_group_count"]=p.executionGroups.size();
   f.values["source_phase_count"]=p.phases.size();
@@ -1818,6 +1922,25 @@ bool orbit::taskflow::collectGenericCostFeatures(const GenericAnalysis &a,
   f.values["readonly_retention_scopes"]=p.readOnlyRetentions.size();
   f.values["serial_tiled"]=p.strategy=="serial-tiled";
   f.values["capacity_bytes"]=p.capacityBytes;
+  f.values["all_source_loops_affine"]=1;f.values["all_source_loops_unit_step"]=1;
+  f.values["source_loop_depth_max"]=0;f.values["source_has_tile_tail"]=0;f.values["mixed8_lane_coverage_exact"]=1;
+  for(size_t axis=0;axis<3;++axis)f.values["source_max_loop_"+std::to_string(axis)+"_iterations"]=0;
+  for(const auto &task:a.tasks)for(size_t axis=0;axis<task.loops.size();++axis) {
+    const auto &loop=task.loops[axis];
+    f.values["all_source_loops_affine"]&=isa<affine::AffineForOp>(loop.operation);
+    f.values["all_source_loops_unit_step"]&=loop.step==1;
+    f.values["source_loop_depth_max"]=std::max(f.values["source_loop_depth_max"],int64_t(axis+1));
+    int64_t count=(loop.upper-loop.lower-1)/loop.step+1;
+    if(axis<3)f.values["source_max_loop_"+std::to_string(axis)+"_iterations"]=std::max(f.values["source_max_loop_"+std::to_string(axis)+"_iterations"],count);
+    if(axis<p.tileSizes.size() && count%p.tileSizes[axis])f.values["source_has_tile_tail"]=1;
+  }
+  for(const auto &implementation:p.taskImplementations)if(implementation.kind=="scalar-product-vector-add-f32") {
+    if(implementation.lanes!=8)f.values["mixed8_lane_coverage_exact"]=0;
+    for(const auto &phase:p.phases)if(phase.task==implementation.task) {
+      auto bound=llvm::find_if(phase.loops,[&](const auto &b){return int64_t(b.loop)==implementation.parallelLoop;});
+      if(bound==phase.loops.end() || (bound->upper-bound->lower)%8)f.values["mixed8_lane_coverage_exact"]=0;
+    }
+  }
   for(size_t axis=0;axis<3;++axis)f.values["max_tile_loop_"+std::to_string(axis)+"_iterations"]=0;
   for(const auto &phase:p.phases) {
     if(phase.task>=a.tasks.size())return fail(error,"cost feature source task is invalid");
@@ -1915,7 +2038,8 @@ bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &fe
     return true;
   }
   if(kind=="features-only")return unknown("uncalibrated","native feature collection only; no fitted coefficients");
-  if(kind!="linear-composite")return fail(error,"unsupported direct-AIR cost provider kind");
+  const bool implementationAware=kind=="implementation-composite";
+  if(kind!="linear-composite" && !implementationAware)return fail(error,"unsupported direct-AIR cost provider kind");
   auto calibration=object->getString("calibration");
   if(calibration=="uncalibrated")return unknown("uncalibrated","direct-AIR composite coefficients are not calibrated");
   if(calibration!="calibrated")return fail(error,"direct-AIR cost model requires explicit calibration status");
@@ -1933,9 +2057,26 @@ bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &fe
   if(!domain || !terms || terms->empty() || terms->size()>4)return fail(error,"direct-AIR composite requires domain and one to four frozen terms");
   auto sources=domain->getArray("source_fingerprints"),implementations=domain->getArray("implementations"),operations=domain->getArray("operations");
   auto ranges=domain->getObject("feature_ranges");
-  if(!sources || sources->empty() || !implementations || implementations->empty() || !operations || !ranges)
+  if((!implementationAware && (!sources || sources->empty())) || !implementations || implementations->empty() || !operations || !ranges)
     return fail(error,"direct-AIR model requires source, implementation, operation and feature coverage");
   auto covered=[](const llvm::json::Array &values,llvm::StringRef key){return llvm::any_of(values,[&](const auto &v){return v.getAsString()==key;});};
+  const auto *families=domain->getArray("family_fingerprints");
+  const auto *architectures=domain->getArray("architecture_fingerprints");
+  auto allowTails=domain->getBoolean("allow_tails");
+  if(implementationAware) {
+    if(domain->get("source_fingerprints") || domain->get("source_feature_ranges"))
+      return fail(error,"implementation-composite uses source-family/feature domains, not exact source-hash ranges");
+    if(!families || families->empty() || !architectures || architectures->empty() || !allowTails)
+      return fail(error,"implementation-composite requires source families, architectures and explicit tail policy");
+    for(const auto *identities:{families,architectures})for(const auto &identity:*identities)
+      if(!identity.getAsString() || !digest(*identity.getAsString()))return fail(error,"implementation-composite family/architecture identity must be SHA256");
+    for(const char *key:{"command_count","implemented_scalar_f32_product_operations",
+        "implemented_mixed8_f32_product_operations","hardware_stage_count","source_max_loop_0_iterations",
+        "source_max_loop_1_iterations","source_max_loop_2_iterations","max_tile_loop_0_iterations",
+        "max_tile_loop_1_iterations","max_tile_loop_2_iterations","source_phase_count","dma_bytes",
+        "resident_payload_bytes","capacity_bytes","core_count_per_stage"})
+      if(!ranges->get(key))return fail(error,"implementation-composite requires explicit shape/tile/work/stage/DMA/resource envelope");
+  }
   std::set<std::string> termsSeen;double total=0;
   for(const auto &term:*terms) {
     auto entry=term.getAsObject();auto name=entry?entry->getString("feature"):std::nullopt;
@@ -1947,6 +2088,9 @@ bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &fe
     if(!std::isfinite(contribution) || !std::isfinite(total+contribution))return fail(error,"direct-AIR composite estimate overflows");
     total+=contribution;
   }
+  if(implementationAware && termsSeen!=std::set<std::string>{"command_count",
+      "implemented_scalar_f32_product_operations","implemented_mixed8_f32_product_operations","hardware_stage_count"})
+    return fail(error,"implementation-composite requires the four declared implementation/work/fixed-stage terms");
   for(const auto &range:*ranges) {
     auto limits=range.second.getAsArray();auto actual=features.values.find(range.first.str());
     if(actual==features.values.end() || !limits || limits->size()!=2 || !(*limits)[0].getAsInteger() || !(*limits)[1].getAsInteger() ||
@@ -1978,7 +2122,23 @@ bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &fe
     return unknown("out_of_domain","partitioned complete-program overhead is not calibrated by this single-command provider");
   if(features.values.find("all_storage_f32")==features.values.end() || features.values.at("all_storage_f32")!=1)
     return unknown("out_of_domain","calibrated direct-AIR provider currently requires f32 storage");
-  for(const auto &source:features.sourceFingerprints)if(!covered(*sources,source))return unknown("out_of_domain","source fingerprint outside frozen source groups");
+  if(!implementationAware)for(const auto &source:features.sourceFingerprints)if(!covered(*sources,source))return unknown("out_of_domain","source fingerprint outside frozen source groups");
+  if(implementationAware) {
+    if(!digest(features.regionFamilyFingerprint) || !covered(*families,features.regionFamilyFingerprint))
+      return unknown("out_of_domain","source SSA/access family outside implementation calibration");
+    if(!digest(features.architectureFingerprint) || !covered(*architectures,features.architectureFingerprint))
+      return unknown("out_of_domain","target memory/link/resource architecture outside implementation calibration");
+    auto fact=[&](const char *key,int64_t value){auto found=features.values.find(key);return found!=features.values.end() && found->second==value;};
+    if(!fact("all_source_loops_affine",1) || !fact("all_source_loops_unit_step",1) || !fact("mixed8_lane_coverage_exact",1))
+      return unknown("out_of_domain","implementation model requires static affine unit-step source and exact supported lane coverage");
+    if(!*allowTails && !fact("source_has_tile_tail",0))return unknown("out_of_domain","source/tile tails not included in frozen calibration domain");
+    for(const auto &operation:features.operations)
+      if(operation.first!="arith.mulf:f32" && operation.first!="arith.addf:f32" && operation.first!="arith.subf:f32")
+        return unknown("out_of_domain","implementation model currently covers source f32 multiply/add/subtract only");
+    for(const auto &implementation:features.implementations)
+      if(implementation!="scalar:1" && implementation!="scalar-product-vector-add-f32:8")
+        return unknown("out_of_domain","implementation model covers scalar and supported mixed8 only");
+  }
   for(const auto &implementation:features.implementations)if(!covered(*implementations,implementation))return unknown("out_of_domain","compute implementation outside calibrated domain");
   for(const auto &operation:features.operations)if(!covered(*operations,operation.first))return unknown("out_of_domain","source operation outside calibrated coverage");
   for(const auto &range:*ranges) {
@@ -1995,7 +2155,7 @@ bool orbit::taskflow::evaluateGenericDirectAIRCost(const GenericCostFeatures &fe
     }
   }
   if(total<=0)return unknown("uncalibrated","composite model has no positive estimate for this candidate");
-  cost.valueMs=total;cost.status="calibrated";cost.reason="composite full-call estimate; terms are not independently measured physical components";
+  cost.valueMs=total;cost.status="calibrated";cost.reason=implementationAware?"implementation-aware prepared-region composite; transfer/runtime included, no independently identified physical components":"composite full-call estimate; terms are not independently measured physical components";
   return true;
 }
 namespace {
@@ -2063,6 +2223,8 @@ bool orbit::taskflow::planGenericMapping(const GenericAnalysis &a,
   if (cfg)
     if (auto capacity = cfg->getInteger("capacity_bytes"))
       p.capacityBytes = *capacity;
+  if (!configureGenericMemory(config,p.capacityBytes,p.memoryBinding,e) ||
+      !getGenericTargetCapabilities(config,p.targetCapabilities,e)) return false;
   for (size_t i = 0; i < a.storages.size(); ++i) {
     int64_t n = storageBytes(a.storages[i]);
     if (n < 0 || p.residentBytes > INT64_MAX - n)
@@ -2245,7 +2407,7 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
                            {"dtype", storage.dtype},
                            {"shape", std::move(shape)},
                            {"bytes", bytes},
-                           {"memory", "system_memory_bo"},
+                           {"memory", p.memoryBinding.hostMemory},
                            {"lifetime", "whole_graph_lifetime"}});
   }
   for (auto task : p.fusedInitializerTasks)
@@ -2434,7 +2596,7 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
            pool.second * (stagingPools.count(pool.first) ? 2 : 1)},
           {"import_staging_bytes",
            stagingPools.count(pool.first) ? pool.second : 0},
-          {"memory", "aie_l1"},
+          {"memory", p.memoryBinding.localMemory},
           {"lifetime", "task source region; actual shape-specific hardware "
                        "pool totals listed in hardware_stages"}});
     begin = end;
@@ -2489,14 +2651,14 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
           {"sizes", ints(t.sizes)},
           {"extent", p.strategy == "serial-tiled" ? "rectangular_tile"
                                                   : "full_static_buffer"},
-          {"source", t.direction == "host_to_l1" ? "host_system_bo" : "aie_l1"},
+          {"source", t.direction == "host_to_l1" ? p.memoryBinding.hostMemory : p.memoryBinding.localMemory},
           {"target",
-           t.direction == "host_to_l1" ? "aie_l1" : "host_system_bo"}});
+           t.direction == "host_to_l1" ? p.memoryBinding.localMemory : p.memoryBinding.hostMemory}});
   if (p.strategy == "single-herd-resident")
     for (size_t i = 0; i < a.storages.size(); ++i)
       residency.push_back(
           llvm::json::Object{{"storage", a.storages[i].id},
-                             {"memory", "aie_l1"},
+                             {"memory", p.memoryBinding.localMemory},
                              {"lifetime", "whole_herd"},
                              {"bytes", storageBytes(a.storages[i])}});
   int64_t logicalReadBytes = 0, logicalWriteBytes = 0, scalarReads = 0,
@@ -2611,6 +2773,9 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
       {"strategy", p.strategy},
       {"placement", "npu_single_core_serial"},
       {"capacity_bytes", p.capacityBytes},
+      {"target_memory", serializeGenericMemory(p.memoryBinding)},
+      {"target_capabilities", serializeGenericCapabilities(p.targetCapabilities)},
+      {"target_capability_identity", p.targetCapabilities.identity},
       {"resident_bytes", p.residentBytes},
       {"phase_peak_live_bytes", phasePeak},
       {"allocation_lifetime",
@@ -2646,6 +2811,10 @@ orbit::taskflow::serializeGenericMapping(const GenericAnalysis &a,
       {"backend_internal_transport",
        "AIR compiler may add shim/L2 staging; final IR ledger required; not "
        "measured traffic"}};
+  if(p.moduleWideChannelConversion)report["backend_legalization"]=llvm::json::Object{
+    {"channel_conversion_scope","module"},{"async_herd_scope","module"},
+    {"local_release_scope","static-hardware-stage"},{"extra_transfer_bytes",0},
+    {"extra_tensor_padding_bytes",0},{"reason","installed DMA-to-channel pass converts every stage; all compact stage loops require matching async herd token scope"}};
   if(p.directCost.enabled) {
     report["direct_air_cost"]=directCostReport(p.directCost);
     report["cost_status"]=p.directCost.status;

@@ -35,6 +35,7 @@ int64_t storageBytes(const GenericStorage &s) {
 bool placements(const GenericAnalysis &a,const StaticConfig &target,
     const ProgramDataOrganizationChoice &choice,std::vector<MappingTaskPlacement> &out,std::string &error) {
   if(choice.placements.size()!=a.tasks.size())return reject(error,"one explicit placement per source task required");
+  if(!validateMemoryArchitecture(target,error))return false;
   out.resize(a.tasks.size());std::set<size_t> seen;
   for(const auto &p:choice.placements) {
     if(p.task>=a.tasks.size() || !seen.insert(p.task).second)return reject(error,"invalid or duplicate task placement");
@@ -42,7 +43,7 @@ bool placements(const GenericAnalysis &a,const StaticConfig &target,
     auto memory=std::find_if(target.memories.begin(),target.memories.end(),[&](const auto &m){return m.id==p.memory;});
     if(resource==target.resources.end() || resource->capacity<1 || resource->kind!="compute" ||
        memory==target.memories.end() || memory->capacityBytes<=0 ||
-       std::find(memory->accessibleDevices.begin(),memory->accessibleDevices.end(),resource->device)==memory->accessibleDevices.end())
+       !memoryAccessible(target,p.memory,p.resource))
       return reject(error,"task resource cannot access selected memory");
     out[p.task]=p;
   } return true;
@@ -62,7 +63,7 @@ bool orbit::taskflow::planProgramDataOrganization(const GenericAnalysis &a,
     const StaticConfig &target,const ProgramDataOrganizationChoice &choice,
     ProgramCommunicationPlan &c,std::string &error) {
   c={}; c.dataPolicy=choice.policy;c.bodyFingerprint=a.bodyFingerprint;
-  c.memories=target.memories;c.resources=target.resources;c.links=target.links;
+  c.domains=target.domains;c.memories=target.memories;c.resources=target.resources;c.links=target.links;
   if(!placements(a,target,choice,c.placements,error))return false;
   std::vector<Effects> effects;if(!sourceEffects(a,effects,error))return false;
   c.computeEstimates=choice.computeEstimates;
@@ -115,16 +116,24 @@ bool orbit::taskflow::planProgramDataOrganization(const GenericAnalysis &a,
     auto found=available.find({storage,memory});
     if(found!=available.end() && c.copies[found->second].version==size_t(latest[storage])) {copy=found->second;return true;}
     if(latest[storage]<0)return reject(error,"source read has no initialized version");
-    size_t source=SIZE_MAX;const StaticTransfer *link=nullptr;
-    for(const auto &entry:available) if(entry.first.first==storage && c.copies[entry.second].version==size_t(latest[storage])) {
-      auto l=linkFor(target,a.storages[storage],entry.first.second,memory,storageBytes(a.storages[storage]));
-      if(l){source=entry.second;link=l;break;}
+    size_t source=SIZE_MAX;std::vector<std::string> path;
+    StaticConfig routes=target;routes.links.clear();int64_t b=storageBytes(a.storages[storage]);
+    // Filter semantic constraints before connectivity, not after choosing a route.
+    for(const auto &l:target.links)if(linkFor(target,a.storages[storage],l.source,l.target,b)==&l)routes.links.push_back(l);
+    for(const auto &entry:available)if(entry.first.first==storage && c.copies[entry.second].version==size_t(latest[storage])) {
+      std::vector<std::string> candidate;std::string ignored;
+      if(findMemoryPath(routes,entry.first.second,memory,candidate,ignored) &&
+         (source==SIZE_MAX || candidate.size()<path.size())){source=entry.second;path=std::move(candidate);}
     }
-    if(!link)return reject(error,"no legal direct transfer for required copy");
-    size_t event=start("transfer",task,memory,link->resource,link->id);read(source,event,false);
-    copy=create(latest[storage],allocation(storage,memory,task),event);
-    int64_t b=storageBytes(a.storages[storage]);if(c.transferBytes>INT64_MAX-b)return reject(error,"traffic overflow");c.transferBytes+=b;
-    if(std::isfinite(link->bandwidthBytesPerMs) && std::isfinite(link->latencyMs) && link->bandwidthBytesPerMs>0 && link->latencyMs>=0 && !link->provenance.source.empty())duration+=link->latencyMs+b/link->bandwidthBytesPerMs;else known=false;
+    if(source==SIZE_MAX || path.empty())return reject(error,"no legal transfer path for required copy");
+    for(const auto &id:path) {
+      auto link=std::find_if(target.links.begin(),target.links.end(),[&](const auto &l){return l.id==id;});
+      size_t event=start("transfer",task,link->target,link->resource,link->id);read(source,event,false);
+      copy=create(latest[storage],allocation(storage,link->target,task),event);
+      if(c.transferBytes>INT64_MAX-b)return reject(error,"traffic overflow");c.transferBytes+=b;
+      if(std::isfinite(link->bandwidthBytesPerMs) && std::isfinite(link->latencyMs) && link->bandwidthBytesPerMs>0 && link->latencyMs>=0 && !link->provenance.source.empty())duration+=link->latencyMs+b/link->bandwidthBytesPerMs;else known=false;
+      source=copy;
+    }
     return true;
   };
   for(size_t task=0;task<a.tasks.size();++task) {
@@ -145,9 +154,14 @@ bool orbit::taskflow::planProgramDataOrganization(const GenericAnalysis &a,
         c.events[event].orderEdges.push_back(c.orderEdges.size());c.orderEdges.push_back({size_t(c.events.rend()-prior-1),event,"source task dependency without value consumption"});}
     }
     if(choice.policy==ProgramDataPolicy::PhaseLocal) {
-      // Imported copies are ephemeral; produced versions remain as their source.
-      for(size_t copy:reads) if(c.copies[copy].createdBy>=0 && c.events[c.copies[copy].createdBy].kind=="transfer")
-        available.erase({c.regions[c.versions[c.copies[copy].version].region].storage,place.memory});
+      // Every imported location is task-local, including intermediate copies
+      // along a multi-hop route. Only external and compute-produced copies
+      // remain valid sources for a later task under this policy.
+      for(auto it=available.begin();it!=available.end();) {
+        auto creator=c.copies[it->second].createdBy;
+        if(creator>=0 && c.events[creator].kind=="transfer")it=available.erase(it);
+        else ++it;
+      }
     }
   }
   for(size_t s=0;s<a.storages.size();++s)if(a.storages[s].role=="output") {
@@ -184,6 +198,7 @@ bool orbit::taskflow::checkProgramDataOrganization(const GenericAnalysis &a,
   if(!sourceEffects(a,effects,error) || !placements(a,target,choice,place,error))return false;
   for(const auto &storage:a.storages)if(storageBytes(storage)<=0)
     return reject(error,"source storage byte count is invalid or overflows int64");
+  if(!c.executionRegions.empty())return reject(error,"whole-task CPU planner has no declared offload submission boundary");
   if(c.dataPolicy!=choice.policy || c.bodyFingerprint!=a.bodyFingerprint ||
      c.regions.size()!=a.storages.size() || c.placements.size()!=place.size())return reject(error,"source/policy/placement coverage mismatch");
   for(size_t t=0;t<place.size();++t)if(c.placements[t].task!=t || c.placements[t].memory!=place[t].memory ||
@@ -192,6 +207,9 @@ bool orbit::taskflow::checkProgramDataOrganization(const GenericAnalysis &a,
   for(size_t s=0;s<a.storages.size();++s)if(c.regions[s].storage!=s ||
       c.regions[s].sizes!=a.storages[s].shape || c.regions[s].offsets!=std::vector<int64_t>(a.storages[s].shape.size(),0))
     return reject(error,"logical region differs from source");
+  StaticConfig copyTarget;copyTarget.memories=c.memories;copyTarget.resources=c.resources;copyTarget.links=c.links;copyTarget.domains=c.domains;
+  if(staticFingerprint(serializeMemoryArchitecture(copyTarget))!=staticFingerprint(serializeMemoryArchitecture(target)))
+    return reject(error,"target architecture contract changed");
   // Target tables are contracts, not candidate-mutable resources.
   if(c.memories.size()!=target.memories.size() || c.resources.size()!=target.resources.size() || c.links.size()!=target.links.size())
     return reject(error,"target contract coverage changed");
@@ -342,8 +360,12 @@ bool orbit::taskflow::checkProgramDataOrganization(const GenericAnalysis &a,
        copy.releasedAfter!=release || al.beginPhase!=begin || al.endPhase!=end)
       return reject(error,"copy users/release/allocation lifetime mismatch");
     if(choice.policy==ProgramDataPolicy::PhaseLocal && copy.createdBy>=0 && c.events[copy.createdBy].kind=="transfer") {
-      std::set<size_t> consumers;for(auto u:users[i])if(c.events[u].kind=="compute")consumers.insert(c.events[u].task);
-      if(consumers.size()>1)return reject(error,"phase-local imported copy retained across consumers");
+      // A transit copy can be consumed only by transfers, so compute-user
+      // counting alone would silently permit retention across later tasks.
+      // Bind all uses to the importing task, independently of the builder.
+      std::set<size_t> consumers{c.events[copy.createdBy].task};
+      for(auto u:users[i])consumers.insert(c.events[u].task);
+      if(consumers.size()>1)return reject(error,"phase-local imported copy retained across task/transfer consumers");
     }
   }
   // Event intervals are the valid serial schedule's actual allocation lifetime;

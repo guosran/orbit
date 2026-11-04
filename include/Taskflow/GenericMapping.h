@@ -77,6 +77,8 @@ struct GenericAIRChannelAllocation {
 struct GenericCostFeatures {
   // Hash of the complete checked execution plan with all price metadata removed.
   std::string executionFingerprint;
+  // Source SSA/access family with static extents/names erased, not a price key.
+  std::string regionFamilyFingerprint, architectureFingerprint;
   std::map<std::string,int64_t> values, operations;
   std::vector<std::string> sourceFingerprints, implementations;
 };
@@ -87,7 +89,34 @@ struct GenericDirectAIRCost {
   std::string status = "disabled", reason, modelDigest, featureDigest;
   std::optional<double> valueMs;
 };
+// AIR-specific realization of a common target-owned architecture. Direction
+// strings in GenericTransfer remain backend channel roles, never locations.
+struct GenericMemoryBinding {
+  GenericMemoryBinding();
+  StaticConfig architecture;
+  std::string hostMemory = "system_memory_bo", localMemory = "aie_l1";
+  std::string computeResource = "npu.compute", dmaResource = "npu.dma";
+  std::string inputLink = "host_to_l1", outputLink = "l1_to_host";
+  std::string submissionResource = "host-submission";
+};
+struct GenericTargetCapabilities {
+  int64_t capacityBytes = 24576;
+  std::vector<int64_t> tileAlignment{1,8,1};
+  std::vector<GenericTaskImplementation> implementations{{0,"scalar",-1,1},{0,"scalar-product-vector-add-f32",-1,8}};
+  std::string identity;
+};
+bool configureGenericMemory(const llvm::json::Value &, int64_t capacity,
+                            GenericMemoryBinding &, std::string &error);
+bool checkGenericMemory(const GenericMemoryBinding &, int64_t capacity,
+                        std::string &error);
+bool getGenericTargetCapabilities(const llvm::json::Value &,
+    GenericTargetCapabilities &, std::string &error);
+llvm::json::Value serializeGenericMemory(const GenericMemoryBinding &);
+llvm::json::Value serializeGenericCapabilities(const GenericTargetCapabilities &);
+bool checkGenericCapabilities(const GenericMemoryBinding &, const GenericTargetCapabilities &, std::string &error);
 struct GenericMappingPlan {
+  GenericMemoryBinding memoryBinding;
+  GenericTargetCapabilities targetCapabilities;
   std::string strategy = "single-herd-resident", bodyFingerprint, planId;
   int64_t capacityBytes = 24576, residentBytes = 0;
   std::vector<size_t> orderedTasks;
@@ -96,6 +125,7 @@ struct GenericMappingPlan {
   std::vector<GenericTileRetention> retainedRegions;
   std::vector<size_t> fusedInitializerTasks;
   std::vector<GenericHardwareStage> hardwareStages;
+  bool moduleWideChannelConversion = false;
   std::vector<GenericAIRChannelAllocation> channelAllocations;
   ProgramMappingChoice choices;
   std::vector<std::vector<size_t>> taskLoopOrders;

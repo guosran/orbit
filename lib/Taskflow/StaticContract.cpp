@@ -234,6 +234,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       throw std::runtime_error("unsupported static config schema");
     c.original = v;
     auto &hw = obj(field(o, "hardware"));
+    if(auto domains=hw.getArray("domains"))for(const auto &v:*domains){auto &d=obj(v);c.domains.push_back({str(d,"id"),str(d,"parent"),str(d,"kind")});}
     std::set<std::string> ids;
     std::map<std::string, StaticResource> resources;
     std::map<std::string, StaticMemory> memories;
@@ -241,9 +242,10 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       auto &o = obj(v);
       StaticResource r{str(o, "id"), str(o, "kind"), str(o, "device"),
                        integer(o, "capacity")};
+      r.domain=str(o,"domain");
       unique(ids, r.id);
       if (r.capacity <= 0 ||
-          (r.kind != "compute" && r.kind != "communication") ||
+          (r.kind != "compute" && r.kind != "communication" && r.kind != "submission") ||
           (r.kind == "compute" && r.device.empty()))
         throw std::runtime_error("invalid resource kind/device/capacity");
       resources[r.id] = r;
@@ -254,6 +256,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       auto &o = obj(v);
       StaticMemory m{str(o, "id"), integer(o, "capacity_bytes"),
                      strings(o, "accessible_devices")};
+      m.domain=str(o,"domain");m.kind=str(o,"kind");m.accessibleResources=strings(o,"accessible_resources",false);
       unique(ids, m.id);
       if (m.capacityBytes <= 0 || m.accessibleDevices.empty())
         throw std::runtime_error("invalid memory capacity/access");
@@ -271,7 +274,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       for (auto &v : *a) {
         auto &o = obj(v);
         StaticTransfer t;
-        t.id = str(o, "id");
+        t.id = str(o, "id");t.domain=str(o,"domain");
         unique(ids, t.id);
         t.resource = str(o, "resource");
         if (!resources.count(t.resource))
@@ -546,6 +549,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       if (std::find(dev.begin(), dev.end(), p.second) == dev.end())
         throw std::runtime_error("output device cannot access memory");
     }
+    if(!validateMemoryArchitecture(c,e))return false;
     return true;
   } catch (const std::exception &x) {
     e = x.what();

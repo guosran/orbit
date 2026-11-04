@@ -157,8 +157,75 @@ int main() {
    }else ++checks;
  }
  reject("negative allocation bytes",[](auto &p){p.allocations.front().bytes=-1;});
+ // Target-owned sharing, resource access and multi-hop connectivity.
+ auto arch=target;arch.domains={{"system","","system"},{"device","system","device"},{"tile0","device","tile"},{"tile1","device","tile"}};
+ arch.resources[0].domain="system";arch.resources[1].domain="tile0";arch.resources[2].domain="device";
+ arch.resources.push_back({"accelerator1","compute","accel",1,"tile1"});
+ arch.memories[0].domain="system";arch.memories[0].kind="dram";arch.memories[0].accessibleResources={"cpu"};
+ arch.memories[1].domain="device";arch.memories[1].kind="shared-sram";arch.memories[1].accessibleResources={"accelerator","accelerator1"};
+ arch.memories.push_back({"local0",192,{"accel"},"tile0","local-sram",{"accelerator"}});
+ arch.memories.push_back({"local1",192,{"accel"},"tile1","local-sram",{"accelerator1"}});
+ auto edge=[&](const char *id,const char *from,const char *to){auto l=in;l.id=id;l.source=from;l.target=to;l.domain="device";return l;};
+ arch.links={edge("to-shared","dram","sram"),edge("to-local0","sram","local0"),edge("to-local1","sram","local1")};
+ auto require=[&](bool valid,const char *name){if(!valid){llvm::errs()<<"architecture: "<<name<<": "<<error<<"\n";ok=false;}else ++checks;};
+ require(validateMemoryArchitecture(arch,error),"shared and two-local architecture");
+ require(memoryAccessible(arch,"sram","accelerator1") && !memoryAccessible(arch,"local0","accelerator1"),"precise resource accessibility overrides same device");
+ std::vector<std::string> path;
+ require(findMemoryPath(arch,"dram","local1",path,error) && path==std::vector<std::string>{"to-shared","to-local1"},"two-hop reachability");
+ require(!findMemoryPath(arch,"local1","local0",path,error),"directed unreachable path");
+ auto malformed=arch;malformed.domains.front().parent="tile0";
+ require(!validateMemoryArchitecture(malformed,error),"ownership cycle rejected");
+ malformed=arch;malformed.memories.back().accessibleResources={"missing"};
+ require(!validateMemoryArchitecture(malformed,error),"unknown accessor rejected");
+ malformed=arch;malformed.links.back().resource="accelerator";
+ require(!validateMemoryArchitecture(malformed,error),"compute resource cannot be DMA");
+ StaticConfig roundtrip;require(parseMemoryArchitecture(serializeMemoryArchitecture(arch),roundtrip,error) &&
+   staticFingerprint(serializeMemoryArchitecture(roundtrip))==staticFingerprint(serializeMemoryArchitecture(arch)),"architecture roundtrip");
+ auto commonChoice=choice;commonChoice.placements.back().resource="accelerator1";commonChoice.computeEstimates.back().resource="accelerator1";
+ ProgramCommunicationPlan sharedPlan,separatePlan,pathPlan;
+ require(planProgramDataOrganization(a,arch,commonChoice,sharedPlan,error) && sharedPlan.transferBytes==64,"shared copy allocated/transferred once across compute resources");
+ auto separate=arch;commonChoice.placements[1].memory="local0";commonChoice.placements[2].memory="local1";
+ separate.assumptions.outputLocations["B"]="local0";separate.assumptions.outputLocations["C"]="local1";
+ require(planProgramDataOrganization(a,separate,commonChoice,separatePlan,error) && separatePlan.transferBytes==192,"shared staging plus two local copies with actual path bytes");
+ auto separateLocalChoice=commonChoice;separateLocalChoice.policy=ProgramDataPolicy::PhaseLocal;
+ ProgramCommunicationPlan separateLocalPlan;
+ require(planProgramDataOrganization(a,separate,separateLocalChoice,separateLocalPlan,error) && separateLocalPlan.transferBytes==256,
+   "phase-local releases every imported multi-hop copy at task boundary");
+ require(checkProgramDataOrganization(a,separate,separateLocalChoice,separateLocalPlan,error) &&
+   checkProgramDataOrganization(a,separate,commonChoice,separatePlan,error),"both multi-hop policies pass independent checking");
+ auto importCount=[&](const ProgramCommunicationPlan &p,const std::string &memory){size_t count=0;
+   for(const auto &copy:p.copies)if(copy.createdBy>=0 && p.events[copy.createdBy].kind=="transfer" &&
+       p.allocations[copy.allocation].memory==memory)++count;return count;};
+ require(importCount(separatePlan,"sram")==1 && importCount(separateLocalPlan,"sram")==2 &&
+   importCount(separatePlan,"local0")==1 && importCount(separatePlan,"local1")==1 &&
+   importCount(separateLocalPlan,"local0")==1 && importCount(separateLocalPlan,"local1")==1,
+   "only retained policy shares a transit creation across tasks");
+ auto hiddenTransitRetention=separatePlan;hiddenTransitRetention.dataPolicy=ProgramDataPolicy::PhaseLocal;
+ error.clear();
+ require(!checkProgramDataOrganization(a,separate,separateLocalChoice,hiddenTransitRetention,error) &&
+   error.find("across task/transfer consumers")!=std::string::npos,
+   "independent checker rejects phase-local transit sharing with accurate lifetimes/costs");
+ // The producer's DRAM version remains a source for both consumers. Removing
+ // imported copies must not discard compute-created copies or fabricate a
+ // new logical version to pay for the second route.
+ require(separateLocalPlan.versions.size()==separatePlan.versions.size() &&
+   separateLocalPlan.dataEdges.size()==separatePlan.dataEdges.size() &&
+   separateLocalPlan.orderEdges.size()==separatePlan.orderEdges.size() &&
+   separateLocalPlan.allocations.size()==separatePlan.allocations.size()+1,
+   "phase-local route recreation preserves source versions and data/order edges");
+ auto unc=arch;for(auto &l:unc.links){l.latencyMs=0;l.bandwidthBytesPerMs=0;l.provenance={};}
+ auto sharedChoice=choice;sharedChoice.placements.back().resource="accelerator1";sharedChoice.computeEstimates.back().resource="accelerator1";
+ require(planProgramDataOrganization(a,unc,sharedChoice,pathPlan,error) && !pathPlan.estimatedMakespanMs && pathPlan.transferBytes==64,"uncalibrated paths still check capacity and validity");
+ malformed=arch;malformed.memories[1].capacityBytes=127;
+ require(!planProgramDataOrganization(a,malformed,sharedChoice,pathPlan,error),"shared memory capacity limits residency");
+ auto denied=sharedChoice;denied.placements.back().memory="local0";
+ require(!planProgramDataOrganization(a,arch,denied,pathPlan,error),"same device cannot bypass local accessibility");
+ auto tampered=sharedPlan;tampered.memories[1].accessibleResources={"accelerator"};
+ require(!checkProgramDataOrganization(a,arch,sharedChoice,tampered,error),"access contract tamper rejected independently");
  llvm::outs()<<llvm::json::Object{{"status",ok?"PASS":"FAIL"},{"checks",int64_t(checks)},
   {"scope","actual MLIR fanout on synthetic CPU target; no cross-stage AIR claim"},
+  {"architecture",serializeMemoryArchitecture(arch)},{"shared_memory_example",serializeProgramCommunication(sharedPlan)},{"separate_local_example",serializeProgramCommunication(separatePlan)},
+  {"separate_local_phase_policy_example",serializeProgramCommunication(separateLocalPlan)},
   {"source_facts",serializeGenericAnalysis(a)},{"phase_local",serializeProgramCommunication(local)},{"retain_across_users",serializeProgramCommunication(retained)}}<<"\n";
  return ok?0:1;
 }

@@ -157,7 +157,7 @@ struct State {
         ? poolKey(p, phases[phase], phase, *demand) : "storage-"+std::to_string(storage)+".data";
     for (size_t i = 0; i < c.allocations.size(); ++i) {
       const auto &al = c.allocations[i];
-      if (al.storage == storage && al.memory == "aie_l1" && al.key == key &&
+      if (al.storage == storage && al.memory == p.memoryBinding.localMemory && al.key == key &&
           al.beginPhase <= phase && phase < al.endPhase) return i;
     }
     return -1;
@@ -168,7 +168,7 @@ struct State {
     available.resize(c.allocations.size()); latest.assign(c.regions.size(),-1);
     host.assign(a.storages.size(),SIZE_MAX);
     for (size_t i = 0; i < c.allocations.size(); ++i)
-      if (c.allocations[i].memory == "system_memory_bo") host[c.allocations[i].storage] = i;
+      if (c.allocations[i].memory == p.memoryBinding.hostMemory) host[c.allocations[i].storage] = i;
     for (size_t cell = 0; cell < c.regions.size(); ++cell) {
       size_t storage = c.regions[cell].storage;
       if (a.storages[storage].role != "input") continue;
@@ -193,8 +193,8 @@ struct State {
       phaseBegin = events.size();
     }
     MappingEvent event; event.kind = std::move(kind); event.phase = phase;
-    event.task = task; event.memory = event.kind == "transfer" ? "" : "aie_l1"; event.link = std::move(link);
-    event.resource = event.kind == "transfer" ? "npu.dma" : "npu.compute";
+    event.task = task; event.memory = event.kind == "transfer" ? "" : p.memoryBinding.localMemory; event.link = std::move(link);
+    event.resource = event.kind == "transfer" ? p.memoryBinding.dmaResource : p.memoryBinding.computeResource;
     event.dependencies = phaseBarrier;
     events.push_back(std::move(event)); return events.size()-1;
   }
@@ -218,7 +218,7 @@ struct State {
     copy.lastUsers = {event}; copy.users.push_back(event); return true;
   }
   void clearLocal(size_t event, size_t al) {
-    if (p.communication.allocations[al].memory == "system_memory_bo") return;
+    if (p.communication.allocations[al].memory == p.memoryBinding.hostMemory) return;
     for (auto item : available[al]) {
       beforeOverwrite(event,item.second);
       p.communication.copies[item.second].releasedAfter = event;
@@ -249,7 +249,7 @@ struct State {
     int64_t external = allocation(t.storage,phase,true);
     if (local < 0 || external < 0) return fail(error,"DMA allocation binding missing");
     size_t source = input ? external : local, target = input ? local : external;
-    size_t event = start("transfer",phase,sourcePhase.task,input ? "host_to_l1" : "l1_to_host");
+    size_t event = start("transfer",phase,sourcePhase.task,input ? p.memoryBinding.inputLink : p.memoryBinding.outputLink);
     auto cells = partition.cells(region(t,a));
     for (size_t cell : cells) if (!read(event,source,cell,error)) return false;
     clearLocal(event,target);
@@ -364,16 +364,16 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
   auto &c = p.communication;
   c.bodyFingerprint = a.bodyFingerprint;
   if (!parseProgramDataPolicy(p.choices.dataOrganization,c.dataPolicy,error)) return false;
-  c.memories = {{"system_memory_bo",INT64_MAX,{"host","npu"}},
-                {"aie_l1",p.capacityBytes,{"npu"}}};
-  c.resources = {{"npu.compute","compute","npu",1}, {"npu.dma","transfer","npu",1}};
-  for (auto direction : {"host_to_l1","l1_to_host"}) {
-    StaticTransfer link;
-    link.id = direction; link.source = direction == std::string("host_to_l1") ? "system_memory_bo" : "aie_l1";
-    link.target = direction == std::string("host_to_l1") ? "aie_l1" : "system_memory_bo";
-    link.resource = "npu.dma";
-    link.provenance = {"target_contract","serial explicit DMA; latency/bandwidth uncalibrated"};
-    c.links.push_back(std::move(link));
+  if(!checkGenericMemory(p.memoryBinding,p.capacityBytes,error)) return false;
+  c.domains=p.memoryBinding.architecture.domains;
+  c.memories=p.memoryBinding.architecture.memories;
+  c.resources=p.memoryBinding.architecture.resources;
+  c.links=p.memoryBinding.architecture.links;
+  for(const auto &t:p.transfers){
+    const auto &b=p.memoryBinding;auto id=t.direction=="host_to_l1"?b.inputLink:b.outputLink;
+    auto l=std::find_if(c.links.begin(),c.links.end(),[&](const auto &link){return link.id==id;});
+    if(l==c.links.end() || t.bytes<l->minBytes || t.bytes>l->maxBytes)
+      return fail(error,"transfer exceeds target link byte limits");
   }
   collectGenericAllocations(a,p,c.allocations);
   State state(p,a,*phases);
@@ -410,7 +410,7 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
   for (auto &copy : c.copies) {
     if (copy.releasedAfter == SIZE_MAX) copy.releasedAfter = c.events.size();
     const auto &allocation = c.allocations[copy.allocation];
-    if (allocation.memory != "system_memory_bo") {
+    if (allocation.memory != p.memoryBinding.hostMemory) {
       auto end = std::lower_bound(c.events.begin(),c.events.end(),allocation.endPhase,
           [](const auto &event, size_t phase) { return event.phase < phase; });
       copy.releasedAfter = std::min(copy.releasedAfter,size_t(end-c.events.begin()));
@@ -426,12 +426,22 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
     if(transfer.bytes<0 || c.transferBytes>INT64_MAX-transfer.bytes) return fail(error,"transfer total overflow");
     c.transferBytes+=transfer.bytes;
   }
+  MappingExecutionRegion call;call.id="program-call";
+  call.placement="npu";call.submissionResource=p.memoryBinding.submissionResource;call.endEvent=c.events.size();
+  for(size_t stage=0;stage<std::max<size_t>(1,p.hardwareStages.size());++stage)call.deviceStages.push_back(stage);
+  c.executionRegions.push_back(std::move(call));
   return true;
 }
 
 bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     const GenericMappingPlan &p, std::string &error) {
   const auto &c = p.communication;
+  if(c.executionRegions.size()!=1)return fail(error,"one checked AIR program-call region required");
+  const auto &call=c.executionRegions.front();std::vector<size_t> stages;
+  for(size_t i=0;i<std::max<size_t>(1,p.hardwareStages.size());++i)stages.push_back(i);
+  if(call.id!="program-call" || call.placement!="npu" || call.submissionResource!=p.memoryBinding.submissionResource ||
+     call.beginEvent!=0 || call.endEvent!=c.events.size() || call.submissionCount!=1 || call.deviceStages!=stages)
+    return fail(error,"program-call coverage/submission/stage contract mismatch");
   ProgramDataPolicy policy;
   if (!parseProgramDataPolicy(p.choices.dataOrganization,policy,error) || c.dataPolicy!=policy || !c.placements.empty())
     return fail(error,"data policy differs from checked mapping choice");
@@ -453,32 +463,12 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
         x.bytes != y.bytes || x.beginPhase != y.beginPhase || x.endPhase != y.endPhase)
       return fail(error,"allocation placement, size or lifetime mismatch");
   }
-  if (c.memories.size() != 2 || c.resources.size() != 2 || c.links.size() != 2 ||
-      c.memories[0].id != "system_memory_bo" || c.memories[0].capacityBytes != INT64_MAX ||
-      c.memories[1].id != "aie_l1" || c.memories[1].capacityBytes != p.capacityBytes ||
-      c.resources[0].id != "npu.compute" || c.resources[0].capacity != 1 ||
-      c.resources[0].kind != "compute" || c.resources[0].device != "npu" ||
-      c.resources[1].id != "npu.dma" || c.resources[1].capacity != 1 ||
-      c.resources[1].kind != "transfer" || c.resources[1].device != "npu" ||
-      c.memories[0].accessibleDevices != std::vector<std::string>{"host","npu"} ||
-      c.memories[1].accessibleDevices != std::vector<std::string>{"npu"})
-    return fail(error,"unsupported memory/resource contract");
-  for (size_t i = 0; i < c.links.size(); ++i) {
-    bool input = i == 0;
-    const auto &link = c.links[i];
-    if (link.id != (input ? "host_to_l1" : "l1_to_host") ||
-        link.source != (input ? "system_memory_bo" : "aie_l1") ||
-        link.target != (input ? "aie_l1" : "system_memory_bo") ||
-        link.resource != "npu.dma" || link.latencyMs != 0 ||
-        link.bandwidthBytesPerMs != 0 || link.temporaryBytes != 0 ||
-        link.minBytes != 0 || link.maxBytes != INT64_MAX ||
-        !link.memory.empty() || !link.sourceLayout.empty() || !link.targetLayout.empty() ||
-        !link.sourceDtype.empty() || !link.targetDtype.empty() ||
-        !link.sourceDevice.empty() || !link.targetDevice.empty() ||
-        link.provenance.kind != "target_contract" ||
-        link.provenance.source != "serial explicit DMA; latency/bandwidth uncalibrated")
-      return fail(error,"transfer link topology/resource/cost mismatch");
-  }
+  if(!checkGenericMemory(p.memoryBinding,p.capacityBytes,error)) return false;
+  StaticConfig actual;actual.memories=c.memories;actual.resources=c.resources;actual.links=c.links;
+  actual.domains=c.domains;
+  if(staticFingerprint(serializeMemoryArchitecture(actual)) !=
+     staticFingerprint(serializeMemoryArchitecture(p.memoryBinding.architecture)))
+    return fail(error,"target memory/resource/path contract changed");
   // Check lifetimes as actual storage allocation intervals, independent of
   // data liveness. Dormant full/tail template pools still consume capacity.
   std::map<std::string,std::map<size_t,int64_t>> deltas;
@@ -504,12 +494,12 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   std::vector<std::map<size_t,size_t>> available(allocations.size());
   std::vector<size_t> host(a.storages.size(),SIZE_MAX);
   for (size_t i = 0; i < allocations.size(); ++i)
-    if (allocations[i].memory == "system_memory_bo") host[allocations[i].storage] = i;
+    if (allocations[i].memory == p.memoryBinding.hostMemory) host[allocations[i].storage] = i;
   auto local = [&](size_t phase, const GenericTileRegion &r) -> int64_t {
     std::string key = p.strategy == "serial-tiled" ? poolKey(p,(*phases)[phase],phase,r)
                   : "storage-"+std::to_string(r.storage)+".data";
     for (size_t i = 0; i < allocations.size(); ++i)
-      if (allocations[i].memory == "aie_l1" && allocations[i].key == key &&
+      if (allocations[i].memory == p.memoryBinding.localMemory && allocations[i].key == key &&
           allocations[i].storage == r.storage && allocations[i].beginPhase <= phase &&
           phase < allocations[i].endPhase) return i;
     return -1;
@@ -538,7 +528,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
       return fail(error,"copy region exceeds its physical allocation");
     if (value.createdBy >= 0) continue;
     if (c.versions[value.version].producer != -1 || value.availableFrom != 0 ||
-        allocation.memory != "system_memory_bo" ||
+        allocation.memory != p.memoryBinding.hostMemory ||
         available[value.allocation].count(cell))
       return fail(error,"fabricated or duplicate initial location copy");
     available[value.allocation][cell] = copy; seenCopies[copy] = true;
@@ -595,7 +585,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
       transferIndex = found->second;
       const auto &t = p.transfers[transferIndex];
       if ((p.strategy == "serial-tiled" && t.phase != event.phase) || event.task != phase.task ||
-          event.link != t.direction || event.resource != "npu.dma" ||
+          event.link != (t.direction=="host_to_l1"?p.memoryBinding.inputLink:p.memoryBinding.outputLink) || event.resource != p.memoryBinding.dmaResource ||
           event.reads != t.sourceCopies || event.writes != t.targetCopies)
         return fail(error,"DMA event differs from actual source/destination binding");
       GenericTileRegion demand;
@@ -613,8 +603,11 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
         countBytes += bytes(a,regions[cell]);
       }
       if (countBytes != t.bytes) return fail(error,"DMA cell bytes differ from planned transfer");
+      auto link=std::find_if(c.links.begin(),c.links.end(),[&](const auto &l){return l.id==event.link;});
+      if(link==c.links.end() || t.bytes<link->minBytes || t.bytes>link->maxBytes)
+        return fail(error,"DMA violates target transfer size capability");
     } else {
-      if (event.resource != "npu.compute" || !event.link.empty())
+      if (event.resource != p.memoryBinding.computeResource || !event.link.empty())
         return fail(error,"compute event uses an invalid execution resource");
       int64_t initializedStorage = -1;
       if (event.kind == "initialize") {
@@ -670,7 +663,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
           return fail(error,"task fails to produce its own unique source version");
         seenVersions[value.version] = true; latest[cell] = value.version;
       }
-      if (al.memory != "system_memory_bo" && reset.insert(value.allocation).second) {
+      if (al.memory != p.memoryBinding.hostMemory && reset.insert(value.allocation).second) {
         for (auto old : available[value.allocation]) {
           beforeOverwrite(old.second); expectedRelease[old.second] = index;
         }
@@ -693,7 +686,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   for (size_t i = 0; i < c.copies.size(); ++i)
   {
     const auto &allocation = allocations[c.copies[i].allocation];
-    if (allocation.memory != "system_memory_bo") {
+    if (allocation.memory != p.memoryBinding.hostMemory) {
       auto end = std::lower_bound(c.events.begin(),c.events.end(),allocation.endPhase,
           [](const auto &event, size_t phase) { return event.phase < phase; });
       expectedRelease[i] = std::min(expectedRelease[i],size_t(end-c.events.begin()));
@@ -718,7 +711,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     transferBytes+=transfer.bytes;
   }
   if(c.transferBytes!=transferBytes || c.estimatedMakespanMs || !c.computeEstimates.empty() || !c.peakMemoryBytes.empty())return fail(error,"native uncalibrated cost or traffic mismatch");
-  for(const auto &event:c.events)if(event.memory!=(event.kind=="transfer"?"":"aie_l1"))return fail(error,"event execution memory mismatch");
+  for(const auto &event:c.events)if(event.memory!=(event.kind=="transfer"?"":p.memoryBinding.localMemory))return fail(error,"event execution memory mismatch");
   return checkEdges(a,c,error);
 }
 
@@ -735,7 +728,7 @@ llvm::json::Value orbit::taskflow::serializeProgramCommunication(const ProgramCo
     for (auto value : values) { number(value); if (!compact) a.push_back(int64_t(value)); }
     return a;
   };
-  llvm::json::Array memories,resources,links,allocations,regions,versions,copies,events,dataEdges,orderEdges,estimates,placements;
+  llvm::json::Array memories,resources,links,allocations,regions,versions,copies,events,dataEdges,orderEdges,estimates,placements,executionRegions;
   llvm::json::Object peaks;
   for(const auto &peak:c.peakMemoryBytes){word(peak.first);number(peak.second);peaks[peak.first]=peak.second;}
   word(programDataPolicyName(c.dataPolicy).str()); word(c.bodyFingerprint);
@@ -743,8 +736,18 @@ llvm::json::Value orbit::taskflow::serializeProgramCommunication(const ProgramCo
   auto jsonWord=[&](const llvm::json::Value &v){std::string value;llvm::raw_string_ostream stream(value);stream<<v;word(value);};
   jsonWord(c.estimatedMakespanMs ? llvm::json::Value(*c.estimatedMakespanMs) : llvm::json::Value(nullptr));
   for(const auto &estimate:c.computeEstimates)jsonWord(serializeMappingComputeEstimate(estimate));
+  for(const auto &region:c.executionRegions){
+    llvm::json::Array stages;for(auto stage:region.deviceStages)stages.push_back(int64_t(stage));
+    llvm::json::Value record=llvm::json::Object{{"id",region.id},{"placement",region.placement},{"submission_resource",region.submissionResource},
+      {"begin_event",int64_t(region.beginEvent)},{"end_event_exclusive",int64_t(region.endEvent)},{"device_stages",std::move(stages)},
+      {"host_submission_count",region.submissionCount},{"submission_kind","host_submission"},
+      {"cost_ownership","prepared-region composite includes submission, device compute/transfers/wait and readback once"}};
+    jsonWord(record);executionRegions.push_back(std::move(record));
+  }
   for(const auto &placement:c.placements){number(placement.task);word(placement.resource);word(placement.memory);word(placement.implementation);
     placements.push_back(llvm::json::Object{{"task",int64_t(placement.task)},{"resource",placement.resource},{"memory",placement.memory},{"implementation",placement.implementation}});}
+  StaticConfig architecture;architecture.domains=c.domains;architecture.memories=c.memories;architecture.resources=c.resources;architecture.links=c.links;
+  auto architectureJSON=serializeMemoryArchitecture(architecture);jsonWord(architectureJSON);
   for (const auto &memory : c.memories) {
     word(memory.id); number(memory.capacityBytes);
     number(memory.accessibleDevices.size());for(const auto &device:memory.accessibleDevices)word(device);
@@ -836,6 +839,8 @@ llvm::json::Value orbit::taskflow::serializeProgramCommunication(const ProgramCo
     {"schedule",c.placements.empty()?"phase barriers and copy producer/overwrite dependencies; ordinals are a topological witness, independent same-phase transfers may overlap":"serial topological whole-task events; compute and direct transfers charged once"},
     {"resource_capacity_scope","logical issue witness, not a measured DMA-engine count or a promise of serialized physical transfers"},
     {"system_capacity_scope","allocation accounting limit, not measured available host RAM"},
+    {"execution_regions",std::move(executionRegions)},
+    {"memory_architecture",std::move(architectureJSON)},
     {"memories",std::move(memories)},{"resources",std::move(resources)},
     {"links",std::move(links)},{"allocations",std::move(allocations)},
     {"logical_regions",std::move(regions)},{"versions",std::move(versions)},

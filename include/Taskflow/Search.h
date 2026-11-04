@@ -3,6 +3,7 @@
 #include "Taskflow/StructuredProgram.h"
 #include "Taskflow/GenericMapping.h"
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <set>
 namespace orbit::taskflow {
@@ -48,6 +49,11 @@ struct SearchAction {
 };
 // Target recommendations affect proposals only, never semantic legality.
 struct SearchPreferences { int64_t m=1, n=1, k=1; };
+// Finite target-aligned neighbors, not legality or a predictive cost model.
+// The search re-analyzes materialized children and uses the public planner.
+std::vector<SearchAction> generateNativeTileActions(const GenericAnalysis &,
+    const std::array<int64_t,3> &current, const GenericTargetCapabilities &,
+    const SearchPreferences &, size_t limit);
 std::vector<SearchAction> generateSearchActions(const Program &, const SearchPreferences & = {});
 std::string canonicalSearchIdentity(const Program &);
 bool runStructuredSearch(const Program &, const SearchOptions &, std::string &error);

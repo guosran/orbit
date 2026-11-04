@@ -146,6 +146,10 @@ int main(int argc, char **argv) {
   reject("unplanned native transfer device",[](auto &p) { p.communication.links.front().sourceDevice="other"; });
   reject("unplanned native transfer memory",[](auto &p) { p.communication.links.front().memory="other"; });
   reject("invented native link calibration",[](auto &p) { p.communication.links.front().provenance.source="measured"; });
+  reject("invented module channel scope",[](auto &p){p.moduleWideChannelConversion=!p.moduleWideChannelConversion;});
+  reject("duplicate launch per input",[](auto &p){p.communication.executionRegions.front().submissionCount=2;});
+  reject("partial program-call coverage",[](auto &p){--p.communication.executionRegions.front().endEvent;});
+  reject("missing device stage",[](auto &p){p.communication.executionRegions.front().deviceStages.pop_back();});
   auto report = serializeGenericMapping(analysis,panel);
   const auto *object = report.getAsObject();
   if (!object->getObject("program_communication") ||

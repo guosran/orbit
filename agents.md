@@ -237,3 +237,68 @@ on entire program candidates and their interacting structure/resource/schedule/
 data decisions; backend-specific code experiments validate those choices and
 their cost feedback. Full FFN device trace, physical DDR counts, arbitrary
 cross-stage sharing and calibrated multicore/mixed predictors remain open.
+
+## Latest completed stage: target memory architecture and predictive search v10
+
+ORBIT remains a whole-program joint search framework. A candidate combines its
+Taskflow computation/dependencies with structure, implementation, resources,
+schedule and data organization. Amoeba/NPU consume these decisions and provide
+capabilities, constraints, cost feedback and code generation. Common memory
+architecture now reuses static resource/memory/link types, with ownership
+domains, precise accessors and directed paths. Copy lifetime/capacity checks
+work without calibrated link costs. Synthetic shared/local SRAM tests distinguish
+phase-local transit imports from retained read-only copies. No physical Amoeba
+capacities or NPU memtile budget are invented.
+
+The direct AIR binding names host BO/local tensor pools, compute/DMA/submission
+resources and links. Its 24,576 B tensor-payload policy and separate 4,096 B stack
+are unchanged; the pool does not mean a single physical SRAM bank. Public
+execution regions share one actual submission across their input dependencies.
+AIR realizes these choices, including explicitly checked whole-module async
+legalization for the installed tail DMA-to-channel conversion.
+
+Original C++ search generates finite tile options from analyzed dimensions,
+alignment and capacity, implementation choices from target capabilities, and
+retention from access reuse. It rebuilds plans after transformations and retains
+identities, actions, legal/failed requests, null-cost exploration and checkpoints.
+Scalar spelling is canonical. The implementation-aware four-term prepared-call
+NPU provider leaves CGRA ML and earlier providers intact. Composite labels
+already include communication/runtime; no separate DMA or per-input launch is
+added. Calibration is limited to its source family, target and feature envelope.
+
+Before timing, 12 train / 6 holdout / 1 capacity-negative cells were registered.
+Train design rank is four, scaled condition10.0643. Three-seed calibration and
+post-freeze holdouts pass 252 and126 output checks. Frozen native predictions
+have1.6304% MAPE /5.4624% maximum error, versus2.6846%/8.6393% for the three-term
+ablation and96.4006%/96.6354% for the old uncalibrated theoretical coefficients.
+Tail15-stage behavior is a narrow tested extrapolation, not broad model coverage.
+
+The frozen model drives original search (224 evaluations,30 calibrated ranks).
+An automatically generated new4/32/64 mixed8 candidate is selected by native
+rank outside training and the four old measured executions, then compiled and
+run with two restricted-search winners and one unpriced exploration. All84
+outputs pass. Equal search ceilings are512 evaluations/six rounds/beam16; actual
+control evaluations are56 and6. Joint/implementation-control predictions tie,
+and paired timing does not establish a joint-search gain. Unknown exploration
+keeps a null prediction after measurement.
+
+A full M5/D2048/I11008 FFN comparison passes12 outputs (max abs2.42144e-8).
+Lifting the new tile choice reduces local payload but doubles planned DMA and
+stages:21.418708s versus21.214368s baseline, no observed speedup. FFN remains
+outside this small arithmetic model. Historical M128 results retain v7/v9
+versions; no new M128 timing is claimed. All474 new device outputs preserve the
+FP32/K-order/1e-5 contract. No DDR counter or new full-device trace is claimed.
+
+Clean-shell CPU reproduction,35 Core/Amoeba/search/AIR groups, existing CGRA
+contracts and new protocol/selection/parser tests pass. Final rebuilt AIR binary
+equals the executed frozen binary; all24 packages regenerate byte-identical
+Taskflow/facts/plans/AIR. Independent Core remains free of AIR/AIE/XRT linkage.
+Original failures, amendments, raw samples and compiler snapshots are preserved.
+
+See `docs/taskflow-implementation-search-v10-validation.md`, the memory/cost/
+automatic-search v10 contracts, and companion `taskflow/docs/implementation-search-v10.md`.
+The fresh-directory entry is `../orbit-artifact/taskflow/scripts/run_taskflow_implementation_search_v10.sh cpu|all NEW_DIRECTORY`.
+The all entry includes selected-candidate hardware and full-M5 validation; this
+delivery ran phases separately and validates the clean-shell CPU entry. Future
+work includes broader calibration, meaningful multicore placement, other
+residency locations, and full-FFN cost coverage driven by measured error.

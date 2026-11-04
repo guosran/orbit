@@ -6,6 +6,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/IR/Builders.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cmath>
 using namespace orbit::taskflow;
@@ -140,6 +142,80 @@ int main(int argc,char **argv) {
   auto observed2=observed();(*observed2.getAsObject())["model_version"]="2";
   auto observedPlanId=planned.planId;
   expect(apply(observed2) && planned.planId!=observedPlanId && planned.directCost.features.executionFingerprint==f.executionFingerprint,"observations checkpoint identity");
+  auto implementationModel=[&](){
+    auto value=model();auto &o=*value.getAsObject();o["kind"]="implementation-composite";
+    llvm::json::Object ranges;
+    for(const auto &entry:f.values)ranges[entry.first]=llvm::json::Array{entry.second,entry.second};
+    llvm::json::Array ops;for(const auto &entry:f.operations)ops.push_back(entry.first);
+    o["domain"]=llvm::json::Object{{"family_fingerprints",llvm::json::Array{f.regionFamilyFingerprint}},
+      {"architecture_fingerprints",llvm::json::Array{f.architectureFingerprint}},
+      {"implementations",llvm::json::Array{"scalar:1","scalar-product-vector-add-f32:8"}},
+      {"operations",std::move(ops)},{"allow_tails",false},{"feature_ranges",std::move(ranges)}};
+    o["terms"]=llvm::json::Array{
+      llvm::json::Object{{"feature","command_count"},{"coefficient_ms",0.1}},
+      llvm::json::Object{{"feature","implemented_scalar_f32_product_operations"},{"coefficient_ms",0.01}},
+      llvm::json::Object{{"feature","implemented_mixed8_f32_product_operations"},{"coefficient_ms",0.005}},
+      llvm::json::Object{{"feature","hardware_stage_count"},{"coefficient_ms",0.2}}};
+    return value;
+  };
+  auto im=implementationModel();
+  expect(evaluateGenericDirectAIRCost(f,im,target,c,error) && c.valueMs && std::abs(*c.valueMs-.3)<1e-12,"implementation composite four terms");
+  auto otherSource=f;otherSource.sourceFingerprints={std::string(64,'c')};
+  expect(evaluateGenericDirectAIRCost(otherSource,im,target,c,error) && c.valueMs,"family admits new source fingerprint");
+  auto implementationOOD=[&](const char *name,auto change){auto facts=f;change(facts);
+    expect(evaluateGenericDirectAIRCost(facts,im,target,c,error) && !c.valueMs && c.status=="out_of_domain",name);};
+  implementationOOD("family OOD",[](auto &v){v.regionFamilyFingerprint=std::string(64,'d');});
+  implementationOOD("architecture OOD",[](auto &v){v.architectureFingerprint=std::string(64,'d');});
+  implementationOOD("new tile outside envelope",[](auto &v){++v.values["max_tile_loop_0_iterations"];});
+  implementationOOD("tail excluded",[](auto &v){v.values["source_has_tile_tail"]=1;});
+  implementationOOD("mixed4 excluded",[](auto &v){v.implementations={"scalar-product-vector-add-f32:4"};});
+  implementationOOD("exp not silently product",[](auto &v){v.operations["math.exp:f32"]=1;});
+  auto missingEnvelope=implementationModel();missingEnvelope.getAsObject()->getObject("domain")->getObject("feature_ranges")->erase("dma_bytes");
+  expect(!evaluateGenericDirectAIRCost(f,missingEnvelope,target,c,error),"implementation envelope mandatory");
+  auto wrongTerms=implementationModel();(*wrongTerms.getAsObject()->getArray("terms"))[1].getAsObject()->operator[]("feature")="dma_bytes";
+  expect(!evaluateGenericDirectAIRCost(f,wrongTerms,target,c,error),"implementation terms frozen not double charged");
+  auto badRegions=plain;badRegions.communication.executionRegions[0].submissionCount=0;
+  expect(!collectGenericCostFeatures(a,badRegions,alteredFeatures,error),"nonpositive public submission rejected");
+  auto twoRegions=plain;twoRegions.communication.executionRegions.push_back(twoRegions.communication.executionRegions[0]);
+  expect(collectGenericCostFeatures(a,twoRegions,alteredFeatures,error) && alteredFeatures.values["command_count"]==2 && alteredFeatures.values["execution_region_count"]==2,"public submissions counted once per region");
+  std::string source;llvm::raw_string_ostream sourceStream(source);module->print(sourceStream);sourceStream.flush();
+  auto replaceAll=[](std::string text,const std::string &from,const std::string &to){size_t at=0;while((at=text.find(from,at))!=std::string::npos){text.replace(at,from.size(),to);at+=to.size();}return text;};
+  // These checks isolate family derivation from target legality: no transformed
+  // program is executed or represented as a successfully checked mapping.
+  auto familyFrom=[&](const std::string &text){
+    auto m=mlir::parseSourceString<mlir::ModuleOp>(text,&context);GenericAnalysis analysis;GenericCostFeatures facts;
+    if(!m || !analyzeGenericProgram(*m,analysis,error) || !collectGenericCostFeatures(analysis,plain,facts,error))return std::string();
+    return facts.regionFamilyFingerprint;
+  };
+  auto bigger=replaceAll(replaceAll(source,"16xf32","24xf32"),"to 16","to 24");
+  expect(familyFrom(bigger)==f.regionFamilyFingerprint,"family erases static extents only");
+  auto renamed=replaceAll(source,"@add","@renamed");
+  expect(familyFrom(renamed)==f.regionFamilyFingerprint,"family erases task and function names");
+  auto clone=mlir::cast<mlir::ModuleOp>(module->clone());GenericAnalysis cloneAnalysis;
+  expect(analyzeGenericProgram(clone,cloneAnalysis,error),"family mutation source analysis");
+  mlir::OpBuilder builder(&context);builder.setInsertionPointToStart(&cloneAnalysis.tasks[0].operation->getRegion(0).front());
+  auto constant=builder.create<mlir::arith::ConstantFloatOp>(clone.getLoc(),llvm::APFloat(1.0f),builder.getF32Type());
+  GenericCostFeatures oneConstant,twoConstant;
+  collectGenericCostFeatures(cloneAnalysis,plain,oneConstant,error);
+  constant->setAttr("value",builder.getF32FloatAttr(2.0));
+  collectGenericCostFeatures(cloneAnalysis,plain,twoConstant,error);
+  expect(oneConstant.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves arithmetic constants");
+  auto loop=mlir::cast<mlir::affine::AffineForOp>(cloneAnalysis.tasks[0].loops[0].operation);
+  loop.setStep(2);GenericCostFeatures changedStep;collectGenericCostFeatures(cloneAnalysis,plain,changedStep,error);
+  expect(changedStep.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves reduction or spatial step");
+  loop.setStep(1);
+  auto load=mlir::cast<mlir::affine::AffineLoadOp>(cloneAnalysis.tasks[0].accesses[0].operation);
+  load.getProperties().map=mlir::AffineMapAttr::get(mlir::AffineMap::get(1,0,{15-builder.getAffineDimExpr(0)},&context));
+  GenericCostFeatures changedMap;collectGenericCostFeatures(cloneAnalysis,plain,changedMap,error);
+  expect(changedMap.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves affine access maps");
+  auto root=cloneAnalysis.storages[0].root;auto oldType=root.getType();
+  root.setType(mlir::MemRefType::get({16},builder.getF32Type(),mlir::StridedLayoutAttr::get(&context,0,{2})));
+  GenericCostFeatures changedLayout;collectGenericCostFeatures(cloneAnalysis,plain,changedLayout,error);
+  expect(changedLayout.regionFamilyFingerprint!=changedMap.regionFamilyFingerprint,"family preserves memory layout");root.setType(oldType);
+  mlir::func::FuncOp(cloneAnalysis.function)->setAttr("orbit.noalias",builder.getStringAttr("changed-contract"));
+  GenericCostFeatures changedAlias;collectGenericCostFeatures(cloneAnalysis,plain,changedAlias,error);
+  expect(changedAlias.regionFamilyFingerprint!=changedMap.regionFamilyFingerprint,"family preserves alias contract");
+  clone.erase();
   llvm::outs()<<llvm::json::Value(llvm::json::Object{{"status",ok?"passed":"failed"},{"checks",int64_t(checks)},{"calibration","synthetic contracts only"}})<<"\n";
   return ok?0:1;
 }

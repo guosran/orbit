@@ -49,3 +49,14 @@ Queued next: evidence-first full FP32 FFN profiling. Decompose the original M128
 已修复vector lowering前后循环遍历轴不一致，保留r2 timeout/错误AIR；lane4目标支持不足明确拒绝。独立SSA/K/lane检查、非整除K及超容量generic add→scale真实执行通过。另保留四input多phase后端stream次序失败并用窄目标能力守卫拒绝；未声称通用四stream修复。Core/Amoeba/搜索/AIR31组、C++成本47项、真实CGRA模型8合约及相关checkpoint/fitter/编排检查通过，独立Core不链接AIR/AIE/XRT/Neura。
 
 报告与复现位于伴随仓库 [FFN profiling v9](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-ffn-profiling-v9.md)。源码仍以整个program的结构、资源、调度和数据组织候选为中心；此次NPU实现/驻留实验为公共搜索提供可执行策略、适用域和完整command成本反馈。没有全FFN设备trace、硬件DDR计数或任意多core预测；single-core trace仅用于其有界窗口。复现入口支持新目录的CPU、训练/冻结/留出及优化分阶段；原始大产物继续保存在伴随仓库的本机ignored results/builds，reviewable证据单独发布。
+
+## Latest stage: target-driven predictive search v10
+
+The completed v10 stage is recorded in English in [agents.md](agents.md) and
+[the validation record](docs/taskflow-implementation-search-v10-validation.md).
+It adds target-provided memory architecture and implementation-aware prediction
+to original whole-program search, and validates an automatically selected new
+execution with 474 total independent device output checks. The frozen model's
+six-holdout MAPE is 1.6304%; full M5 configuration transfer is correct but shows
+no speedup. Historical M128 results retain their earlier identities. Core and
+experiment artifacts remain in their separate repositories.

@@ -67,9 +67,19 @@ struct ProgramDataOrganizationChoice {
   std::vector<MappingComputeEstimate> computeEstimates;
   std::optional<double> clockMHz;
 };
+// A call boundary is shared by all region inputs. Device stages and data
+// transfers remain distinct events; submission cost belongs to this boundary.
+struct MappingExecutionRegion {
+  std::string id, placement, submissionResource;
+  size_t beginEvent = 0, endEvent = 0; // half-open event coverage
+  std::vector<size_t> deviceStages;
+  int64_t submissionCount = 1;
+};
 struct ProgramCommunicationPlan {
+  std::vector<MappingExecutionRegion> executionRegions;
   // Capacities/topology are target facts. Copy placement/lifetimes and event
   // order are checked choices. No uncalibrated wall-clock schedule is invented.
+  std::vector<StaticResourceDomain> domains;
   std::vector<StaticMemory> memories;
   std::vector<StaticResource> resources;
   std::vector<StaticTransfer> links;

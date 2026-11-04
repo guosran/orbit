@@ -1,5 +1,5 @@
 add_mlir_library(MLIRTaskflowStructured StructuredProgram.cpp Search.cpp
-  StaticAnalysis.cpp StaticContract.cpp StaticCommunication.cpp
+  MemoryArchitecture.cpp StaticAnalysis.cpp StaticContract.cpp StaticCommunication.cpp
   StaticMapper.cpp StaticChecker.cpp StaticEvaluation.cpp StaticRegion.cpp
   StaticRegionChecker.cpp GenericAnalysis.cpp GenericMapping.cpp GenericCommunication.cpp ProgramDataOrganization.cpp ProgramPartition.cpp NativeTransforms.cpp PARTIAL_SOURCES_INTENDED
   LINK_LIBS PUBLIC MLIRTaskflow LLVMSupport MLIRAffineDialect MLIRArithDialect

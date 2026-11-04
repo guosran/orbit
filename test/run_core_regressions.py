@@ -59,8 +59,10 @@ def main():
     python('static-regions', 'TaskflowMapping/regions.py')
     python('search-preferences', 'TaskflowMapping/search_preferences.py')
     python('search-contract', 'TaskflowValidation/search_contract.py')
+    python('memory-architecture', 'TaskflowAIR/memory_architecture_v10.py')
     python('data-policy', 'TaskflowAIR/data_organization_v8.py')
     python('joint-data-search', 'TaskflowAIR/joint_data_search_v8.py')
+    python('automatic-native-search', 'TaskflowGeneric/automatic_search_v10.py')
     if args.amoeba_tool:
         python('original-native-search', 'TaskflowMapping/native_search.py', tool,
                '--amoeba-tool', args.amoeba_tool.resolve())
@@ -74,6 +76,8 @@ def main():
         python('air-joint-data-search', 'TaskflowAIR/joint_data_search_v8.py', air, '--air')
         python('air-unsupported', 'TaskflowGeneric/unsupported_v6.py', air)
         python('air-pool-names', 'TaskflowGeneric/pool_names_v6.py', air)
+        python('air-tail-channel-scope', 'TaskflowAIR/tail_channel_scope_v10.py', air, '--air-opt', args.air_opt)
+        python('air-memory-architecture', 'TaskflowAIR/memory_architecture_v10.py', air, '--air')
         python('air-mixed-f32', 'TaskflowAIR/mixed_f32_v9.py', air, '--air-opt', args.air_opt)
         python('air-stream-capacity', 'TaskflowAIR/stream_capacity_v9.py', air)
         def shaped_source(template, m, k, n):

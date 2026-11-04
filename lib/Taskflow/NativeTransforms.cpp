@@ -170,6 +170,14 @@ bool orbit::taskflow::setNativeImplementation(ModuleOp module,
     error = "implementation requires scalar/1, independent-lane-f32/positive lanes, or scalar-product-vector-add-f32/four-or-eight lanes";
     return false;
   }
+  // Scalar/1 is the module default. Keep one canonical representation so
+  // switching back from a vector choice cannot create a second identity for
+  // the same source body, checked plan and executable implementation.
+  if(kind=="scalar") {
+    module->removeAttr("orbit.implementation");
+    module->removeAttr("orbit.vector_lanes");
+    return true;
+  }
   Builder b(module.getContext());
   module->setAttr("orbit.implementation", b.getStringAttr(kind));
   module->setAttr("orbit.vector_lanes", b.getI64IntegerAttr(lanes));

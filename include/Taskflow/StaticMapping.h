@@ -31,14 +31,22 @@ struct StaticAnalysis {
 struct StaticProvenance {
   std::string kind, source;
 };
+// Ownership is independent of accessibility and transfer connectivity.
+struct StaticResourceDomain {
+  std::string id, parent, kind;
+};
 struct StaticResource {
   std::string id, kind, device;
   int64_t capacity = 0;
+  std::string domain;
 };
 struct StaticMemory {
   std::string id;
   int64_t capacityBytes = 0;
   std::vector<std::string> accessibleDevices;
+  std::string domain, kind;
+  // When present, this is the precise allow-list; device access is legacy.
+  std::vector<std::string> accessibleResources;
 };
 struct StaticTransfer {
   std::string id, source, target, resource, memory, sourceLayout, targetLayout;
@@ -46,6 +54,7 @@ struct StaticTransfer {
   double latencyMs = 0, bandwidthBytesPerMs = 0;
   int64_t minBytes = 0, maxBytes = INT64_MAX, temporaryBytes = 0;
   StaticProvenance provenance;
+  std::string domain;
 };
 struct StaticCost {
   std::string kind, scope;
@@ -88,6 +97,7 @@ struct StaticAssumptions {
           maxRegionCells = 100000;
 };
 struct StaticConfig {
+  std::vector<StaticResourceDomain> domains;
   std::vector<StaticResource> resources;
   std::vector<StaticMemory> memories;
   std::vector<StaticTransfer> links, conversions, synchronizations;
@@ -162,6 +172,16 @@ struct StaticMappingResult {
   bool exhaustiveAssignments = false, regionExactCover = false;
   uint64_t possibleAssignments = 0, evaluatedAssignments = 0, budget = 0;
 };
+// These functions validate topology/capacity without requiring calibrated costs.
+bool validateMemoryArchitecture(const StaticConfig &, std::string &error);
+bool memoryAccessible(const StaticConfig &, llvm::StringRef memory,
+                      llvm::StringRef computeResource);
+bool findMemoryPath(const StaticConfig &, llvm::StringRef source,
+                    llvm::StringRef target, std::vector<std::string> &links,
+                    std::string &error);
+bool parseMemoryArchitecture(const llvm::json::Value &, StaticConfig &,
+                             std::string &error);
+llvm::json::Value serializeMemoryArchitecture(const StaticConfig &);
 bool analyzeStaticProgram(mlir::ModuleOp, StaticAnalysis &, std::string &error);
 bool parseStaticConfig(const llvm::json::Value &, StaticConfig &,
                        std::string &error);
