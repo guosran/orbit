@@ -58,11 +58,23 @@ j::Object nativeRequestedConfiguration(mlir::ModuleOp module) {
   bool readable=readNativeMappingChoice(module,choice,diagnostic);
   auto kind=module->getAttrOfType<mlir::StringAttr>("orbit.implementation");
   auto lanes=module->getAttrOfType<mlir::IntegerAttr>("orbit.vector_lanes");
-  return j::Object{{"scope","requested canonical source attributes; not a legal mapping witness"},
+  j::Object result{{"scope","requested canonical source attributes; not a legal mapping witness"},
       {"tile_sizes",std::move(sizes)},{"data_organization",choice.dataOrganization},
+      {"residency",choice.residency},{"grouping",choice.grouping},
       {"storage",choice.storage},{"reuse_loop",choice.reuseLoop},{"panel_loop",choice.panelLoop},
       {"implementation",kind?kind.str():"scalar"},{"vector_lanes",lanes?lanes.getInt():1},
       {"mapping_readable",readable},{"diagnostic",diagnostic}};
+  if(!choice.taskGroup.empty()){j::Array v;for(auto t:choice.taskGroup)v.push_back(int64_t(t));result["task_group"]=std::move(v);}
+  if(!choice.retainedStorages.empty()){j::Array v;for(auto t:choice.retainedStorages)v.push_back(int64_t(t));result["retained_storages"]=std::move(v);}
+  if(!choice.residencyGroups.empty()){j::Array groups;for(const auto &g:choice.residencyGroups){j::Array tasks,storages;for(auto t:g.tasks)tasks.push_back(int64_t(t));for(auto x:g.retainedStorages)storages.push_back(int64_t(x));groups.push_back(j::Object{{"tasks",std::move(tasks)},{"retained_storages",std::move(storages)}});}result["residency_groups"]=std::move(groups);}
+
+  if(auto devices=module->getAttrOfType<mlir::ArrayAttr>("orbit.heterogeneous_devices")) {
+    j::Array values;for(auto value:devices)if(auto s=mlir::dyn_cast<mlir::StringAttr>(value))values.push_back(s.str());
+    result["heterogeneous_devices"]=std::move(values);
+    j::Array cuts;if(auto boundaries=module->getAttrOfType<mlir::DenseI64ArrayAttr>("orbit.heterogeneous_cuts"))for(auto cut:boundaries.asArrayRef())cuts.push_back(cut);
+    result["region_cuts"]=std::move(cuts);
+  }
+  return result;
 }
 j::Value uncalibratedMappingSummary(const j::Value &result) {
   auto object=result.getAsObject();auto best=object?object->getObject("best_plan"):nullptr;
@@ -100,7 +112,10 @@ std::string materializedMLIR(const Program &p) {
 }
 j::Value row(const State &s) {
   j::Array chain;for(auto &action:s.actionChain)chain.push_back(action);
-  return j::Object{{"search_key",s.key},{"candidate_id",s.nativeMLIR.empty()?s.p.candidateId:s.key},{"evaluation_identity",s.evaluationIdentity},{"parent",s.parent},{"action",s.action},{"action_chain",std::move(chain)},{"round",s.round},{"status",s.status},{"score",scored(s)?j::Value(s.score):j::Value(nullptr)},{"program",s.nativeMLIR.empty()?printPlan(s.p):j::Value(nullptr)},{"native_mlir",s.nativeMLIR.empty()?j::Value(nullptr):j::Value(s.nativeMLIR)},{"evaluation",j::Value(s.response)}};
+  auto feedback=s.response.getAsObject();
+  const std::string graph=feedback?feedback->getString("program_graph_id").value_or("").str():"";
+  const std::string candidate=feedback?feedback->getString("program_candidate_id").value_or("").str():"";
+  return j::Object{{"search_key",s.key},{"candidate_id",s.nativeMLIR.empty()?s.p.candidateId:s.key},{"evaluation_identity",s.evaluationIdentity},{"program_graph_id",graph},{"program_candidate_id",candidate},{"parent",s.parent},{"action",s.action},{"action_chain",std::move(chain)},{"round",s.round},{"status",s.status},{"score",scored(s)?j::Value(s.score):j::Value(nullptr)},{"program",s.nativeMLIR.empty()?printPlan(s.p):j::Value(nullptr)},{"native_mlir",s.nativeMLIR.empty()?j::Value(nullptr):j::Value(s.nativeMLIR)},{"evaluation",j::Value(s.response)}};
 }
 }
 std::string orbit::taskflow::canonicalSearchIdentity(const Program &p) {
@@ -166,10 +181,14 @@ std::vector<SearchAction> orbit::taskflow::generateNativeTileActions(
 }
 bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOptions &o,std::string &e) {
   const bool nativeAir = o.backend == "air" && (o.evaluator.empty() || o.evaluator == "native");
+  const bool nativeAmoeba = o.backend=="amoeba" && bool(o.nativeEvaluator);
+  const bool nativeHeterogeneous=o.backend=="cpu-npu" && bool(o.nativeEvaluator);
+  const bool nativePlugin=nativeAmoeba||nativeHeterogeneous;
   const bool nativeStatic = (o.backend == "static" || nativeAir) && (o.evaluator.empty() || o.evaluator == "native");
-  if((o.backend!="amoeba"&&o.backend!="npu"&&o.backend!="static"&&o.backend!="air")||o.maxRounds<1||o.maxCandidates<1||o.beamWidth<1||o.outputDir.empty()||(!nativeStatic && o.evaluator.empty())) {e="invalid structured search options";return false;}
+  const bool nativeInternal=nativeStatic||nativePlugin;
+  if((o.backend!="amoeba"&&o.backend!="npu"&&o.backend!="static"&&o.backend!="air"&&o.backend!="cpu-npu")||o.maxRounds<1||o.maxCandidates<1||o.beamWidth<1||o.outputDir.empty()||(!nativeInternal && o.evaluator.empty()) || (nativePlugin && o.nativeBackendIdentity.empty())) {e="invalid structured search options";return false;}
   const bool nativeBody = !o.nativeSourceMLIR.empty();
-  if(nativeBody && !nativeAir) {e="native-body search currently requires backend=air native evaluator";return false;}
+  if(nativeBody && !nativeAir && !nativePlugin) {e="native-body search requires a registered target evaluator";return false;}
   mlir::DialectRegistry nativeRegistry;
   nativeRegistry.insert<mlir::taskflow::TaskflowDialect,mlir::affine::AffineDialect,mlir::arith::ArithDialect,mlir::func::FuncDialect,mlir::math::MathDialect,mlir::memref::MemRefDialect,mlir::scf::SCFDialect>();
   mlir::MLIRContext nativeContext(nativeRegistry);
@@ -193,6 +212,8 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       if(!setNativeImplementation(*module,kind?kind.str():"scalar",lanes?lanes.getInt():1,reason))return false;
     }
     if(split&&!splitNativeOuterLoops(*module,reason))return false;
+    if(mappingAction && !mappingAction->backendAction.empty() &&
+        (!o.nativeApplyAction || !o.nativeApplyAction(*module,*mappingAction,reason)))return false;
     if(tiles&&!setNativeAIRTileSizes(*module,tiles->tileM,tiles->tileN,tiles->tileK,reason))return false;
     if(mappingAction && mappingAction->mapping &&
        !setNativeMappingChoice(*module,*mappingAction->mapping,reason))return false;
@@ -220,8 +241,10 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
   if(auto ec=llvm::sys::fs::create_directories(o.outputDir)){e=ec.message();return false;}
   j::Value config=j::Object{};if(!o.targetConfigFile.empty()&&!read(o.targetConfigFile,config,e))return false;
   if(!config.getAsObject()){e="target config must be a JSON object";return false;}
+  if(nativePlugin)for(auto key:{"native_auto_candidates","native_air_tile_candidates","native_mapping_candidates","native_implementation_candidates","native_program_partition_candidates"})
+    if(config.getAsObject()->get(key)){e="Amoeba program-graph target does not support AIR action option: "+std::string(key);return false;}
   j::Value staticConfig=nullptr;
-  if (nativeStatic) {
+  if (nativeInternal) {
     if (auto path=config.getAsObject()->getString("mapping_config")) {
       if (!read(path->str(),staticConfig,e)) return false;
     } else staticConfig=config;
@@ -239,10 +262,11 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     // vary data organization within each structural class without treating
     // every residency action name as a new structural configuration.
     module->getOperation()->removeAttr("orbit.mapping");
+    if(nativeHeterogeneous)module->getOperation()->removeAttr("orbit.heterogeneous_cuts");
     std::string text;llvm::raw_string_ostream stream(text);module->print(stream);
     return hash(text);
   };
-  bool automatic=false;std::string automaticMode="joint";size_t maxTileProposals=12;int64_t explorationSlots=0;
+  bool automatic=false;std::string automaticMode="joint";size_t maxTileProposals=12,maxResidencyProposals=8,maxResidencyGroups=4;int64_t explorationSlots=0;
   GenericTargetCapabilities proposalCapabilities;
   SearchPreferences preferences;
   j::Object automaticProposals;
@@ -259,12 +283,16 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       if(!value || *value<1 || *value>64) {e="max_tile_proposals must be an integer in [1,64]";return false;}
       maxTileProposals=size_t(*value);
     }
+    for(auto field:{"max_residency_proposals","max_residency_groups"})if(auto count=object->get(field)){
+      auto value=count->getAsInteger();if(!value||*value<1||*value>64){e=std::string(field)+" must be an integer in [1,64]";return false;}
+      (llvm::StringRef(field)=="max_residency_proposals"?maxResidencyProposals:maxResidencyGroups)=size_t(*value);
+    }
     if(auto count=object->get("exploration_slots")) {
       auto value=count->getAsInteger();
       if(!value || *value<0 || *value>o.beamWidth) {e="exploration_slots must be an integer in [0,beam width]";return false;}
       explorationSlots=*value;
     }
-    for(auto &entry:*object)if(entry.first!="mode" && entry.first!="max_tile_proposals" && entry.first!="exploration_slots") {
+    for(auto &entry:*object)if(entry.first!="mode" && entry.first!="max_tile_proposals" && entry.first!="exploration_slots" && entry.first!="max_residency_proposals" && entry.first!="max_residency_groups") {
       e="unknown native_auto_candidates field";return false;
     }
     if(!getGenericTargetCapabilities(staticConfig,proposalCapabilities,e))return false;
@@ -273,7 +301,8 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     }
   }
   std::vector<SearchAction> nativeActions;
-  if(!automatic)nativeActions.push_back({"split_outer_loops",{}});
+  if(nativePlugin)nativeActions=o.nativeActions;
+  else if(!automatic)nativeActions.push_back({"split_outer_loops",{}});
   if (auto candidates=config.getAsObject()->getArray("native_air_tile_candidates")) {
     nativeActions.clear();
     for (auto &candidate:*candidates) {
@@ -382,13 +411,30 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       auto module=parseNative(state.nativeMLIR); GenericAnalysis analysis;
       std::string diagnostic;
       if (module && analyzeGenericProgram(*module,analysis,diagnostic))
-        for (auto choice:discoverGenericMappingChoices(analysis)) {
+        for (auto choice:discoverGenericMappingChoices(analysis,maxResidencyProposals,maxResidencyGroups)) {
           if (choice.residency=="phase-local") continue;
-          SearchAction action{"mapping_"+choice.dataOrganization+"_storage_"+
+          std::string name=choice.grouping=="shape-major"?"mapping_shape_major":choice.grouping=="tile-major"?"mapping_tile_major":choice.residency=="whole-program"?"mapping_whole_program":
+              choice.residency=="tiled-phase-local"?"mapping_tiled_phase_local":
+              "mapping_"+choice.dataOrganization+"_storage_"+
               std::to_string(choice.storage)+"_reuse_"+
-              std::to_string(choice.reuseLoop)+"_panel_"+
-              std::to_string(choice.panelLoop),{}};
-          action.mapping=std::move(choice); actions.push_back(std::move(action));
+              std::to_string(choice.reuseLoop)+"_panel_"+std::to_string(choice.panelLoop);
+          if(!choice.residencyGroups.empty()){name="mapping_residency";for(const auto &group:choice.residencyGroups){name+="_tasks";for(auto t:group.tasks)name+="_"+std::to_string(t);name+="_data";for(auto x:group.retainedStorages)name+="_"+std::to_string(x);}}
+          SearchAction action{name,{}};action.mapping=choice;
+          if(automatic) {
+            auto candidate=parseNative(state.nativeMLIR);GenericAnalysis facts;GenericMappingPlan plan;diagnostic.clear();
+            bool legal=setNativeMappingChoice(*candidate,choice,diagnostic) &&
+                analyzeGenericProgram(*candidate,facts,diagnostic) && planGenericMapping(facts,staticConfig,plan,diagnostic);
+            std::string text;llvm::raw_string_ostream stream(text);candidate->print(stream);stream.flush();
+            j::Object proposal{{"action",name},{"kind","data-organization"},{"candidate_id",hash(text)},
+                {"requested_configuration",nativeRequestedConfiguration(*candidate)},{"planner_supported",legal},
+                {"reason",diagnostic},{"target_capability_identity",proposalCapabilities.identity},
+                {"capacity_bytes",proposalCapabilities.capacityBytes},
+                {"resident_bytes",legal?j::Value(plan.residentBytes):j::Value(nullptr)}};
+            if(!legal)proposal["native_mlir"]=text;
+            automaticProposals[state.key].getAsArray()->push_back(std::move(proposal));
+            if(!legal)continue;
+          }
+          actions.push_back(std::move(action));
         }
     }
     return actions;
@@ -434,7 +480,8 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     return selected;
   };
   std::string executable, evaluatorIdentity = "native-cpp-program-data-organization-v8";
-  if (!nativeStatic) {
+  if (nativePlugin) evaluatorIdentity=o.nativeBackendIdentity;
+  else if (!nativeInternal) {
     auto found = llvm::sys::findProgramByName(o.evaluator);
     if (!found) { e="evaluator executable not found"; return false; }
     executable=*found;
@@ -446,6 +493,11 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
   dependencyBinding+=fileDigest(llvm::sys::fs::getMainExecutable(nullptr,(void*)&runStructuredSearch));
   const std::string evaluationBinding=hash(dependencyBinding+o.backend+canonicalJSON(config)+evaluatorIdentity);
   const auto evaluationIdentityFor=[&](const State &s){return hash(evaluationBinding+stateIdentity(s));};
+  auto evaluateNative=[&](const std::string &text,const std::string &directory,std::string &reason) {
+    return nativePlugin ? o.nativeEvaluator(text,staticConfig,directory,reason) :
+      (nativeAir ? evaluateGenericMLIR(text,staticConfig,reason) : evaluateStaticMLIR(text,staticConfig,reason));
+  };
+  const char *scoreField=nativeAmoeba?"makespan_cycles":((nativeAir||nativeHeterogeneous)?"estimated_ms":"makespan_ms");
   std::string binding=hash(evaluationBinding+sourceKey+std::to_string(o.maxCandidates)+":"+std::to_string(o.maxRounds)+":"+std::to_string(o.beamWidth));
   if(!o.resume && !write(o.outputDir+"/binding-components.json",render(j::Object{
       {"dependencies",hash(dependencyBinding)},{"source",sourceKey},
@@ -457,6 +509,24 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
   j::Array selections,attempts;
   auto save=[&](){j::Array rows,bs;for(auto &s:archive)rows.push_back(row(s));for(auto &s:beam)bs.push_back(s.key);
     return write(cp,render(j::Object{{"schema","orbit.structured.search.v1"},{"binding",binding},{"next_round",nextRound},{"evaluations",evaluations},{"archive",std::move(rows)},{"beam",std::move(bs)},{"selections",j::Array(selections)},{"attempts",j::Array(attempts)}}),e);};
+  auto checkGraphArtifacts=[&](const State &state,const j::Value &result) {
+    if(!nativeAir && !nativePlugin)return true;
+    auto object=result.getAsObject();auto expected=object?object->get("program_graph"):nullptr;
+    auto dot=object?object->getString("program_graph_dot"):std::nullopt;
+    auto id=object?object->getString("program_graph_id"):std::nullopt;
+    auto feedback=state.response.getAsObject();
+    j::Value savedGraph=nullptr;std::string reason;
+    auto graphFile=o.outputDir+"/candidates/"+state.key+"/program-graph.json";
+    auto dotFile=llvm::MemoryBuffer::getFile(o.outputDir+"/candidates/"+state.key+"/program-graph.dot");
+    std::string programCandidate=id?staticFingerprint(j::Object{{"source_id",stateSource(state)},{"program_graph_id",id->str()}}):"";
+    if(!expected || !dot || !id || !feedback || feedback->getString("program_graph_id")!=id ||
+        feedback->getString("program_candidate_id")!=programCandidate ||
+        !read(graphFile,savedGraph,reason) || canonicalJSON(savedGraph)!=canonicalJSON(*expected) ||
+        !dotFile || (*dotFile)->getBuffer()!=*dot) {
+      e="checkpoint program graph artifact/identity failed independent re-evaluation";return false;
+    }
+    return true;
+  };
   if(o.resume){j::Value saved=nullptr;if(!read(cp,saved,e))return false;auto root=saved.getAsObject();
     if(!root||root->getString("schema")!="orbit.structured.search.v1"||root->getString("binding")!=binding){e="checkpoint binding differs (source/config/evaluator/budget)";return false;}
     auto rows=root->getArray("archive"),bs=root->getArray("beam");
@@ -472,6 +542,12 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       if(nativeBody){s.nativeMLIR=x->getString("native_mlir").value_or("").str();if(!nativeTransform(s.nativeMLIR,false,e))return false;}else if(!x->get("program")||!parsePlan(*x->get("program"),s.p,e))return false;
       s.key=x->getString("search_key").value_or("").str();s.parent=x->getString("parent").value_or("").str();s.action=x->getString("action").value_or("").str();s.status=x->getString("status").value_or("").str();s.round=x->getInteger("round").value_or(0);s.score=x->getNumber("score").value_or(0);if(auto v=x->get("evaluation"))s.response=*v;
       s.evaluationIdentity=x->getString("evaluation_identity").value_or("").str();
+      if(nativeAir) if(auto feedback=s.response.getAsObject()) {
+        if(x->getString("program_graph_id").value_or("")!=feedback->getString("program_graph_id").value_or("") ||
+           x->getString("program_candidate_id").value_or("")!=feedback->getString("program_candidate_id").value_or("")) {
+          e="checkpoint archive common graph/candidate identity differs from feedback";return false;
+        }
+      }
       if(auto chain=x->getArray("action_chain"))for(auto &action:*chain) {
         auto name=action.getAsString();if(!name){e="invalid action chain";return false;}
         s.actionChain.push_back(name->str());
@@ -481,23 +557,27 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       if(scored(s)) {
         auto r=s.response.getAsObject();auto score=r?r->getObject("score"):nullptr;
         if(!r||(o.backend=="static" && r->getString("evaluation_kind")!="static_estimate")||r->getString("status")!="passed"||r->getString("candidate_id")!=stateCandidate(s)||r->getString("source_id")!=stateSource(s)||!score||score->getString("unit")!=(o.backend=="amoeba"?"cycles":"ms")||score->getNumber("value")!=s.score){e="checkpoint evaluation consistency failed";return false;}
-        if (nativeStatic) {
+        if (nativeInternal) {
           if(r->getString("evaluation_identity")!=s.evaluationIdentity){e="checkpoint feedback evaluation identity mismatch";return false;}
           std::string diagnostic;
-          auto replanned=nativeAir ? evaluateGenericMLIR(stateMLIR(s),staticConfig,diagnostic) : evaluateStaticMLIR(materializedMLIR(s.p),staticConfig,diagnostic);
+          std::string revalidation=o.outputDir+"/candidates/"+s.key+"/revalidation";
+          if(nativePlugin){llvm::SmallString<256> fresh;if(auto code=llvm::sys::fs::createUniqueDirectory(revalidation,fresh)){e=code.message();return false;}revalidation=fresh.str().str();}
+          auto replanned=evaluateNative(stateMLIR(s),revalidation,diagnostic);
+          if(!checkGraphArtifacts(s,replanned))return false;
           auto result=replanned.getAsObject();
           auto best=result ? result->getObject("best_plan") : nullptr;
           if(!best || result->getString("status")=="unsupported" ||
-              best->getNumber(nativeAir ? "estimated_ms" : "makespan_ms")!=s.score ||
+              best->getNumber(scoreField)!=s.score ||
               r->getString("plan_id")!=best->getString("plan_id") ||
               r->getString("evaluator_kind")!="native_cpp") {
             e="native checkpoint score failed independent re-evaluation";return false;
           }
-          if(nativeAir && best->getObject("direct_air_cost")) {
+          if((nativeAir && best->getObject("direct_air_cost")) || nativeHeterogeneous) {
             const bool observed=best->getString("cost_status")=="measured";
             const bool predicted=best->getString("cost_status")=="calibrated";
-            if(r->getString("evaluation_kind")!=(observed?"measured_feedback":(predicted?"model_prediction":"static_estimate")) ||
-               score->getString("provenance")!=(observed?"exact-observation-table":(predicted?"calibrated-direct-air-model":"static-plan-estimate")) ||
+            const bool mechanism=best->getString("cost_status")=="assumption-driven-estimate" || best->getString("cost_status")=="mechanism-estimate-with-declared-provenance";
+            if(r->getString("evaluation_kind")!=(mechanism?"mechanism_estimate":observed?"measured_feedback":(predicted?"model_prediction":"static_estimate")) ||
+               score->getString("provenance")!=(mechanism?"declared-event-mechanism-estimate":observed?"exact-observation-table":(predicted?(nativeHeterogeneous?"frozen-heterogeneous-region-model":"calibrated-direct-air-model"):"static-plan-estimate")) ||
                score->getBoolean("physical_hardware_measurement")!=observed ||
                r->getBoolean("executed")!=false) {
               e="native checkpoint measurement/prediction provenance mismatch";return false;
@@ -511,6 +591,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
         }
         auto feedback=s.response.getAsObject();std::string diagnostic;
         auto replanned=evaluateGenericMLIR(stateMLIR(s),staticConfig,diagnostic);
+        if(!checkGraphArtifacts(s,replanned))return false;
         auto result=replanned.getAsObject();auto best=result?result->getObject("best_plan"):nullptr;
         auto old=feedback?feedback->get("diagnostics"):nullptr;
         if(!explorable(s) || !feedback || feedback->getString("candidate_id")!=stateCandidate(s) ||
@@ -658,26 +739,41 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     ++evaluations;llvm::sys::fs::remove(response);
     std::string executionError;
     int rc=0;
-    if (nativeStatic) {
-      auto result=nativeAir ? evaluateGenericMLIR(mlir,staticConfig,executionError) : evaluateStaticMLIR(mlir,staticConfig,executionError);
+    if (nativeInternal) {
+      auto result=evaluateNative(mlir,dir+"/evaluation",executionError);
       if (!write(dir+"/mapping-result.json",render(result),e)) return false;
+      if(auto value=result.getAsObject()) {
+        if(auto graph=value->get("program_graph"))
+          if(!write(dir+"/program-graph.json",render(*graph),e))return false;
+        if(auto dot=value->getString("program_graph_dot"))
+          if(!write(dir+"/program-graph.dot",*dot,e))return false;
+      }
       auto object=result.getAsObject();
       auto best=object ? object->getObject("best_plan") : nullptr;
       bool unsupported=object && object->getString("status")=="unsupported";
-      auto value=best && !unsupported ? best->getNumber(nativeAir ? "estimated_ms" : "makespan_ms") : std::nullopt;
+      auto value=best && !unsupported ? best->getNumber(scoreField) : std::nullopt;
       j::Object feedback{{"schema","orbit.search.feedback.v1"},{"backend",o.backend},
           {"candidate_id",nativeBody?s.key:s.p.candidateId},{"source_id",stateSource(s)},
           {"evaluation_identity",s.evaluationIdentity},
           {"evaluation_kind","static_estimate"},{"evaluator_kind","native_cpp"},
           {"executed",false},{"status",value ? "passed" : (!unsupported && nativeAir && best ? "uncalibrated" : "unsupported")},
           {"evidence_path",dir+"/mapping-result.json"}};
+      if(object && object->getString("program_graph_id")) {
+        auto graph=object->getString("program_graph_id")->str();
+        auto programCandidate=staticFingerprint(j::Object{{"source_id",stateSource(s)},{"program_graph_id",graph}});
+        feedback["program_graph_id"]=graph;feedback["program_candidate_id"]=programCandidate;
+        (*req.getAsObject())["program_graph_id"]=graph;
+        (*req.getAsObject())["program_candidate_id"]=programCandidate;
+        if(!write(request,render(req),e))return false;
+      }
       if(value) {
         const bool observed=nativeAir && best->getString("cost_status")=="measured";
-        const bool predicted=nativeAir && best->getString("cost_status")=="calibrated";
-        feedback["evaluation_kind"]=observed?"measured_feedback":(predicted?"model_prediction":"static_estimate");
+        const bool predicted=(nativeAir||nativeHeterogeneous) && best->getString("cost_status")=="calibrated";
+        const bool mechanism=best->getString("cost_status")=="assumption-driven-estimate" || best->getString("cost_status")=="mechanism-estimate-with-declared-provenance";
+        feedback["evaluation_kind"]=mechanism?"mechanism_estimate":observed?"measured_feedback":(predicted?"model_prediction":"static_estimate");
         feedback["plan_id"]=best->getString("plan_id").value_or("").str();
-        feedback["score"]=j::Object{{"value",*value},{"unit","ms"},
-          {"provenance",observed?"exact-observation-table":(predicted?"calibrated-direct-air-model":"static-plan-estimate")},
+        feedback["score"]=j::Object{{"value",*value},{"unit",nativeAmoeba?"cycles":"ms"},
+          {"provenance",nativeAmoeba?"amoeba-program-graph-provider-and-production-schedule":(mechanism?"declared-event-mechanism-estimate":observed?"exact-observation-table":(predicted?(nativeHeterogeneous?"frozen-heterogeneous-region-model":"calibrated-direct-air-model"):"static-plan-estimate"))},
           {"physical_hardware_measurement",observed}};
         if(observed) feedback["measurement_reuse"]="SHA-bound prior complete-command observations; this evaluation does not submit hardware";
       }

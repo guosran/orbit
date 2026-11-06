@@ -6,7 +6,9 @@
 #include <array>
 #include <optional>
 #include <set>
+#include <functional>
 namespace orbit::taskflow {
+struct SearchAction;
 // Extracted from JointNeighborhoodSearchPass::selectBeam. Both legacy Neura
 // and structured search share scored-only, unique-key, diversity selection.
 template<class State, class Less, class Scored, class Key, class Configuration>
@@ -37,7 +39,13 @@ struct SearchOptions {
   int64_t maxRounds=2, maxCandidates=9, beamWidth=1;
   bool resume=false;
   std::string nativeSourceMLIR; // optional actual-body candidates; same search driver
-
+  // Backend plugins provide capabilities/evaluation without linking Core to a
+  // target implementation. Native candidate/graph/cache handling stays here.
+  std::string nativeBackendIdentity;
+  std::function<llvm::json::Value(llvm::StringRef,const llvm::json::Value&,
+      llvm::StringRef,std::string&)> nativeEvaluator;
+  std::function<bool(mlir::ModuleOp,const SearchAction&,std::string&)> nativeApplyAction;
+  std::vector<SearchAction> nativeActions;
 };
 struct SearchAction {
   std::string name;
@@ -46,6 +54,8 @@ struct SearchAction {
   std::string implementation;
   int64_t vectorLanes = 1;
   int64_t partitionExtent = -1; // -1 unchanged, 0 single command, >0 program fission
+  std::string backendAction;
+  std::vector<int64_t> backendParameters;
 };
 // Target recommendations affect proposals only, never semantic legality.
 struct SearchPreferences { int64_t m=1, n=1, k=1; };

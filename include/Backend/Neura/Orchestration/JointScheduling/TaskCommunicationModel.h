@@ -35,13 +35,15 @@ class InterTaskNetworkCommunicationModel final
     : public ::mlir::taskflow::TaskCommunicationModel {
 public:
   InterTaskNetworkCommunicationModel(TaskEdgeGraph edge_graph,
-                                     InterTaskNetworkSpec network)
-      : edge_graph_(std::move(edge_graph)), network_(std::move(network)),
+                                     InterTaskNetworkSpec network,
+                                     bool publicGraph = false)
+      : publicGraph_(publicGraph), edge_graph_(std::move(edge_graph)), network_(std::move(network)),
         committedLinkIntervals_(network_.getLinks().size()),
         trialLinkIntervals_(network_.getLinks().size()),
         committedLocalIntervals_(network_.getRows() * network_.getColumns()),
         trialLocalIntervals_(network_.getRows() * network_.getColumns()) {}
 
+  bool hasAuthoritativeDependencies() const override { return publicGraph_; }
   bool getTaskPredecessors(Operation *consumer,
                            llvm::SmallVectorImpl<Operation *> &predecessors,
                            std::string &error) const override;
@@ -113,6 +115,7 @@ public:
   const InterTaskNetworkSpec &getNetworkSpec() const { return network_; }
 
 private:
+  bool publicGraph_ = false;
   // These caches belong to one immutable edge-graph/network model instance.
   // Reservations do not affect either the payload facts or the optimistic
   // endpoint metrics.  They are mutable only so const lower-bound queries can

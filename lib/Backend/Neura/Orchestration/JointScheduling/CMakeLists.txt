@@ -22,6 +22,7 @@ add_mlir_library(MLIRAmoebaNeuraJointScheduling
   CommonAmoebaParentProfiles.cpp
   CommonMapperReplayWrapper.cpp
   ProductionFixedScheduleCommunication.cpp
+  ProgramGraphAmoeba.cpp
   EnumerateJointSemanticRewritePass.cpp
   EnumerateJointGraphClosurePass.cpp
   JointNeighborhoodSearchPass.cpp

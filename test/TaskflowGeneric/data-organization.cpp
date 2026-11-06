@@ -222,6 +222,51 @@ int main() {
  require(!planProgramDataOrganization(a,arch,denied,pathPlan,error),"same device cannot bypass local accessibility");
  auto tampered=sharedPlan;tampered.memories[1].accessibleResources={"accelerator"};
  require(!checkProgramDataOrganization(a,arch,sharedChoice,tampered,error),"access contract tamper rejected independently");
+ // Both adapters now produce the canonical ProgramGraph, while their finite
+ // source-domain/copy-policy checks remain independent.
+ require(retained.instances.size()==3 && retained.source.function==a.function &&
+   retained.executionRegions.size()==1 && retained.executionRegions.front().submissionCount==0 &&
+   checkProgramGraph(retained,error),"whole-task result is a checked common source/instance graph");
+ reject("common allocation lifetime",[](auto &p){p.allocationLifetime="phase-pool";});
+ reject("common compute clock",[](auto &p){p.clockMHz=1000;});
+ reject("common source binding",[](auto &p){p.source.bodyFingerprint="not-the-source";});
+ reject("common instance domain",[](auto &p){--p.instances.front().domain.front().upper;});
+ reject("common instance implementation",[](auto &p){p.instances.front().implementation="invented";});
+ reject("common instance missing",[](auto &p){p.instances.pop_back();});
+ reject("host graph fabricated submission",[](auto &p){p.executionRegions.front().submissionCount=1;});
+ reject("common transfer bytes",[](auto &p){for(auto &e:p.events)if(e.kind=="transfer"){++e.transferBytes;break;}});
+ reject("common transfer region",[](auto &p){for(auto &e:p.events)if(e.kind=="transfer"){--e.transferRegion->sizes.front();break;}});
+ reject("common schedule missing event",[](auto &p){p.schedule.events.pop_back();});
+ // Twelve logical bytes are allocated with a target-owned16-byte quantum.
+ // Padding consumes memory but does not become fabricated DMA traffic.
+ std::string alignedSource=source;size_t at=0;
+ while((at=alignedSource.find("16",at))!=std::string::npos){alignedSource.replace(at,2,"3");++at;}
+ auto alignedModule=mlir::parseSourceString<mlir::ModuleOp>(alignedSource,&context);GenericAnalysis alignedFacts;
+ require(alignedModule && analyzeGenericProgram(*alignedModule,alignedFacts,error),"aligned small actual source");
+ auto alignedTarget=target;alignedTarget.memories.back().alignmentBytes=16;
+ ProgramCommunicationPlan alignedPlan;
+ require(planProgramDataOrganization(alignedFacts,alignedTarget,choice,alignedPlan,error) && alignedPlan.transferBytes==12 &&
+   alignedPlan.peakMemoryBytes["sram"]==48,"alignment rounds allocations without rounding transfer payload");
+ bool alignedAllocations=true;
+ for(const auto &allocation:alignedPlan.allocations)if(allocation.memory=="sram")alignedAllocations&=allocation.bytes==16;
+ require(alignedAllocations && checkProgramDataOrganization(alignedFacts,alignedTarget,choice,alignedPlan,error),"independent checker accepts target-aligned allocations");
+ auto unpadded=alignedPlan;
+ for(auto &allocation:unpadded.allocations)if(allocation.memory=="sram"){allocation.bytes=12;break;}
+ require(!checkProgramDataOrganization(alignedFacts,alignedTarget,choice,unpadded,error),"independent checker rejects logical-size unpadded allocation");
+ auto alignedSmall=alignedTarget;alignedSmall.memories.back().capacityBytes=47;
+ require(!planProgramDataOrganization(alignedFacts,alignedSmall,choice,pathPlan,error),"alignment padding can exceed otherwise sufficient logical capacity");
+ StaticConfig alignedRoundtrip;
+ require(parseMemoryArchitecture(serializeMemoryArchitecture(alignedTarget),alignedRoundtrip,error) &&
+   alignedRoundtrip.memories.back().alignmentBytes==16,"nondefault alignment roundtrip");
+ auto invalidAlignment=alignedTarget;invalidAlignment.memories.back().alignmentBytes=0;
+ require(!validateMemoryArchitecture(invalidAlignment,error),"zero alignment invalid");
+ invalidAlignment.memories.back().alignmentBytes=-1;
+ require(!validateMemoryArchitecture(invalidAlignment,error),"negative alignment invalid");
+ auto architectureJSON=serializeMemoryArchitecture(alignedTarget);
+ (*architectureJSON.getAsObject()->getArray("memories"))[1].getAsObject()->operator[]("alignment_bytes")="sixteen";
+ require(!parseMemoryArchitecture(architectureJSON,alignedRoundtrip,error),"noninteger alignment invalid");
+ auto defaultArchitecture=serializeMemoryArchitecture(target);
+ require(!(*defaultArchitecture.getAsObject()->getArray("memories"))[1].getAsObject()->get("alignment_bytes"),"default alignment preserves old architecture serialization");
  llvm::outs()<<llvm::json::Object{{"status",ok?"PASS":"FAIL"},{"checks",int64_t(checks)},
   {"scope","actual MLIR fanout on synthetic CPU target; no cross-stage AIR claim"},
   {"architecture",serializeMemoryArchitecture(arch)},{"shared_memory_example",serializeProgramCommunication(sharedPlan)},{"separate_local_example",serializeProgramCommunication(separatePlan)},

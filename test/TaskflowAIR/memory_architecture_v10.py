@@ -47,13 +47,24 @@ assert {x['memory'] for x in renamed['program_communication']['allocations']}=={
 region=renamed['program_communication']['execution_regions']
 assert len(region)==1 and region[0]['host_submission_count']==1
 assert len(region[0]['device_stages'])==len(renamed['hardware_stages'])
+# Device labels do not override explicit instance ownership, access and links.
+# A target may choose arbitrary device names, including these historical names.
 for name,mutate in [
     ('cpu-compute-binding',lambda c:c['generic_air']['memory_architecture']['resources'][0].update(device='host')),
     ('cpu-dma-binding',lambda c:c['generic_air']['memory_architecture']['resources'][1].update(device='host')),
     ('device-submission-binding',lambda c:c['generic_air']['memory_architecture']['resources'][2].update(device='npu')),
+]:
+    changed=copy.deepcopy(cfg);mutate(changed);run(name,changed)
+# These are legal common target descriptions but exceed the installed AIR
+# implementation capability. Core preserves them; AIR must reject, not remap.
+for name,mutate in [
     ('wrong-local-kind',lambda c:c['generic_air']['memory_architecture']['memories'][1].update(kind='dram')),
     ('wrong-host-kind',lambda c:c['generic_air']['memory_architecture']['memories'][0].update(kind='local-sram')),
     ('wrong-local-owner',lambda c:c['generic_air']['memory_architecture']['memories'][1].update(domain='system')),
+    ('unsupported-physical-coordinate',lambda c:c['generic_air']['memory_architecture']['domains'][-1]['coordinates'].update(column=1)),
+]:
+    changed=copy.deepcopy(cfg);mutate(changed);run(name,changed,ok=not a.air)
+for name,mutate in [
     ('unknown-local',lambda c:c['generic_air']['memory_binding'].update(local_memory='absent')),
     ('inaccessible',lambda c:c['generic_air']['memory_architecture']['memories'][1].update(accessible_resources=['absent'])),
     ('wrong-direction',lambda c:c['generic_air']['memory_architecture']['links'][0].update(target='system.dram')),

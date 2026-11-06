@@ -67,6 +67,12 @@ bool orbit::taskflow::setNativeAIRTileSizes(ModuleOp module, int64_t m,
     error = "AIR tile sizes must all be positive";
     return false;
   }
+  ProgramMappingChoice current;
+  if(!readNativeMappingChoice(module,current,error))return false;
+  if(current.residency=="whole-program") {
+    ProgramMappingChoice tiled;tiled.residency="tiled-phase-local";
+    if(!setNativeMappingChoice(module,tiled,error))return false;
+  }
   module->setAttr("orbit.air_tile_sizes",
                   Builder(module.getContext()).getDenseI64ArrayAttr({m, n, k}));
   return true;
@@ -82,24 +88,38 @@ bool resolveMappingChoice(const orbit::taskflow::ProgramMappingChoice &input,
   // canonical source always distinguishes lifetime policy from realization.
   if(choice.residency=="retain-across-users") choice.residency="readonly-panel";
   if(choice.dataOrganization.empty())
-    choice.dataOrganization=choice.residency=="readonly-panel"?"retain-across-users":"phase-local";
+    choice.dataOrganization=(choice.residency=="readonly-panel"||choice.residency=="whole-program")?"retain-across-users":"phase-local";
+  bool tileMajor=choice.grouping=="tile-major",shapeMajor=choice.grouping=="shape-major";
+  if(tileMajor||shapeMajor) {
+    if(choice.residency.empty())choice.residency="tiled-phase-local";
+    if(choice.residency!="tiled-phase-local"||choice.storage!=-1||choice.reuseLoop!=-1||choice.panelLoop!=-1){error="instance grouping requires plain tiled realization without readonly-panel scope";return false;}
+    if(input.dataOrganization.empty())choice.dataOrganization=tileMajor?"retain-across-users":"phase-local";
+    if(choice.dataOrganization!=(tileMajor?"retain-across-users":"phase-local")||
+       (tileMajor&&((choice.residencyGroups.empty()&&(choice.taskGroup.empty()||choice.retainedStorages.empty()))||(!choice.residencyGroups.empty()&&(!choice.taskGroup.empty()||!choice.retainedStorages.empty()))))||
+       (shapeMajor&&(!choice.taskGroup.empty()||!choice.retainedStorages.empty()||!choice.residencyGroups.empty()))){error="instance grouping has inconsistent retention scope";return false;}
+    return true;
+  }
+  if(!choice.taskGroup.empty()||!choice.retainedStorages.empty()||!choice.residencyGroups.empty()){error="task/data groups require tile-major grouping";return false;}
   ProgramDataPolicy policy;
   if(!parseProgramDataPolicy(choice.dataOrganization,policy,error)) return false;
   choice.dataOrganization=programDataPolicyName(policy).str();
   bool retained=policy==ProgramDataPolicy::RetainAcrossUsers;
-  std::string realization=retained?"readonly-panel":"phase-local";
-  std::string grouping=retained?"readonly-panel-scope":"task-shape-stages";
+  bool whole=choice.residency=="whole-program";
+  bool tiled=choice.residency=="tiled-phase-local";
+  if((whole&&!retained)||(tiled&&retained)){error="explicit residency contradicts data organization";return false;}
+  std::string realization=whole?"whole-program":tiled?"tiled-phase-local":retained?"readonly-panel":"phase-local";
+  std::string grouping=whole?"whole-program":retained?"readonly-panel-scope":"task-shape-stages";
   if((!choice.residency.empty() && choice.residency!=realization) ||
      (!choice.grouping.empty() && choice.grouping!=grouping)) {
     error="data organization contradicts the requested residency realization or grouping";return false;
   }
   choice.residency=realization;choice.grouping=grouping;
-  if(retained) {
+  if(retained && !whole) {
     if(choice.storage<0 || choice.reuseLoop<0 || choice.panelLoop<0 || choice.reuseLoop==choice.panelLoop) {
       error="retain-across-users requires storage and distinct source reuse/panel loops";return false;
     }
   } else if(choice.storage!=-1 || choice.reuseLoop!=-1 || choice.panelLoop!=-1) {
-    error="phase-local data organization cannot carry a retained storage/loop scope";return false;
+    error="non-panel data organization cannot carry a retained storage/loop scope";return false;
   }
   return true;
 }
@@ -115,10 +135,27 @@ bool orbit::taskflow::readNativeMappingChoice(ModuleOp module,
     for(auto item:mapping) {
       StringRef name=item.getName().getValue();
       if(name!="data_organization" && name!="residency" && name!="grouping" &&
-         name!="storage" && name!="reuse_loop" && name!="panel_loop") {
+         name!="storage" && name!="reuse_loop" && name!="panel_loop" && name!="task_group" && name!="retained_storages" && name!="residency_groups") {
         error="unknown program mapping choice field: "+name.str();return false;
       }
-      if(name=="storage" || name=="reuse_loop" || name=="panel_loop") {
+      if(name=="residency_groups") {
+        auto groups=dyn_cast<ArrayAttr>(item.getValue());if(!groups){error="residency_groups must be an array of dictionaries";return false;}
+        for(auto raw:groups){auto group=dyn_cast<DictionaryAttr>(raw);if(!group||group.size()!=2){error="residency group requires tasks and retained_storages";return false;}
+          ProgramResidencyGroup scope;
+          for(auto field:group){auto name=field.getName().getValue();if(name!="tasks"&&name!="retained_storages"){error="unknown residency group field";return false;}
+            auto values=dyn_cast<ArrayAttr>(field.getValue());if(!values){error="residency group members must be integer arrays";return false;}
+            auto &out=name=="tasks"?scope.tasks:scope.retainedStorages;
+            for(auto raw:values){auto value=dyn_cast<IntegerAttr>(raw);if(!value||value.getInt()<0){error="invalid residency group identity";return false;}out.push_back(size_t(value.getInt()));}
+          }
+          if(scope.tasks.size()<2||scope.retainedStorages.empty()){error="residency group requires multiple tasks and retained data";return false;}
+          input.residencyGroups.push_back(std::move(scope));
+        }
+        if(input.residencyGroups.empty()){error="explicit residency_groups must be nonempty";return false;}
+      } else if(name=="task_group"||name=="retained_storages") {
+        auto values=dyn_cast<ArrayAttr>(item.getValue());if(!values){error="task/data groups must be integer arrays";return false;}
+        auto &dest=name=="task_group"?input.taskGroup:input.retainedStorages;
+        for(auto raw:values){auto value=dyn_cast<IntegerAttr>(raw);if(!value||value.getInt()<0){error="negative/noninteger group identity";return false;}dest.push_back(size_t(value.getInt()));}
+      } else if(name=="storage" || name=="reuse_loop" || name=="panel_loop") {
         auto value=dyn_cast<IntegerAttr>(item.getValue());
         if(!value || !value.getValue().isSignedIntN(64)) {error="mapping storage/loop choices must be signed 64-bit integers";return false;}
         if(name=="storage") input.storage=value.getInt();
@@ -141,9 +178,10 @@ bool orbit::taskflow::setNativeMappingChoice(ModuleOp module,
   ProgramMappingChoice choice;
   if(!resolveMappingChoice(input,choice,error)) return false;
   // Canonical default: no candidate identity for merely explicit defaults.
-  if(choice.dataOrganization=="phase-local") {
+  if(choice.residency=="phase-local" && choice.grouping=="task-shape-stages") {
     module->removeAttr("orbit.mapping");return true;
   }
+  if(choice.residency=="whole-program")module->removeAttr("orbit.air_tile_sizes");
   Builder b(module.getContext());NamedAttrList attrs;
   attrs.set("data_organization",b.getStringAttr(choice.dataOrganization));
   attrs.set("residency",b.getStringAttr(choice.residency));
@@ -151,6 +189,14 @@ bool orbit::taskflow::setNativeMappingChoice(ModuleOp module,
   attrs.set("storage",b.getI64IntegerAttr(choice.storage));
   attrs.set("reuse_loop",b.getI64IntegerAttr(choice.reuseLoop));
   attrs.set("panel_loop",b.getI64IntegerAttr(choice.panelLoop));
+  auto list=[&](const std::vector<size_t>&values){SmallVector<Attribute> result;for(auto v:values)result.push_back(b.getI64IntegerAttr(v));return b.getArrayAttr(result);};
+  if(!choice.taskGroup.empty())attrs.set("task_group",list(choice.taskGroup));
+  if(!choice.retainedStorages.empty())attrs.set("retained_storages",list(choice.retainedStorages));
+  if(!choice.residencyGroups.empty()){
+    SmallVector<Attribute> groups;
+    for(const auto &g:choice.residencyGroups){NamedAttrList fields;fields.set("tasks",list(g.tasks));fields.set("retained_storages",list(g.retainedStorages));groups.push_back(fields.getDictionary(module.getContext()));}
+    attrs.set("residency_groups",b.getArrayAttr(groups));
+  }
   module->setAttr("orbit.mapping",attrs.getDictionary(module.getContext()));
   return true;
 }

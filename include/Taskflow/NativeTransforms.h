@@ -11,6 +11,8 @@ bool splitNativeOuterLoops(mlir::ModuleOp module, std::string &error);
 // Distribute a write-only prologue from an independent rectangular loop nest.
 // This preserves each output element's update order; no arithmetic is matched.
 bool distributeNativeInitialization(mlir::ModuleOp module, std::string &error);
+// Tiling an explicit whole-program realization switches it back to
+// tiled-phase-local; readonly-panel scope composes with ordinary tiling.
 bool setNativeAIRTileSizes(mlir::ModuleOp module, int64_t m, int64_t n,
                            int64_t k, std::string &error);
 // Materialize a whole-program mapping choice; legality is checked against

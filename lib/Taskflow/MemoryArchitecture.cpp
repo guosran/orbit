@@ -1,4 +1,5 @@
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/ProgramTargetBinding.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -21,10 +22,10 @@ bool readStrings(const O &o,llvm::StringRef key,std::vector<std::string> &out,st
 }
 std::string string(const O &o,llvm::StringRef key){return o.getString(key).value_or("").str();}
 StaticConfig npuArchitecture(int64_t capacity){
-  StaticConfig c;c.domains={{"system","","system"},{"npu","system","device"},{"npu.tile","npu","tile"}};
-  c.resources={{"npu.compute","compute","npu",1,"npu.tile"},{"npu.dma","transfer","npu",1,"npu"},{"host-submission","submission","host",1,"system"},{"host.worker","compute","host",1,"system"}};
+  StaticConfig c;c.domains={{"system","","system"},{"npu","system","device"},{"npu.tile(0,2)","npu","tile",{{"column",0},{"row",2}}}};
+  c.resources={{"npu.compute","compute","npu",1,"npu.tile(0,2)"},{"npu.dma","transfer","npu",1,"npu"},{"host-submission","submission","host",1,"system"},{"host.worker","compute","host",1,"system"}};
   c.memories={{"system_memory_bo",INT64_MAX,{"host"},"system","system-bo",{"host.worker"}},
-              {"aie_l1",capacity,{"npu"},"npu.tile","local-sram",{"npu.compute"}}};
+              {"aie_l1",capacity,{"npu"},"npu.tile(0,2)","local-sram",{"npu.compute"}}};
   for(bool input:{true,false}){StaticTransfer t;t.id=input?"host_to_l1":"l1_to_host";
     t.source=input?"system_memory_bo":"aie_l1";t.target=input?"aie_l1":"system_memory_bo";t.resource="npu.dma";t.domain="npu";
     t.provenance={"target_contract","serial explicit DMA; latency/bandwidth uncalibrated"};c.links.push_back(t);}
@@ -38,14 +39,22 @@ bool orbit::taskflow::memoryAccessible(const StaticConfig &c,llvm::StringRef mid
 }
 bool orbit::taskflow::validateMemoryArchitecture(const StaticConfig &c,std::string &e){
   std::map<std::string,std::string> domains;std::set<std::string> ids;
-  for(const auto &d:c.domains){if(d.id.empty() || d.kind.empty() || !domains.emplace(d.id,d.parent).second)return fail(e,"invalid/duplicate domain");}
+  for(const auto &d:c.domains){for(const auto &axis:d.coordinates)if(axis.first.empty())return fail(e,"empty coordinate axis");if(d.id.empty() || d.kind.empty() || !domains.emplace(d.id,d.parent).second)return fail(e,"invalid/duplicate domain");}
   for(const auto &d:c.domains){std::set<std::string> seen;std::string id=d.id;while(!id.empty()){
     if(!domains.count(id) || !seen.insert(id).second)return fail(e,"unknown parent or cyclic domain ownership");id=domains.at(id);}}
   auto domain=[&](const std::string &d){return d.empty() || domains.count(d);};
   for(const auto &r:c.resources)if(r.id.empty() || !ids.insert(r.id).second || r.capacity<=0 || (r.kind=="compute" && r.device.empty()) || !domain(r.domain) ||
-      (r.kind!="compute" && r.kind!="communication" && r.kind!="transfer" && r.kind!="submission"))return fail(e,"invalid resource/domain/capacity");
-  ids.clear();for(const auto &m:c.memories){if(m.id.empty() || !ids.insert(m.id).second || m.capacityBytes<=0 || !domain(m.domain) ||
+      (r.kind!="compute" && r.kind!="communication" && r.kind!="transfer" && r.kind!="submission" && r.kind!="shared"))return fail(e,"invalid resource/domain/capacity");
+  std::map<std::string,int> sharedState;
+  std::function<bool(const StaticResource &)> sharedVisit=[&](const auto &r) {
+    if(sharedState[r.id]==1)return false;if(sharedState[r.id]==2)return true;sharedState[r.id]=1;
+    for(const auto &entry:r.sharedResources){auto target=resource(c,entry.first);if(!target || entry.second<=0 || entry.second>target->capacity || !sharedVisit(*target))return false;}
+    sharedState[r.id]=2;return true;
+  };
+  for(const auto &r:c.resources)if(!sharedVisit(r))return fail(e,"invalid/cyclic shared resource reference");
+  ids.clear();for(const auto &m:c.memories){if(m.id.empty() || !ids.insert(m.id).second || m.capacityBytes<=0 || m.alignmentBytes<=0 || !domain(m.domain) ||
        (m.accessibleDevices.empty() && m.accessibleResources.empty()))return fail(e,"invalid memory/domain/capacity/access");
+    if(!m.capacityKnown && m.capacityBytes!=INT64_MAX)return fail(e,"unknown memory capacity must use the arithmetic accounting ceiling");
     std::set<std::string> seen;for(const auto &id:m.accessibleResources){auto r=resource(c,id);if(!r || r->kind!="compute" || !seen.insert(id).second)return fail(e,"memory has unknown/duplicate compute accessor");}}
   if(c.memories.empty() || c.resources.empty())return fail(e,"memory and resource instances required");
   ids.clear();for(const auto &l:c.links){auto r=resource(c,l.resource);if(l.id.empty() || !ids.insert(l.id).second || !memory(c,l.source) || !memory(c,l.target) ||
@@ -62,9 +71,11 @@ bool orbit::taskflow::findMemoryPath(const StaticConfig &c,llvm::StringRef sourc
 }
 llvm::json::Value orbit::taskflow::serializeMemoryArchitecture(const StaticConfig &c){
   A domains,resources,memories,links;
-  for(const auto &d:c.domains)domains.push_back(O{{"id",d.id},{"parent",d.parent},{"kind",d.kind}});
-  for(const auto &r:c.resources)resources.push_back(O{{"id",r.id},{"kind",r.kind},{"device",r.device},{"capacity",r.capacity},{"domain",r.domain}});
-  for(const auto &m:c.memories)memories.push_back(O{{"id",m.id},{"capacity_bytes",m.capacityBytes},{"accessible_devices",strings(m.accessibleDevices)},{"accessible_resources",strings(m.accessibleResources)},{"domain",m.domain},{"kind",m.kind}});
+  for(const auto &d:c.domains){O x{{"id",d.id},{"parent",d.parent},{"kind",d.kind}};if(!d.coordinates.empty()){O coords;for(auto &a:d.coordinates)coords[a.first]=a.second;x["coordinates"]=std::move(coords);}domains.push_back(std::move(x));}
+  for(const auto &r:c.resources){O x{{"id",r.id},{"kind",r.kind},{"device",r.device},{"capacity",r.capacity},{"domain",r.domain}};if(!r.sharedResources.empty()){O shares;for(auto &a:r.sharedResources)shares[a.first]=a.second;x["shared_resources"]=std::move(shares);}resources.push_back(std::move(x));}
+  for(const auto &m:c.memories){O entry{{"id",m.id},{"capacity_bytes",m.capacityBytes},{"accessible_devices",strings(m.accessibleDevices)},{"accessible_resources",strings(m.accessibleResources)},{"domain",m.domain},{"kind",m.kind}};
+    if(!m.capacityKnown){entry["capacity_bytes"]=nullptr;entry["capacity_known"]=false;}
+    if(m.alignmentBytes!=1)entry["alignment_bytes"]=m.alignmentBytes;memories.push_back(std::move(entry));}
   for(const auto &l:c.links)links.push_back(O{{"id",l.id},{"source",l.source},{"target",l.target},{"resource",l.resource},{"domain",l.domain},
     {"latency_ms",l.latencyMs},{"bandwidth_bytes_per_ms",l.bandwidthBytesPerMs},{"min_bytes",l.minBytes},{"max_bytes",l.maxBytes},{"temporary_bytes",l.temporaryBytes},
     {"source_layout",l.sourceLayout},{"target_layout",l.targetLayout},{"source_dtype",l.sourceDtype},{"target_dtype",l.targetDtype},
@@ -75,10 +86,15 @@ llvm::json::Value orbit::taskflow::serializeMemoryArchitecture(const StaticConfi
 bool orbit::taskflow::parseMemoryArchitecture(const V &v,StaticConfig &c,std::string &e){
   c={};auto o=v.getAsObject();if(!o)return fail(e,"expected target object");
   if(auto v=o->get("domains"))if(!v->getAsArray())return fail(e,"domains must be array");
-  if(auto ds=o->getArray("domains"))for(const auto &v:*ds){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","parent","kind"},e))return fail(e,"invalid domain");c.domains.push_back({string(*x,"id"),string(*x,"parent"),string(*x,"kind")});}
+  if(auto ds=o->getArray("domains"))for(const auto &v:*ds){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","parent","kind"},e))return fail(e,"invalid domain");StaticResourceDomain d{string(*x,"id"),string(*x,"parent"),string(*x,"kind")};if(auto value=x->get("coordinates")){auto coords=value->getAsObject();if(!coords)return fail(e,"coordinates must be integer object");for(const auto &entry:*coords){auto n=entry.second.getAsInteger();if(!n || entry.first.str().empty())return fail(e,"invalid coordinate axis/value");d.coordinates[entry.first.str()]=*n;}}c.domains.push_back(std::move(d));}
   auto rs=o->getArray("resources"),ms=o->getArray("memories"),ls=o->getArray("links");if(!rs || !ms || !ls)return fail(e,"resources/memories/links arrays required");
-  for(const auto &v:*rs){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","kind","device","domain"},e))return fail(e,"invalid resource");auto n=x->getInteger("capacity");if(!n)return fail(e,"resource capacity required");c.resources.push_back({string(*x,"id"),string(*x,"kind"),string(*x,"device"),*n,string(*x,"domain")});}
-  for(const auto &v:*ms){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","kind","domain"},e))return fail(e,"invalid memory");auto n=x->getInteger("capacity_bytes");if(!n)return fail(e,"memory capacity required");StaticMemory m;m.id=string(*x,"id");m.capacityBytes=*n;m.domain=string(*x,"domain");m.kind=string(*x,"kind");
+  for(const auto &v:*rs){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","kind","device","domain"},e))return fail(e,"invalid resource");auto n=x->getInteger("capacity");if(!n)return fail(e,"resource capacity required");StaticResource r{string(*x,"id"),string(*x,"kind"),string(*x,"device"),*n,string(*x,"domain")};if(auto value=x->get("shared_resources")){auto shares=value->getAsObject();if(!shares)return fail(e,"shared_resources must be integer object");for(const auto &entry:*shares){auto n=entry.second.getAsInteger();if(!n)return fail(e,"invalid shared resource units");r.sharedResources[entry.first.str()]=*n;}}c.resources.push_back(std::move(r));}
+  for(const auto &v:*ms){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","kind","domain"},e))return fail(e,"invalid memory");StaticMemory m;m.id=string(*x,"id");m.domain=string(*x,"domain");m.kind=string(*x,"kind");
+    if(auto known=x->get("capacity_known")){auto value=known->getAsBoolean();if(!value)return fail(e,"capacity_known must be boolean");m.capacityKnown=*value;}
+    auto n=x->getInteger("capacity_bytes");
+    if(m.capacityKnown){if(!n)return fail(e,"known memory capacity required");m.capacityBytes=*n;}
+    else {auto value=x->get("capacity_bytes");if(!value || !value->getAsNull())return fail(e,"unknown memory capacity requires null bytes");m.capacityBytes=INT64_MAX;}
+    if(auto value=x->get("alignment_bytes")){auto alignment=value->getAsInteger();if(!alignment)return fail(e,"integer memory alignment required");m.alignmentBytes=*alignment;}
     if(!readStrings(*x,"accessible_devices",m.accessibleDevices,e) || !readStrings(*x,"accessible_resources",m.accessibleResources,e))return false;c.memories.push_back(m);}
   for(const auto &v:*ls){auto x=v.getAsObject();if(!x || !textFields(*x,{"id","source","target","resource","domain","memory","source_device","target_device","source_layout","target_layout","source_dtype","target_dtype"},e))return fail(e,"invalid link");StaticTransfer l;l.id=string(*x,"id");l.source=string(*x,"source");l.target=string(*x,"target");l.resource=string(*x,"resource");l.domain=string(*x,"domain");
     for(auto entry:{std::make_pair("latency_ms",&l.latencyMs),std::make_pair("bandwidth_bytes_per_ms",&l.bandwidthBytesPerMs)})if(const V *p=x->get(entry.first)){auto n=p->getAsNumber();if(!n)return fail(e,"invalid link cost");*entry.second=*n;}
@@ -93,15 +109,8 @@ llvm::json::Value orbit::taskflow::serializeGenericMemory(const GenericMemoryBin
   return O{{"architecture",serializeMemoryArchitecture(b.architecture)},{"binding",O{{"host_memory",b.hostMemory},{"local_memory",b.localMemory},{"compute_resource",b.computeResource},{"dma_resource",b.dmaResource},{"input_link",b.inputLink},{"output_link",b.outputLink},{"submission_resource",b.submissionResource},{"host_air_memory_space",0},{"local_air_memory_space",2}}}};
 }
 bool orbit::taskflow::checkGenericMemory(const GenericMemoryBinding &b,int64_t capacity,std::string &e){
-  const auto &c=b.architecture;if(!validateMemoryArchitecture(c,e))return false;auto host=memory(c,b.hostMemory),local=memory(c,b.localMemory);auto compute=resource(c,b.computeResource),dma=resource(c,b.dmaResource),submit=resource(c,b.submissionResource);
-  if(!host || !local || host==local || !compute || compute->capacity!=1 || !dma || dma->capacity!=1 || !submit || submit->kind!="submission" || submit->capacity!=1 || capacity<=0 || capacity>24576 || local->capacityBytes!=capacity || !memoryAccessible(c,b.localMemory,b.computeResource))return fail(e,"unsupported direct-AIR memory/resource binding or payload budget");
-  if(compute->device!="npu" || dma->device!="npu" || submit->device!="host" ||
-     host->kind!="system-bo" || local->kind!="local-sram" || compute->domain!=local->domain)
-    return fail(e,"direct-AIR target binding requires host BO, compute-owned NPU local SRAM, NPU DMA and host submission resources");
-  for(bool input:{true,false}){auto it=std::find_if(c.links.begin(),c.links.end(),[&](const auto &l){return l.id==(input?b.inputLink:b.outputLink);});
-    if(it==c.links.end() || it->source!=(input?b.hostMemory:b.localMemory) || it->target!=(input?b.localMemory:b.hostMemory) || it->resource!=b.dmaResource || it->temporaryBytes ||
-       !it->sourceLayout.empty() || !it->targetLayout.empty() || !it->sourceDtype.empty() || !it->targetDtype.empty())return fail(e,"AIR binding requires direct row-major unchanged-dtype DMA links without scratch");}
-  return true;
+  ProgramTargetBindingView view{b.hostMemory,b.localMemory,b.computeResource,b.dmaResource,b.inputLink,b.outputLink,b.submissionResource};
+  return checkProgramTargetBinding(b.architecture,view,capacity,e);
 }
 bool orbit::taskflow::configureGenericMemory(const V &config,int64_t capacity,GenericMemoryBinding &b,std::string &e){
   b=GenericMemoryBinding{};b.architecture=npuArchitecture(capacity);auto object=config.getAsObject();auto cfg=object?object->getObject("generic_air"):nullptr;
@@ -112,10 +121,10 @@ bool orbit::taskflow::configureGenericMemory(const V &config,int64_t capacity,Ge
 }
 llvm::json::Value orbit::taskflow::serializeGenericCapabilities(const GenericTargetCapabilities &c){
   A align,impl;for(auto n:c.tileAlignment)align.push_back(n);for(const auto &i:c.implementations)impl.push_back(O{{"kind",i.kind},{"lanes",i.lanes}});
-  return O{{"capacity_bytes",c.capacityBytes},{"tile_alignment",std::move(align)},{"implementations",std::move(impl)}};
+  return O{{"capacity_bytes",c.capacityBytes},{"max_group_inputs",c.maxGroupInputs},{"max_group_outputs",c.maxGroupOutputs},{"acquire_all_inputs_at_group_entry",c.acquireAllInputsAtGroupEntry},{"tile_alignment",std::move(align)},{"implementations",std::move(impl)}};
 }
 bool orbit::taskflow::checkGenericCapabilities(const GenericMemoryBinding &b,const GenericTargetCapabilities &c,std::string &e){
-  if(c.tileAlignment.size()!=3 || c.implementations.empty() || !checkGenericMemory(b,c.capacityBytes,e))return fail(e,"invalid target capability coverage");
+  if(c.maxGroupInputs<0 || c.maxGroupOutputs<0 || c.tileAlignment.size()!=3 || c.implementations.empty() || !checkGenericMemory(b,c.capacityBytes,e))return fail(e,"invalid target capability coverage");
   for(auto n:c.tileAlignment)if(n<=0)return fail(e,"positive tile alignment required");
   std::set<std::pair<std::string,int64_t>> seen;
   for(const auto &i:c.implementations)if(!((i.kind=="scalar" && i.lanes==1)||(i.kind=="scalar-product-vector-add-f32"&&i.lanes==8)) ||
@@ -129,6 +138,8 @@ bool orbit::taskflow::getGenericTargetCapabilities(const V &config,GenericTarget
   GenericMemoryBinding b;if(!configureGenericMemory(config,c.capacityBytes,b,e))return false;
   if(cfg)if(auto v=cfg->get("capabilities")){
     auto cap=v->getAsObject();if(!cap)return fail(e,"capabilities must be object");
+    for(auto entry:{std::make_pair("max_group_inputs",&c.maxGroupInputs),std::make_pair("max_group_outputs",&c.maxGroupOutputs)})if(auto v=cap->get(entry.first)){auto n=v->getAsInteger();if(!n || *n<0)return fail(e,"nonnegative group stream limit required");*entry.second=*n;}
+    if(auto v=cap->get("acquire_all_inputs_at_group_entry")){auto b=v->getAsBoolean();if(!b)return fail(e,"input acquisition policy must be boolean");c.acquireAllInputsAtGroupEntry=*b;}
     if(auto v=cap->get("tile_alignment")){auto a=v->getAsArray();if(!a || a->size()!=3)return fail(e,"three tile alignments required");c.tileAlignment.clear();for(const auto &v:*a){auto n=v.getAsInteger();if(!n || *n<=0)return fail(e,"positive tile alignment required");c.tileAlignment.push_back(*n);}}
     if(auto v=cap->get("implementations")){auto a=v->getAsArray();if(!a)return fail(e,"implementation capabilities must be array");c.implementations.clear();for(const auto &v:*a){auto o=v.getAsObject();if(!o)return fail(e,"invalid implementation capability");GenericTaskImplementation i;i.kind=string(*o,"kind");
       i.lanes=i.kind=="scalar"?1:8;if(auto v=o->get("lanes")){auto n=v->getAsInteger();if(!n)return fail(e,"integer vector lanes required");i.lanes=*n;}c.implementations.push_back(i);}}

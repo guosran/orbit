@@ -26,6 +26,14 @@
 #include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
 #include "TaskflowFissionSourceReplay.h"
 #include "ProductionSchedulerAdapter.h"
+#include "ProgramGraphAmoeba.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 
@@ -2245,6 +2253,8 @@ public:
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<affine::AffineDialect,arith::ArithDialect,cf::ControlFlowDialect,
+        LLVM::LLVMDialect,memref::MemRefDialect,scf::SCFDialect,math::MathDialect>();
     registerTaskflowFissionCanonicalLoweringDependencies(registry);
     // These passes run in nested managers while the outer manager has already
     // entered its execution context. Declare their dialects here so loading a
@@ -2361,6 +2371,17 @@ public:
       canonical.emitError() << message;
       signalPassFailure();
     };
+    if (decisionFlow == "program-graph") {
+      if(structuredBackend!="amoeba") {fatal("program-graph decision flow requires backend=amoeba");return;}
+      orbit::taskflow::SearchOptions options{"amoeba","native",outputDir,structuredConfig,checkpoint,maxRounds,maxCandidates,beamWidth,resume};
+      ProgramGraphAmoebaOptions backend;
+      backend.function=functionName;backend.architecture=architecturePath;backend.architectureContract=architectureContract;
+      backend.model=modelPath;backend.cache=cachePath;backend.sourceRepository=sourceRepository;backend.sourceCommit=sourceCommit;
+      backend.architectureTransferCatalog=architectureTransferCatalog;backend.modelNamespace=modelNamespace;backend.context=canonical.getContext();
+      if(!configureProgramGraphAmoebaSearch(canonical,options,backend,error) ||
+          !orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},options,error)) fatal(error);
+      return;
+    }
     if (decisionFlow == "structured" && structuredBackend == "air" && !canonical.getBody()->empty()) {
       orbit::taskflow::SearchOptions options{structuredBackend,structuredEvaluator,outputDir,structuredConfig,checkpoint,maxRounds,maxCandidates,beamWidth,resume};
       llvm::raw_string_ostream stream(options.nativeSourceMLIR);canonical.print(stream);
@@ -8884,3 +8905,31 @@ std::unique_ptr<Pass> createSearchJointNeighborhoodPass() {
   return std::make_unique<SearchJointNeighborhoodPass>();
 }
 } // namespace mlir::amoeba::neura
+
+namespace mlir::amoeba::neura::joint_scheduling {
+bool predictProgramGraphTaskCosts(ModuleOp module,func::FuncOp function,
+    const ProgramGraphAmoebaOptions &options,StringRef graphId,StringRef output,
+    ArrayRef<::orbit::taskflow::AmoebaTaskShape> shapes,int64_t peRows,int64_t peColumns,
+    std::vector<TaskShapeChoice> &choices,std::vector<TaskShapeCost> &costs,
+    std::vector<int64_t> &durations,std::string &error) {
+  std::string catalogue;bool fatal=false;
+  if(!runCurrentCostPredictor(module,function,function.getName(),graphId,output,
+      options.model,options.cache,llvm::sys::path::parent_path(options.model),options.architectureContract,options.architecture,
+      peRows,peColumns,options.sourceRepository,options.sourceCommit,
+      options.architectureTransferCatalog,options.modelNamespace,20,false,catalogue,error,fatal))return false;
+  auto metadata=collectAnalyticalTaskMetadata(function,error);auto catalogGraph=readCatalogGraphId(catalogue);
+  TaskShapeCostCache cache;
+  if(failed(metadata) || !catalogGraph || metadata->size()!=shapes.size() ||
+      !cache.load(catalogue,function.getName(),*metadata,options.sourceRepository,options.sourceCommit,
+          options.architecture,*catalogGraph,error,false,neighborhoodReplaySourceText(module)))return false;
+  for(size_t i=0;i<metadata->size();++i) {
+    TaskShapeChoice choice{(*metadata)[i].name,(*metadata)[i].tripCount,
+        RectShape{shapes[i].rows,shapes[i].columns,shapes[i].rows*peRows,shapes[i].columns*peColumns}};
+    auto cost=cache.get(choice,error);
+    if(!cost || !cost->supported) {if(error.empty())error="actual CGRA model does not support requested source/shape";return false;}
+    auto duration=durationFromCost(*cost,choice.tripCount,error);if(!duration)return false;
+    choices.push_back(choice);costs.push_back(*cost);durations.push_back(*duration);
+  }
+  return true;
+}
+}

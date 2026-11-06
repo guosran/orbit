@@ -96,6 +96,8 @@ struct TaskNode;
 class TaskMemoryGraph;
 
 class TaskCommunicationModel;
+// The exact physical context-slot parser used by the production scheduler.
+bool getProductionContextSlots(int &slots,std::string &error);
 
 // Opaque reservation state supplied by an optional communication model.
 // The owner and type tag are part of the contract: callers must never pass a
@@ -114,6 +116,8 @@ struct TaskCommunicationReservationCheckpoint {
 class TaskCommunicationModel {
 public:
   virtual ~TaskCommunicationModel() = default;
+  // Public-graph adapters supply the complete checked dependency relation.
+  virtual bool hasAuthoritativeDependencies() const { return false; }
 
   virtual bool
   getTaskPredecessors(Operation *consumer,

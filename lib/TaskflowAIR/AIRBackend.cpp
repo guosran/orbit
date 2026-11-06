@@ -2,6 +2,7 @@
 #include "Taskflow/GenericAnalysis.h"
 #include "Taskflow/GenericMapping.h"
 #include "Taskflow/StaticMapping.h"
+#include "Taskflow/ProgramTargetBinding.h"
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -175,9 +176,24 @@ bool bindDMACopies(OpBuilder &b, const GenericAnalysis &a,
 // A rectangular transfer uses the external tensor's physical strides and a
 // densely packed local tile. Offsets are in elements, independently per side.
 Value tileDMA(OpBuilder &b, Type token, Value external, Value local,
-              const GenericTileRegion &r, bool input, ValueRange deps,
+              const GenericTileRegion &witness, bool input, ValueRange deps,
               StringRef storage, size_t phase, ArrayRef<Value> shifts = {},
               const GenericAnalysis *analysis=nullptr, const GenericMappingPlan *plan=nullptr, std::string *error=nullptr) {
+  GenericTileRegion r=witness;
+  if(plan) {
+    const auto &events=plan->communication.events;
+    auto event=llvm::find_if(events,[&](const auto &entry) {
+      return entry.kind=="transfer" && entry.phase==phase && entry.transferRegion &&
+          entry.transferRegion->storage==witness.storage &&
+          entry.link==(input?plan->memoryBinding.inputLink:plan->memoryBinding.outputLink);
+    });
+    if(event==events.end()) {*error="AIR DMA missing common transfer event";return {};}
+    const auto &region=*event->transferRegion;
+    if(region.offsets!=witness.offsets || region.sizes!=witness.sizes) {
+      *error="AIR phase geometry differs from authoritative common transfer region";return {};
+    }
+    r.storage=region.storage;r.offsets=region.offsets;r.sizes=region.sizes;
+  }
   Value result = dma(b, token, input ? local : external,
                      input ? external : local, deps, storage,
                      input ? "host_to_l1" : "l1_to_host");
@@ -216,9 +232,23 @@ Value tileDMA(OpBuilder &b, Type token, Value external, Value local,
   op->setAttr("orbit.phase", b.getI64IntegerAttr(phase));
   if(plan) {
     std::string direction=input?"host_to_l1":"l1_to_host";
-    auto transfer=llvm::find_if(plan->transfers,[&](const auto &entry){return entry.phase==phase && entry.storage==r.storage && entry.direction==direction && entry.offsets==r.offsets && entry.sizes==r.sizes;});
-    if(transfer==plan->transfers.end()) *error="AIR DMA has no exact public phase/region transfer";
-    else bindDMACopies(b,*analysis,*plan,op,external,local,*transfer,*error);
+    const auto &graph=plan->communication;
+    const auto event=llvm::find_if(graph.events,[&](const auto &entry) {
+      if(entry.kind!="transfer" || entry.phase!=phase || !entry.transferRegion) return false;
+      const auto &region=*entry.transferRegion;
+      return region.storage==r.storage && region.offsets==r.offsets && region.sizes==r.sizes &&
+          entry.link==(input?plan->memoryBinding.inputLink:plan->memoryBinding.outputLink);
+    });
+    if(event==graph.events.end()) *error="AIR DMA has no exact common transfer event/region";
+    else {
+      GenericTransfer transfer;
+      transfer.storage=event->transferRegion->storage;transfer.phase=event->phase;
+      transfer.direction=direction;transfer.offsets=event->transferRegion->offsets;
+      transfer.sizes=event->transferRegion->sizes;transfer.bytes=event->transferBytes;
+      transfer.event=std::distance(graph.events.begin(),event);
+      transfer.sourceCopies=event->reads;transfer.targetCopies=event->writes;
+      bindDMACopies(b,*analysis,*plan,op,external,local,transfer,*error);
+    }
   }
   return result;
 }
@@ -527,6 +557,22 @@ void emitTileBody(OpBuilder &b, const GenericAnalysis &a,
 static bool lowerGenericToAIRImpl(const GenericAnalysis &, const GenericMappingPlan &,
   OwningOpRef<ModuleOp> &, std::string &, bool,
   llvm::function_ref<LogicalResult(ModuleOp)>, bool = false);
+// Public data-organization choices select an existing checked realization.
+// They must not silently fall back to a different copy lifetime at this boundary.
+static bool checkDataOrganizationRealization(const GenericMappingPlan &plan,
+                                             std::string &error) {
+  if (plan.choices.residency == "whole-program" &&
+      (plan.strategy != "single-herd-resident" || !plan.hardwareStages.empty())) {
+    error = "AIR whole-program residency requires one resident herd with no stage-local pools";
+    return false;
+  }
+  if (plan.choices.residency == "tiled-phase-local" &&
+      plan.strategy != "serial-tiled") {
+    error = "AIR tiled-phase-local residency requires the checked serial-tiled realization";
+    return false;
+  }
+  return true;
+}
 bool orbit::taskflow::checkGenericAIRMapping(const GenericAnalysis &a,
                                              const GenericMappingPlan &plan,
                                              ModuleOp module,
@@ -535,9 +581,10 @@ bool orbit::taskflow::checkGenericAIRMapping(const GenericAnalysis &a,
     error = reason.str();
     return false;
   };
-  if (!checkGenericMapping(a, plan, error))
+  if (!checkGenericMapping(a, plan, error) ||
+      !checkDataOrganizationRealization(plan, error))
     return false;
-  if (plan.strategy == "serial-tiled") {
+  if (plan.strategy == "serial-tiled" || plan.strategy == "single-herd-resident") {
     OwningOpRef<ModuleOp> expected;
     bool approximate = module->hasAttr("orbit.math_approximation");
     if (!lowerGenericToAIRImpl(a, plan, expected, error, approximate,
@@ -547,7 +594,7 @@ bool orbit::taskflow::checkGenericAIRMapping(const GenericAnalysis &a,
     llvm::raw_string_ostream actualStream(actualText), expectedStream(expectedText);
     module.print(actualStream); expected->print(expectedStream);
     if (actualText != expectedText)
-      return reject("AIR tiled operations differ from the checked source/phase/ABI/DMA schedule");
+      return reject("AIR operations differ from the checked source/phase/ABI/DMA schedule");
     return true;
   }
   auto identity = module->getAttrOfType<StringAttr>("orbit.mapping_plan");
@@ -765,7 +812,11 @@ bool channelEndpoints(const GenericAnalysis &a, const GenericMappingPlan &plan,
                       ModuleOp module, std::vector<CheckedChannel> &channels,
                       std::string &error) {
   auto reject=[&](const std::string &message) {error=message;return false;};
-  if (!checkGenericMapping(a,plan,error)) return false;
+  if (!checkGenericMapping(a,plan,error) || !checkProgramGraphSource(a,plan.communication,error)) return false;
+  auto graphIdentity=module->getAttrOfType<StringAttr>("orbit.program_graph");
+  if(!graphIdentity || graphIdentity.getValue()!=programGraphIdentity(plan.communication)) {
+    error="AIR channels do not bind the checked common program graph";return false;
+  }
   auto source=module->getAttrOfType<StringAttr>("orbit.source_fingerprint");
   auto identity=module->getAttrOfType<StringAttr>("orbit.mapping_plan");
   if (!source || source.getValue()!=a.bodyFingerprint || !identity || identity.getValue()!=plan.planId)
@@ -1062,15 +1113,58 @@ bool orbit::taskflow::checkGenericAIRChannels(const GenericAnalysis &a,
   return true;
 }
 
-static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
+static bool lowerGenericToAIRImpl(const GenericAnalysis &source,
                                         const GenericMappingPlan &plan,
                                         OwningOpRef<ModuleOp> &output,
                                         std::string &error,
                                         bool approximateExp,
                                         llvm::function_ref<LogicalResult(ModuleOp)> normalize,
                                         bool skipCheck) {
-  if (!checkGenericMapping(a, plan, error))
+  if (!checkGenericMapping(source, plan, error) ||
+      !checkDataOrganizationRealization(plan, error) ||
+      !checkProgramGraphSource(source,plan.communication,error) ||
+      !checkProgramGraph(plan.communication,error))
     return false;
+  // Backend capability, including legacy resident plans: target-owned names
+  // are arbitrary, while this installed implementation supports one colocated
+  // local SRAM at the explicitly declared physical coordinate only.
+  std::string targetComputeOwner,targetMemoryOwner;
+  if(!programResourceOwner(plan.memoryBinding.architecture,plan.memoryBinding.computeResource,targetComputeOwner,error) ||
+     !programMemoryOwner(plan.memoryBinding.architecture,plan.memoryBinding.localMemory,targetMemoryOwner,error))return false;
+  const auto *physicalDomain=programDomain(plan.memoryBinding.architecture,targetComputeOwner);
+  const auto *localDescription=programMemory(plan.memoryBinding.architecture,plan.memoryBinding.localMemory);
+  const auto *hostDescription=programMemory(plan.memoryBinding.architecture,plan.memoryBinding.hostMemory);
+  if(!physicalDomain || targetComputeOwner!=targetMemoryOwner ||
+     !physicalDomain->coordinates.count("column") || !physicalDomain->coordinates.count("row") ||
+     physicalDomain->coordinates.at("column")!=0 || physicalDomain->coordinates.at("row")!=2 ||
+     !localDescription || localDescription->kind!="local-sram" || !hostDescription || hostDescription->kind!="system-bo") {
+    error="AIR backend capability supports target-declared column=0,row=2 with colocated local-sram and system-bo endpoints; unsupported mappings are not remapped";return false;
+  }
+  if(!plan.targetCapabilities.acquireAllInputsAtGroupEntry) {
+    error="AIR backend capability requires acquire_all_inputs_at_group_entry=true";return false;
+  }
+  const auto &graph=plan.communication;
+  const auto &a=graph.source;
+  std::map<size_t,const MappingTaskInstance *> sourceInstances;
+  for(const auto &instance:graph.instances)
+    if(instance.kind=="source-task") sourceInstances.emplace(instance.phase,&instance);
+  auto commonPhase=[&](size_t pi) {
+    GenericTilePhase phase=plan.phases[pi];
+    auto found=sourceInstances.find(pi);
+    if(found==sourceInstances.end()) {error="AIR phase has no common source task instance";return phase;}
+    const auto &instance=*found->second;
+    phase.task=instance.task;phase.computationEvent=instance.event;phase.loops.clear();
+    for(const auto &domain:instance.domain) phase.loops.push_back({domain.loop,domain.lower,domain.upper});
+    return phase;
+  };
+  auto commonTransfer=[&](size_t phase,size_t storage,bool input) -> const MappingEvent * {
+    auto event=llvm::find_if(graph.events,[&](const auto &entry) {
+      return entry.kind=="transfer" && entry.phase==phase && entry.transferRegion &&
+          entry.transferRegion->storage==storage &&
+          entry.link==(input?plan.memoryBinding.inputLink:plan.memoryBinding.outputLink);
+    });
+    return event==graph.events.end()?nullptr:&*event;
+  };
   // The validated serial path has two independent tile DMA ports per
   // direction. The installed packet fan-in cannot yet be relied upon to
   // preserve independent BO stream boundaries across repeated phases when
@@ -1080,10 +1174,10 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     for(const auto &stage:plan.hardwareStages) {
       if(stage.endPhase-stage.beginPhase<=1) continue;
       std::set<size_t> incoming,outgoing;
-      for(const auto &transfer:plan.transfers) {
-        if(transfer.phase<stage.beginPhase || transfer.phase>=stage.endPhase) continue;
-        if(transfer.direction=="host_to_l1") incoming.insert(transfer.storage);
-        if(transfer.direction=="l1_to_host") outgoing.insert(transfer.storage);
+      for(const auto &event:graph.events) {
+        if(event.kind!="transfer" || !event.transferRegion || event.phase<stage.beginPhase || event.phase>=stage.endPhase) continue;
+        if(event.link==plan.memoryBinding.inputLink) incoming.insert(event.transferRegion->storage);
+        if(event.link==plan.memoryBinding.outputLink) outgoing.insert(event.transferRegion->storage);
       }
       if(incoming.size()>2 || outgoing.size()>2) {
         error="repeated serial-tiled AIR stage exceeds validated independent storage stream capability: at most two input and two output storages; packet fan-in across repeated phases is not validated";
@@ -1091,13 +1185,13 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       }
     }
   }
-  if(llvm::any_of(plan.taskImplementations,[](const auto &implementation) {
-       return implementation.kind=="scalar-product-vector-add-f32" && implementation.lanes!=8;
+  if(llvm::any_of(graph.instances,[](const auto &implementation) {
+       return implementation.implementation=="scalar-product-vector-add-f32" && implementation.lanes!=8;
      })) {
     error="mixed f32 implementation requires eight lanes on the installed AIR target; four-lane vector register legalization is unavailable";
     return false;
   }
-  if(llvm::any_of(plan.taskImplementations,[](const auto &implementation){return implementation.kind=="independent-lane-f32";})) {
+  if(llvm::any_of(graph.instances,[](const auto &implementation){return implementation.implementation=="independent-lane-f32";})) {
     error="independent-lane-f32 is unavailable on the validated AIR target: installed Peano cannot legalize strict f32 vector multiplication; BF16 emulation is not enabled";
     return false;
   }
@@ -1158,8 +1252,13 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
   b.setInsertionPointToEnd(output->getBody());
   SmallVector<Type> abiTypes(function.getArgumentTypes());
   if (plan.strategy == "serial-tiled")
-    for (auto &s : a.storages)
-      if (s.role == "temporary") abiTypes.push_back(s.root.getType());
+    for (size_t i = 0; i < a.storages.size(); ++i)
+      if (a.storages[i].role == "temporary" &&
+          llvm::any_of(graph.allocations, [&](const auto &allocation) {
+            return allocation.storage == i &&
+                   allocation.memory == plan.memoryBinding.hostMemory;
+          }))
+        abiTypes.push_back(a.storages[i].root.getType());
   auto fn = b.create<func::FuncOp>(loc, function.getName(),
                                    b.getFunctionType(abiTypes, {}));
   auto *entry = fn.addEntryBlock();
@@ -1181,63 +1280,132 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
   b.setInsertionPointToStart(&herd->getRegion(0).front());
   auto ha = herd->getRegion(0).front().getArguments().drop_front(4);
   Type token = OpaqueType::get(b.getStringAttr("air"), "async.token");
+  // Original function arguments keep their ABI positions. Only temporary
+  // storages that have a checked system-memory allocation receive extra BOs.
+  // A shared local intermediate is an ordinary pool/view, never an implicit BO.
+  std::vector<int64_t> externalArgument(a.storages.size(), -1);
+  size_t nextTemporaryArgument = function.getNumArguments();
+  for (size_t i = 0; i < a.storages.size(); ++i) {
+    if (auto arg = dyn_cast<BlockArgument>(a.storages[i].root))
+      externalArgument[i] = arg.getArgNumber();
+    else if (llvm::any_of(graph.allocations, [&](const auto &allocation) {
+               return allocation.storage == i &&
+                      allocation.memory == plan.memoryBinding.hostMemory;
+             }))
+      externalArgument[i] = nextTemporaryArgument++;
+  }
   if (plan.strategy == "serial-tiled") {
-    for (size_t stageIndex=0;stageIndex<plan.hardwareStages.size();++stageIndex) {
-    size_t stageBegin=plan.hardwareStages[stageIndex].beginPhase;
-    size_t stageEnd=plan.hardwareStages[stageIndex].endPhase;
-    auto locallyInitialized = [&](size_t storage) {
-      return llvm::any_of(plan.retainedRegions,[&](const auto &scope) {
-        return scope.beginPhase>=stageBegin && scope.endPhase<=stageEnd && scope.storage==storage && scope.initializerTask>=0;
-      });
+    if (graph.executionGroups.empty()) {
+      error = "AIR tiled realization requires explicit common execution groups";
+      return false;
+    }
+    for (size_t stageIndex=0;stageIndex<graph.executionGroups.size();++stageIndex) {
+    const auto &executionGroup = graph.executionGroups[stageIndex];
+    size_t stageBegin=executionGroup.beginPhase;
+    size_t stageEnd=executionGroup.endPhase;
+    std::string computeOwner, memoryOwner;
+    if (!programResourceOwner(plan.memoryBinding.architecture,
+          executionGroup.resource, computeOwner, error) ||
+        !programMemoryOwner(plan.memoryBinding.architecture,
+          executionGroup.memory, memoryOwner, error)) return false;
+    const auto *domain = programDomain(plan.memoryBinding.architecture, computeOwner);
+    auto coordinate = [&](llvm::StringRef axis) -> int64_t {
+      if (!domain) return -1;
+      auto found = domain->coordinates.find(axis.str());
+      return found == domain->coordinates.end() ? -1 : found->second;
     };
+    if (executionGroup.spatialOwner != computeOwner || memoryOwner != computeOwner ||
+        coordinate("column") != 0 || coordinate("row") != 2) {
+      error = "AIR backend capability requires colocated target compute/local-memory owners with declared column=0,row=2; other positions are not remapped";
+      return false;
+    }
+    SmallVector<int64_t> groupMembers(executionGroup.memberEvents.begin(),
+                                     executionGroup.memberEvents.end());
+    herd->setAttr("orbit.execution_group", b.getI64IntegerAttr(stageIndex));
+    herd->setAttr("orbit.group_members", b.getDenseI64ArrayAttr(groupMembers));
+    herd->setAttr("orbit.spatial_owner", b.getStringAttr(executionGroup.spatialOwner));
+    for (size_t pi = stageBegin; pi < stageEnd; ++pi) {
+      auto instance = sourceInstances.find(pi);
+      if (instance == sourceInstances.end() ||
+          !llvm::is_contained(executionGroup.memberEvents, instance->second->event)) {
+        error = "AIR phase computation is not owned by its common execution group";
+        return false;
+      }
+      const auto &firstTask = a.tasks[plan.phases[stageBegin].task];
+      const auto &task = a.tasks[plan.phases[pi].task];
+      if (task.loops.size() != firstTask.loops.size() ||
+          plan.taskLoopOrders[plan.phases[pi].task] !=
+              plan.taskLoopOrders[plan.phases[stageBegin].task]) {
+        error = "AIR grouped task instances require one checked loop-coordinate system";
+        return false;
+      }
+    }
     SmallVector<Value> external(a.storages.size());
-    size_t scratch = function.getNumArguments();
     for (size_t i = 0; i < a.storages.size(); ++i) {
-      auto arg = dyn_cast<BlockArgument>(a.storages[i].root);
-      external[i] = ha[arg ? arg.getArgNumber() : scratch++];
+      if (externalArgument[i] >= 0)
+        external[i] = ha[externalArgument[i]];
+    }
+    for (const auto &event : graph.events) {
+      if (event.kind != "transfer" || !event.transferRegion ||
+          event.phase < stageBegin || event.phase >= stageEnd ||
+          (event.link != plan.memoryBinding.inputLink &&
+           event.link != plan.memoryBinding.outputLink))
+        continue;
+      if (!external[event.transferRegion->storage]) {
+        error = "AIR common boundary transfer has no checked external BO allocation";
+        return false;
+      }
     }
     // Keep distinct storage pools in each hardware stage. Reuse them only
     // across serial tiles of that stage; host BOs carry stage boundaries.
-    auto readonlyScopeOf=[&](size_t phase,size_t storage) -> const GenericReadOnlyRetention * {
-      auto found=llvm::find_if(plan.readOnlyRetentions,[&](const auto &scope){return scope.storage==storage && scope.beginPhase<=phase && phase<scope.endPhase;});
-      return found==plan.readOnlyRetentions.end()?nullptr:&*found;
-    };
-    auto storagePoolBase = [](size_t storage) { return "storage-" + std::to_string(storage) + ".data"; };
-    auto storagePoolKey = [&](const GenericTileRegion &r, const GenericTilePhase &phase) {
-      std::string key=storagePoolBase(r.storage);
-      if (r.read && !r.write) {
-        key += ".input";
-        for (auto n:r.sizes) key += "." + std::to_string(n);
-        key += ".loops";
-        for (auto &bound:phase.loops) key += "." + std::to_string(bound.upper-bound.lower);
+    // Common allocation identities and capacities are authoritative. Native
+    // phases describe source tiling/compression, never choose another pool.
+    auto commonPoolKey=[&](size_t phase,size_t storage,bool incoming=false) -> std::string {
+      const std::vector<size_t> *copies=nullptr;
+      if(incoming) {
+        if(auto event=commonTransfer(phase,storage,true)) copies=&event->writes;
+      } else {
+        auto instance=sourceInstances.find(phase);
+        if(instance!=sourceInstances.end()) {
+          const auto &event=graph.events[instance->second->event];
+          for(const auto *list:{&event.writes,&event.reads})
+            if(llvm::any_of(*list,[&](size_t id){return graph.allocations[graph.copies[id].allocation].storage==storage;})) {copies=list;break;}
+        }
       }
+      std::string key;
+      if(copies) for(size_t id:*copies) {
+        const auto &allocation=graph.allocations[graph.copies[id].allocation];
+        if(allocation.storage!=storage || allocation.memory!=plan.memoryBinding.localMemory) continue;
+        if(!key.empty() && key!=allocation.key) {error="AIR source access spans multiple common local allocations";return {};}
+        key=allocation.key;
+      }
+      if(key.empty()) error="AIR source access has no common local copy allocation";
       return key;
     };
-    std::map<std::string, int64_t> poolElements;
-    std::map<std::string, Type> poolTypes;
-    std::map<std::string, size_t> poolStorages;
-    std::map<std::string, Value> pools;
-    for (size_t phaseIndex = stageBegin; phaseIndex < stageEnd; ++phaseIndex) {
-      auto &phase = plan.phases[phaseIndex];
-      std::map<std::string, int64_t> used;
-      for (auto &r : phase.regions) {
-        auto &storage = a.storages[r.storage];
-        int64_t count = 1;
-        for (auto n : r.sizes) count *= n;
-        auto poolKey=storagePoolKey(r,phase);
-        if(auto scope=readonlyScopeOf(phaseIndex,r.storage)) {
-          poolKey=storagePoolBase(r.storage)+".readonly-panel";count=1;for(auto n:scope->sizes) count*=n;
-        }
-        used[poolKey] += count;
-        poolStorages[poolKey] = r.storage;
-        poolTypes[poolKey] = cast<MemRefType>(storage.root.getType()).getElementType();
-        if (r.read && r.write && !locallyInitialized(r.storage)) {
-          used[storagePoolBase(r.storage) + ".incoming"] += count;
-          poolStorages[storagePoolBase(r.storage) + ".incoming"] = r.storage;
-          poolTypes[storagePoolBase(r.storage) + ".incoming"] = poolTypes[storagePoolBase(r.storage)];
-        }
+    std::map<std::string,int64_t> poolElements;
+    std::map<std::string,Type> poolTypes;
+    std::map<std::string,size_t> poolStorages;
+    std::map<std::string,Value> pools;
+    for(const auto &allocation:graph.allocations) {
+      if(allocation.memory!=plan.memoryBinding.localMemory || allocation.endPhase<=stageBegin || allocation.beginPhase>=stageEnd) continue;
+      if (allocation.addressing != "reusable-slot") {
+        error = "AIR tiled local pool requires checked reusable-slot addressing";
+        return false;
       }
-      for (auto &[dtype, count] : used) poolElements[dtype] = std::max(poolElements[dtype], count);
+      if (allocation.spatialOwner != executionGroup.spatialOwner) {
+        error = "AIR local allocation owner differs from its common execution group";
+        return false;
+      }
+      if(allocation.beginPhase!=stageBegin || allocation.endPhase!=stageEnd) {
+        error="AIR common pool lifetime must equal its checked hardware stage";return false;
+      }
+      auto type=cast<MemRefType>(graph.source.storages[allocation.storage].root.getType()).getElementType();
+      int64_t bytes=(type.getIntOrFloatBitWidth()+7)/8;
+      if(allocation.bytes<=0 || allocation.bytes%bytes || poolElements.count(allocation.key)) {
+        error="AIR common allocation has invalid size or duplicate stage key";return false;
+      }
+      poolElements[allocation.key]=allocation.bytes/bytes;
+      poolTypes[allocation.key]=type;poolStorages[allocation.key]=allocation.storage;
     }
     int64_t poolBytes = 0;
     for (auto &[dtype, count] : poolElements)
@@ -1249,6 +1417,8 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     for (auto &[dtype, count] : poolElements) {
       auto type = MemRefType::get({count}, poolTypes[dtype], MemRefLayoutAttrInterface{}, b.getI32IntegerAttr(2));
       auto alloc = b.create<memref::AllocOp>(loc, type);
+      auto allocation=llvm::find_if(graph.allocations,[&](const auto &entry){return entry.key==dtype && entry.memory==plan.memoryBinding.localMemory && entry.beginPhase==stageBegin;});
+      alloc->setAttr("orbit.allocation",b.getI64IntegerAttr(std::distance(graph.allocations.begin(),allocation)));
       alloc->setAttr("orbit.tile_pool", b.getStringAttr(dtype));
       alloc->setAttr("orbit.storage_index", b.getI64IntegerAttr(poolStorages[dtype]));
       if (moduleChannelConversion)
@@ -1280,35 +1450,57 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       b.create<memref::StoreOp>(loc,value,destination,indices);
       if (!loops.empty()) b.setInsertionPointAfter(loops.front());
     };
-    struct Shifts { Value dependency; std::vector<Value> loops, retained; std::vector<std::vector<Value>> regions; std::vector<const GenericReadOnlyRetention *> readonly; std::vector<std::vector<Value>> readonlyShifts; };
-    auto implementationOf=[&](size_t task) -> const GenericTaskImplementation * {
-      auto found=llvm::find_if(plan.taskImplementations,[&](const auto &impl){return impl.task==task;});
-      return found==plan.taskImplementations.end()?nullptr:&*found;
+    struct Shifts { Value dependency; std::vector<bool> preloaded; std::vector<Value> loops, retained; std::vector<std::vector<Value>> regions; std::vector<const GenericReadOnlyRetention *> readonly; std::vector<std::vector<Value>> readonlyShifts; };
+    auto implementationOf=[&](const MappingTaskInstance &instance) {
+      GenericTaskImplementation result;
+      result.task=instance.task;result.kind=instance.implementation;
+      result.parallelLoop=instance.parallelLoop;result.lanes=instance.lanes;return result;
     };
-    auto emitPhase = [&](size_t pi, const Shifts &shifts) {
-      auto &phase = plan.phases[pi];
+    auto emitPhaseOutputs = [&](size_t pi, const Shifts &shifts, Value complete) {
+      auto phase=commonPhase(pi);
+      SmallVector<Value> outgoing;
+      for (auto &r : phase.regions)
+        if (commonTransfer(pi,r.storage,false) && !shifts.retained[r.storage]) {
+          Value local=tileView(r,pi,commonPoolKey(pi,r.storage));
+          outgoing.push_back(tileDMA(b,token,external[r.storage],local,r,false,
+              {complete},a.storages[r.storage].id,pi,
+              shifts.regions[r.storage],&a,&plan,&error));
+        }
+      return outgoing.empty() ? complete
+          : make(b,"air.wait_all",outgoing,{token})->getResult(0);
+    };
+    auto emitPhase = [&](size_t pi, const Shifts &shifts, bool exportOutputs) {
+
+      auto phase=commonPhase(pi);
+      auto implementation=implementationOf(*sourceInstances.at(pi));
       SmallVector<Value> local(a.storages.size()), incoming;
       SmallVector<std::pair<Value,GenericTileRegion>> staged;
       for (auto &r : phase.regions) {
         if (shifts.retained[r.storage]) { local[r.storage]=shifts.retained[r.storage]; continue; }
-        Value view=tileView(r,pi,storagePoolKey(r,phase));
+        Value view=tileView(r,pi,commonPoolKey(pi,r.storage));
         local[r.storage]=view;
-        if (r.read) {
+        if (commonTransfer(pi,r.storage,true) &&
+            (shifts.preloaded.empty() || !shifts.preloaded[r.storage])) {
           Value input=view;
           if (r.write) {
-            input=tileView(r,pi,storagePoolBase(r.storage) + ".incoming");
+            input=tileView(r,pi,commonPoolKey(pi,r.storage,true));
             staged.push_back({input,r});
           }
           incoming.push_back(tileDMA(b,token,external[r.storage],input,r,true,{shifts.dependency},a.storages[r.storage].id,pi,shifts.regions[r.storage],&a,&plan,&error));
         }
       }
+      if (shifts.dependency && !llvm::is_contained(incoming, shifts.dependency))
+        incoming.insert(incoming.begin(), shifts.dependency);
       auto *start = make(b, "air.wait_all", incoming);
       start->setAttr("orbit.phase", b.getI64IntegerAttr(pi));
       SmallVector<int64_t> phaseDeps(phase.dependencies.begin(), phase.dependencies.end());
       start->setAttr("orbit.phase_dependencies", b.getDenseI64ArrayAttr(phaseDeps));
       start->setAttr("orbit.task", b.getStringAttr(a.tasks[phase.task].id));
       start->setAttr("orbit.computation_event",b.getI64IntegerAttr(phase.computationEvent));
-      const auto &event=plan.communication.events[phase.computationEvent];
+      const auto &event=graph.events[phase.computationEvent];
+      start->setAttr("orbit.source_instance",b.getI64IntegerAttr(sourceInstances.at(pi)-graph.instances.data()));
+      SmallVector<int64_t> commonDependencies(event.dependencies.begin(),event.dependencies.end());
+      start->setAttr("orbit.public_dependencies",b.getDenseI64ArrayAttr(commonDependencies));
       SmallVector<int64_t> reads(event.reads.begin(),event.reads.end()), writes(event.writes.begin(),event.writes.end());
       start->setAttr("orbit.read_copies",b.getDenseI64ArrayAttr(reads));
       start->setAttr("orbit.write_copies",b.getDenseI64ArrayAttr(writes));
@@ -1319,12 +1511,9 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
         r.offsets=shifts.readonly[r.storage]->offsets;r.sizes=shifts.readonly[r.storage]->sizes;
         effectiveShifts[r.storage]=shifts.readonlyShifts[r.storage];
       }
-      emitTileBody(b, a, effective, local, shifts.loops, effectiveShifts,implementationOf(phase.task),&error);
-      SmallVector<Value> outgoing;
-      for (auto &r : phase.regions)
-        if (r.write && !shifts.retained[r.storage]) outgoing.push_back(tileDMA(b, token, external[r.storage], local[r.storage], r, false, {shifts.dependency}, a.storages[r.storage].id, pi, shifts.regions[r.storage],&a,&plan,&error));
-      if (outgoing.empty()) outgoing.push_back(shifts.dependency);
-      return make(b, "air.wait_all", outgoing, {token})->getResult(0);
+      emitTileBody(b, a, effective, local, shifts.loops, effectiveShifts,&implementation,&error);
+      return exportOutputs ? emitPhaseOutputs(pi,shifts,shifts.dependency)
+                           : shifts.dependency;
     };
     // Compress only consecutive, exactly translation-equivalent source tiles.
     // Every candidate is compared against the checked finite schedule, so this
@@ -1336,7 +1525,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       for(const auto &scope:plan.readOnlyRetentions)
         if(scope.beginPhase==begin && scope.endPhase==end && !active.retained[scope.storage]) {
           GenericTileRegion region{scope.storage,scope.offsets,scope.sizes,true,false};
-          Value panel=tileView(region,begin,storagePoolBase(scope.storage)+".readonly-panel");
+          Value panel=tileView(region,begin,commonPoolKey(begin,scope.storage));
           Value imported=tileDMA(b,token,external[scope.storage],panel,region,true,{active.dependency},a.storages[scope.storage].id,begin,active.regions[scope.storage],&a,&plan,&error);
           imported.getDefiningOp()->setAttr("orbit.readonly_retained_begin",b.getI64IntegerAttr(begin));
           imported.getDefiningOp()->setAttr("orbit.readonly_retained_end",b.getI64IntegerAttr(end));
@@ -1348,20 +1537,31 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       for (const auto &scope : plan.retainedRegions)
         if (scope.beginPhase==begin && scope.endPhase==end && !active.retained[scope.storage]) {
           auto region=llvm::find_if(first.regions,[&](const auto &r) {return r.storage==scope.storage;});
-          Value output=tileView(*region,begin,storagePoolBase(scope.storage));
+          Value output=tileView(*region,begin,commonPoolKey(begin,scope.storage));
           if (scope.initializerTask >= 0) {
             GenericTilePhase initialization;
-            initialization.task=scope.initializerTask;
+            auto instance=llvm::find_if(graph.instances,[&](const auto &entry) {
+              return entry.phase==begin && entry.task==size_t(scope.initializerTask) && entry.kind!="source-task";
+            });
+            if(instance==graph.instances.end()) {error="AIR retained initialization has no common task instance";return active.dependency;}
+            initialization.task=instance->task;
             initialization.regions.push_back(*region);
-            auto &initializer=a.tasks[scope.initializerTask];
-            for(size_t l=0;l<initializer.loops.size();++l)
-              initialization.loops.push_back({l,first.loops[l].lower,first.loops[l].upper});
+            auto &initializer=graph.source.tasks[instance->task];
+            // Initializer instances carry the controlling update domain. The
+            // checked source-initializer projection uses its actual loop prefix
+            // once, never repeats initialization along the reduction axis.
+            for(const auto &domain:instance->domain)
+              if(domain.loop<initializer.loops.size())
+                initialization.loops.push_back({domain.loop,domain.lower,domain.upper});
+            auto implementation=implementationOf(*instance);
             SmallVector<Value> initialized(a.storages.size());
             initialized[scope.storage]=output;
-            emitTileBody(b,a,initialization,initialized,active.loops,active.regions,implementationOf(initialization.task),&error);
+            emitTileBody(b,a,initialization,initialized,active.loops,active.regions,&implementation,&error);
             output.getDefiningOp()->setAttr("orbit.initializer_task",b.getStringAttr(initializer.id));
+            output.getDefiningOp()->setAttr("orbit.source_instance",b.getI64IntegerAttr(std::distance(graph.instances.begin(),instance)));
+            output.getDefiningOp()->setAttr("orbit.initialization_event",b.getI64IntegerAttr(instance->event));
           } else {
-            Value input=tileView(*region,begin,storagePoolBase(scope.storage) + ".incoming");
+            Value input=tileView(*region,begin,commonPoolKey(begin,scope.storage,true));
             Value transferred=tileDMA(b,token,external[scope.storage],input,*region,true,{active.dependency},a.storages[scope.storage].id,begin,active.regions[scope.storage],&a,&plan,&error);
             make(b,"air.wait_all",{transferred});
             copyTile(input,output,*region);
@@ -1381,7 +1581,52 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
         }
         return exported.empty() ? complete : make(b,"air.wait_all",exported,{token})->getResult(0);
       };
-      if (depth == first.loops.size()) return finishRetention(emitPhase(begin, active));
+      if (depth == first.loops.size()) {
+        // A block leaf may own several actual task instances sharing one copy.
+        bool sharedBlock=llvm::any_of(
+            ArrayRef<GenericTilePhase>(plan.phases).slice(begin,end-begin),
+            [&](const auto &phase) { return phase.task!=first.task; });
+        // A public all-input-entry refinement is observable causality, not
+        // merely a declaration. If a later task introduces another boundary
+        // input, issue that real DMA before the first body and await every
+        // input token there. Keep its local view available to its actual user;
+        // emitPhase must not silently perform a second import.
+        const auto *residencyScope=genericResidencyScope(plan,begin);
+        if(residencyScope && residencyScope->inputReleasePolicy=="last-reader") {
+          active.preloaded.assign(a.storages.size(),false);
+          SmallVector<Value> entryTokens{active.dependency};
+          for(size_t pi=begin;pi<end;++pi)
+            for(const auto &region:plan.phases[pi].regions)
+              if(commonTransfer(pi,region.storage,true)) {
+                if(active.preloaded[region.storage]) {
+                  error="AIR block input requires a distinct checked shared-input implementation";
+                  return active.dependency;
+                }
+                Value local=tileView(region,pi,commonPoolKey(pi,region.storage,true));
+                entryTokens.push_back(tileDMA(b,token,external[region.storage],local,
+                    region,true,{active.dependency},a.storages[region.storage].id,pi,
+                    active.regions[region.storage],&a,&plan,&error));
+                active.preloaded[region.storage]=true;
+              }
+          active.dependency=make(b,"air.wait_all",entryTokens,{token})->getResult(0);
+        }
+        Value complete = active.dependency;
+        for (size_t pi = begin; pi < end; ++pi) {
+          Shifts sequential = active;
+          sequential.dependency = complete;
+          complete = emitPhase(pi, sequential, !sharedBlock);
+        }
+        if (sharedBlock) {
+          // The common group releases output buffers after its last compute.
+          // Emit every member body before any output DMA; keep the two output
+          // streams independent rather than creating a B-export -> C edge.
+          SmallVector<Value> exported;
+          for (size_t pi=begin;pi<end;++pi)
+            exported.push_back(emitPhaseOutputs(pi,active,complete));
+          complete=make(b,"air.wait_all",exported,{token})->getResult(0);
+        }
+        return finishRetention(complete);
+      }
       size_t scheduleLoop=plan.taskLoopOrders[first.task][depth];
       std::vector<std::pair<size_t,size_t>> children;
       for (size_t i = begin; i < end;) {
@@ -1398,17 +1643,43 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
         std::vector<int64_t> loopDelta(first.loops.size());
         std::vector<std::vector<int64_t>> regionDelta(a.storages.size());
         if (child + 1 < children.size()) {
-          auto &x = plan.phases[children[child].first];
-          auto &y = plan.phases[children[child+1].first];
-          for (size_t l = 0; l < x.loops.size(); ++l) loopDelta[l] = y.loops[l].lower - x.loops[l].lower;
-          for (size_t r = 0; r < x.regions.size(); ++r) {
-            auto &xr=x.regions[r]; auto &yr=y.regions[r];
-            if (xr.storage != yr.storage || xr.offsets.size() != yr.offsets.size()) continue;
-            regionDelta[xr.storage].resize(xr.offsets.size());
-            for (size_t d=0;d<xr.offsets.size();++d) regionDelta[xr.storage][d]=yr.offsets[d]-xr.offsets[d];
+          bool patternCompatible =
+              children[child+1].second-children[child+1].first == width;
+          std::vector<bool> regionKnown(a.storages.size(), false);
+          // Include all members of a repeated P/B/C pattern. Its producer's
+          // regions alone do not describe consumer-only output coordinate shifts.
+          for (size_t j = 0; j < width && patternCompatible; ++j) {
+            auto &x = plan.phases[children[child].first+j];
+            auto &y = plan.phases[children[child+1].first+j];
+            patternCompatible = x.task == y.task &&
+                x.loops.size() == y.loops.size() &&
+                x.regions.size() == y.regions.size();
+            for (size_t l = 0; l < x.loops.size() && patternCompatible; ++l) {
+              int64_t delta = y.loops[l].lower-x.loops[l].lower;
+              if (!j) loopDelta[l] = delta;
+              patternCompatible &= delta == loopDelta[l] &&
+                  y.loops[l].upper-x.loops[l].upper == delta;
+            }
+            for (size_t r = 0; r < x.regions.size() && patternCompatible; ++r) {
+              auto &xr = x.regions[r]; auto &yr = y.regions[r];
+              patternCompatible &= xr.storage == yr.storage &&
+                  xr.offsets.size() == yr.offsets.size() &&
+                  xr.sizes == yr.sizes && xr.read == yr.read &&
+                  xr.write == yr.write;
+              if (!patternCompatible) break;
+              std::vector<int64_t> delta(xr.offsets.size());
+              for (size_t d = 0; d < delta.size(); ++d)
+                delta[d] = yr.offsets[d]-xr.offsets[d];
+              if (regionKnown[xr.storage])
+                patternCompatible &= regionDelta[xr.storage] == delta;
+              else {
+                regionKnown[xr.storage] = true;
+                regionDelta[xr.storage] = std::move(delta);
+              }
+            }
           }
           for (size_t next=child+1;next<children.size();++next) {
-            bool equivalent=children[next].second-children[next].first==width;
+            bool equivalent=patternCompatible && children[next].second-children[next].first==width;
             int64_t factor=next-child;
             for (size_t j=0;j<width && equivalent;++j) {
               auto &base=plan.phases[children[child].first+j];
@@ -1456,9 +1727,8 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       }
       return finishRetention(completion);
     };
-    for (size_t begin=stageBegin;begin<stageEnd;) {
-      size_t end=begin+1;
-      while(end<stageEnd && plan.phases[end].task==plan.phases[begin].task) ++end;
+    {
+      size_t begin=stageBegin, end=stageEnd;
       Shifts shifts;
       shifts.dependency = make(b, "air.wait_all", {}, {token})->getResult(0);
       shifts.loops.resize(a.tasks[plan.phases[begin].task].loops.size());
@@ -1469,7 +1739,6 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
       for(size_t r=0;r<a.storages.size();++r) shifts.regions[r].resize(a.storages[r].shape.size());
       Value complete = emitRange(begin,end,0,shifts);
       make(b, "air.wait_all", {complete});
-      begin=end;
     }
     // The target allocates these L1 pools statically for the whole stage.
     // Its channel dependency importer cannot reconnect an end-of-stage
@@ -1478,14 +1747,14 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     // allocation lifetime here, including stages without port-pinning needs.
     if (!moduleChannelConversion)
       for (auto &[dtype, pool] : pools) b.create<memref::DeallocOp>(loc, pool);
-    if (stageIndex + 1 < plan.hardwareStages.size()) {
+    if (stageIndex + 1 < graph.executionGroups.size()) {
       make(b, "air.herd_terminator");
       b.setInsertionPointAfter(herd);
       if (herd->getNumResults()) make(b, "air.wait_all", {herd->getResult(0)});
       make(b, "air.segment_terminator");
       b.setInsertionPointAfter(segment); make(b, "air.launch_terminator");
       b.setInsertionPointAfter(launch);
-      std::string suffix = std::to_string(plan.hardwareStages[stageIndex+1].beginPhase);
+      std::string suffix = std::to_string(graph.executionGroups[stageIndex+1].beginPhase);
       launch = hierarchy(b, "air.launch", "orbit_launch_" + suffix, {c1,c1}, args);
       b.setInsertionPointToStart(&launch->getRegion(0).front());
       SmallVector<Value> stageArgs(launch->getRegion(0).front().getArguments().drop_front(4));
@@ -1507,24 +1776,32 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     auto lt =
         MemRefType::get(t.getShape(), t.getElementType(),
                         MemRefLayoutAttrInterface{}, b.getI32IntegerAttr(2));
+    auto allocation=llvm::find_if(graph.allocations,[&](const auto &entry){return entry.storage==i && entry.memory==plan.memoryBinding.localMemory;});
+    if(allocation==graph.allocations.end() || allocation->bytes!=lt.getNumElements()*((lt.getElementType().getIntOrFloatBitWidth()+7)/8)) {
+      error="resident AIR allocation differs from common local storage";return false;
+    }
     auto alloc = b.create<memref::AllocOp>(loc, lt);
+    alloc->setAttr("orbit.allocation",b.getI64IntegerAttr(std::distance(graph.allocations.begin(),allocation)));
+    alloc->setAttr("orbit.tile_pool",b.getStringAttr(allocation->key));
     alloc->setAttr("orbit.storage", b.getStringAttr(s.id));
     local[i] = alloc;
-    if (s.role == "input") {
+    if (auto event=commonTransfer(0,i,true)) {
       auto ba = dyn_cast<BlockArgument>(s.root);
       if (!ba) {
         error = "input storage must be function argument";
         return false;
       }
-      Value imported=dma(b,token,local[i],ha[ba.getArgNumber()],{},s.id,"host_to_l1");
-      auto transfer=llvm::find_if(plan.transfers,[&](const auto &entry){return entry.storage==i && entry.direction=="host_to_l1";});
-      if(transfer==plan.transfers.end() || !bindDMACopies(b,a,plan,imported.getDefiningOp(),ha[ba.getArgNumber()],local[i],*transfer,error)) return false;
+      const auto &region=*event->transferRegion;
+      GenericTileRegion demand{region.storage,region.offsets,region.sizes,true,false};
+      Value imported=tileDMA(b,token,ha[ba.getArgNumber()],local[i],demand,true,{},s.id,event->phase,{},&a,&plan,&error);
+      if(!error.empty())return false;
       pending.push_back(imported);
     }
   }
   Value previous;
-  for (size_t ti : plan.orderedTasks) {
-    auto &t = a.tasks[ti];
+  for (const auto &[phase,instance] : sourceInstances) {
+    auto &t = graph.source.tasks[instance->task];
+    if(instance->implementation!="scalar") {error="resident AIR common task implementation requires scalar realization";return false;}
     SmallVector<Value> deps;
     if (previous)
       deps.push_back(previous);
@@ -1536,6 +1813,13 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
     // AIR then derives loop/DMA async edges from the real memory effects.
     auto *start = make(b, "air.wait_all", deps);
     start->setAttr("orbit.task", b.getStringAttr(t.id));
+    start->setAttr("orbit.computation_event",b.getI64IntegerAttr(instance->event));
+    start->setAttr("orbit.source_instance",b.getI64IntegerAttr(instance-graph.instances.data()));
+    const auto &event=graph.events[instance->event];
+    SmallVector<int64_t> commonReads(event.reads.begin(),event.reads.end()),commonWrites(event.writes.begin(),event.writes.end()),commonDeps(event.dependencies.begin(),event.dependencies.end());
+    start->setAttr("orbit.read_copies",b.getDenseI64ArrayAttr(commonReads));
+    start->setAttr("orbit.write_copies",b.getDenseI64ArrayAttr(commonWrites));
+    start->setAttr("orbit.public_dependencies",b.getDenseI64ArrayAttr(commonDeps));
     SmallVector<int64_t> sourceDeps(t.dependencies.begin(),
                                     t.dependencies.end());
     start->setAttr("orbit.source_dependencies",
@@ -1554,15 +1838,16 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
   }
   SmallVector<Value> final;
   for (size_t i = 0; i < a.storages.size(); ++i)
-    if (a.storages[i].role == "output") {
+    if (auto event=commonTransfer(sourceInstances.rbegin()->first,i,false)) {
       auto ba = dyn_cast<BlockArgument>(a.storages[i].root);
       if (!ba) {
         error = "output storage must be function argument";
         return false;
       }
-      Value exported=dma(b,token,ha[ba.getArgNumber()],local[i],{previous},a.storages[i].id,"l1_to_host");
-      auto transfer=llvm::find_if(plan.transfers,[&](const auto &entry){return entry.storage==i && entry.direction=="l1_to_host";});
-      if(transfer==plan.transfers.end() || !bindDMACopies(b,a,plan,exported.getDefiningOp(),ha[ba.getArgNumber()],local[i],*transfer,error)) return false;
+      const auto &region=*event->transferRegion;
+      GenericTileRegion demand{region.storage,region.offsets,region.sizes,false,true};
+      Value exported=tileDMA(b,token,ha[ba.getArgNumber()],local[i],demand,false,{previous},a.storages[i].id,event->phase,{},&a,&plan,&error);
+      if(!error.empty())return false;
       final.push_back(exported);
     }
   if (final.empty() && previous)
@@ -1579,18 +1864,22 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &a,
   make(b, "air.launch_terminator");
   b.setInsertionPointAfter(launch);
   b.create<func::ReturnOp>(loc);
+  output->getOperation()->setAttr("orbit.program_graph",b.getStringAttr(programGraphIdentity(graph)));
+  output->getOperation()->setAttr("orbit.graph_schedule_realization",b.getStringAttr("common execution groups and explicit copy/release dependencies; source compute order preserved; conservative timing reservations are separate from runtime arbitration"));
   output->getOperation()->setAttr("orbit.source_fingerprint",
                                   b.getStringAttr(a.bodyFingerprint));
   output->getOperation()->setAttr("orbit.mapping_plan",
                                   b.getStringAttr(plan.planId));
   output->getOperation()->setAttr("orbit.data_organization",
                                   b.getStringAttr(plan.choices.dataOrganization));
+  output->getOperation()->setAttr("orbit.data_organization_realization",
+                                  b.getStringAttr(plan.choices.residency));
   output->getOperation()->setAttr("orbit.data_organization_scope",
-      b.getStringAttr(plan.choices.dataOrganization=="retain-across-users"
-        ? "readonly users within a single execution group; no cross-stage SRAM retention"
-        : "phase-local input copies; source output/reduction lifetime preserved"));
-  if(llvm::any_of(plan.taskImplementations,[](const auto &implementation) {
-       return implementation.kind=="scalar-product-vector-add-f32";
+      b.getStringAttr(plan.strategy == "single-herd-resident"
+        ? "whole-program local copies; intermediate and input copies shared by all consumers in one herd"
+: "checked execution-group local allocations and copy users; no cross-group SRAM retention"));
+  if(llvm::any_of(graph.instances,[](const auto &implementation) {
+       return implementation.implementation=="scalar-product-vector-add-f32";
      })) {
     output->getOperation()->setAttr("orbit.f32_lane_legalization",b.getStringAttr(
         "scalar-product-vector-add-f32; scalar compiler-rt mul/div; source-ordered vector add/sub; no FMA/BF16"));

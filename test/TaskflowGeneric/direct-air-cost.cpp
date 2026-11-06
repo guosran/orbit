@@ -1,4 +1,5 @@
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/GenericProgramTiming.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -7,6 +8,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cmath>
@@ -61,6 +63,25 @@ int main(int argc,char **argv) {
   };
   expect(apply(m) && checkGenericMapping(a,planned,error),"checked opt-in plan");
   auto original=planned;
+  auto five=model();
+  five.getAsObject()->getArray("terms")->push_back(llvm::json::Object{
+      {"feature","source_scalar_reads"},{"coefficient_ms",0.0002}});
+  expect(apply(five) && planned.hasCost && std::abs(planned.estimatedMs-0.6584)<1e-12,
+      "five-term implementation-class composite");
+  llvm::json::Value timing=nullptr;
+  expect(evaluateGenericProgramTiming(a,planned,timing,error),"same graph native timing bridge");
+  auto *full=timing.getAsObject()?timing.getAsObject()->getObject("complete_invocation"):nullptr;
+  expect(full && full->getNumber("makespan_ms") &&
+      std::abs(*full->getNumber("makespan_ms")-planned.estimatedMs)<1e-12 &&
+      full->getArray("activities")->size()==1 && full->getArray("unknowns")->empty(),
+      "whole invocation explicitly covers all native events and submit boundary once");
+  expect(timing.getAsObject()->getString("graph_id")==programGraphIdentity(plain.communication),
+      "price leaves public graph identity unchanged");
+  expect(evaluateGenericProgramTiming(a,plain,timing,error) &&
+      !timing.getAsObject()->getObject("complete_invocation")->getNumber("makespan_ms") &&
+      !timing.getAsObject()->getObject("internal_mechanisms")->getArray("unknowns")->empty(),
+      "unknown native timing retains internal diagnostics");
+  expect(apply(m),"restore original four-term plan");
   expect(planned.planId!=plain.planId && planned.hasCost,"model bound to identity");
   auto report=serializeGenericMapping(a,planned);
   expect(report.getAsObject()->get("theoretical_coefficients")->kind()==llvm::json::Value::Null,"composite not legacy theory");
@@ -74,7 +95,7 @@ int main(int argc,char **argv) {
   mutation("provider value mutation",[](auto &p){p.directCost.valueMs=7;});
   auto bad=[&](const char *name,auto change){auto v=model();change(*v.getAsObject());expect(!evaluateGenericDirectAIRCost(f,v,target,c,error),name);};
   bad("negative coefficient",[](auto &v){(*v.getArray("terms"))[0].getAsObject()->operator[]("coefficient_ms")=-1.0;});
-  bad("too many terms",[](auto &v){v.getArray("terms")->push_back(llvm::json::Value((*v.getArray("terms"))[0]));});
+  bad("too many terms",[](auto &v){for(const char *key:{"source_scalar_reads","source_scalar_writes","source_f32_product_operations","source_math_exp_f32_operations","active_compute_events"})v.getArray("terms")->push_back(llvm::json::Object{{"feature",key},{"coefficient_ms",0.001}});});
   bad("duplicate term",[](auto &v){(*v.getArray("terms"))[1]=llvm::json::Value((*v.getArray("terms"))[0]);});
   bad("unknown feature",[](auto &v){(*v.getArray("terms"))[0].getAsObject()->operator[]("feature")="unknown";});
   bad("missing provenance",[](auto &v){v.erase("training_manifest_digest");});
@@ -116,8 +137,12 @@ int main(int argc,char **argv) {
   sameUnpriced.estimatedMs=99;sameUnpriced.theoreticalPerByteMs=7;sameUnpriced.costProvenance="different price";
   GenericCostFeatures unchanged;
   expect(collectGenericCostFeatures(a,sameUnpriced,unchanged,error) && unchanged.executionFingerprint==f.executionFingerprint,"price independent execution identity");
-  auto altered=plain;altered.capacityBytes+=1;GenericCostFeatures alteredFeatures;
-  expect(collectGenericCostFeatures(a,altered,alteredFeatures,error) && alteredFeatures.executionFingerprint!=f.executionFingerprint,"resource execution identity");
+  GenericMappingPlan altered;GenericCostFeatures alteredFeatures;
+  llvm::json::Value smallerTarget=llvm::json::Object{{"generic_air",llvm::json::Object{
+      {"tile_sizes",llvm::json::Array{4}},{"capacity_bytes",plain.capacityBytes-1}}}};
+  expect(planGenericMapping(a,smallerTarget,altered,error) &&
+      collectGenericCostFeatures(a,altered,alteredFeatures,error) &&
+      alteredFeatures.executionFingerprint!=f.executionFingerprint,"checked smaller-resource execution identity");
   auto observed=[&](){return llvm::json::Value(llvm::json::Object{
     {"schema","orbit.direct-air.cost.v1"},{"kind","observed-table"},{"model_id","synthetic-observations"},{"model_version","1"},
     {"boundary","prepared-command-host-to-host"},{"target",llvm::json::Value(llvm::json::Object(*m.getAsObject()->getObject("target")))},
@@ -176,15 +201,33 @@ int main(int argc,char **argv) {
   expect(!evaluateGenericDirectAIRCost(f,wrongTerms,target,c,error),"implementation terms frozen not double charged");
   auto badRegions=plain;badRegions.communication.executionRegions[0].submissionCount=0;
   expect(!collectGenericCostFeatures(a,badRegions,alteredFeatures,error),"nonpositive public submission rejected");
-  auto twoRegions=plain;twoRegions.communication.executionRegions.push_back(twoRegions.communication.executionRegions[0]);
-  expect(collectGenericCostFeatures(a,twoRegions,alteredFeatures,error) && alteredFeatures.values["command_count"]==2 && alteredFeatures.values["execution_region_count"]==2,"public submissions counted once per region");
+  auto overlapping=plain;overlapping.communication.executionRegions.push_back(overlapping.communication.executionRegions[0]);
+  expect(!collectGenericCostFeatures(a,overlapping,alteredFeatures,error) && error.find("overlapping execution regions")!=std::string::npos,"overlapping public submission regions rejected");
+  // A refined native invocation owns explicit lifecycle and event membership.
+  // Merely splitting its ordinal interval does not create two legal calls;
+  // task/copy memberships and lifecycle must be lowered together.
+  auto twoRegions=plain;auto secondRegion=twoRegions.communication.executionRegions[0];
+  size_t split=twoRegions.communication.events.size()/2;
+  twoRegions.communication.executionRegions[0].id="synthetic-first";
+  twoRegions.communication.executionRegions[0].endEvent=split;
+  secondRegion.id="synthetic-second";secondRegion.beginEvent=split;
+  secondRegion.deviceStages.clear();twoRegions.communication.executionRegions.push_back(secondRegion);
+  expect(!finalizeProgramGraph(a,twoRegions.communication,&twoRegions,error) ||
+      !checkProgramGraph(twoRegions.communication,error) ||
+      !collectGenericCostFeatures(a,twoRegions,alteredFeatures,error),
+      "ordinal split cannot duplicate a refined invocation lifecycle");
   std::string source;llvm::raw_string_ostream sourceStream(source);module->print(sourceStream);sourceStream.flush();
   auto replaceAll=[](std::string text,const std::string &from,const std::string &to){size_t at=0;while((at=text.find(from,at))!=std::string::npos){text.replace(at,from.size(),to);at+=to.size();}return text;};
-  // These checks isolate family derivation from target legality: no transformed
-  // program is executed or represented as a successfully checked mapping.
+  // Reanalyze and rebuild every mutated source: features must never borrow a
+  // checked graph from a different body or stale access table. No execution.
+  auto freshFacts=[&](mlir::ModuleOp body,GenericCostFeatures &facts) {
+    GenericAnalysis analysis;GenericMappingPlan plan;
+    return analyzeGenericProgram(body,analysis,error) && planGenericMapping(analysis,config,plan,error) &&
+        collectGenericCostFeatures(analysis,plan,facts,error);
+  };
   auto familyFrom=[&](const std::string &text){
-    auto m=mlir::parseSourceString<mlir::ModuleOp>(text,&context);GenericAnalysis analysis;GenericCostFeatures facts;
-    if(!m || !analyzeGenericProgram(*m,analysis,error) || !collectGenericCostFeatures(analysis,plain,facts,error))return std::string();
+    auto m=mlir::parseSourceString<mlir::ModuleOp>(text,&context);GenericCostFeatures facts;
+    if(!m || !freshFacts(*m,facts))return std::string();
     return facts.regionFamilyFingerprint;
   };
   auto bigger=replaceAll(replaceAll(source,"16xf32","24xf32"),"to 16","to 24");
@@ -196,25 +239,31 @@ int main(int argc,char **argv) {
   mlir::OpBuilder builder(&context);builder.setInsertionPointToStart(&cloneAnalysis.tasks[0].operation->getRegion(0).front());
   auto constant=builder.create<mlir::arith::ConstantFloatOp>(clone.getLoc(),llvm::APFloat(1.0f),builder.getF32Type());
   GenericCostFeatures oneConstant,twoConstant;
-  collectGenericCostFeatures(cloneAnalysis,plain,oneConstant,error);
+  expect(freshFacts(clone,oneConstant),"constant-one source has a checked graph");
   constant->setAttr("value",builder.getF32FloatAttr(2.0));
-  collectGenericCostFeatures(cloneAnalysis,plain,twoConstant,error);
+  expect(freshFacts(clone,twoConstant),"constant-two source has a checked graph");
   expect(oneConstant.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves arithmetic constants");
   auto loop=mlir::cast<mlir::affine::AffineForOp>(cloneAnalysis.tasks[0].loops[0].operation);
-  loop.setStep(2);GenericCostFeatures changedStep;collectGenericCostFeatures(cloneAnalysis,plain,changedStep,error);
-  expect(changedStep.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves reduction or spatial step");
+  loop.setStep(2);GenericCostFeatures changedStep;
+  expect(!freshFacts(clone,changedStep) && error.find("output not completely initialized")!=std::string::npos,
+      "stepped output with unwritten cells rejects before cost extraction");
   loop.setStep(1);
   auto load=mlir::cast<mlir::affine::AffineLoadOp>(cloneAnalysis.tasks[0].accesses[0].operation);
   load.getProperties().map=mlir::AffineMapAttr::get(mlir::AffineMap::get(1,0,{15-builder.getAffineDimExpr(0)},&context));
-  GenericCostFeatures changedMap;collectGenericCostFeatures(cloneAnalysis,plain,changedMap,error);
+  GenericCostFeatures changedMap;expect(freshFacts(clone,changedMap),"affine-map mutation has a checked graph");
   expect(changedMap.regionFamilyFingerprint!=twoConstant.regionFamilyFingerprint,"family preserves affine access maps");
-  auto root=cloneAnalysis.storages[0].root;auto oldType=root.getType();
-  root.setType(mlir::MemRefType::get({16},builder.getF32Type(),mlir::StridedLayoutAttr::get(&context,0,{2})));
-  GenericCostFeatures changedLayout;collectGenericCostFeatures(cloneAnalysis,plain,changedLayout,error);
-  expect(changedLayout.regionFamilyFingerprint!=changedMap.regionFamilyFingerprint,"family preserves memory layout");root.setType(oldType);
+  // Change every function/task/body/access type consistently, so this is a
+  // valid MLIR layout capability negative rather than an invalid SSA signature.
+  auto stridedText=replaceAll(source,"memref<16xf32>","memref<16xf32, strided<[2]>>");
+  auto strided=mlir::parseSourceString<mlir::ModuleOp>(stridedText,&context);
+  GenericCostFeatures changedLayout;
+  expect(strided && mlir::succeeded(mlir::verify(*strided)) &&
+      !freshFacts(*strided,changedLayout) && error.find("identity-layout")!=std::string::npos,
+      "valid nonidentity-layout source explicitly rejects native layout capability");
   mlir::func::FuncOp(cloneAnalysis.function)->setAttr("orbit.noalias",builder.getStringAttr("changed-contract"));
-  GenericCostFeatures changedAlias;collectGenericCostFeatures(cloneAnalysis,plain,changedAlias,error);
-  expect(changedAlias.regionFamilyFingerprint!=changedMap.regionFamilyFingerprint,"family preserves alias contract");
+  GenericCostFeatures changedAlias;
+  expect(!freshFacts(clone,changedAlias) && error.find("orbit.noalias must be unit or true")!=std::string::npos,
+      "invalid alias contract rejects instead of using stale graph facts");
   clone.erase();
   llvm::outs()<<llvm::json::Value(llvm::json::Object{{"status",ok?"passed":"failed"},{"checks",int64_t(checks)},{"calibration","synthetic contracts only"}})<<"\n";
   return ok?0:1;

@@ -234,7 +234,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       throw std::runtime_error("unsupported static config schema");
     c.original = v;
     auto &hw = obj(field(o, "hardware"));
-    if(auto domains=hw.getArray("domains"))for(const auto &v:*domains){auto &d=obj(v);c.domains.push_back({str(d,"id"),str(d,"parent"),str(d,"kind")});}
+    if(auto domains=hw.getArray("domains"))for(const auto &v:*domains){auto &d=obj(v);StaticResourceDomain domain{str(d,"id"),str(d,"parent"),str(d,"kind")};if(auto v=d.get("coordinates")){auto coords=v->getAsObject();if(!coords)throw std::runtime_error("coordinates must be integer object");for(const auto &entry:*coords){auto n=entry.second.getAsInteger();if(!n || entry.first.str().empty())throw std::runtime_error("invalid coordinate");domain.coordinates[entry.first.str()]=*n;}}c.domains.push_back(std::move(domain));}
     std::set<std::string> ids;
     std::map<std::string, StaticResource> resources;
     std::map<std::string, StaticMemory> memories;
@@ -242,10 +242,10 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       auto &o = obj(v);
       StaticResource r{str(o, "id"), str(o, "kind"), str(o, "device"),
                        integer(o, "capacity")};
-      r.domain=str(o,"domain");
+      r.domain=str(o,"domain");if(auto v=o.get("shared_resources")){auto shares=v->getAsObject();if(!shares)throw std::runtime_error("shared_resources must be integer object");for(const auto &entry:*shares){auto n=entry.second.getAsInteger();if(!n)throw std::runtime_error("invalid shared resource units");r.sharedResources[entry.first.str()]=*n;}}
       unique(ids, r.id);
       if (r.capacity <= 0 ||
-          (r.kind != "compute" && r.kind != "communication" && r.kind != "submission") ||
+          (r.kind != "compute" && r.kind != "communication" && r.kind != "submission" && r.kind != "transfer" && r.kind != "shared") ||
           (r.kind == "compute" && r.device.empty()))
         throw std::runtime_error("invalid resource kind/device/capacity");
       resources[r.id] = r;
@@ -257,6 +257,7 @@ bool orbit::taskflow::parseStaticConfig(const V &v, StaticConfig &c,
       StaticMemory m{str(o, "id"), integer(o, "capacity_bytes"),
                      strings(o, "accessible_devices")};
       m.domain=str(o,"domain");m.kind=str(o,"kind");m.accessibleResources=strings(o,"accessible_resources",false);
+      m.alignmentBytes=integer(o,"alignment_bytes",false,1);
       unique(ids, m.id);
       if (m.capacityBytes <= 0 || m.accessibleDevices.empty())
         throw std::runtime_error("invalid memory capacity/access");

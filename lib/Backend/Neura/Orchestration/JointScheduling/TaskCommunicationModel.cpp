@@ -1,3 +1,4 @@
+#include "Backend/Neura/Orchestration/JointScheduling/ProgramGraphCommunication.h"
 //===- TaskCommunicationModel.cpp ---------------------------*- C++ -*-===//
 //
 // Adapts the explicit task-edge and inter-task network contracts to the
@@ -1005,8 +1006,10 @@ createInterTaskNetworkCommunicationModel(func::FuncOp function, int grid_rows,
   TaskEdgeGraphOptions edge_options;
   edge_options.require_payload = true;
   edge_options.read_control_predecessors = true;
-  FailureOr<TaskEdgeGraph> edge_graph =
-      buildTaskEdgeGraph(function, edge_options, error);
+  const auto *publicGraph=activeProgramGraphCommunication();
+  FailureOr<TaskEdgeGraph> edge_graph = publicGraph
+      ? buildTaskEdgeGraphFromProgramGraph(function,*publicGraph,error)
+      : buildTaskEdgeGraph(function, edge_options, error);
   if (failed(edge_graph))
     return failure();
 
@@ -1022,7 +1025,7 @@ createInterTaskNetworkCommunicationModel(func::FuncOp function, int grid_rows,
     return failure();
 
   return std::make_unique<InterTaskNetworkCommunicationModel>(
-      std::move(*edge_graph), std::move(**network));
+      std::move(*edge_graph), std::move(**network), publicGraph!=nullptr);
 }
 
 } // namespace joint_scheduling

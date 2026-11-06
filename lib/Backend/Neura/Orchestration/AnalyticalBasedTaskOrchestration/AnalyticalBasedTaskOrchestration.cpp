@@ -1,3 +1,5 @@
+#include "Backend/Neura/Orchestration/JointScheduling/ProgramGraphCommunication.h"
+#include "Taskflow/ProgramMapping.h"
 // Orchestrates a materialized joint-scheduling candidate.
 
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
@@ -237,6 +239,18 @@ bool AnalyticalBasedTaskOrchestration::runTaskOrchestration(func::FuncOp func) {
       return false;
     }
     communication_model = std::move(*created);
+    if(communication_model->hasAuthoritativeDependencies()) {
+      auto graph=amoeba::neura::joint_scheduling::activeProgramGraphCommunication();
+      if(!graph) {func.emitError("missing active common graph");return false;}
+      Builder commonBuilder(func.getContext());SmallVector<int64_t> transfers,orders;
+      for(const auto &edge:communication_model->getTypedEdges()) {
+        if(edge.programGraphEvent>=0)transfers.push_back(edge.programGraphEvent);
+        if(edge.programGraphOrder>=0)orders.push_back(edge.programGraphOrder);
+      }
+      func->setAttr("joint_scheduling_program_graph_id",commonBuilder.getStringAttr(::orbit::taskflow::programGraphIdentity(*graph)));
+      func->setAttr("joint_scheduling_program_graph_transfer_events",commonBuilder.getDenseI64ArrayAttr(transfers));
+      func->setAttr("joint_scheduling_program_graph_order_edges",commonBuilder.getDenseI64ArrayAttr(orders));
+    }
   }
   TaskScheduler scheduler(grid_rows_, grid_cols_, mode_,
                           ShapeSelectionPolicy::FixedOrientation,

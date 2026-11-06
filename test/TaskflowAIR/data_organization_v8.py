@@ -97,7 +97,7 @@ if a.air:
     text = (a.output/'changed-body.air.mlir').read_text()
     assert '"arith.subf"' in text and '"arith.mulf"' not in text
     assert 'orbit.readonly_retained_begin' in text and '.readonly-panel' in text
-    assert 'retain-across-users' in text and 'no cross-stage SRAM retention' in text
+    assert 'retain-across-users' in text and 'no cross-group SRAM retention' in text
 (a.output/'summary.json').write_text(json.dumps({'passed': True, 'hardware_execution': False,
     'air_checked': a.air, 'wide_baseline_local_bytes': wide['resident_bytes'],
     'retained_local_bytes': public['resident_bytes'],

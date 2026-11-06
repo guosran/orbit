@@ -2,6 +2,7 @@ add_mlir_library(MLIRAmoebaNeuraOrchestrationUtil
     orchestration_utils.cpp
     JointScheduling/InterTaskNetwork.cpp
     JointScheduling/TaskCommunicationModel.cpp
+    JointScheduling/ProgramGraphCommunication.cpp
     JointScheduling/TaskEdgeContract.cpp
 
     PARTIAL_SOURCES_INTENDED
@@ -15,6 +16,7 @@ add_mlir_library(MLIRAmoebaNeuraOrchestrationUtil
     MLIRSupport
     MLIRFuncDialect
     MLIRTaskflow
+    MLIRTaskflowStructured
     MLIRAmoebaNeuraBackendOptions
     LLVMSupport
 )

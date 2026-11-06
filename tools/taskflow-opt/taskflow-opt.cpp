@@ -1,8 +1,10 @@
+#include "Taskflow/GenericProgramTiming.h"
 #include "Taskflow/Search.h"
 #include "Taskflow/GenericAnalysis.h"
 #include "Taskflow/GenericMapping.h"
 #include "Taskflow/NativeTransforms.h"
 #include "Taskflow/ProgramPartition.h"
+#include "Taskflow/HeterogeneousSearch.h"
 #ifdef ORBIT_ENABLE_AIR
 #include "Taskflow/AIRBackend.h"
 #endif
@@ -61,7 +63,14 @@ static cl::opt<bool>
 static cl::opt<std::string> mappingOutput("mapping-output"),
     checkMapping("check-mapping"), analysisOutput("analysis-output");
 static cl::opt<bool> genericAnalyze("generic-analyze"), genericMap("generic-map"), lowerAIR("lower-to-air"), nativeInterface("native-interface"), airPassPipeline("air-pass-pipeline"), airApproximateExp("air-approximate-exp");
-static cl::opt<std::string> airOutput("air-output"), checkAIR("check-air");
+static cl::opt<std::string> airOutput("air-output"), checkAIR("check-air"), checkAIE("check-aie"),
+    implementationOutput("implementation-output"), implementationFactsOutput("implementation-facts-output");
+static cl::opt<std::string> programTimingOutput("program-timing-output",
+    cl::desc("Export checked native features, composite timeline and unidentified internal events"));
+static cl::opt<bool> programGraph("program-graph",
+    cl::desc("Build and check the public task/data/communication graph"));
+static cl::opt<std::string> programGraphOutput("program-graph-output"),
+    programGraphDOT("program-graph-dot"), checkProgramGraphFile("check-program-graph");
 static cl::opt<std::string> legalizeAIRChannels("legalize-air-channels",
     cl::desc("Apply checked plan channel resources to converted generic AIR")),
     checkAIRChannels("check-air-channels",
@@ -81,6 +90,10 @@ static cl::opt<int64_t> programPartition("program-partition", cl::init(0),
     cl::desc("Independent whole-program source-axis instances per command"));
 static cl::opt<std::string> lowerProgram("lower-program-to-air",
     cl::desc("Write checked partition templates and invocation manifest to a NEW directory"));
+static cl::opt<std::string> heterogeneousOutput("heterogeneous-output",
+    cl::desc("Export checked CPU/NPU regions and native implementations to a NEW directory"));
+static cl::opt<std::string> checkHeterogeneous("check-heterogeneous",
+    cl::desc("Compare a static manifest with source/target reconstruction"));
 int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
                               "ORBIT independent structured Taskflow core\n");
@@ -92,7 +105,7 @@ int main(int argc, char **argv) {
 #ifdef ORBIT_ENABLE_AIR
   registry.insert<mlir::vector::VectorDialect>();
   context.appendDialectRegistry(registry);
-  if (lowerAIR || !lowerProgram.empty() || airPassPipeline || !checkAIR.empty() ||
+  if (lowerAIR || !lowerProgram.empty() || !heterogeneousOutput.empty() || airPassPipeline || (!checkAIR.empty() || !checkAIE.empty()) ||
       !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
     context.allowUnregisteredDialects();
     prepareGenericAIRContext(context);
@@ -159,6 +172,50 @@ int main(int argc, char **argv) {
     out << llvm::formatv("{0:2}\n", value);
     return true;
   };
+  auto emitGraph = [&](const ProgramGraph &graph) {
+    if (!checkProgramGraph(graph,error)) return false;
+    auto view=serializeProgramGraph(graph);
+    if (!checkProgramGraphFile.empty()) {
+      auto expected=readJSON(checkProgramGraphFile);
+      if (!expected) { error=llvm::toString(expected.takeError());return false; }
+      if (staticFingerprint(*expected)!=staticFingerprint(view)) {error="program graph view differs from checked source/target/candidate";return false;}
+    }
+    if (!programGraphOutput.empty() && !writeJSON(programGraphOutput,view)) return false;
+    if (!programGraphDOT.empty()) {
+      std::error_code ec;llvm::raw_fd_ostream output(programGraphDOT,ec);
+      if(ec){error=ec.message();return false;}output<<renderProgramGraphDOT(graph);
+    }
+    return true;
+  };
+  const bool wantsGraph=!programTimingOutput.empty() || programGraph || !programGraphOutput.empty() || !programGraphDOT.empty() || !checkProgramGraphFile.empty();
+  if(search && backend=="cpu-npu") {
+    auto module=parse(text);if(!module)return fatal("native Taskflow source required");
+    SearchOptions options{backend,evaluator,searchOutput,targetConfig,searchCheckpoint,searchRounds,searchBudget,searchWidth,searchResume};
+    if(!configureHeterogeneousSearch(*module,options,error))return fatal(error);
+    return runStructuredSearch(Program{},options,error)?0:fatal(error);
+  }
+  if(!heterogeneousOutput.empty()) {
+    if(llvm::sys::fs::exists(heterogeneousOutput))return fatal("heterogeneous output directory must be new");
+    auto module=parse(text);if(!module || mlir::failed(mlir::verify(*module)))return fatal("valid Taskflow source required");
+    llvm::json::Value config=llvm::json::Object{};
+    if(!targetConfig.empty()){auto c=readJSON(targetConfig);if(!c)return fatal(llvm::toString(c.takeError()));config=std::move(*c);}
+    HeterogeneousAIREmitter emitter;
+#ifdef ORBIT_ENABLE_AIR
+    emitter=[&](const GenericAnalysis &source,const GenericMappingPlan &plan,const std::string &path,std::string &error) {
+      mlir::OwningOpRef<mlir::ModuleOp> air;
+      if(!lowerGenericToAIR(source,plan,air,error))return false;
+      std::error_code ec;llvm::raw_fd_ostream out(path,ec);if(ec){error=ec.message();return false;}
+      air->print(out,mlir::OpPrintingFlags().printGenericOpForm());out<<"\n";return true;
+    };
+#endif
+    llvm::json::Value manifest=nullptr;
+    if(!exportHeterogeneousProgram(*module,config,heterogeneousOutput,manifest,error,emitter))return fatal(error);
+    if(!checkHeterogeneous.empty()){
+      auto expected=readJSON(checkHeterogeneous);if(!expected)return fatal(llvm::toString(expected.takeError()));
+      if(staticFingerprint(*expected)!=staticFingerprint(manifest))return fatal("heterogeneous manifest differs from source/target reconstruction");
+    }
+    return 0;
+  }
   if (airPassPipeline) {
     if (airApproximateExp || !targetConfig.empty()) return fatal("--air-pass-pipeline uses the default exact resident plan; use --lower-to-air for explicit target/approximation options");
 #ifdef ORBIT_ENABLE_AIR
@@ -187,7 +244,7 @@ int main(int argc, char **argv) {
     }
     return runStructuredSearch(Program{},options,error) ? 0 : fatal(error);
   }
-  if (genericAnalyze || genericMap || lowerAIR || !lowerProgram.empty() || !checkAIR.empty() ||
+  if (wantsGraph || genericAnalyze || genericMap || lowerAIR || !lowerProgram.empty() || (!checkAIR.empty() || !checkAIE.empty()) ||
       !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
     auto module = parse(text);
     if (!module || mlir::failed(mlir::verify(*module))) return fatal("valid native Taskflow MLIR required");
@@ -204,12 +261,25 @@ int main(int argc, char **argv) {
     GenericAnalysis analysis;
     if (!analyzeGenericProgram(*module, analysis, error)) return fatal(error);
     if (!writeJSON(analysisOutput, serializeGenericAnalysis(analysis))) return fatal(error);
-    if (genericMap || lowerAIR || !lowerProgram.empty() || !checkAIR.empty() ||
+    if (wantsGraph || genericMap || lowerAIR || !lowerProgram.empty() || (!checkAIR.empty() || !checkAIE.empty()) ||
         !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
       llvm::json::Value config = llvm::json::Object{};
       if (!targetConfig.empty()) {auto value=readJSON(targetConfig); if(!value)return fatal(llvm::toString(value.takeError()));config=std::move(*value);}
+      const auto *configuration=config.getAsObject();
+      const auto *graphConfiguration=configuration?configuration->getObject("program_graph"):nullptr;
+      if(graphConfiguration && graphConfiguration->getString("adapter")=="whole-task") {
+        if(!programTimingOutput.empty())return fatal("--program-timing-output requires the native NPU adapter; use evaluateProgramTiming for whole-task backend annotations");
+        if(lowerAIR || !lowerProgram.empty() || (!checkAIR.empty() || !checkAIE.empty()) || !legalizeAIRChannels.empty() || !checkAIRChannels.empty())
+          return fatal("whole-task public graph is a CPU planning adapter; direct AIR requires the checked native target realization");
+        StaticConfig target;ProgramDataOrganizationChoice choice;ProgramGraph graph;
+        if(!parseWholeTaskProgramGraphConfig(config,target,choice,error) ||
+           !planProgramDataOrganization(analysis,target,choice,graph,error) || !emitGraph(graph) ||
+           !writeJSON(mappingOutput,serializeProgramGraph(graph)))return fatal(error);
+        return 0;
+      }
+      if(graphConfiguration && graphConfiguration->getString("adapter")!="native")return fatal("unsupported program graph adapter");
       if(module->getOperation()->hasAttr("orbit.program_partition_extent")) {
-        if(lowerAIR || !checkAIR.empty() || !legalizeAIRChannels.empty() || !checkAIRChannels.empty())
+        if(lowerAIR || (!checkAIR.empty() || !checkAIE.empty()) || !legalizeAIRChannels.empty() || !checkAIRChannels.empty())
           return fatal("partitioned program requires --lower-program-to-air; a single AIR command would ignore its schedule");
         auto chunk=module->getOperation()->getAttrOfType<mlir::IntegerAttr>("orbit.program_partition_extent");
         ProgramPartitionPlan partition;
@@ -272,6 +342,12 @@ int main(int argc, char **argv) {
       if(!lowerProgram.empty())return fatal("--lower-program-to-air requires a program partition choice");
       GenericMappingPlan plan;
       if (!planGenericMapping(analysis, config, plan, error)) return fatal(error);
+      if(wantsGraph && !emitGraph(plan.communication))return fatal(error);
+      if (!programTimingOutput.empty()) {
+        llvm::json::Value timing=nullptr;
+        if (!evaluateGenericProgramTiming(analysis,plan,timing,error) ||
+            !writeJSON(programTimingOutput,timing))return fatal(error);
+      }
       if (!writeJSON(mappingOutput, serializeGenericMapping(analysis,plan))) return fatal(error);
       if (!legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
 #ifdef ORBIT_ENABLE_AIR
@@ -302,12 +378,33 @@ int main(int argc, char **argv) {
         return fatal("AIR channel legalization requires ORBIT_ENABLE_AIR=ON");
 #endif
       }
+      if (!checkAIE.empty()) {
+#ifdef ORBIT_ENABLE_AIR
+        context.allowUnregisteredDialects();
+        auto candidateBytes=llvm::MemoryBuffer::getFile(checkAIE);if(!candidateBytes)return fatal(candidateBytes.getError().message());
+        auto candidate=parse((*candidateBytes)->getBuffer());
+        if(!candidate)return fatal("invalid generic final-AIE MLIR");
+        llvm::json::Value receipt=llvm::json::Object{};
+        bool valid=checkGenericAIEImplementation(analysis,plan,*candidate,receipt,error);
+        if(auto *object=receipt.getAsObject()){(*object)["valid"]=valid;(*object)["diagnostic"]=error;}
+        if(!writeJSON(implementationOutput,std::move(receipt)) ||
+           !writeJSON(implementationFactsOutput,extractGenericAIRImplementation(*candidate)))return fatal(error);
+        if(!valid)return fatal(error);
+        return 0;
+#else
+        return fatal("AIE implementation checker requires ORBIT_ENABLE_AIR=ON");
+#endif
+      }
       if (!checkAIR.empty()) {
 #ifdef ORBIT_ENABLE_AIR
         context.allowUnregisteredDialects();
         auto candidateBytes=llvm::MemoryBuffer::getFile(checkAIR);if(!candidateBytes)return fatal(candidateBytes.getError().message());
         auto candidate=parse((*candidateBytes)->getBuffer());
-        if(!candidate || !checkGenericAIRMapping(analysis,plan,*candidate,error))return fatal(error);
+        if(!candidate)return fatal("invalid generic AIR MLIR");
+        bool valid=checkGenericAIRMapping(analysis,plan,*candidate,error);
+        if(!writeJSON(implementationOutput,llvm::json::Object{{"level","AIR"},{"valid",valid},{"diagnostic",error}}) ||
+           !writeJSON(implementationFactsOutput,extractGenericAIRImplementation(*candidate)))return fatal(error);
+        if(!valid)return fatal(error);
         return 0;
 #else
         return fatal("AIR mapping checker requires ORBIT_ENABLE_AIR=ON");

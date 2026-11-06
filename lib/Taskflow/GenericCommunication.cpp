@@ -1,9 +1,11 @@
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/ProgramTargetBinding.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <set>
 using namespace orbit::taskflow;
 llvm::StringRef orbit::taskflow::programDataPolicyName(ProgramDataPolicy policy) {
@@ -17,6 +19,8 @@ bool orbit::taskflow::parseProgramDataPolicy(llvm::StringRef value,
   return true;
 }
 namespace {
+std::string nativeDevice(const GenericMappingPlan &p){auto *resource=programResource(p.memoryBinding.architecture,p.memoryBinding.computeResource);return resource?resource->device:std::string{};}
+
 bool fail(std::string &error, const std::string &message) {
   error = "program communication: " + message;
   return false;
@@ -126,13 +130,72 @@ std::string poolKey(const GenericMappingPlan &p, const GenericTilePhase &phase,
   for (const auto &scope : p.readOnlyRetentions)
     if (scope.storage == r.storage && scope.beginPhase <= index && index < scope.endPhase)
       return key+".readonly-panel";
-  if (r.read && !r.write) {
+  if (r.read && !r.write && !genericLocallyRetained(p,index,r.storage)) {
     key += ".input";
     for (auto n : r.sizes) key += "."+std::to_string(n);
     key += ".loops";
     for (auto bound : phase.loops) key += "."+std::to_string(bound.upper-bound.lower);
   }
   return key;
+}
+// Native tile groups acquire their input/output slots at block entry and
+// release them after the last compute. Source phase indices bind instances;
+// their ordinal order is not a DMA-completion barrier. The event vector below
+// remains topological while deferred exports retain their producer phase.
+std::vector<size_t> tileGroupPredecessors(const GenericMappingPlan &p,
+    llvm::StringRef kind,size_t phase,llvm::StringRef link) {
+  std::vector<size_t> result;
+  const auto *scope=genericResidencyScope(p,phase);if(!scope)return result;
+  const size_t width=scope->tasks.size(),begin=scope->beginPhase+(phase-scope->beginPhase)/width*width;
+  auto compute=[&](size_t sourcePhase){auto e=p.phases[sourcePhase].computationEvent;if(e>=0)result.push_back(size_t(e));};
+  if(kind!="transfer") {
+    if(phase>begin)compute(phase-1);
+    if(phase==begin){
+      if(p.targetCapabilities.acquireAllInputsAtGroupEntry){
+        for(const auto &transfer:p.transfers)
+          if(transfer.phase>=begin&&transfer.phase<begin+width&&transfer.direction=="host_to_l1"&&transfer.event>=0)result.push_back(size_t(transfer.event));
+      }
+      if(begin>scope->beginPhase){
+        for(const auto &transfer:p.transfers)
+          if(transfer.phase>=begin-width&&transfer.phase<begin&&transfer.direction=="l1_to_host"&&transfer.event>=0)result.push_back(size_t(transfer.event));
+      }
+    }
+  } else if(link==p.memoryBinding.outputLink)compute(begin+width-1);
+  else if(begin>scope->beginPhase&&scope->inputReleasePolicy=="group-tail")compute(begin-1);
+  // last-reader inputs use the per-allocation creator/all-users overwrite
+  // constraints. Their earlier release must not inherit an unrelated core tail.
+  return result;
+}
+// A configured native group has one ordered core, but independently serviced
+// input and output slots. Only group transitions impose a complete control
+// frontier. Within a group readiness and alias reuse derive DMA ordering.
+std::vector<size_t> serialGroupPredecessors(const GenericMappingPlan &p,
+    const std::vector<MappingEvent> &events,size_t before,llvm::StringRef kind,
+    size_t phase,llvm::StringRef link,std::map<size_t,std::vector<size_t>> &frontiers) {
+  std::vector<size_t> result=tileGroupPredecessors(p,kind,phase,link);
+  auto group=std::find_if(p.executionGroups.begin(),p.executionGroups.end(),
+      [&](const auto &g){return g.beginPhase<=phase&&phase<g.endPhase;});
+  if(group==p.executionGroups.end())return result; // placement checker diagnoses coverage
+  size_t groupIndex=group-p.executionGroups.begin();
+  auto cached=frontiers.find(groupIndex);
+  if(cached==frontiers.end()) {
+    std::vector<size_t> control;
+    auto parents=group->dependencies;parents.insert(parents.end(),group->implementationDependencies.begin(),group->implementationDependencies.end());
+    for(auto parent:parents)if(parent<p.executionGroups.size()) {
+      const auto &boundary=p.executionGroups[parent];std::set<size_t> frontier;
+      for(size_t e=0;e<before;++e)if(boundary.beginPhase<=events[e].phase&&events[e].phase<boundary.endPhase)frontier.insert(e);
+      for(size_t e=0;e<before;++e)if(boundary.beginPhase<=events[e].phase&&events[e].phase<boundary.endPhase)
+        for(auto predecessor:events[e].dependencies)frontier.erase(predecessor);
+      control.insert(control.end(),frontier.begin(),frontier.end());
+    }
+    cached=frontiers.emplace(groupIndex,std::move(control)).first;
+  }
+  result.insert(result.end(),cached->second.begin(),cached->second.end());
+  if(kind!="transfer")for(size_t e=before;e>0;--e) {
+    const auto &previous=events[e-1];
+    if(previous.kind!="transfer"&&group->beginPhase<=previous.phase&&previous.phase<group->endPhase){result.push_back(e-1);break;}
+  }
+  return result;
 }
 // A serial native adapter has the same explicit latest-version, per-location
 // copy state and overwrite dependencies as StaticCommunication. It does not
@@ -146,6 +209,7 @@ struct State {
   std::vector<int64_t> latest;
   std::vector<size_t> host;
   std::vector<size_t> phaseBarrier;
+  std::map<size_t,std::vector<size_t>> groupFrontiers;
   size_t barrierPhase = SIZE_MAX, phaseBegin = 0;
   State(GenericMappingPlan &p, const GenericAnalysis &a,
         const std::vector<GenericTilePhase> &phases) : p(p),a(a),phases(phases) {}
@@ -183,7 +247,7 @@ struct State {
   }
   size_t start(std::string kind, size_t phase, size_t task, std::string link = {}) {
     auto &events = p.communication.events;
-    if (phase != barrierPhase) {
+    if (p.strategy!="serial-tiled" && phase != barrierPhase) {
       std::set<size_t> frontier;
       for (size_t index = phaseBegin; index < events.size(); ++index) frontier.insert(index);
       for (size_t index = phaseBegin; index < events.size(); ++index)
@@ -195,7 +259,7 @@ struct State {
     MappingEvent event; event.kind = std::move(kind); event.phase = phase;
     event.task = task; event.memory = event.kind == "transfer" ? "" : p.memoryBinding.localMemory; event.link = std::move(link);
     event.resource = event.kind == "transfer" ? p.memoryBinding.dmaResource : p.memoryBinding.computeResource;
-    event.dependencies = phaseBarrier;
+    event.dependencies = p.strategy=="serial-tiled" ? serialGroupPredecessors(p,events,events.size(),event.kind,phase,event.link,groupFrontiers) : phaseBarrier;
     events.push_back(std::move(event)); return events.size()-1;
   }
   void depend(size_t event, int64_t producer) {
@@ -205,7 +269,8 @@ struct State {
   void beforeOverwrite(size_t event, size_t copy) {
     const auto &value = p.communication.copies[copy];
     depend(event,value.createdBy);
-    for (size_t user : value.lastUsers) depend(event,user);
+    const auto &users=p.strategy=="serial-tiled"?value.users:value.lastUsers;
+    for (size_t user : users) depend(event,user);
   }
   bool read(size_t event, size_t al, size_t cell, std::string &error) {
     auto found = available[al].find(cell);
@@ -250,6 +315,8 @@ struct State {
     if (local < 0 || external < 0) return fail(error,"DMA allocation binding missing");
     size_t source = input ? external : local, target = input ? local : external;
     size_t event = start("transfer",phase,sourcePhase.task,input ? p.memoryBinding.inputLink : p.memoryBinding.outputLink);
+    p.communication.events[event].transferRegion=region(t,a);
+    p.communication.events[event].transferBytes=t.bytes;
     auto cells = partition.cells(region(t,a));
     for (size_t cell : cells) if (!read(event,source,cell,error)) return false;
     clearLocal(event,target);
@@ -357,6 +424,13 @@ bool checkEdges(const GenericAnalysis &a,const ProgramCommunicationPlan &c,std::
 bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
                                                 GenericMappingPlan &p,
                                                 std::string &error) {
+  if(p.choices.grouping=="tile-major" && (genericResidencyGroups(p.choices).empty()||llvm::any_of(genericResidencyGroups(p.choices),[](const auto &g){return g.tasks.empty()||g.retainedStorages.empty();})))return fail(error,"tile-major communication requires a nonempty task group");
+  size_t previousScopeEnd=0;
+  for(const auto &scope:p.residencyScopes){
+    if(scope.tasks.size()<2||scope.retainedStorages.empty()||scope.beginPhase<previousScopeEnd||scope.beginPhase>=scope.endPhase||scope.endPhase>p.phases.size()||(scope.endPhase-scope.beginPhase)%scope.tasks.size()!=0)return fail(error,"invalid resolved residency scope bounds or block width");
+    if(scope.inputReleasePolicy!="group-tail"&&scope.inputReleasePolicy!="last-reader")return fail(error,"unknown residency input release policy");
+    previousScopeEnd=scope.endPhase;
+  }
   p.communication = ProgramCommunicationPlan{};
   std::vector<GenericTilePhase> resident;
   const std::vector<GenericTilePhase> *phases;
@@ -386,21 +460,42 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
   for (const auto &scope : p.retainedRegions)
     if (scope.initializerTask >= 0) initializers[scope.beginPhase].push_back(&scope);
   size_t transferIndex = 0;
+  std::vector<size_t> deferredOutputs;
+  std::set<size_t> groupImported;
+
   std::set<size_t> fused(p.fusedInitializerTasks.begin(),p.fusedInitializerTasks.end());
   for (size_t phase = 0; phase < phases->size(); ++phase) {
     if (p.strategy == "serial-tiled" && fused.count((*phases)[phase].task)) continue;
     size_t end = transferIndex;
+    if(p.strategy=="serial-tiled"&&p.targetCapabilities.acquireAllInputsAtGroupEntry){
+      const auto *scope=genericResidencyScope(p,phase);
+      if(scope&&(phase-scope->beginPhase)%scope->tasks.size()==0){
+        for(size_t t=transferIndex;t<p.transfers.size()&&p.transfers[t].phase<phase+scope->tasks.size();++t)
+          if(p.transfers[t].direction=="host_to_l1"){
+            if(!state.transfer(t,p.transfers[t].phase,error))return false;
+            groupImported.insert(t);
+          }
+      }
+    }
     if (p.strategy == "serial-tiled") {
       while (end < p.transfers.size() && p.transfers[end].phase == phase) ++end;
       for (size_t t = transferIndex; t < end; ++t)
-        if (p.transfers[t].direction == "host_to_l1" && !state.transfer(t,phase,error)) return false;
+        if (p.transfers[t].direction == "host_to_l1" && !groupImported.count(t) && !state.transfer(t,phase,error)) return false;
     }
     for (auto scope : initializers[phase])
       if (!state.compute(phase,scope->initializerTask,scope->storage,error)) return false;
     if (!state.compute(phase,-1,0,error)) return false;
     if (p.strategy == "serial-tiled") {
       for (size_t t = transferIndex; t < end; ++t)
-        if (p.transfers[t].direction == "l1_to_host" && !state.transfer(t,phase,error)) return false;
+        if (p.transfers[t].direction == "l1_to_host") {
+          if(genericResidencyScope(p,phase))deferredOutputs.push_back(t);
+          else if(!state.transfer(t,phase,error))return false;
+        }
+      const auto *scope=genericResidencyScope(p,phase);
+      if(scope && (phase+1-scope->beginPhase)%scope->tasks.size()==0) {
+        for(auto t:deferredOutputs)if(!state.transfer(t,p.transfers[t].phase,error))return false;
+        deferredOutputs.clear();
+      }
       transferIndex = end;
     }
   }
@@ -411,10 +506,14 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
     if (copy.releasedAfter == SIZE_MAX) copy.releasedAfter = c.events.size();
     const auto &allocation = c.allocations[copy.allocation];
     if (allocation.memory != p.memoryBinding.hostMemory) {
-      auto end = std::lower_bound(c.events.begin(),c.events.end(),allocation.endPhase,
-          [](const auto &event, size_t phase) { return event.phase < phase; });
+      auto end = std::find_if(c.events.begin(),c.events.end(),
+          [&](const auto &event) { return event.phase >= allocation.endPhase; });
       copy.releasedAfter = std::min(copy.releasedAfter,size_t(end-c.events.begin()));
     }
+    // An event reads its old copies before writing replacement copies. Public
+    // validity is half-open, so that final read belongs to [available, event+1).
+    if(!copy.users.empty() && copy.users.back()==copy.releasedAfter && copy.releasedAfter<c.events.size())
+      ++copy.releasedAfter;
   }
   for (auto &event : c.events) {
     auto &deps = event.dependencies;
@@ -427,19 +526,38 @@ bool orbit::taskflow::buildProgramCommunication(const GenericAnalysis &a,
     c.transferBytes+=transfer.bytes;
   }
   MappingExecutionRegion call;call.id="program-call";
-  call.placement="npu";call.submissionResource=p.memoryBinding.submissionResource;call.endEvent=c.events.size();
+  call.placement=nativeDevice(p);call.invocationLifecycle="host-device";call.submissionResource=p.memoryBinding.submissionResource;call.endEvent=c.events.size();
   for(size_t stage=0;stage<std::max<size_t>(1,p.hardwareStages.size());++stage)call.deviceStages.push_back(stage);
   c.executionRegions.push_back(std::move(call));
+  if(!finalizeProgramGraph(a,c,&p,error))return false;
+  p.executionGroups=c.executionGroups;
   return true;
 }
 
 bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     const GenericMappingPlan &p, std::string &error) {
+  if(p.choices.grouping=="tile-major" && (genericResidencyGroups(p.choices).empty()||llvm::any_of(genericResidencyGroups(p.choices),[](const auto &g){return g.tasks.empty()||g.retainedStorages.empty();})))return fail(error,"tile-major communication requires a nonempty task group");
+  size_t previousScopeEnd=0;
+  for(const auto &scope:p.residencyScopes){
+    if(scope.tasks.size()<2||scope.retainedStorages.empty()||scope.beginPhase<previousScopeEnd||scope.beginPhase>=scope.endPhase||scope.endPhase>p.phases.size()||(scope.endPhase-scope.beginPhase)%scope.tasks.size()!=0)return fail(error,"invalid resolved residency scope bounds or block width");
+    if(scope.inputReleasePolicy!="group-tail"&&scope.inputReleasePolicy!="last-reader")return fail(error,"unknown residency input release policy");
+    previousScopeEnd=scope.endPhase;
+  }
   const auto &c = p.communication;
+  if(c.executionGroups.size()!=p.executionGroups.size())return fail(error,"public execution group witness coverage mismatch");
+  for(size_t i=0;i<c.executionGroups.size();++i){const auto &x=c.executionGroups[i],&y=p.executionGroups[i];if(std::tie(x.beginPhase,x.endPhase,x.resource,x.memory,x.dependencies,x.memberEvents,x.spatialOwner,x.implementationDependencies)!=std::tie(y.beginPhase,y.endPhase,y.resource,y.memory,y.dependencies,y.memberEvents,y.spatialOwner,y.implementationDependencies))return fail(error,"public execution group differs from native witness");}
+  std::map<size_t,std::string> inputs,outputs;
+  for(size_t storage=0;storage<a.storages.size();++storage) {
+    if(a.storages[storage].role=="input")inputs[storage]=p.memoryBinding.hostMemory;
+    if(a.storages[storage].role=="output")outputs[storage]=p.memoryBinding.hostMemory;
+  }
+  if(c.inputLocations!=inputs || c.outputLocations!=outputs)
+    return fail(error,"native graph input/output boundary differs from source roles and host binding");
+  if(c.clockMHz || c.allocationLifetime!="phase-pool")return fail(error,"native graph requires unknown clock and phase-pool allocation lifetime");
   if(c.executionRegions.size()!=1)return fail(error,"one checked AIR program-call region required");
   const auto &call=c.executionRegions.front();std::vector<size_t> stages;
   for(size_t i=0;i<std::max<size_t>(1,p.hardwareStages.size());++i)stages.push_back(i);
-  if(call.id!="program-call" || call.placement!="npu" || call.submissionResource!=p.memoryBinding.submissionResource ||
+  if(call.id!="program-call" || call.placement!=nativeDevice(p) || call.invocationLifecycle!="host-device" || call.submissionResource!=p.memoryBinding.submissionResource ||
      call.beginEvent!=0 || call.endEvent!=c.events.size() || call.submissionCount!=1 || call.deviceStages!=stages)
     return fail(error,"program-call coverage/submission/stage contract mismatch");
   ProgramDataPolicy policy;
@@ -460,7 +578,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   for (size_t i = 0; i < allocations.size(); ++i) {
     const auto &x = allocations[i], &y = c.allocations[i];
     if (x.storage != y.storage || x.memory != y.memory || x.key != y.key ||
-        x.bytes != y.bytes || x.beginPhase != y.beginPhase || x.endPhase != y.endPhase)
+        x.bytes != y.bytes || x.beginPhase != y.beginPhase || x.endPhase != y.endPhase || x.addressing != y.addressing || x.spatialOwner != y.spatialOwner)
       return fail(error,"allocation placement, size or lifetime mismatch");
   }
   if(!checkGenericMemory(p.memoryBinding,p.capacityBytes,error)) return false;
@@ -506,7 +624,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   };
   std::vector<bool> seenVersions(c.versions.size()), seenCopies(c.copies.size());
   std::vector<size_t> expectedRelease(c.copies.size(),c.events.size());
-  std::vector<std::vector<size_t>> expectedUsers(c.copies.size());
+  std::vector<std::vector<size_t>> expectedUsers(c.copies.size()), allUsers(c.copies.size());
   for (size_t v = 0; v < c.versions.size(); ++v) {
     const auto &version = c.versions[v];
     if (version.region >= regions.size() || version.producer < -1 ||
@@ -551,13 +669,14 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     if (scope.initializerTask >= 0)
       initializers.emplace(scope.beginPhase,scope.initializerTask,scope.storage);
   size_t previousPhase = 0;
+  std::map<size_t,std::vector<size_t>> groupFrontiers;
   std::set<size_t> phaseBarrier;
   size_t phaseBegin = 0;
   for (size_t index = 0; index < c.events.size(); ++index) {
     const auto &event = c.events[index];
-    if (event.phase >= phases->size() || event.phase < previousPhase)
+    if (event.phase >= phases->size() || (p.choices.grouping!="tile-major" && event.phase < previousPhase))
       return fail(error,"event execution schedule violates task instance order");
-    if (index && event.phase != previousPhase) {
+    if (p.strategy!="serial-tiled" && index && event.phase != previousPhase) {
       phaseBarrier.clear();
       for (size_t prior = phaseBegin; prior < index; ++prior) phaseBarrier.insert(prior);
       for (size_t prior = phaseBegin; prior < index; ++prior)
@@ -570,10 +689,12 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     auto depend = [&](int64_t producer) {
       if (producer >= 0 && producer != int64_t(index)) dependency.insert(producer);
     };
-    dependency.insert(phaseBarrier.begin(),phaseBarrier.end());
+    if(p.strategy=="serial-tiled") {auto group=serialGroupPredecessors(p,c.events,index,event.kind,event.phase,event.link,groupFrontiers);for(auto parent:group)if(parent<index)dependency.insert(parent);}
+    else dependency.insert(phaseBarrier.begin(),phaseBarrier.end());
     auto beforeOverwrite = [&](size_t copy) {
       depend(c.copies[copy].createdBy);
-      for (auto user : expectedUsers[copy]) depend(user);
+      const auto &users=p.strategy=="serial-tiled"?allUsers[copy]:expectedUsers[copy];
+      for (auto user : users) depend(user);
     };
     using Key = std::pair<size_t,size_t>; // allocation, logical cell
     std::set<Key> expectedReads, expectedWrites;
@@ -584,6 +705,8 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
       if (found == transferAt.end()) return fail(error,"unplanned transfer event");
       transferIndex = found->second;
       const auto &t = p.transfers[transferIndex];
+      if(!event.transferRegion || !same(*event.transferRegion,region(t,a)) || event.transferBytes!=t.bytes)
+        return fail(error,"common transfer payload differs from native DMA plan");
       if ((p.strategy == "serial-tiled" && t.phase != event.phase) || event.task != phase.task ||
           event.link != (t.direction=="host_to_l1"?p.memoryBinding.inputLink:p.memoryBinding.outputLink) || event.resource != p.memoryBinding.dmaResource ||
           event.reads != t.sourceCopies || event.writes != t.targetCopies)
@@ -607,6 +730,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
       if(link==c.links.end() || t.bytes<link->minBytes || t.bytes>link->maxBytes)
         return fail(error,"DMA violates target transfer size capability");
     } else {
+      if(event.transferRegion || event.transferBytes)return fail(error,"compute event cannot carry transfer payload");
       if (event.resource != p.memoryBinding.computeResource || !event.link.empty())
         return fail(error,"compute event uses an invalid execution resource");
       int64_t initializedStorage = -1;
@@ -642,7 +766,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
           int64_t(value.version) != latest[cell] || al.beginPhase > event.phase ||
           event.phase >= al.endPhase || !actualReads.emplace(value.allocation,cell).second)
         return fail(error,"read of stale, overwritten, released or duplicate copy");
-      expectedUsers[copy] = {index};
+      expectedUsers[copy] = {index};allUsers[copy].push_back(index);
       depend(value.createdBy);
     }
     if (actualReads != expectedReads) return fail(error,"task/transfer reads do not cover actual source access versions");
@@ -677,7 +801,7 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
     }
     if (actualWrites != expectedWrites) return fail(error,"task/transfer output copies miss actual written regions");
     if (event.dependencies != std::vector<size_t>(dependency.begin(),dependency.end()))
-      return fail(error,"missing/fabricated phase-barrier, copy-producer or overwrite completion dependency");
+      return fail(error,"missing/fabricated group-control, core-order, copy-producer or overwrite dependency");
   }
   if (!initializers.empty()) return fail(error,"missing local source initializer");
   for (size_t phase = 0; phase < phases->size(); ++phase)
@@ -687,10 +811,13 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   {
     const auto &allocation = allocations[c.copies[i].allocation];
     if (allocation.memory != p.memoryBinding.hostMemory) {
-      auto end = std::lower_bound(c.events.begin(),c.events.end(),allocation.endPhase,
-          [](const auto &event, size_t phase) { return event.phase < phase; });
+      auto end = std::find_if(c.events.begin(),c.events.end(),
+          [&](const auto &event) { return event.phase >= allocation.endPhase; });
       expectedRelease[i] = std::min(expectedRelease[i],size_t(end-c.events.begin()));
     }
+    // Replay the ordered read-before-write event boundary independently.
+    if(!expectedUsers[i].empty() && expectedUsers[i].back()==expectedRelease[i] && expectedRelease[i]<c.events.size())
+      ++expectedRelease[i];
     if (!seenCopies[i] || c.copies[i].releasedAfter != expectedRelease[i] ||
         c.copies[i].lastUsers != expectedUsers[i])
       return fail(error,"copy lifetime, final user or release/reuse mismatch");
@@ -712,7 +839,26 @@ bool orbit::taskflow::checkProgramCommunication(const GenericAnalysis &a,
   }
   if(c.transferBytes!=transferBytes || c.estimatedMakespanMs || !c.computeEstimates.empty() || !c.peakMemoryBytes.empty())return fail(error,"native uncalibrated cost or traffic mismatch");
   for(const auto &event:c.events)if(event.memory!=(event.kind=="transfer"?"":p.memoryBinding.localMemory))return fail(error,"event execution memory mismatch");
-  return checkEdges(a,c,error);
+  if(!checkEdges(a,c,error))return false;
+  size_t instance=0;
+  for(size_t event=0;event<c.events.size();++event)if(c.events[event].kind!="transfer") {
+    if(instance>=c.instances.size())return fail(error,"missing common native task instance");
+    const auto &value=c.instances[instance++];const auto &execution=c.events[event];const auto &phase=(*phases)[execution.phase];
+    auto implementation=std::find_if(p.taskImplementations.begin(),p.taskImplementations.end(),
+        [&](const auto &candidate){return candidate.task==execution.task;});
+    if(implementation==p.taskImplementations.end())return fail(error,"common native instance has no selected implementation");
+    if(value.task!=execution.task || value.event!=event || value.phase!=execution.phase || value.domainTask!=phase.task ||
+       value.kind!=(execution.kind=="initialize"?"source-initializer":"source-task") ||
+       value.implementation!=implementation->kind || value.lanes!=implementation->lanes ||
+       value.parallelLoop!=implementation->parallelLoop || value.domain.size()!=phase.loops.size())
+      return fail(error,"common native instance source/phase/implementation mismatch");
+    for(size_t loop=0;loop<phase.loops.size();++loop){const auto &bound=value.domain[loop];const auto &expected=phase.loops[loop];
+      if(expected.loop>=a.tasks[phase.task].loops.size() || bound.loop!=expected.loop || bound.lower!=expected.lower || bound.upper!=expected.upper ||
+         bound.step!=a.tasks[phase.task].loops[expected.loop].step)
+        return fail(error,"common native instance loop domain differs from chosen source tile");}
+  }
+  if(instance!=c.instances.size())return fail(error,"fabricated common native task instance");
+  return checkProgramGraphSource(a,c,error) && checkProgramGraph(c,error);
 }
 
 llvm::json::Value orbit::taskflow::serializeProgramCommunication(const GenericMappingPlan &p) {
@@ -740,18 +886,24 @@ llvm::json::Value orbit::taskflow::serializeProgramCommunication(const ProgramCo
     llvm::json::Array stages;for(auto stage:region.deviceStages)stages.push_back(int64_t(stage));
     llvm::json::Value record=llvm::json::Object{{"id",region.id},{"placement",region.placement},{"submission_resource",region.submissionResource},
       {"begin_event",int64_t(region.beginEvent)},{"end_event_exclusive",int64_t(region.endEvent)},{"device_stages",std::move(stages)},
-      {"host_submission_count",region.submissionCount},{"submission_kind","host_submission"},
-      {"cost_ownership","prepared-region composite includes submission, device compute/transfers/wait and readback once"}};
+      {"host_submission_count",region.submissionCount},{"submission_kind",region.submissionCount?"host_submission":"none"},
+      {"cost_ownership",region.submissionCount?"prepared-region composite includes submission, device compute/transfers/wait and readback once":"host graph execution; no device submission charge"}};
+    if(!region.invocationLifecycle.empty())(*record.getAsObject())["invocation_lifecycle"]=region.invocationLifecycle;
     jsonWord(record);executionRegions.push_back(std::move(record));
   }
   for(const auto &placement:c.placements){number(placement.task);word(placement.resource);word(placement.memory);word(placement.implementation);
-    placements.push_back(llvm::json::Object{{"task",int64_t(placement.task)},{"resource",placement.resource},{"memory",placement.memory},{"implementation",placement.implementation}});}
+    llvm::json::Object entry{{"task",int64_t(placement.task)},{"resource",placement.resource},{"memory",placement.memory},{"implementation",placement.implementation}};
+    if(placement.resourceCount!=1 || !placement.resourceShape.empty()){number(placement.resourceCount);for(auto n:placement.resourceShape)number(n);entry["resource_count"]=placement.resourceCount;llvm::json::Array shape;for(auto n:placement.resourceShape)shape.push_back(n);entry["resource_shape"]=std::move(shape);}
+    placements.push_back(std::move(entry));}
   StaticConfig architecture;architecture.domains=c.domains;architecture.memories=c.memories;architecture.resources=c.resources;architecture.links=c.links;
   auto architectureJSON=serializeMemoryArchitecture(architecture);jsonWord(architectureJSON);
   for (const auto &memory : c.memories) {
     word(memory.id); number(memory.capacityBytes);
     number(memory.accessibleDevices.size());for(const auto &device:memory.accessibleDevices)word(device);
-    memories.push_back(llvm::json::Object{{"id",memory.id},{"capacity_bytes",memory.capacityBytes}});
+    llvm::json::Object entry{{"id",memory.id},{"capacity_bytes",memory.capacityBytes}};
+    if(!memory.capacityKnown){entry["capacity_bytes"]=nullptr;entry["capacity_known"]=false;}
+    if(memory.alignmentBytes!=1)entry["alignment_bytes"]=memory.alignmentBytes;
+    memories.push_back(std::move(entry));
   }
   for (const auto &resource : c.resources) {
     word(resource.id); word(resource.kind); word(resource.device); number(resource.capacity);
@@ -836,7 +988,7 @@ llvm::json::Value orbit::taskflow::serializeProgramCommunication(const ProgramCo
     {"adapter",c.placements.empty()?"native arbitrary-rank adapter of Static allocation/version/location-copy semantics":"whole-task exact-region adapter of actual Taskflow analysis to Static target contracts"},
     {"memory_peak_bytes",std::move(peaks)},
     {"memory_lifetime_scope",c.placements.empty()?"native physical pool phase intervals; copies have event validity":"event intervals count distinct allocations once; phase fields are conservative summaries"},
-    {"schedule",c.placements.empty()?"phase barriers and copy producer/overwrite dependencies; ordinals are a topological witness, independent same-phase transfers may overlap":"serial topological whole-task events; compute and direct transfers charged once"},
+    {"schedule",c.placements.empty()?"explicit group control, core order and copy producer/overwrite dependencies; ordinals are a topological witness, not completion barriers":"serial topological whole-task events; compute and direct transfers charged once"},
     {"resource_capacity_scope","logical issue witness, not a measured DMA-engine count or a promise of serialized physical transfers"},
     {"system_capacity_scope","allocation accounting limit, not measured available host RAM"},
     {"execution_regions",std::move(executionRegions)},

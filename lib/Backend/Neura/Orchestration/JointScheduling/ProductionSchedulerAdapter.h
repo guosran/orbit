@@ -56,6 +56,9 @@ struct ProductionScheduledResult {
   int64_t makespan = 0;
   uint64_t replayedEdges = 0;
   bool replayedEdgesKnown = false;
+  std::string programGraphId;
+  std::string communicationTraceMLIR, dependencyTraceMLIR;
+  std::vector<int64_t> programGraphTransfers, programGraphOrders;
 };
 
 namespace detail {
@@ -69,6 +72,9 @@ inline void removeProductionCloneAttrs(func::FuncOp function) {
   // Exact schedule/replay metadata belongs to the ORBIT enumerator and must
   // never steer this production invocation.  Remove it only on the clone.
   for (StringRef attr : {
+           StringRef("joint_scheduling_program_graph_id"),
+           StringRef("joint_scheduling_program_graph_transfer_events"),
+           StringRef("joint_scheduling_program_graph_order_edges"),
            StringRef("joint_scheduling_exact_dispatch_order"),
            StringRef("joint_scheduling_exact_replay_timing"),
            StringRef("joint_scheduling_predicted_makespan"),
@@ -295,6 +301,13 @@ inline bool scheduleWithAmoebaProductionPass(
     return false;
   }
 
+  if(auto identity=clonedFunction->getAttrOfType<StringAttr>("joint_scheduling_program_graph_id")) {
+    out.programGraphId=identity.str();
+    if(auto values=clonedFunction->getAttrOfType<DenseI64ArrayAttr>("joint_scheduling_program_graph_transfer_events"))
+      out.programGraphTransfers.assign(values.asArrayRef().begin(),values.asArrayRef().end());
+    if(auto values=clonedFunction->getAttrOfType<DenseI64ArrayAttr>("joint_scheduling_program_graph_order_edges"))
+      out.programGraphOrders.assign(values.asArrayRef().begin(),values.asArrayRef().end());
+  }
   std::map<std::string, size_t> clonedTaskIndices;
   SmallVector<taskflow::TaskflowTaskOp> clonedTasks;
   clonedFunction.walk([&](taskflow::TaskflowTaskOp task) {
@@ -439,6 +452,8 @@ inline bool scheduleWithAmoebaProductionPass(
       committedEdgeIndices.insert(index.getInt());
     }
   }
+  { llvm::raw_string_ostream os(out.communicationTraceMLIR);communicationTrace.print(os); }
+  { llvm::raw_string_ostream os(out.dependencyTraceMLIR);dependencyTrace.print(os); }
   out.replayedEdges = committedEdgeIndices.size();
   out.replayedEdgesKnown = true;
   return true;

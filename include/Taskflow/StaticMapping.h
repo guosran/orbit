@@ -34,11 +34,16 @@ struct StaticProvenance {
 // Ownership is independent of accessibility and transfer connectivity.
 struct StaticResourceDomain {
   std::string id, parent, kind;
+  // Target-defined physical axes. Generic code validates types/references only.
+  std::map<std::string,int64_t> coordinates;
 };
 struct StaticResource {
   std::string id, kind, device;
   int64_t capacity = 0;
   std::string domain;
+  // Minimum reservation implications per unit; concurrent activities contend
+  // through the referenced shared resource, independently of identifier names.
+  std::map<std::string,int64_t> sharedResources;
 };
 struct StaticMemory {
   std::string id;
@@ -47,6 +52,11 @@ struct StaticMemory {
   std::string domain, kind;
   // When present, this is the precise allow-list; device access is legacy.
   std::vector<std::string> accessibleResources;
+  // Allocation byte quantum; default1 is payload accounting, not physical bank alignment.
+  int64_t alignmentBytes = 1;
+  // False means physical byte capacity is not modeled by this target. The
+  // internal INT64_MAX ceiling is arithmetic accounting, never physical SRAM.
+  bool capacityKnown = true;
 };
 struct StaticTransfer {
   std::string id, source, target, resource, memory, sourceLayout, targetLayout;

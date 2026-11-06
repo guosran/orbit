@@ -6,17 +6,37 @@
 namespace orbit::taskflow {
 // Search choices are separate from source access/dependence facts and from
 // the AIR resource bindings below. Indices refer to analyzed source objects.
+struct ProgramResidencyGroup {
+  std::vector<size_t> tasks, retainedStorages;
+  bool operator==(const ProgramResidencyGroup &other) const {
+    return tasks==other.tasks && retainedStorages==other.retainedStorages;
+  }
+  bool operator!=(const ProgramResidencyGroup &other) const {return !(*this==other);}
+};
 struct ProgramMappingChoice {
   // Empty realization/grouping are accepted only as syntactic adapter-auto
   // inputs. Every checked plan stores their resolved canonical values.
+  // phase-local is the legacy adapter-auto choice; explicit realizations are
+  // tiled-phase-local, readonly-panel, and whole-program. The latter retains
+  // graph intermediates/shared input copies in one capacity-checked program.
   std::string residency;
   int64_t storage = -1, reuseLoop = -1, panelLoop = -1;
   std::string grouping;
   // Public copy lifetime choice; empty is legacy input only.
   std::string dataOrganization;
+  // tile-major executes corresponding pointwise instances of this closed task
+  // group before advancing the spatial tile. Retained logical storages have
+  // one shared local copy and no materialized host boundary inside the group.
+  // shape-major reorders independent tiles only within each source task.
+  // Empty vectors preserve the legacy ungrouped source action.
+  std::vector<size_t> taskGroup, retainedStorages;
+  // Scoped decisions. Legacy fields above denote one group when this is empty.
+  // A logical storage may also have consumers outside its local residency scope.
+  std::vector<ProgramResidencyGroup> residencyGroups;
 };
 std::vector<ProgramMappingChoice>
-discoverGenericMappingChoices(const GenericAnalysis &);
+discoverGenericMappingChoices(const GenericAnalysis &,size_t maxResidencyProposals=8,
+                              size_t maxResidencyGroups=4);
 struct GenericTaskImplementation {
   size_t task = 0;
   std::string kind = "scalar";
@@ -25,11 +45,6 @@ struct GenericTaskImplementation {
 struct GenericReadOnlyRetention {
   size_t beginPhase = 0, endPhase = 0, storage = 0;
   std::vector<int64_t> offsets, sizes;
-};
-struct ProgramExecutionGroup {
-  size_t beginPhase = 0, endPhase = 0;
-  std::string resource, memory;
-  std::vector<size_t> dependencies;
 };
 struct GenericLoopBounds {
   size_t loop = 0;
@@ -50,6 +65,12 @@ struct GenericTilePhase {
 struct GenericTileRetention {
   size_t beginPhase = 0, endPhase = 0, storage = 0;
   int64_t initializerTask = -1;
+};
+struct GenericResidencyScope {
+  size_t beginPhase=0, endPhase=0;
+  std::vector<size_t> tasks, retainedStorages, boundaryExports;
+  // Selected implementation lifetime contract, not a semantic source edge.
+  std::string inputReleasePolicy="group-tail"; // group-tail | last-reader
 };
 struct GenericTransfer {
   size_t storage = 0;
@@ -85,7 +106,7 @@ struct GenericCostFeatures {
 struct GenericDirectAIRCost {
   bool enabled = false;
   GenericCostFeatures features;
-  llvm::json::Value model = nullptr, target = nullptr;
+  llvm::json::Value model = nullptr, target = nullptr, eventTiming = nullptr;
   std::string status = "disabled", reason, modelDigest, featureDigest;
   std::optional<double> valueMs;
 };
@@ -101,6 +122,8 @@ struct GenericMemoryBinding {
 };
 struct GenericTargetCapabilities {
   int64_t capacityBytes = 24576;
+  int64_t maxGroupInputs=2,maxGroupOutputs=2;
+  bool acquireAllInputsAtGroupEntry=true;
   std::vector<int64_t> tileAlignment{1,8,1};
   std::vector<GenericTaskImplementation> implementations{{0,"scalar",-1,1},{0,"scalar-product-vector-add-f32",-1,8}};
   std::string identity;
@@ -122,6 +145,7 @@ struct GenericMappingPlan {
   std::vector<size_t> orderedTasks;
   std::vector<GenericTransfer> transfers;
   std::vector<GenericTilePhase> phases;
+  std::vector<GenericResidencyScope> residencyScopes;
   std::vector<GenericTileRetention> retainedRegions;
   std::vector<size_t> fusedInitializerTasks;
   std::vector<GenericHardwareStage> hardwareStages;
@@ -144,6 +168,10 @@ struct GenericMappingPlan {
          theoreticalPerByteMs = 0;
   std::string costProvenance = "unknown: direct AIR path not calibrated";
 };
+// Resolved scope queries are shared with lowering; no backend placement inference.
+const GenericResidencyScope *genericResidencyScope(const GenericMappingPlan &,size_t phase);
+bool genericLocallyRetained(const GenericMappingPlan &,size_t phase,size_t storage);
+std::vector<ProgramResidencyGroup> genericResidencyGroups(const ProgramMappingChoice &);
 bool planGenericMapping(const GenericAnalysis &,
                         const llvm::json::Value &config, GenericMappingPlan &,
                         std::string &error);

@@ -21,6 +21,8 @@
 #include <optional>
 #include <string>
 
+namespace orbit::taskflow { struct ProgramGraph; }
+
 namespace mlir {
 namespace amoeba {
 namespace neura {
@@ -128,6 +130,8 @@ struct TaskEdge {
   // A missing payload is an explicit unknown.  It must not be interpreted as
   // zero by a communication-aware scheduler.
   std::optional<uint64_t> payload_bits;
+  // Public adapter provenance. Legacy edges retain -1 and unchanged contracts.
+  int64_t programGraphEvent = -1, programGraphOrder = -1;
 };
 
 // Options controlling construction of a typed graph.  The default preserves
@@ -156,6 +160,8 @@ private:
   buildTaskEdgeGraph(func::FuncOp func, const TaskEdgeGraphOptions &options,
                      std::string &error);
 
+  friend FailureOr<TaskEdgeGraph> buildTaskEdgeGraphFromProgramGraph(
+      func::FuncOp,const ::orbit::taskflow::ProgramGraph &,std::string &);
   llvm::SmallVector<taskflow::TaskflowTaskOp> tasks_;
   llvm::SmallVector<TaskEdge> edges_;
 };

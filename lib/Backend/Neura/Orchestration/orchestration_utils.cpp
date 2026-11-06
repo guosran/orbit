@@ -382,6 +382,7 @@ public:
     // Phase 3: Build explicit task dependency edges. Keep scalar/value SSA
     // dependencies visible through value_inputs, and also scan all operands to
     // catch taskflow dependency_read_in/dependency_write_in token edges.
+    if (!communication_model || !communication_model->hasAuthoritativeDependencies())
     for (auto &consumer_node : task_nodes) {
       for (Value value_input : consumer_node->op.getValueInputs()) {
         addProducerDependency(value_input, consumer_node.get());
@@ -1957,3 +1958,7 @@ int TaskScheduler::computeScore(TaskNode *task_node,
 
 } // namespace taskflow
 } // namespace mlir
+
+namespace mlir::taskflow {
+bool getProductionContextSlots(int &slots,std::string &error) {return loadContextMemItems(slots,error);}
+}

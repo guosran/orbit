@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
   reject("wrong memory capacity",[](auto &p) { --p.communication.memories.back().capacityBytes; });
   reject("resource overbooking",[](auto &p) { p.communication.resources.front().capacity = 0; });
   reject("unavailable communication link",[](auto &p) { p.communication.links.front().target = "system_memory_bo"; });
-  reject("group without schedule dependency",[](auto &p) { p.executionGroups.back().dependencies.clear(); });
+  reject("group without implementation schedule dependency",[](auto &p) { p.executionGroups.back().implementationDependencies.clear(); });
   reject("unproved loop reordering",[](auto &p) { std::swap(p.taskLoopOrders.back()[1],p.taskLoopOrders.back()[2]); });
   reject("wrong panel region",[](auto &p) { --p.readOnlyRetentions.front().sizes.front(); });
   reject("panel released before reuse",[](auto &p) { --p.readOnlyRetentions.front().endPhase; });
@@ -155,6 +155,48 @@ int main(int argc, char **argv) {
   if (!object->getObject("program_communication") ||
       object->getArray("discovered_mapping_opportunities")->size() < 2) ok = false;
   else ++checks;
+  // Explicit whole-program and tiled-phase-local choices preserve the old
+  // adapter-auto default while making residency a reversible search action.
+  mlir::OwningOpRef<mlir::ModuleOp> wholeModule(mlir::cast<mlir::ModuleOp>(module->clone()));ProgramMappingChoice wholeChoice;wholeChoice.residency="whole-program";
+  GenericAnalysis wholeAnalysis;GenericMappingPlan wholePlan;llvm::json::Value emptyConfig=llvm::json::Object{};
+  if(!setNativeAIRTileSizes(*wholeModule,1,2,3,error)||!setNativeMappingChoice(*wholeModule,wholeChoice,error)||
+     wholeModule->getOperation()->hasAttr("orbit.air_tile_sizes")||!analyzeGenericProgram(*wholeModule,wholeAnalysis,error)||
+     !planGenericMapping(wholeAnalysis,emptyConfig,wholePlan,error)||wholePlan.strategy!="single-herd-resident"||
+     wholePlan.communication.dataPolicy!=ProgramDataPolicy::RetainAcrossUsers){llvm::errs()<<"explicit whole-program mapping failed: "<<error<<"\n";ok=false;}else ++checks;
+  GenericMappingPlan invalidPlan;
+  if(planGenericMapping(wholeAnalysis,config,invalidPlan,error)){llvm::errs()<<"whole-program silently swallowed target tiling\n";ok=false;}else ++checks;
+  auto lowCapacity=llvm::json::Value(llvm::json::Object{{"generic_air",llvm::json::Object{{"capacity_bytes",64}}}});
+  if(planGenericMapping(wholeAnalysis,lowCapacity,invalidPlan,error)){llvm::errs()<<"whole-program silently fell back after capacity failure\n";ok=false;}else ++checks;
+  auto fabricated=wholePlan;fabricated.choices.residency="tiled-phase-local";fabricated.choices.dataOrganization="phase-local";fabricated.choices.grouping="task-shape-stages";
+  if(checkGenericMapping(wholeAnalysis,fabricated,error)){llvm::errs()<<"accepted tiled choice with resident realization\n";ok=false;}else ++checks;
+  if(!setNativeAIRTileSizes(*wholeModule,2,2,4,error)||!analyzeGenericProgram(*wholeModule,wholeAnalysis,error)||
+     !planGenericMapping(wholeAnalysis,emptyConfig,wholePlan,error)||wholePlan.strategy!="serial-tiled"||wholePlan.choices.residency!="tiled-phase-local"){
+    llvm::errs()<<"tile action failed to materialize reverse residency transition: "<<error<<"\n";ok=false;
+  }else ++checks;
+  ProgramMappingChoice contradiction;contradiction.residency="whole-program";contradiction.dataOrganization="phase-local";
+  if(setNativeMappingChoice(*wholeModule,contradiction,error)){llvm::errs()<<"accepted contradictory whole-program policy\n";ok=false;}else ++checks;
+  // Broadcast reuse is inferred from affine accesses, with no arithmetic-name
+  // matching. The same tile schedule switches repeated input loads to one copy.
+  std::string broadcastPath=argv[1];broadcastPath=broadcastPath.substr(0,broadcastPath.find_last_of('/')+1)+"broadcast.mlir";
+  auto broadcast=mlir::parseSourceFile<mlir::ModuleOp>(broadcastPath,&context);GenericAnalysis ba;GenericMappingPlan repeated,shared;
+  llvm::json::Value bc=llvm::json::Object{{"generic_air",llvm::json::Object{{"tile_sizes",llvm::json::Array{1,16}}}}};
+  bool validBroadcast=broadcast&&analyzeGenericProgram(*broadcast,ba,error);ProgramMappingChoice reuse;bool discovered=false;
+  if(validBroadcast)for(auto &c:discoverGenericMappingChoices(ba))if(c.residency=="readonly-panel"&&c.storage==0&&c.reuseLoop==0&&c.panelLoop==1){reuse=c;discovered=true;}
+  ProgramMappingChoice forceTiled;forceTiled.residency="tiled-phase-local";
+  if(!discovered||!setNativeMappingChoice(*broadcast,forceTiled,error)||!analyzeGenericProgram(*broadcast,ba,error)||!planGenericMapping(ba,bc,repeated,error)||
+     !setNativeMappingChoice(*broadcast,reuse,error)||!analyzeGenericProgram(*broadcast,ba,error)||!planGenericMapping(ba,bc,shared,error)){
+    llvm::errs()<<"source-derived broadcast reuse mapping failed: "<<error<<"\n";ok=false;
+  }else{
+    ++checks;int64_t repeatedBytes=0,sharedBytes=0;for(auto &t:repeated.transfers)repeatedBytes+=t.bytes;for(auto &t:shared.transfers)sharedBytes+=t.bytes;
+    if(repeatedBytes!=512||sharedBytes!=320||shared.readOnlyRetentions.size()!=1||repeated.hardwareStages.size()!=1||shared.hardwareStages.size()!=1){llvm::errs()<<"broadcast input reuse did not preserve one stage and reduce exact bytes: "<<repeatedBytes<<" -> "<<sharedBytes<<"\n";ok=false;}else ++checks;
+    size_t sharedInputCopies=0;for(auto &copy:shared.communication.copies)if(shared.communication.allocations[copy.allocation].storage==0&&copy.createdBy>=0){++sharedInputCopies;if(copy.users.size()!=4){llvm::errs()<<"one retained input copy lacks four real consumers\n";ok=false;}}
+    if(sharedInputCopies==1)++checks;else{llvm::errs()<<"retained broadcast did not share exactly one physical input copy\n";ok=false;}
+    GenericCostFeatures contrastFeatures;GenericDirectAIRCost contrastCost;
+    llvm::json::Value contrastModel=llvm::json::Object{{"schema","orbit.direct-air.cost.v1"},{"kind","contrast-composite"}};
+    if(!collectGenericCostFeatures(ba,shared,contrastFeatures,error)||!evaluateGenericDirectAIRCost(contrastFeatures,contrastModel,emptyConfig,contrastCost,error)||contrastCost.valueMs||contrastCost.status!="uncalibrated"){
+      llvm::errs()<<"contrast-only model became a complete absolute score: "<<error<<"\n";ok=false;
+    }else ++checks;
+  }
   const char *indirectSource = R"mlir(
 module attributes {orbit.implementation = "independent-lane-f32", orbit.vector_lanes = 2 : i64} {
   func.func @derived(%x: memref<8xf32> {orbit.role = "input"}, %y: memref<4xf32> {orbit.role = "output"}) attributes {orbit.noalias} {
