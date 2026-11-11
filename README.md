@@ -57,3 +57,12 @@ Model weights remain in the artifact and are evaluated by the existing C++ imple
 ## Optional native constraint optimization
 
 The [CP-SAT v22 interface](docs/taskflow-cpsat-v22.md) adds bounded reuse/tiling composition and independently checked NPU2 shard placement using optional C++ OR-Tools. The default Core build keeps this dependency off. [Validation and solver-time scaling](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-cpsat-v22-validation.md) distinguish finite surrogate optimality, full planner costs and actual hardware behavior.
+
+The [public ProgramGraph joint solver (v23)](docs/taskflow-program-joint-v23.md)
+puts partitioning, local grouping/copies, placement, transfer routes and resource
+scheduling in one source-bound model. Its current executable subset is static
+pointwise programs with explicit host communication between configurations;
+GEMM/attention and arbitrary cross-core residency are outside that joint path.
+A checked baseline and model/time limits bound incomplete solves. The companion
+[v23 validation](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-program-joint-v23-validation.md)
+records independent oracle cases, actual AIE/NPU checks and scaling limits.

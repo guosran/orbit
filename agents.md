@@ -1396,3 +1396,52 @@ remain in orbit-artifact. Preserve all failed stack/routing/property/timeout
 pilots and all frozen original binaries. NPU sessions remain main-only under
 /tmp/npu.lock with process deadlines. This checkpoint alone does not authorize future commits
 or pushes.
+
+## v23: public ProgramGraph joint constraint realization
+
+ProgramJointDomain/Solver/Plan now build one source-bound public graph model
+for finite partition variants, connected local grouping, copy boundaries,
+compute/SRAM placement, transfer links, configurations and resource intervals.
+No complete-plan price table or separate placement solve is used by this entry.
+The original v22 local `cp-sat` mode remains historical. Native AIR search selects
+this entry with native_auto_candidates={mode:joint,algorithm:cp-sat-program};
+legacy proposal fields and staged resume are rejected for this fresh finite solve.
+
+The checked public baseline is saved before CP-SAT; AIR mode also checks its
+source/copy/static-buffer realization first. Model limits and deadlines retain
+that baseline with truthful UNKNOWN/RESOURCE_LIMIT. Final AIE checking consumes
+frozen decisions without solving, proves complete caller ABI forwarding and
+cross-owner/symbol isolation before per-core projection, and checks actual
+selected computations, copies, addresses, locks, placement and configurations.
+Each configuration has a separate synchronous AIR launch so installed channel
+conversion preserves the explicit host BO round trip.
+
+Current executable scope is static scalar pointwise identity-grid programs,
+independent axis-zero partitions, equal storage grids, unique writers and direct
+host/core DMA. Connected group copies and explicit host-mediated inter-group
+communication are supported; GEMM/reductions, layout search, packet/memtile and
+arbitrary cross-core SRAM residency are outside this joint path. An assumed
+resource timeline guides choices; timed runtime dispatch and hardware-latency
+optimality are not claimed. Final toolchain/AIE checking remains mandatory.
+
+Validation: Core44 and combined61 pass; optional solver-on/off public contracts
+pass23 each; final AIE contracts pass39 cases across three implementations.
+Two source graphs (shared-input FP32 arithmetic and a17x64 chain) yield five
+actual NPU implementations, including changed grouping, two cores, a9-row/tail
+partition and two configurations with a host temporary. Two fresh processes per
+implementation pass80 calls/128 complete arrays against FP32 and FP64 references
+at unchanged1e-5 tolerances; maximum absolute error is1.1920928955078125e-7.
+
+Sixteen serialized scaling runs vary2–128 tasks,1/2/4 compute resources and one
+or three partition variants. The two-core single-variant model reaches96125
+variables/220307 constraints at64 tasks;32/64 exhaust useful1-second solves,
+while128 stops at the100000-variable guard. All retain checked baselines. Whole
+process time can exceed the soft budget (about1.30seconds at64); finite-domain
+completeness does not mean unrestricted program-space completeness. Raw RSS is
+process high-water telemetry, not isolated solver allocations.
+
+See docs/taskflow-program-joint-v23.md and companion
+ taskflow/docs/taskflow-program-joint-v23-validation.md. Artifact scripts own
+experiments, full output arrays and measurements. Frozen prior tools/failures
+remain preserved. NPU work stays main-only under/tmp/npu.lock with deadlines.
+This checkpoint does not authorize future commits or pushes.

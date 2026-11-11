@@ -136,11 +136,19 @@ struct MappingScheduledEvent {
   std::vector<size_t> predecessors;
   std::optional<double> startMs, endMs;
 };
+struct MappingScheduledConfiguration {
+  std::vector<size_t> groups;
+  double startMs=0,endMs=0,setupMs=0;
+};
 struct MappingGraphSchedule {
   // A conservative serial realization of the dependency/resource partial
   // order. Unknown durations never become zero-duration measured work.
   std::string policy = "serial-event-order";
   std::vector<MappingScheduledEvent> events;
+  // Present only for the opt-in public constraint-resource schedule.
+  std::string modelIdentity, timingBoundary;
+  std::vector<double> eventDurationsMs;
+  std::vector<MappingScheduledConfiguration> configurations;
   std::optional<double> estimatedMakespanMs;
   std::vector<std::string> uncalibrated;
 };
@@ -191,6 +199,7 @@ bool finalizeProgramGraph(const GenericAnalysis &, ProgramGraph &,
 // Independent common validation; adapter checkers additionally prove their
 // supported source-region and backend realization correspondence.
 bool checkProgramGraph(const ProgramGraph &, std::string &error);
+bool checkProgramResourceSchedule(const ProgramGraph &, std::string &error);
 bool checkProgramGraphSource(const GenericAnalysis &, const ProgramGraph &,
                              std::string &error);
 // Physical allocation reuse constraints, separate from logical consumption.

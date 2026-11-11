@@ -153,6 +153,10 @@ bool checkSourceInstanceCoverage(const ProgramGraph &graph, std::string &error) 
 // and schedule serialization explicitly without changing semantic dependencies.
 bool schedule(const ProgramGraph &graph, MappingGraphSchedule &out, std::string &error) {
   const auto policy=graph.schedule.policy;
+  if(policy=="constraint-resource-schedule") {
+    if(!checkProgramResourceSchedule(graph,error))return false;
+    out=graph.schedule;return true;
+  }
   if(policy!="serial-event-order" && policy!="dependency-order-witness")return fail(error,"unsupported graph schedule policy");
   out = {};
   out.policy=policy;
@@ -214,10 +218,19 @@ llvm::json::Value scheduleJSON(const MappingGraphSchedule &value) {
         {"start_ms", event.startMs ? llvm::json::Value(*event.startMs) : llvm::json::Value(nullptr)},
         {"end_ms", event.endMs ? llvm::json::Value(*event.endMs) : llvm::json::Value(nullptr)}});
   for (const auto &reason : value.uncalibrated) missing.push_back(reason);
-  return Object{{"policy", value.policy}, {"events", std::move(events)},
+  Object result{{"policy", value.policy}, {"events", std::move(events)},
       {"estimated_makespan_ms", value.estimatedMakespanMs ? llvm::json::Value(*value.estimatedMakespanMs) : llvm::json::Value(nullptr)},
       {"uncalibrated", std::move(missing)},
       {"timing_boundary", value.policy=="serial-event-order" ? "serial compute and transfer events; explicit region call overhead remains unknown unless separately calibrated" : "dependency witness only; backend cycle/resource schedule is separately bound"}};
+  if(value.policy=="constraint-resource-schedule") {
+    Array costs,configurations;
+    for(auto cost:value.eventDurationsMs)costs.push_back(cost);
+    for(const auto &c:value.configurations)configurations.push_back(Object{{"groups",indices(c.groups)},
+        {"start_ms",c.startMs},{"end_ms",c.endMs},{"setup_ms",c.setupMs}});
+    result["model_identity"]=value.modelIdentity;result["timing_boundary"]=value.timingBoundary;
+    result["event_durations_ms"]=std::move(costs);result["configurations"]=std::move(configurations);
+  }
+  return result;
 }
 llvm::json::Value graphJSON(const ProgramGraph &graph) {
   Array instances, transfers, regions, logicalData, sourceDependencies;

@@ -98,3 +98,10 @@ target_link_libraries(taskflow-reuse-constraints-test PRIVATE MLIRTaskflowStruct
 add_executable(taskflow-cpsat-opt taskflow-cpsat-opt.cpp)
 target_compile_options(taskflow-cpsat-opt PRIVATE -fexceptions)
 target_link_libraries(taskflow-cpsat-opt PRIVATE ORBITConstraintSearch LLVMSupport)
+
+if(ORBIT_ENABLE_ORTOOLS)
+  set(ORBIT_JOINT_TEST_MODE --require-solver)
+else()
+  set(ORBIT_JOINT_TEST_MODE --unavailable)
+endif()
+add_custom_target(check-taskflow-program-joint COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_joint_v23.py $<TARGET_FILE:taskflow-opt> ${ORBIT_JOINT_TEST_MODE} DEPENDS taskflow-opt)

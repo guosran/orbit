@@ -4,10 +4,12 @@
 #include "Taskflow/GenericMapping.h"
 #include "Taskflow/NativeTransforms.h"
 #include "Taskflow/ProgramPartition.h"
+#include "Taskflow/ProgramJointSearch.h"
 #include "Taskflow/HeterogeneousSearch.h"
 #ifdef ORBIT_ENABLE_AIR
 #include "Taskflow/AIRBackend.h"
 #include "Taskflow/NPUIndependentShards.h"
+#include "Taskflow/ProgramJointAIR.h"
 #endif
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "Taskflow/StaticMapping.h"
@@ -98,6 +100,13 @@ static cl::opt<std::string> checkHeterogeneous("check-heterogeneous",
 static cl::opt<std::string> lowerMulticore("lower-multicore-to-air",cl::desc("Write a CP-SAT-placed independent-shard AIR program to a NEW directory"));
 static cl::opt<std::string> checkMulticoreAIE("check-multicore-aie",cl::desc("Independently check final multi-core AIE for the source and target"));
 static cl::opt<int64_t> npuShards("npu-shards",cl::init(2));
+static cl::opt<std::string> jointSearch("joint-program-search",cl::desc("Joint public ProgramGraph CP-SAT search; write evidence to a new directory"));
+static cl::opt<std::string> jointPlan("joint-program-plan",cl::desc("Recheck source-bound joint decisions from this JSON file without solving"));
+static cl::opt<std::string> checkJointAIE("check-joint-aie");
+static cl::opt<bool> jointBaselineOnly("joint-baseline-only");
+static cl::opt<bool> jointLower("joint-lower-air",cl::desc("Lower the chosen public joint graph to AIR in the search directory"));
+static cl::opt<double> jointSeconds("joint-seconds",cl::init(5));
+static cl::opt<int64_t> jointVariables("joint-max-variables",cl::init(100000));
 int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
                               "ORBIT independent structured Taskflow core\n");
@@ -109,7 +118,7 @@ int main(int argc, char **argv) {
 #ifdef ORBIT_ENABLE_AIR
   registry.insert<mlir::vector::VectorDialect>();
   context.appendDialectRegistry(registry);
-  if (lowerAIR || !lowerMulticore.empty() || !checkMulticoreAIE.empty() || !lowerProgram.empty() || !heterogeneousOutput.empty() || airPassPipeline || (!checkAIR.empty() || !checkAIE.empty()) ||
+  if (lowerAIR || jointLower || !checkJointAIE.empty() || !lowerMulticore.empty() || !checkMulticoreAIE.empty() || !lowerProgram.empty() || !heterogeneousOutput.empty() || airPassPipeline || (!checkAIR.empty() || !checkAIE.empty()) ||
       !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
     context.allowUnregisteredDialects();
     prepareGenericAIRContext(context);
@@ -192,6 +201,55 @@ int main(int argc, char **argv) {
     return true;
   };
   const bool wantsGraph=!programTimingOutput.empty() || programGraph || !programGraphOutput.empty() || !programGraphDOT.empty() || !checkProgramGraphFile.empty();
+  if(search&&backend=="air"&&!targetConfig.empty()){
+    auto cfg=readJSON(targetConfig);if(!cfg)return fatal(llvm::toString(cfg.takeError()));auto root=cfg->getAsObject();auto options=root?root->getObject("native_auto_candidates"):nullptr;
+    if(options&&options->getString("algorithm")=="cp-sat-program"){if(options->getString("mode")!="joint")return fatal("cp-sat-program requires native_auto_candidates.mode=joint");if(searchResume||!searchCheckpoint.empty())return fatal("public joint search currently writes a fresh finite solve; staged-search resume is unsupported");for(auto &entry:*options)if(entry.first!="mode"&&entry.first!="algorithm")return fatal("cp-sat-program domain and budgets use program_joint and --joint-seconds, not legacy proposal fields");if(searchOutput.empty())return fatal("--search-output required for public joint search");jointSearch=searchOutput.getValue();}
+  }
+  if(!jointSearch.empty() || !jointPlan.empty() || !checkJointAIE.empty()) {
+    auto module=parse(text);if(!module||mlir::failed(mlir::verify(*module)))return fatal("valid native Taskflow source required");
+    llvm::json::Value config=llvm::json::Object{};if(!targetConfig.empty()){auto c=readJSON(targetConfig);if(!c)return fatal(llvm::toString(c.takeError()));config=std::move(*c);}
+#ifdef ORBIT_ENABLE_AIR
+    if(!configureProgramJointNPU(config,npuShards,error))return fatal(error);
+#endif
+    GenericAnalysis analysis;ProgramJointDomain domain;if(!analyzeGenericProgram(*module,analysis,error)||!buildProgramJointDomain(analysis,config,domain,error))return fatal(error);
+    auto baseline=baselineProgramJointDomain(domain);ProgramGraph baselineGraph;
+    if(baseline.hasPlan&&(!materializeProgramJointSolution(domain,baseline,baselineGraph,error)||!checkProgramJointSolution(domain,baseline,baselineGraph,error)))return fatal(error);
+    if(!jointSearch.empty()){
+      if(llvm::sys::fs::exists(jointSearch))return fatal("joint output directory must be new");if(auto ec=llvm::sys::fs::create_directories(jointSearch))return fatal(ec.message());
+      if(!writeJSON(jointSearch+"/domain.json",serializeProgramJointDomain(domain))||!writeJSON(jointSearch+"/baseline.json",serializeProgramJointSolution(domain,baseline,baseline.hasPlan?&baselineGraph:nullptr))||!writeJSON(jointSearch+"/target.json",config))return fatal(error);
+#ifdef ORBIT_ENABLE_AIR
+      if(jointLower&&baseline.hasPlan){mlir::OwningOpRef<mlir::ModuleOp> air;llvm::json::Value manifest=nullptr;if(!lowerProgramJointToAIR(*module,config,domain,baseline,baselineGraph,air,manifest,error))return fatal("baseline cannot lower: "+error);std::error_code ec;llvm::raw_fd_ostream stream(jointSearch+"/baseline.air.mlir",ec);if(ec)return fatal(ec.message());air->print(stream,mlir::OpPrintingFlags().printGenericOpForm());stream<<"\n";if(!writeJSON(jointSearch+"/baseline-air.json",manifest))return fatal(error);}
+#endif
+    }
+    ProgramJointSolution solution;
+    if(!jointPlan.empty()){auto record=readJSON(jointPlan);if(!record)return fatal(llvm::toString(record.takeError()));auto object=record->getAsObject();if(!object||object->getString("domain_id")!=domain.identity)return fatal("joint plan source/target/domain identity mismatch");if(!parseProgramJointSolution(*record,solution,error))return fatal(error);}
+    else if(jointBaselineOnly)solution=baseline;
+    else {ConstraintSearchOptions options;options.wallSeconds=jointSeconds;options.maxVariables=jointVariables;solution=solveProgramJointDomain(domain,options,&baseline);}
+    ProgramGraph graph;if(solution.hasPlan&&(!materializeProgramJointSolution(domain,solution,graph,error)||!checkProgramJointSolution(domain,solution,graph,error)))return fatal(error);
+    if(!jointSearch.empty()&&!writeJSON(jointSearch+"/solution.json",serializeProgramJointSolution(domain,solution,solution.hasPlan?&graph:nullptr)))return fatal(error);
+    if(!jointPlan.empty()&&solution.hasPlan){auto record=readJSON(jointPlan);auto stored=record?record->getAsObject()->get("program_graph"):nullptr;if(!stored||staticFingerprint(*stored)!=staticFingerprint(serializeProgramGraph(graph)))return fatal("stored joint public graph differs from checked decisions");}
+    if(!checkJointAIE.empty()){
+#ifdef ORBIT_ENABLE_AIR
+      if(jointPlan.empty())return fatal("--check-joint-aie requires --joint-program-plan to check frozen choices without solving");
+      auto candidateBytes=llvm::MemoryBuffer::getFile(checkJointAIE);if(!candidateBytes)return fatal(candidateBytes.getError().message());auto actual=parse((*candidateBytes)->getBuffer());if(!actual)return fatal("valid generic final AIE required");llvm::json::Value receipt=nullptr;bool valid=checkProgramJointAIE(*module,config,domain,solution,graph,*actual,receipt,error);if(!writeJSON(implementationOutput,receipt))return fatal(error);return valid?0:fatal(error);
+#else
+      return fatal("joint AIE checker requires ORBIT_ENABLE_AIR=ON");
+#endif
+    }
+    if(jointLower){
+#ifdef ORBIT_ENABLE_AIR
+      if(jointSearch.empty()||!solution.hasPlan)return fatal("--joint-lower-air requires a search directory and checked plan");
+      mlir::OwningOpRef<mlir::ModuleOp> air;llvm::json::Value manifest=nullptr;if(!lowerProgramJointToAIR(*module,config,domain,solution,graph,air,manifest,error))return fatal(error);
+      std::error_code ec;llvm::raw_fd_ostream stream(jointSearch+"/program.air.mlir",ec);if(ec)return fatal(ec.message());air->print(stream,mlir::OpPrintingFlags().printGenericOpForm());stream<<"\n";
+      if(!writeJSON(jointSearch+"/manifest.json",manifest)||!writeJSON(jointSearch+"/abi.json",*manifest.getAsObject()->get("abi"))||!writeJSON(jointSearch+"/target.json",config))return fatal(error);
+#else
+      return fatal("joint AIR lowering requires ORBIT_ENABLE_AIR=ON");
+#endif
+    }
+    if(solution.hasPlan&&!emitGraph(graph))return fatal(error);
+    if(!mappingOutput.empty()&&!writeJSON(mappingOutput,serializeProgramJointSolution(domain,solution,solution.hasPlan?&graph:nullptr)))return fatal(error);
+    return solution.hasPlan?0:fatal(solution.message);
+  }
   if(!lowerMulticore.empty() || !checkMulticoreAIE.empty()) {
 #ifdef ORBIT_ENABLE_AIR
     auto module=parse(text);if(!module || mlir::failed(mlir::verify(*module)))return fatal("valid Taskflow source required");
