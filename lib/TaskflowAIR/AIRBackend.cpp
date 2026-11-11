@@ -1599,7 +1599,7 @@ static bool lowerGenericToAIRImpl(const GenericAnalysis &source,
             for(const auto &region:plan.phases[pi].regions)
               if(commonTransfer(pi,region.storage,true)) {
                 if(active.preloaded[region.storage]) {
-                  error="AIR block input requires a distinct checked shared-input implementation";
+                  error="AIR block contains duplicate public input deliveries; shared readers require one checked copy";
                   return active.dependency;
                 }
                 Value local=tileView(region,pi,commonPoolKey(pi,region.storage,true));

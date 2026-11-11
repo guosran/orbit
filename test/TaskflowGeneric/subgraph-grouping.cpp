@@ -42,7 +42,7 @@ int main(int argc,char **argv){
   if(!require(combinedDiscovered,"original action discovery composes an additional group"))return 1;
   auto rejected=[&](ProgramMappingChoice choice,const char *name){GenericMappingPlan p;error.clear();return require(!build(choice,p),name);};
   auto overlap=combined;overlap.residencyGroups.push_back(first.residencyGroups.front());if(!rejected(overlap,"overlapping group rejection"))return 1;
-  auto noncontiguous=first;noncontiguous.residencyGroups[0].tasks={1,3};if(!rejected(noncontiguous,"noncontiguous group proof rejection"))return 1;
+  auto noncontiguous=first;noncontiguous.residencyGroups[0].tasks={1,3};GenericMappingPlan reordered;if(!require(build(noncontiguous,reordered)&&reordered.residencyScopes.front().tasks==std::vector<size_t>({1,3}),"dependency-convex noncontiguous group preserves task identities"))return 1;
   auto wrongProducer=second;wrongProducer.residencyGroups[0].retainedStorages={x};if(!rejected(wrongProducer,"retained producer outside selected scope rejected"))return 1;
   if(!require(build(combined,both),"restore valid graph"))return 1;
   auto bad=both;bad.residencyScopes.front().boundaryExports.clear();bad.planId.clear();if(!require(!checkGenericMapping(facts,bad,error),"fabricated missing boundary export rejected"))return 1;

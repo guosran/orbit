@@ -1,0 +1,116 @@
+{
+  "model_version": "v20-v19-unchanged-nine-assumptions-r1",
+  "target_version": "v20-data-region-reuse-r1",
+  "generic_air": {
+    "capacity_bytes": 24576,
+    "cost_model": {
+      "schema": "orbit.direct-air.cost.v1",
+      "kind": "event-mechanism",
+      "mode": "estimate",
+      "model_id": "v18-transparent-algorithm-validation-r1",
+      "model_version": "v18-r1",
+      "boundary": "prepared-command-host-to-host",
+      "implementations": [
+        "scalar"
+      ],
+      "parameters": {
+        "compute.startup": {
+          "value": 200.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed fixed local task-instance/loop entry work, excluding explicit transfers and group configuration."
+          }
+        },
+        "compute.operation": {
+          "value": 2.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed ns per logical nonconstant arith/math source operation of the scalar implementation; not instruction-level latency."
+          }
+        },
+        "compute.memory_access": {
+          "value": 3.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed effective ns per source load/store including correlated indexing/local-loop work; no independent memory-bank calibration."
+          }
+        },
+        "communication.startup": {
+          "value": 500.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed effective ns per public transfer/core-delivery activity including lock/setup. Public transfers may coalesce to fewer runtime BDs; this is not runtime-BD or physical DMA latency."
+          }
+        },
+        "communication.bandwidth": {
+          "value": 1.0,
+          "unit": "bytes/ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed effective payload throughput in bytes/ns for the bound system-to-local path; not measured DDR bandwidth."
+          }
+        },
+        "configuration.startup": {
+          "value": 40000.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed40000ns per explicit execution group. Magnitude is informed by old coupled stage effects, but is NOT transferred isolated configuration calibration."
+          }
+        },
+        "host.submit": {
+          "value": 100000.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed prepared-call entry/TO-sync/host dispatch envelope per actual shared invocation, excluding device work and group setup."
+          }
+        },
+        "host.complete": {
+          "value": 100000.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed completion observation/FROM-sync/host return envelope per invocation, excluding separately priced device work."
+          }
+        },
+        "host.visibility": {
+          "value": 0.0,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "Assumed zero separate price because visibility/ABI work is owned by the host entry/return envelopes, not because physical synchronization is free."
+          }
+        }
+      },
+      "scope": "Explicit assumption-driven resource-scheduled search objective, not a calibrated or validated ranking model. Same parameters for all program/candidate shapes; no per-program total-time fitting. v19 reuses all nine numeric assumptions unchanged; not device calibration."
+    }
+  },
+  "native_auto_candidates": {
+    "mode": "joint",
+    "max_tile_proposals": 4,
+    "exploration_slots": 0,
+    "max_joint_proposals": 32,
+    "max_joint_tiles": 16,
+    "max_residency_proposals": 32,
+    "max_residency_groups": 4,
+    "algorithm": "joint",
+    "tile_generator": "constraint",
+    "stage_rounds": 2,
+    "max_scope_sets": 32,
+    "max_catalogue_configurations": 512,
+    "max_generation_attempts": 2048,
+    "max_generator_planner_calls": 2048,
+    "max_internal_planner_calls": 2048,
+    "max_cost_provider_calls": 24
+  },
+  "search_preferences": {
+    "m_alignment": 1,
+    "n_alignment": 8,
+    "k_alignment": 1
+  }
+}

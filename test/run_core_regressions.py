@@ -57,6 +57,9 @@ def main():
     checker('taskflow-program-mechanism-test', fixtures / 'broadcast.mlir')
     checker('taskflow-target-binding-test')
     checker('taskflow-subgraph-grouping-test', fixtures / 'subgraphs-v19.mlir')
+    checker('taskflow-reuse-test', fixtures / 'reuse-interleaved-v20.mlir', fixtures / 'reuse-interleaved-permuted-v20.mlir', fixtures / 'reuse-shared-input-v20.mlir', fixtures / 'reuse-shared-input-permuted-v20.mlir')
+    checker('taskflow-reuse-constraints-test', fixtures / 'reuse-interleaved-v20.mlir', CORE_ROOT / 'test/TaskflowGeneric/reuse-assumptions-v21.json')
+    checker('taskflow-shared-input-test', fixtures / 'shared-input-v20.mlir')
     checker('taskflow-program-partition-test')
     checker('taskflow-data-organization-test')
     checker('taskflow-direct-air-cost-test', CORE_ROOT / 'test/TaskflowGeneric/add.mlir')
@@ -84,6 +87,10 @@ def main():
     python('data-policy', 'TaskflowAIR/data_organization_v8.py')
     python('joint-data-search', 'TaskflowAIR/joint_data_search_v8.py')
     python('automatic-native-search', 'TaskflowGeneric/automatic_search_v10.py')
+    python('data-reuse-staged-search-v21', 'TaskflowGeneric/data_reuse_search_v21.py', tool,
+           '--source', fixtures / 'reuse-interleaved-v20.mlir',
+           '--config', CORE_ROOT / 'test/TaskflowGeneric/reuse-assumptions-v21.json',
+           '--tile-m', '12', '--tile-n', '136')
     if args.amoeba_tool:
         python('original-native-search', 'TaskflowMapping/native_search.py', tool,
                '--amoeba-tool', args.amoeba_tool.resolve())

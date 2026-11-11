@@ -12,6 +12,7 @@ bool orbit::taskflow::evaluateGenericMechanismCost(const GenericAnalysis &source
     const GenericMappingPlan &plan, const llvm::json::Value &model,
     const llvm::json::Value &target, GenericDirectAIRCost &cost,
     std::string &error) {
+  recordGenericMappingCostProviderCall();
   cost = {}; cost.enabled = true; cost.model = llvm::json::Value(model);
   cost.target = llvm::json::Value(target); cost.modelDigest = staticFingerprint(model);
   if (!collectGenericCostFeatures(source, plan, cost.features, error)) return false;

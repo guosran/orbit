@@ -303,6 +303,7 @@ bool orbit::taskflow::checkGenericAIEImplementation(const GenericAnalysis &a,
   std::vector<size_t> oldCompute,oldOutput;std::vector<size_t> terminal;
   for(size_t block=begin;block<group.endPhase;block+=width){std::vector<size_t> compute,in,out;std::set<size_t> inStorage,outStorage;
    for(size_t ei=0;ei<n;++ei){const auto &e=g.events[ei];if(e.phase<block || e.phase>=block+width)continue;if(e.kind=="compute")compute.push_back(ei);else if(e.kind=="transfer" && e.transferRegion){if(e.link==plan.memoryBinding.inputLink){in.push_back(ei);inStorage.insert(e.transferRegion->storage);}else if(e.link==plan.memoryBinding.outputLink){out.push_back(ei);outStorage.insert(e.transferRegion->storage);}else return reject("unknown boundary link");}else return reject("unsupported non-pointwise activity");}
+   if(in.size()!=inStorage.size())return reject("shared boundary input is loaded more than once in one block");
    if(compute.size()!=width || inStorage!=inputs || outStorage!=outputs)return reject("actual stream set differs from necessary public boundary transfers");
    for(size_t j=1;j<compute.size();++j)edge(compute[j-1],compute[j]);
    for(auto t:in)edge(t,compute.front());for(auto t:out)edge(compute.back(),t);

@@ -86,6 +86,22 @@ def main():
    elif ch=='}':depth-=1
    end+=1
   segment=body[opening+1:end-1]
+  # Move a real free-lock release before all source accesses. Its lock and
+  # unit SSA operands remain intact; causal checking must reject early reuse.
+  first_view=re.search(r'(?m)^[ \t]*%\w+ = "memref.reinterpret_cast"[^\n]*\n',segment)
+  release=next((m for m in re.finditer(r'(?m)^[ \t]*"aie.use_lock"[^\n]+action = 1[^\n]*\n',segment) if first_view and m.start()>first_view.start()),None)
+  if first_view and release:
+   mutated=segment[:first_view.start()]+release[0]+segment[first_view.start():release.start()]+segment[release.end():]
+   mutations.setdefault('early-free-lock-before-all-readers',body[:opening+1]+mutated+body[end-1:])
+  # Distinct phase views of a shared logical storage must retain one actual
+  # buffer root. Change only a later root, keeping source metadata and type.
+  same_views=list(re.finditer(r'(%\w+) = "memref.reinterpret_cast"\((%\w+)[^\n]+orbit.storage = "([^"]+)"[^\n]*\n',segment))
+  for view in same_views:
+   prior=next((v for v in same_views if v.start()<view.start() and v[3]==view[3] and v[2]==view[2]),None)
+   other=next((v for v in same_views if v[3]!=view[3] and v[2]!=view[2] and v[0].split(' -> ')[-1]==view[0].split(' -> ')[-1]),None)
+   if prior and other:
+    mutated=segment[:view.start(2)]+other[2]+segment[view.end(2):]
+    mutations.setdefault('shared-copy-divergent-actual-buffer',body[:opening+1]+mutated+body[end-1:]);break
   views=list(re.finditer(r'(?m)^[ \t]*%\w+ = "memref.reinterpret_cast"[^\n]+orbit.phase = (\d+)[^\n]*\n',segment))
   transitions=[]
   for view in views:

@@ -14,7 +14,7 @@ cmake -S "$core_root" -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DZLIB_LIBRARY=/usr/lib/x86_64-linux-gnu/libz.so -DZLIB_INCLUDE_DIR=/usr/include \
   -DORBIT_ENABLE_NEURA=OFF -DORBIT_ENABLE_AIR=OFF
 cmake --build "$build_dir" --target taskflow-opt taskflow-generic-mapping-test \
-  taskflow-tiled-mapping-test taskflow-program-mapping-test taskflow-instance-grouping-test taskflow-program-mechanism-test taskflow-target-binding-test taskflow-subgraph-grouping-test \
+  taskflow-tiled-mapping-test taskflow-program-mapping-test taskflow-instance-grouping-test taskflow-program-mechanism-test taskflow-target-binding-test taskflow-subgraph-grouping-test taskflow-reuse-test taskflow-reuse-constraints-test taskflow-shared-input-test \
   taskflow-program-partition-test taskflow-data-organization-test \
   taskflow-direct-air-cost-test taskflow-program-graph-test taskflow-amoeba-program-graph-test \
   taskflow-heterogeneous-mapping-test taskflow-mechanism-cost-test \

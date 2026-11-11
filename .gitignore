@@ -15,6 +15,7 @@ __pycache__/
 !architecture_with_counter.yaml
 /test/**/*.asm
 /test/**/*.json
+!/test/TaskflowGeneric/reuse-assumptions-v21.json
 /test/**/*.dot
 /test/**/*.png
 .lit_test_times.txt

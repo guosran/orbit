@@ -6,6 +6,8 @@
 namespace orbit::taskflow {
 // Search choices are separate from source access/dependence facts and from
 // the AIR resource bindings below. Indices refer to analyzed source objects.
+// Retained storages may be uniquely produced data, or immutable external input
+// shared by at least two member readers of the exact same tile rectangle.
 struct ProgramResidencyGroup {
   std::vector<size_t> tasks, retainedStorages;
   bool operator==(const ProgramResidencyGroup &other) const {
@@ -172,6 +174,13 @@ struct GenericMappingPlan {
 const GenericResidencyScope *genericResidencyScope(const GenericMappingPlan &,size_t phase);
 bool genericLocallyRetained(const GenericMappingPlan &,size_t phase,size_t storage);
 std::vector<ProgramResidencyGroup> genericResidencyGroups(const ProgramMappingChoice &);
+// Monotonic process/thread-local diagnostics only. They neither select plans
+// nor alter candidate/cache identities. Snapshot deltas count actual entries,
+// including the planner's internal final checker invocation.
+struct GenericMappingStatistics { uint64_t plannerCalls=0, checkerCalls=0, costProviderCalls=0; };
+GenericMappingStatistics genericMappingStatistics();
+// Shared by the two native complete-cost providers; no nested double charge.
+void recordGenericMappingCostProviderCall();
 bool planGenericMapping(const GenericAnalysis &,
                         const llvm::json::Value &config, GenericMappingPlan &,
                         std::string &error);

@@ -1214,3 +1214,140 @@ legacy NPU adapter label; actual resource/device/owner binding is target-derived
 and this tag must never be interpreted as an architecture or mapping decision.
 Broader noncontiguous residency, multi-core hardware and complex layouts remain
 explicit backend boundaries. No automatic push or commit.
+
+## v20: data-region reuse and compatible subgraph tiling
+
+`GenericReuse.h/.cpp` discovers opportunities from actual exact rectangular
+accesses, singleton versions, unique producers and consumer demands, including
+immutable external inputs. It emits the existing ProgramMappingChoice plus tile
+sizes; ProgramGraph remains the sole public execution graph. No workload name,
+fixed task/storage index, Python planner or new scheduler participates.
+
+Selected groups are contracted in the complete source dependency DAG. Convex
+path closure supplies required intermediate tasks; a cyclic quotient rejects.
+Topological expansion changes orderedTasks while preserving source indices,
+body pointers, versions and data/order constraints. Tile-major lowering still
+consumes contiguous execution groups, which may now be noncontiguous in source.
+Internal whole-task pure-order barriers remain explicitly unsupported. External
+pure-order dependencies must survive contraction and actual implementation
+checking; never delete one to make a group legal.
+
+Bounded consumer scopes and current/row-shrunk/column-shrunk compatible tiles
+are jointly checked through native source transforms and the existing mapping
+planner. Capacity rejection feeds tile selection. Scope round-robin preserves
+consumer coverage before additional tile variants. Diagnostics retain the seed,
+exact region/version, consumers, closure, memory, payload peak, boundary bytes,
+delivery/configuration counts and rejection reasons. This finite enumeration is
+not an exhaustive Pareto or globally optimal solver. Timing and parent selection
+still use the complete checked ProgramGraph/ProgramTiming.
+
+The existing retainedStorages selection also accepts globally immutable inputs
+with at least two group readers. The first equal-rectangle import creates one
+local copy for all readers; later duplicate deliveries disappear. Input ABI
+allocations remain, inputs are never exported, and refill waits for every old
+reader. Different rectangles reject. Explicit last-reader policy and actual
+AIR/AIE lock/buffer checking substantiate this behavior; runner BO reuse is not
+the implementation. One logical storage still belongs to at most one disjoint
+selected residency scope. Broader layouts, reductions, in-place updates and
+multi-core native realization do not inherit this certification.
+
+`native_auto_candidates.algorithm` selects `v19-contiguous` (compatibility
+default), `fixed-tiling`, `reuse-then-tiling` or `data-reuse-joint`. The last three
+require mode=joint. max_joint_proposals/max_joint_tiles each range1..64 with
+defaults8/4; tests use32/4,96 evaluations,beam2,two rounds. Reuse-first chooses
+scope at the current tile or the first feasible capacity repair, then tunes
+tiles in later rounds; it is not deliberately denied repaired scopes. Original
+source hashing, action chains, cache, checkpoint replay and target binding are
+retained. Strict mode keeps absolute costs unknown. All nine v19/v18 numeric
+assumptions are unchanged; no device fitting occurs.
+
+New evidence belongs in companion results/taskflow/data-reuse-v20 and its final
+DELIVERY/RESULTS/REPRODUCE files. Two different17x136 arithmetic programs test
+interleaved fanout/join plus an independent reuse chain, and shared-input/join.
+Both source arrangements have equal semantic reuse opportunities. The original
+two-round search selects and expands scored first-round parents; case1 honestly
+selects the same best plan for joint and reuse-first. CPU search-plan signatures
+are scoped to the same source and are not hardware measurements or compiled
+binary-equivalence proofs. Actual compiled representatives have exact complete
+graph/plan correspondence and independent actual AIR/AIE checks.
+
+Current independent Core regression coverage is42 groups, including16 reuse and
+25 shared-input checks. Preserve the first Core failure, which expected a now
+legal dependency-convex noncontiguous group to reject; the subsequent change is
+an acceptance-contract update, not a production bypass. Preserve all failed
+drafts, interrupted CPU snapshots and previous evidence. Current Core/AIR builds
+are new; the original Neura/CGRA optimizer remains a preserved historical binary.
+All device work is main-agent-only, serial under /tmp/npu.lock with an outer
+120-second timeout. No commit or push is authorized automatically.
+
+## v21: controlled reuse and tiling decisions
+
+The new native policies are `strong-reuse-first`, `strong-tile-first`,
+`alternating`, `joint`, and the offline `catalogue` reference. Historical v20
+policies remain available with their original decisions. Strong reuse-first
+admits multiple disjoint scopes and deterministic feasible tile repairs before
+freezing organization; strong tile-first freezes its tile before searching all
+admitted organizations. Alternating uses reuse/tile/reuse/tile stages. Joint can
+change one scope and tile together. All use existing source actions, complete
+ProgramGraph, planner, scheduler, checker and structured search. Do not infer a
+general affine or multilevel memory solver from this bounded implementation.
+
+`GenericReuseOptions` builds a shared scope/tile catalogue from source-backed
+reuse opportunities. Source singleton/full-consumer scopes, immutable-input
+first-pair/full scopes and bounded disjoint combinations are explicit limits.
+Tile origins include capacity boundaries, divisor/tail sizes, target alignment
+preferences, current neighbors and halving. A proven distinct-buffer payload
+lower bound can reject excessive occupancy; a small lower bound cannot certify
+capacity. Every admitted configuration still passes the complete planner.
+Pareto comparisons require identical groups and boundary exports and include
+peak storage, bytes, deliveries, configurations and compute instances; the
+reference retains dominated configurations.
+
+All new policies/generators share the explicit optimizer-domain compute-instance
+bound256. Exact static task-tile counts screen expensive plans and are checked
+against generated phases. These exclusions are search complexity limits, never
+backend illegality claims. Hard alignment/divisibility restrictions require
+explicit tile_constraints; target alignment remains a preference. Protocolr3
+records the pre-hardware CPU deadline pilot and this uniform amendment while
+preserving earlier protocols and failures.
+
+Raw telemetry counts generation attempts, internal planner/checker entries,
+actual complete cost-provider calls, score queries, cache hits and elapsed time.
+Independent checker repricing is charged. Cost budgets16/32/64 and wall budgets
+5/15seconds include catalogue construction, with equal remaining round quotas.
+Nonpreemptive work can overshoot a wall deadline and reports that amount.
+Historical controls use unmatched score-query budgets and are context only.
+Checkpoint revalidation has separate actual-work counters; the restored policy
+ledger and current-process raw counters have different meanings.
+
+Checked-outcome caches hold no MLIR pointers or reusable scored plans, bind
+source semantics/target/model/choice/domain, and avoid repeated discovery probes.
+Selected plans and resumed artifacts still undergo complete independent checks.
+Atomic completed-round prefixes retain interrupted evidence and can repeat an
+unfinished round. Do not erase failed builds, JSON reproductions, timeout pilots,
+old numerical data, or immutable tool snapshots when reproducing this work.
+
+Evidence belongs in companion `results/taskflow/data-reuse-v21`; its final
+DELIVERY/RESULTS/REPRODUCE identify the accepted build and measurements. Questions
+A (space), B (strategy within a common pool), C (budget) and D (tile generation)
+must be answered separately. A catalogue optimum is only for its admitted finite
+set and assumed model. Deduplicate final actual implementations across strategy
+labels before hardware measurement. Main alone runs locked NPU sessions with
+complete outputs and unchanged tolerance/model, including two fresh processes.
+Current Core/AIR binaries and preserved historical Amoeba/CGRA binaries remain
+distinct. No automatic commit or push.
+
+The completed v21 delivery passes Core44, combined61, preserved Neura17/CGRA8
+and lit35. All120 primary policy runs plus six finite references complete; an
+extra four-round legacy series is resource-stopped after one completed run and
+one incomplete checkpoint, with the original two-round compatibility retained.
+The32 distinct compiled AIE implementations pass full searched/compiled plan and
+graph equality; five batches in ten main-agent processes produce1224 calls and
+2448 complete independently checked output arrays. FP32/FP64 maxima are
+2.980232238769531e-7 and2.384185791015625e-7. New shapes improve paired timing
+against halving-reference plans in interleaved and coupling; shared-input has no
+stable improvement. Strong tile-first/alternating match or beat joint, and three
+model-untied pairs have resolved wrong order in both sessions. Candidate geometry,
+work budget and decision freezing are distinct contributions; neither pure joint
+superiority nor fine hardware ranking is established. Final evidence lives in
+the v21 DELIVERY/RESULTS/REPRODUCE files. Preserve every failure and frozen tool.

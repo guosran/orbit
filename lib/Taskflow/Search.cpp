@@ -1,6 +1,7 @@
 #include "Taskflow/Search.h"
 #include "Taskflow/StaticEvaluation.h"
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/GenericReuse.h"
 #include "Taskflow/NativeTransforms.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -17,6 +18,7 @@
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cmath>
+#include <chrono>
 #include <map>
 #include <numeric>
 using namespace orbit::taskflow;
@@ -180,6 +182,9 @@ std::vector<SearchAction> orbit::taskflow::generateNativeTileActions(
   return actions;
 }
 bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOptions &o,std::string &e) {
+  const auto searchStart=std::chrono::steady_clock::now();
+  auto elapsedMs=[&](){return std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-searchStart).count();};
   const bool nativeAir = o.backend == "air" && (o.evaluator.empty() || o.evaluator == "native");
   const bool nativeAmoeba = o.backend=="amoeba" && bool(o.nativeEvaluator);
   const bool nativeHeterogeneous=o.backend=="cpu-npu" && bool(o.nativeEvaluator);
@@ -266,10 +271,27 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     std::string text;llvm::raw_string_ostream stream(text);module->print(stream);
     return hash(text);
   };
-  bool automatic=false;std::string automaticMode="joint";size_t maxTileProposals=12,maxResidencyProposals=8,maxResidencyGroups=4;int64_t explorationSlots=0;
+  bool automatic=false;std::string automaticMode="joint", reuseAlgorithm="v19-contiguous";size_t maxJointProposals=8,maxJointTiles=4;size_t maxTileProposals=12,maxResidencyProposals=8,maxResidencyGroups=4;int64_t explorationSlots=0;
   GenericTargetCapabilities proposalCapabilities;
   SearchPreferences preferences;
   j::Object automaticProposals;
+  bool catalogueMode=false,catalogueBuilt=false,reportTelemetry=false;
+  GenericReuseOptions catalogueOptions;
+  GenericReuseDiscovery catalogueDiscovery;
+  int64_t stageRounds=2,maxInternalPlannerCalls=2048,maxCostProviderCalls=0;
+  double maxWallTimeMs=0;
+  std::string budgetStop;
+  bool perRoundEvaluationQuota=true;
+  int64_t chargedPlannerCalls=0,chargedCheckerCalls=0,chargedCostCalls=0;
+  j::Array evaluationTrace;
+  j::Array strategyExclusions;
+  const auto mappingStatisticsStart=genericMappingStatistics();
+  auto plannerCalls=[&](){return int64_t(genericMappingStatistics().plannerCalls-mappingStatisticsStart.plannerCalls);};
+  auto checkerCalls=[&](){return int64_t(genericMappingStatistics().checkerCalls-mappingStatisticsStart.checkerCalls);};
+  auto costProviderCalls=[&](){return int64_t(genericMappingStatistics().costProviderCalls-mappingStatisticsStart.costProviderCalls);};
+  std::string evaluationBinding;
+  std::map<std::string,std::vector<SearchAction>> actionCache;
+  int64_t actionCacheHits=0,actionCacheMisses=0;
   if(auto setting=config.getAsObject()->get("native_auto_candidates")) {
     auto object=setting->getAsObject();
     if(!nativeBody || !object) {e="native_auto_candidates requires native source and an object";return false;}
@@ -277,6 +299,63 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     if(auto mode=object->getString("mode"))automaticMode=mode->str();
     if(automaticMode!="joint" && automaticMode!="tiling-only" && automaticMode!="implementation-residency") {
       e="native auto mode must be joint, tiling-only or implementation-residency";return false;
+    }
+    if(auto algorithm=object->getString("algorithm"))reuseAlgorithm=algorithm->str();
+    catalogueMode=reuseAlgorithm=="strong-reuse-first" || reuseAlgorithm=="strong-tile-first" ||
+        reuseAlgorithm=="alternating" || reuseAlgorithm=="joint" || reuseAlgorithm=="catalogue";
+    if(!catalogueMode && reuseAlgorithm!="v19-contiguous" && reuseAlgorithm!="fixed-tiling" &&
+       reuseAlgorithm!="reuse-then-tiling" && reuseAlgorithm!="data-reuse-joint") {
+      e="unknown native auto algorithm";return false;
+    }
+    if(reuseAlgorithm!="v19-contiguous" && automaticMode!="joint") {
+      e="data reuse algorithms require native auto mode joint";return false;
+    }
+    if(catalogueMode){maxJointTiles=16;catalogueOptions.maxScopeSets=32;
+      catalogueOptions.maxCatalogueConfigurations=512;catalogueOptions.maxAttempts=2048;catalogueOptions.maxComputeInstances=256;
+      catalogueOptions.maxPlannerCalls=2048;}
+    if(auto field=object->getString("tile_generator"))catalogueOptions.tileGenerator=field->str();
+    if(catalogueOptions.tileGenerator!="constraint" && catalogueOptions.tileGenerator!="historical-halving") {
+      e="tile_generator must be constraint or historical-halving";return false;
+    }
+    for(auto field:{"stage_rounds","max_scope_sets","max_catalogue_configurations",
+                    "max_generation_attempts","max_generator_planner_calls",
+                    "max_internal_planner_calls","max_cost_provider_calls","max_compute_instances"})if(auto value=object->get(field)) {
+      auto count=value->getAsInteger();
+      if(!count || *count<1 || *count>1000000){e=std::string(field)+" must be an integer in [1,1000000]";return false;}
+      if(llvm::StringRef(field)=="stage_rounds")stageRounds=*count;
+      else if(llvm::StringRef(field)=="max_scope_sets")catalogueOptions.maxScopeSets=*count;
+      else if(llvm::StringRef(field)=="max_catalogue_configurations")catalogueOptions.maxCatalogueConfigurations=*count;
+      else if(llvm::StringRef(field)=="max_generation_attempts")catalogueOptions.maxAttempts=*count;
+      else if(llvm::StringRef(field)=="max_generator_planner_calls")catalogueOptions.maxPlannerCalls=*count;
+      else if(llvm::StringRef(field)=="max_internal_planner_calls")maxInternalPlannerCalls=*count;
+      else if(llvm::StringRef(field)=="max_compute_instances")catalogueOptions.maxComputeInstances=*count;
+      else maxCostProviderCalls=*count;
+    }
+    if(auto field=object->get("per_round_evaluation_quota")) {
+      auto value=field->getAsBoolean();if(!value){e="per_round_evaluation_quota must be boolean";return false;}
+      perRoundEvaluationQuota=*value;
+    }
+    if(auto field=object->get("max_wall_time_ms")) {
+      auto value=field->getAsNumber();
+      if(!value || !std::isfinite(*value) || *value<=0){e="max_wall_time_ms must be finite and positive";return false;}
+      maxWallTimeMs=*value;
+    }
+    if(auto field=object->get("tile_constraints")) {
+      auto constraints=field->getAsObject();if(!constraints){e="tile_constraints must be an object";return false;}
+      if(auto alignment=constraints->get("alignment")) {
+        auto values=alignment->getAsArray();if(!values || values->size()!=3){e="tile constraint alignment needs three integers";return false;}
+        for(const auto &value:*values){auto count=value.getAsInteger();if(!count || *count<=0){e="tile constraint alignment must be positive";return false;}catalogueOptions.requiredAlignment.push_back(*count);}
+      }
+      if(auto divisible=constraints->get("require_divisible")) {
+        auto value=divisible->getAsBoolean();if(!value){e="require_divisible must be boolean";return false;}
+        catalogueOptions.requireDivisible=*value;
+      }
+      for(const auto &entry:*constraints)if(entry.first!="alignment" && entry.first!="require_divisible") {e="unknown tile constraint";return false;}
+    }
+    for(auto field:{"max_joint_proposals","max_joint_tiles"})if(auto count=object->get(field)) {
+      auto value=count->getAsInteger();
+      if(!value || *value<1 || *value>64){e=std::string(field)+" must be an integer in [1,64]";return false;}
+      (llvm::StringRef(field)=="max_joint_proposals"?maxJointProposals:maxJointTiles)=size_t(*value);
     }
     if(auto count=object->get("max_tile_proposals")) {
       auto value=count->getAsInteger();
@@ -292,9 +371,19 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       if(!value || *value<0 || *value>o.beamWidth) {e="exploration_slots must be an integer in [0,beam width]";return false;}
       explorationSlots=*value;
     }
-    for(auto &entry:*object)if(entry.first!="mode" && entry.first!="max_tile_proposals" && entry.first!="exploration_slots" && entry.first!="max_residency_proposals" && entry.first!="max_residency_groups") {
+    for(auto &entry:*object)if(entry.first!="mode" && entry.first!="max_tile_proposals" && entry.first!="exploration_slots" && entry.first!="max_residency_proposals" && entry.first!="max_residency_groups" && entry.first!="algorithm" && entry.first!="max_joint_proposals" && entry.first!="max_joint_tiles" && entry.first!="stage_rounds" &&
+       entry.first!="tile_generator" && entry.first!="max_scope_sets" && entry.first!="max_catalogue_configurations" &&
+       entry.first!="max_generation_attempts" && entry.first!="max_generator_planner_calls" &&
+       entry.first!="max_internal_planner_calls" && entry.first!="max_cost_provider_calls" && entry.first!="max_compute_instances" &&
+       entry.first!="max_wall_time_ms" && entry.first!="tile_constraints" && entry.first!="per_round_evaluation_quota") {
       e="unknown native_auto_candidates field";return false;
     }
+    reportTelemetry=catalogueMode || object->get("max_cost_provider_calls") ||
+        object->get("max_internal_planner_calls") || object->get("max_wall_time_ms");
+    catalogueOptions.maxTileProposals=maxJointTiles;
+    catalogueOptions.maxGroups=maxResidencyGroups;
+    catalogueOptions.maxProposals=catalogueOptions.maxCatalogueConfigurations;
+    catalogueOptions.catalogue=true;catalogueOptions.includeBaseline=true;
     if(!getGenericTargetCapabilities(staticConfig,proposalCapabilities,e))return false;
     if(proposalCapabilities.tileAlignment.size()!=3 || proposalCapabilities.capacityBytes<=0) {
       e="native automatic proposals require three tile alignments and positive target capacity";return false;
@@ -357,13 +446,188 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     SearchAction local{"auto_mapping_phase_local",{}};
     local.mapping=ProgramMappingChoice{};nativeActions.push_back(std::move(local));
   }
-  auto nativeActionsFor=[&](const State &state) {
+  struct CatalogueCandidate {
+    SearchAction action;
+    std::string key,configurationId,organization;
+    std::vector<int64_t> tile;
+    std::set<std::string> groups;
+    j::Value derivation=nullptr;
+  };
+  std::vector<CatalogueCandidate> catalogue;
+  std::string catalogueError;double catalogueMaterializationMs=0;
+  auto groupKeys=[](const ProgramMappingChoice &mapping) {
+    std::set<std::string> keys;
+    for(const auto &group:genericResidencyGroups(mapping)) {
+      std::string key;for(auto task:group.tasks)key+=std::to_string(task)+",";
+      key+="/";for(auto storage:group.retainedStorages)key+=std::to_string(storage)+",";
+      keys.insert(std::move(key));
+    }
+    return keys;
+  };
+  auto organizationKey=[&](const ProgramMappingChoice &mapping) {
+    std::string key;for(const auto &group:groupKeys(mapping))key+=group+";";
+    return key;
+  };
+  auto tileVolume=[](const std::vector<int64_t> &tile) {
+    long double product=1;for(auto size:tile)product*=size;return product;
+  };
+  auto buildCatalogue=[&]() {
+    if(catalogueBuilt)return;
+    catalogueBuilt=true;
+    auto module=parseNative(sourceText);GenericAnalysis analysis;
+    if(!module || !analyzeGenericProgram(*module,analysis,catalogueError))return;
+    if(auto sizes=module->getOperation()->getAttrOfType<mlir::DenseI64ArrayAttr>("orbit.air_tile_sizes"))
+      catalogueOptions.currentTile.assign(sizes.asArrayRef().begin(),sizes.asArrayRef().end());
+    catalogueOptions.currentTile.resize(3,1);
+    catalogueOptions.maxPlannerCalls=std::min(catalogueOptions.maxPlannerCalls,
+        size_t(std::max<int64_t>(0,maxInternalPlannerCalls-chargedPlannerCalls)));
+    if(maxWallTimeMs>0) {
+      auto remaining=maxWallTimeMs-elapsedMs();
+      if(remaining<=0) {
+        budgetStop="wallclock";catalogueDiscovery.stopReason="wallclock-before-catalogue";
+        write(o.outputDir+"/catalogue.json",render(j::Object{
+            {"schema","orbit.reuse.catalogue.v21"},{"catalogue_id",""},{"catalogue_complete",false},
+            {"stop_reason",catalogueDiscovery.stopReason},
+            {"generation_stats",serializeGenericReuseStats(catalogueDiscovery.stats)},
+            {"proposals",j::Array{}},{"rejected",j::Array{}}}),catalogueError);
+        return;
+      }
+      catalogueOptions.maxWallTimeMs=remaining;
+    }
+    // Optimizer policy and budget do not change target semantics or catalogue
+    // identity. Build a fresh projection rather than retaining erased keys.
+    j::Object targetFields;
+    if(auto object=staticConfig.getAsObject())for(const auto &entry:*object)
+      if(entry.first!="native_auto_candidates" && entry.first!="search_diversity_slots" &&
+         entry.first!="search_preferences")targetFields[entry.first.str()]=j::Value(entry.second);
+    j::Value targetConfig(std::move(targetFields));
+    catalogueDiscovery=discoverGenericReuseConfigurations(analysis,targetConfig,catalogueOptions);
+    chargedPlannerCalls+=catalogueDiscovery.stats.plannerCalls;
+    chargedCheckerCalls+=catalogueDiscovery.stats.checkerCalls;
+    const auto materializationStart=elapsedMs();
+    j::Array reports;
+    for(auto &proposal:catalogueDiscovery.proposals) {
+      if(proposal.tileSizes.size()!=3)continue;
+      CatalogueCandidate candidate;
+      candidate.tile=proposal.tileSizes;candidate.groups=groupKeys(proposal.mapping);
+      candidate.organization=organizationKey(proposal.mapping);
+      candidate.action.mapping=proposal.mapping;
+      candidate.action.options.tileM=proposal.tileSizes[0];
+      candidate.action.options.tileN=proposal.tileSizes[1];
+      candidate.action.options.tileK=proposal.tileSizes[2];
+      std::string text=sourceText,reason;
+      if(!nativeTransform(text,false,reason,&candidate.action.options,&candidate.action)) {
+        catalogueError="checked catalogue failed source materialization: "+reason;return;
+      }
+      candidate.key=hash(text);
+      candidate.configurationId=hash(catalogueDiscovery.catalogueId+candidate.key);
+      candidate.action.name="catalogue_"+candidate.configurationId.substr(0,20);
+      candidate.derivation=std::move(proposal.diagnostics);
+      const auto directory=o.outputDir+"/catalogue-sources";
+      if(auto ec=llvm::sys::fs::create_directories(directory)){catalogueError=ec.message();return;}
+      const auto path=directory+"/"+candidate.key+".mlir";
+      if(!write(path,text,catalogueError))return;
+      auto parsed=parseNative(text);
+      reports.push_back(j::Object{{"configuration_id",candidate.configurationId},
+          {"candidate_id",candidate.key},{"action",candidate.action.name},{"native_source",path},
+          {"organization_key",candidate.organization},
+          {"requested_configuration",nativeRequestedConfiguration(*parsed)},
+          {"derivation",j::Value(candidate.derivation)}});
+      catalogue.push_back(std::move(candidate));
+    }
+    catalogueMaterializationMs=elapsedMs()-materializationStart;
+    if(!write(o.outputDir+"/catalogue.json",render(j::Object{
+        {"schema","orbit.reuse.catalogue.v21"},{"catalogue_id",catalogueDiscovery.catalogueId},
+        {"catalogue_complete",catalogueDiscovery.catalogueComplete},
+        {"stop_reason",catalogueDiscovery.stopReason},
+        {"generation_stats",serializeGenericReuseStats(catalogueDiscovery.stats)},
+        {"proposals",std::move(reports)},{"rejected",j::Array(catalogueDiscovery.rejected)}}),catalogueError))return;
+  };
+  auto catalogueActionsFor=[&](const State &state,int64_t round) {
+    buildCatalogue();std::vector<SearchAction> actions;
+    if(!catalogueError.empty())return actions;
+    auto module=parseNative(state.nativeMLIR);ProgramMappingChoice mapping;std::string reason;
+    if(!module || !readNativeMappingChoice(*module,mapping,reason)){
+      catalogueError="cannot recover parent catalogue organization: "+reason;return actions;
+    }
+    const auto organization=organizationKey(mapping);const auto groups=groupKeys(mapping);
+    auto tile=catalogueOptions.currentTile;
+    if(auto sizes=module->getOperation()->getAttrOfType<mlir::DenseI64ArrayAttr>("orbit.air_tile_sizes"))
+      tile.assign(sizes.asArrayRef().begin(),sizes.asArrayRef().end());
+    const bool firstStage=round<=stageRounds;
+    std::string stage=reuseAlgorithm=="strong-reuse-first" ? (firstStage?"reuse":"tile-frozen-organization") :
+        reuseAlgorithm=="strong-tile-first" ? (firstStage?"tile":"reuse-frozen-tile") :
+        reuseAlgorithm=="alternating" ? (round%2?"reuse-frozen-tile":"tile-frozen-organization") : reuseAlgorithm;
+    std::map<std::string,const CatalogueCandidate*> witnesses;
+    if(reuseAlgorithm=="strong-reuse-first" && firstStage)for(const auto &candidate:catalogue) {
+      auto found=witnesses.find(candidate.organization);
+      const bool anchor=candidate.tile==catalogueOptions.currentTile;
+      if(found==witnesses.end() || (anchor && found->second->tile!=catalogueOptions.currentTile) ||
+          (found->second->tile!=catalogueOptions.currentTile &&
+           (tileVolume(candidate.tile)>tileVolume(found->second->tile) ||
+            (tileVolume(candidate.tile)==tileVolume(found->second->tile) && candidate.tile>found->second->tile))))
+        witnesses[candidate.organization]=&candidate;
+    }
+    j::Array reports;std::map<size_t,std::vector<const CatalogueCandidate*>> allowedByGroupCount;
+    for(const auto &candidate:catalogue) {
+      bool allowed=true;std::string exclusion;
+      if(reuseAlgorithm=="strong-reuse-first") {
+        allowed=firstStage ? witnesses[candidate.organization]==&candidate : candidate.organization==organization;
+        exclusion=firstStage?"deterministic-current-or-largest-feasible-witness":"organization-frozen";
+      } else if(reuseAlgorithm=="strong-tile-first") {
+        allowed=firstStage?candidate.groups.empty():candidate.tile==tile;
+        exclusion=firstStage?"baseline-organization-frozen":"tile-frozen";
+      } else if(reuseAlgorithm=="alternating") {
+        allowed=round%2?candidate.tile==tile:candidate.organization==organization;
+        exclusion=round%2?"tile-frozen":"organization-frozen";
+      } else if(reuseAlgorithm=="joint") {
+        size_t removed=0,added=0;
+        for(const auto &key:groups)removed+=!candidate.groups.count(key);
+        for(const auto &key:candidate.groups)added+=!groups.count(key);
+        allowed=std::max(removed,added)<=1;exclusion="more-than-one-group-edit";
+      }
+      if(allowed)allowedByGroupCount[candidate.groups.size()].push_back(&candidate);
+      else strategyExclusions.push_back(j::Object{{"parent",state.key},{"round",round},
+          {"stage",stage},{"configuration_id",candidate.configurationId},{"candidate_id",candidate.key},
+          {"reason",exclusion}});
+      reports.push_back(j::Object{{"parent",state.key},{"round",round},{"stage",stage},
+          {"action",candidate.action.name},{"configuration_id",candidate.configurationId},
+          {"candidate_id",candidate.key},{"admitted",allowed},{"reason",allowed?"stage-permitted":exclusion},
+          {"feasibility_repair",allowed && reuseAlgorithm=="strong-reuse-first" && firstStage &&
+             candidate.tile!=catalogueOptions.currentTile}});
+    }
+    // A policy-independent round-robin across group counts keeps complete
+    // multigroup configurations visible under a finite prefix budget. It uses
+    // no timing score from the unpriced legality catalogue.
+    for(size_t depth=0;;++depth) {
+      bool progress=false;
+      for(const auto &bucket:allowedByGroupCount)if(depth<bucket.second.size()) {
+        actions.push_back(bucket.second[depth]->action);progress=true;
+      }
+      if(!progress)break;
+    }
+    automaticProposals[state.key+"@round_"+std::to_string(round)]=std::move(reports);
+    return actions;
+  };
+  auto nativeActionsFor=[&](const State &state,int64_t expansionRound=-1) {
+    if(expansionRound<0)expansionRound=state.round+1;
+    const auto cacheKey=hash(evaluationBinding+state.key+":"+std::to_string(expansionRound));
+    if(auto found=actionCache.find(cacheKey);found!=actionCache.end()) {
+      ++actionCacheHits;return found->second;
+    }
+    ++actionCacheMisses;
+    if(catalogueMode) {
+      auto actions=catalogueActionsFor(state,expansionRound);
+      actionCache.emplace(cacheKey,actions);return actions;
+    }
     auto actions=nativeActions;
     if(automatic) {
       auto module=parseNative(state.nativeMLIR);GenericAnalysis analysis;std::string diagnostic;
       j::Array proposals;
       if(module && analyzeGenericProgram(*module,analysis,diagnostic)) {
-        if(automaticMode!="implementation-residency") {
+        if(automaticMode!="implementation-residency" &&
+           (reuseAlgorithm=="v19-contiguous" || reuseAlgorithm=="data-reuse-joint" ||
+            (reuseAlgorithm=="reuse-then-tiling" && state.round>0))) {
           std::array<int64_t,3> current{1,1,1};
           if(auto sizes=module->getOperation()->getAttrOfType<mlir::DenseI64ArrayAttr>("orbit.air_tile_sizes")) {
             if(sizes.size()==3)std::copy(sizes.asArrayRef().begin(),sizes.asArrayRef().end(),current.begin());
@@ -395,7 +659,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
             if(legal)actions.push_back(std::move(action));
           }
         }
-        if(automaticMode!="tiling-only")for(const auto &implementation:proposalCapabilities.implementations) {
+        if(automaticMode!="tiling-only" && reuseAlgorithm=="v19-contiguous")for(const auto &implementation:proposalCapabilities.implementations) {
           SearchAction action{"auto_implementation_"+implementation.kind+"_"+std::to_string(implementation.lanes),{}};
           action.implementation=implementation.kind;action.vectorLanes=implementation.lanes;
           actions.push_back(std::move(action));
@@ -407,7 +671,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
              : automaticMode=="implementation-residency" && action.options.tileM;
       }),actions.end());
     }
-    if (discoverMappings && (!automatic || automaticMode!="tiling-only")) {
+    if (discoverMappings && (!automatic || (automaticMode!="tiling-only" && reuseAlgorithm=="v19-contiguous"))) {
       auto module=parseNative(state.nativeMLIR); GenericAnalysis analysis;
       std::string diagnostic;
       if (module && analyzeGenericProgram(*module,analysis,diagnostic))
@@ -437,6 +701,47 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
           actions.push_back(std::move(action));
         }
     }
+    if(automatic && automaticMode!="tiling-only" && reuseAlgorithm!="v19-contiguous" &&
+       !(reuseAlgorithm=="reuse-then-tiling" && state.round>0)) {
+      auto module=parseNative(state.nativeMLIR);GenericAnalysis analysis;std::string diagnostic;
+      if(module && analyzeGenericProgram(*module,analysis,diagnostic)) {
+        auto discovery=discoverGenericReuseProposals(analysis,staticConfig,maxJointProposals,
+            maxResidencyGroups,reuseAlgorithm=="fixed-tiling"?1:maxJointTiles);
+        auto &reports=*automaticProposals[state.key].getAsArray();
+        for(auto &rejection:discovery.rejected)reports.push_back(std::move(rejection));
+        std::set<std::string> sequentialScopes;
+        for(auto &proposal:discovery.proposals) {
+          SearchAction action{"reuse_joint_"+std::to_string(reports.size()),{}};
+          action.mapping=proposal.mapping;
+          if(proposal.tileSizes.size()!=3)continue;
+          action.options.tileM=proposal.tileSizes[0];
+          action.options.tileN=proposal.tileSizes[1];
+          action.options.tileK=proposal.tileSizes[2];
+          // Sequential reuse selection retains the first legal propagated tile
+          // per scope (current tile first, otherwise bounded capacity repair).
+          // Later rounds change tiles only, preserving that selected scope.
+          std::string child=state.nativeMLIR;diagnostic.clear();
+          bool legal=nativeTransform(child,false,diagnostic,&action.options,&action);
+          if(reuseAlgorithm=="reuse-then-tiling" && legal) {
+            auto scopeModule=parseNative(child);
+            auto mapping=scopeModule->getOperation()->getAttr("orbit.mapping");
+            std::string scope;llvm::raw_string_ostream stream(scope);stream<<mapping;
+            if(!sequentialScopes.insert(scope).second)continue;
+          }
+          j::Object report{{"action",action.name},{"kind","data-reuse-joint"},
+              {"algorithm",reuseAlgorithm},{"candidate_id",legal?j::Value(hash(child)):j::Value(nullptr)},
+              {"planner_supported",legal},{"reason",diagnostic},
+              {"reuse_derivation",std::move(proposal.diagnostics)}};
+          if(legal) {
+            auto candidate=parseNative(child);
+            report["requested_configuration"]=nativeRequestedConfiguration(*candidate);
+            actions.push_back(std::move(action));
+          }
+          reports.push_back(std::move(report));
+        }
+      }
+    }
+    actionCache.emplace(cacheKey,actions);
     return actions;
   };
   if(auto v=config.getAsObject()->get("search_preferences")) {
@@ -491,11 +796,20 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
   }
   std::string dependencyBinding;bindFiles(config,dependencyBinding);
   dependencyBinding+=fileDigest(llvm::sys::fs::getMainExecutable(nullptr,(void*)&runStructuredSearch));
-  const std::string evaluationBinding=hash(dependencyBinding+o.backend+canonicalJSON(config)+evaluatorIdentity);
+  evaluationBinding=hash(dependencyBinding+o.backend+canonicalJSON(config)+evaluatorIdentity);
   const auto evaluationIdentityFor=[&](const State &s){return hash(evaluationBinding+stateIdentity(s));};
+  std::map<std::string,GenericMappingStatistics> checkpointEvaluationWork;
+  bool checkingCheckpoint=false;
   auto evaluateNative=[&](const std::string &text,const std::string &directory,std::string &reason) {
-    return nativePlugin ? o.nativeEvaluator(text,staticConfig,directory,reason) :
+    const auto before=genericMappingStatistics();
+    auto result=nativePlugin ? o.nativeEvaluator(text,staticConfig,directory,reason) :
       (nativeAir ? evaluateGenericMLIR(text,staticConfig,reason) : evaluateStaticMLIR(text,staticConfig,reason));
+    if(catalogueMode && checkingCheckpoint) {
+      const auto after=genericMappingStatistics();
+      checkpointEvaluationWork[hash(text)]={after.plannerCalls-before.plannerCalls,
+          after.checkerCalls-before.checkerCalls,after.costProviderCalls-before.costProviderCalls};
+    }
+    return result;
   };
   const char *scoreField=nativeAmoeba?"makespan_cycles":((nativeAir||nativeHeterogeneous)?"estimated_ms":"makespan_ms");
   std::string binding=hash(evaluationBinding+sourceKey+std::to_string(o.maxCandidates)+":"+std::to_string(o.maxRounds)+":"+std::to_string(o.beamWidth));
@@ -508,7 +822,9 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
   std::vector<State> archive,beam;std::set<std::string> seen; int64_t nextRound=1, evaluations=0;
   j::Array selections,attempts;
   auto save=[&](){j::Array rows,bs;for(auto &s:archive)rows.push_back(row(s));for(auto &s:beam)bs.push_back(s.key);
-    return write(cp,render(j::Object{{"schema","orbit.structured.search.v1"},{"binding",binding},{"next_round",nextRound},{"evaluations",evaluations},{"archive",std::move(rows)},{"beam",std::move(bs)},{"selections",j::Array(selections)},{"attempts",j::Array(attempts)}}),e);};
+    j::Object saved{{"schema","orbit.structured.search.v1"},{"binding",binding},{"next_round",nextRound},{"evaluations",evaluations},{"archive",std::move(rows)},{"beam",std::move(bs)},{"selections",j::Array(selections)},{"attempts",j::Array(attempts)}};
+    if(catalogueMode){saved["trace"]=j::Array(evaluationTrace);saved["budget_stop"]=budgetStop;}
+    return write(cp,render(std::move(saved)),e);};
   auto checkGraphArtifacts=[&](const State &state,const j::Value &result) {
     if(!nativeAir && !nativePlugin)return true;
     auto object=result.getAsObject();auto expected=object?object->get("program_graph"):nullptr;
@@ -527,7 +843,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     }
     return true;
   };
-  if(o.resume){j::Value saved=nullptr;if(!read(cp,saved,e))return false;auto root=saved.getAsObject();
+  if(o.resume){checkingCheckpoint=true;j::Value saved=nullptr;if(!read(cp,saved,e))return false;auto root=saved.getAsObject();
     if(!root||root->getString("schema")!="orbit.structured.search.v1"||root->getString("binding")!=binding){e="checkpoint binding differs (source/config/evaluator/budget)";return false;}
     auto rows=root->getArray("archive"),bs=root->getArray("beam");
     if(!rows||!bs||!root->getInteger("next_round")||!root->getInteger("evaluations")){e="invalid checkpoint";return false;}
@@ -538,6 +854,17 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       e="checkpoint round/evaluation/history consistency failed";return false;
     }
     selections=*savedSelections;attempts=*savedAttempts;
+    if(catalogueMode) {
+      auto trace=root->getArray("trace");if(!trace){e="catalogue checkpoint lacks score/work trace";return false;}
+      evaluationTrace=*trace;budgetStop=root->getString("budget_stop").value_or("").str();
+      if(evaluationTrace.size()!=size_t(evaluations)){e="checkpoint work trace/evaluation count differs";return false;}
+      for(const auto &event:evaluationTrace) {
+        auto row=event.getAsObject();if(!row){e="invalid checkpoint work trace";return false;}
+        chargedPlannerCalls+=row->getInteger("planner_calls_delta").value_or(0);
+        chargedCheckerCalls+=row->getInteger("checker_calls_delta").value_or(0);
+        chargedCostCalls+=row->getInteger("cost_provider_calls_delta").value_or(0);
+      }
+    }
     for(auto &r:*rows){auto x=r.getAsObject();State s;if(!x)return false;
       if(nativeBody){s.nativeMLIR=x->getString("native_mlir").value_or("").str();if(!nativeTransform(s.nativeMLIR,false,e))return false;}else if(!x->get("program")||!parsePlan(*x->get("program"),s.p,e))return false;
       s.key=x->getString("search_key").value_or("").str();s.parent=x->getString("parent").value_or("").str();s.action=x->getString("action").value_or("").str();s.status=x->getString("status").value_or("").str();s.round=x->getInteger("round").value_or(0);s.score=x->getNumber("score").value_or(0);if(auto v=x->get("evaluation"))s.response=*v;
@@ -590,7 +917,8 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
           e="uncalibrated exploration checkpoint contains a fabricated score";return false;
         }
         auto feedback=s.response.getAsObject();std::string diagnostic;
-        auto replanned=evaluateGenericMLIR(stateMLIR(s),staticConfig,diagnostic);
+        auto replanned=catalogueMode ? evaluateNative(stateMLIR(s),"",diagnostic) :
+            evaluateGenericMLIR(stateMLIR(s),staticConfig,diagnostic);
         if(!checkGraphArtifacts(s,replanned))return false;
         auto result=replanned.getAsObject();auto best=result?result->getObject("best_plan"):nullptr;
         auto old=feedback?feedback->get("diagnostics"):nullptr;
@@ -616,6 +944,35 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       }
       if(!seen.insert(s.key).second){e="duplicate checkpoint archive identity";return false;}
       archive.push_back(std::move(s));}
+    if(catalogueMode) {
+      int64_t cumulativePlans=0,cumulativeChecks=0,cumulativeCosts=0;
+      double lastElapsed=-1,best=0;std::string bestKey;
+      std::vector<const State*> measured;
+      for(const auto &state:archive)if(state.status!="budget_unmeasured")measured.push_back(&state);
+      if(evaluationTrace.size()!=measured.size()){e="checkpoint trace/archive count differs";return false;}
+      for(size_t index=0;index<evaluationTrace.size();++index) {
+        const auto &state=*measured[index];auto event=evaluationTrace[index].getAsObject();
+        auto work=checkpointEvaluationWork.find(state.key);
+        if(!event || event->getString("candidate_id")!=state.key ||
+           event->getInteger("score_queries")!=int64_t(index+1) || work==checkpointEvaluationWork.end() ||
+           event->getInteger("planner_calls_delta")!=int64_t(work->second.plannerCalls) ||
+           event->getInteger("checker_calls_delta")!=int64_t(work->second.checkerCalls) ||
+           event->getInteger("cost_provider_calls_delta")!=int64_t(work->second.costProviderCalls)) {
+          e="checkpoint trace work differs from independent native re-evaluation";return false;
+        }
+        cumulativePlans+=work->second.plannerCalls;cumulativeChecks+=work->second.checkerCalls;
+        cumulativeCosts+=work->second.costProviderCalls;
+        if(scored(state) && (best<=0 || state.score<best || (state.score==best && state.key<bestKey))){best=state.score;bestKey=state.key;}
+        auto time=event->getNumber("elapsed_ms");
+        if(!time || !std::isfinite(*time) || *time<lastElapsed ||
+           event->getInteger("raw_cost_provider_calls")!=cumulativeCosts ||
+           (best>0 ? event->getNumber("best_score")!=best : (!event->get("best_score") || render(*event->get("best_score"))!="null")) ||
+           (best>0 && event->getString("best_candidate")!=bestKey)) {
+          e="checkpoint best-so-far/work trace consistency failed";return false;
+        }
+        lastElapsed=*time;
+      }
+    }
     size_t baselineCount=0;
     int64_t countedEvaluations=0;
     for (const auto &state:archive) {
@@ -634,7 +991,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       } else {
         auto parent=llvm::find_if(archive,[&](const auto &s){return s.key==state.parent;});
         if (parent==archive.end()) {e="action chain parent missing";return false;}
-        if(!parentEligible(*parent) || state.round!=parent->round+1) {
+        if(!parentEligible(*parent) || (catalogueMode ? state.round<=parent->round : state.round!=parent->round+1)) {
           e="checkpoint parent/child round consistency failed";return false;
         }
         bool selectedParent=state.round==1 ? parent->key==sourceKey : false;
@@ -647,7 +1004,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
         if(!selectedParent) {e="checkpoint parent was not selected in preceding round";return false;}
         auto chain=parent->actionChain;chain.push_back(state.action);
         if (chain!=state.actionChain) {e="action chain disagrees with parent";return false;}
-        auto actions=nativeBody ? nativeActionsFor(*parent) : generateSearchActions(parent->p,preferences);
+        auto actions=nativeBody ? nativeActionsFor(*parent,state.round) : generateSearchActions(parent->p,preferences);
         auto action=llvm::find_if(actions,[&](const auto &a){return a.name==state.action;});
         if(action==actions.end()) {e="checkpoint action is not a current source-derived proposal";return false;}
         State replay=*parent;
@@ -668,31 +1025,90 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     if(parentEligible(*baseline)) expectedBeam.push_back(baseline->key);
     for(size_t i=0;i<selections.size();++i) {
       if(expectedBeam.empty()) {e="checkpoint completed a round without an eligible parent beam";return false;}
-      // A completed round must account for every current proposal, including
-      // unmeasured budget rows. Otherwise an empty forged selection could skip
-      // work while appearing internally self-consistent.
-      for(const auto &parentKey:expectedBeam) {
-        auto parent=llvm::find_if(archive,[&](const auto &s){return s.key==parentKey;});
-        auto actions=nativeBody ? nativeActionsFor(*parent) : generateSearchActions(parent->p,preferences);
-        for(const auto &action:actions) {
-          State replay=*parent;std::string diagnostic;
-          bool valid=nativeBody ? nativeTransform(replay.nativeMLIR,action.name=="split_outer_loops",diagnostic,
-              action.options.tileM?&action.options:nullptr,&action)
-              : (transform(replay.p,action.options,diagnostic) && validate(replay.p,diagnostic));
-          if(!valid)continue;
-          auto key=stateIdentity(replay);
-          if(llvm::none_of(archive,[&](const auto &s){return s.key==key && s.round<=int64_t(i+1);})) {
-            e="checkpoint completed round omits a current proposal";return false;
+      auto selection=selections[i].getAsObject();
+      auto selected=selection ? selection->getArray("selected") : nullptr;
+      std::vector<State> replayCandidates;
+      if(catalogueMode) {
+        auto prefix=selection?selection->getArray("proposal_prefix"):nullptr;
+        auto stop=selection?selection->getString("quota_stop"):std::nullopt;
+        auto quota=selection?selection->getInteger("score_query_quota"):std::nullopt;
+        if(!prefix || !stop || !quota || *quota<1){e="checkpoint stage prefix/quota missing";return false;}
+        size_t prefixIndex=0,totalActions=0;
+        for(const auto &parentKey:expectedBeam) {
+          auto parent=llvm::find_if(archive,[&](const auto &state){return state.key==parentKey;});
+          replayCandidates.push_back(*parent);
+          const auto actions=nativeActionsFor(*parent,int64_t(i+1));totalActions+=actions.size();
+          for(const auto &action:actions) {
+            if(prefixIndex>=prefix->size())break;
+            auto entry=(*prefix)[prefixIndex++].getAsObject();
+            if(!entry || entry->getString("parent")!=parentKey || entry->getString("action")!=action.name) {
+              e="checkpoint attempted actions are not an admitted stage prefix";return false;
+            }
+            State replay=*parent;std::string diagnostic;
+            bool valid=nativeTransform(replay.nativeMLIR,false,diagnostic,&action.options,&action);
+            auto status=entry->getString("status");
+            if(!valid) {
+              if(status!="semantic_invalid"){e="checkpoint invalid prefix action was treated as valid";return false;}
+              continue;
+            }
+            const auto key=stateIdentity(replay);
+            if(entry->getString("candidate_id")!=key){e="checkpoint prefix materialization identity differs";return false;}
+            auto candidate=llvm::find_if(archive,[&](const auto &state){return state.key==key;});
+            if(status=="budget_rejected") {
+              if(prefixIndex!=prefix->size() || candidate!=archive.end()) {e="checkpoint rejected prefix candidate was archived";return false;}
+              continue;
+            }
+            if(candidate==archive.end() || candidate->round>int64_t(i+1) ||
+               (status!="duplicate" && status!="archived")) {e="checkpoint attempted prefix candidate missing";return false;}
+            if(status=="archived" && (candidate->round!=int64_t(i+1) || candidate->parent!=parentKey || candidate->action!=action.name)) {
+              e="checkpoint archived prefix origin differs";return false;
+            }
+            if(parentEligible(*candidate))replayCandidates.push_back(*candidate);
+          }
+        }
+        if(prefixIndex!=prefix->size() || (prefix->size()<totalActions && *stop=="all-admitted-actions-attempted")) {
+          e="checkpoint stage prefix termination differs";return false;
+        }
+        int64_t queries=0;
+        for(const auto &state:archive)if(state.round==int64_t(i+1)) {
+          ++queries;
+          if(llvm::none_of(*prefix,[&](const auto &value){auto entry=value.getAsObject();return entry && entry->getString("candidate_id")==state.key && entry->getString("status")=="archived";})) {
+            e="checkpoint stage prefix omits archived work";return false;
+          }
+        }
+        if(selection->getInteger("score_queries")!=queries || queries>*quota ||
+           (*stop=="score-query-quota" && queries!=*quota)) {
+          e="checkpoint stage score quota/attempt count differs";return false;
+        }
+        if(*stop!="all-admitted-actions-attempted" && *stop!="score-query-quota" &&
+           *stop!="round-wallclock-quota" && *stop!="wallclock" &&
+           *stop!="internal-planner-budget" && *stop!="cost-provider-budget" && *stop!="score-query-budget") {
+          e="checkpoint unknown stage termination";return false;
+        }
+      } else {
+        // Legacy completed rounds account for every current proposal.
+        for(const auto &parentKey:expectedBeam) {
+          auto parent=llvm::find_if(archive,[&](const auto &state){return state.key==parentKey;});
+          auto actions=nativeBody ? nativeActionsFor(*parent,int64_t(i+1)) : generateSearchActions(parent->p,preferences);
+          for(const auto &action:actions) {
+            State replay=*parent;std::string diagnostic;
+            bool valid=nativeBody ? nativeTransform(replay.nativeMLIR,action.name=="split_outer_loops",diagnostic,
+                action.options.tileM?&action.options:nullptr,&action)
+                : (transform(replay.p,action.options,diagnostic) && validate(replay.p,diagnostic));
+            if(!valid)continue;
+            auto key=stateIdentity(replay);
+            if(llvm::none_of(archive,[&](const auto &state){return state.key==key && state.round<=int64_t(i+1);})) {
+              e="checkpoint completed round omits a current proposal";return false;
+            }
           }
         }
       }
-      auto selection=selections[i].getAsObject();
-      auto selected=selection ? selection->getArray("selected") : nullptr;
       if(!selection || selection->getInteger("round")!=int64_t(i+1) || !selected || selected->size()>size_t(o.beamWidth)) {
         e="checkpoint selection history consistency failed";return false;
       }
       std::vector<State> candidates;
-      for(const auto &state:archive) if(state.round==int64_t(i+1)) candidates.push_back(state);
+      if(catalogueMode)candidates=std::move(replayCandidates);
+      else for(const auto &state:archive)if(state.round==int64_t(i+1))candidates.push_back(state);
       auto recomputed=selectParents(std::move(candidates));
       if(recomputed.size()!=selected->size()) {e="checkpoint selected beam differs from scored round";return false;}
       expectedBeam.clear();
@@ -721,13 +1137,21 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       beam.push_back(*state);
     }
   }
+  checkingCheckpoint=false;
   auto evaluate=[&](State &s)->bool {
+    const auto evaluationWorkStart=genericMappingStatistics();
     s.evaluationIdentity=evaluationIdentityFor(s);
     std::string dir=o.outputDir+"/candidates/"+s.key;if(auto ec=llvm::sys::fs::create_directories(dir)){e=ec.message();return false;}
     std::string plan=render(nativeBody ? j::Value(j::Object{{"kind","native_mlir_interface_only"},{"body_sha256",s.key}}) : printPlan(s.p)), mlir=stateMLIR(s);
     if(mlir.empty())return false;
     if(!write(dir+"/plan.json",plan,e)||!write(dir+"/taskflow.mlir",mlir,e))return false;
     if(evaluations>=o.maxCandidates){s.status="budget_unmeasured";return true;}
+    if(catalogueMode) {
+      if(maxWallTimeMs>0 && elapsedMs()>=maxWallTimeMs)budgetStop="wallclock";
+      else if(chargedPlannerCalls>=maxInternalPlannerCalls)budgetStop="internal-planner-budget";
+      else if(maxCostProviderCalls>0 && chargedCostCalls+2>maxCostProviderCalls)budgetStop="cost-provider-budget";
+      if(!budgetStop.empty()){s.status="budget_unmeasured";return true;}
+    }
     if(s.p.tasks.size()>4096){s.status="unsupported";s.response=j::Object{{"reason","target task-count guard: >4096"}};return true;}
     j::Value req=j::Object{{"schema","orbit.search.evaluation.v1"},{"backend",o.backend},{"candidate_id",nativeBody?s.key:s.p.candidateId},{"search_key",s.key},{"evaluation_identity",s.evaluationIdentity},{"source_id",stateSource(s)},{"plan_path",dir+"/plan.json"},{"mlir_path",dir+"/taskflow.mlir"},{"output_dir",dir+"/evaluation"},{"target_config",j::Value(config)}};
     if(nativeBody) {
@@ -792,12 +1216,102 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
         if(status&&*status=="passed" && (o.backend!="static" || r->getString("evaluation_kind")=="static_estimate") && r->getString("candidate_id")==stateCandidate(s) && r->getString("source_id")==stateSource(s)){auto score=r->getObject("score");if(score){auto v=score->getNumber("value");auto unit=score->getString("unit");if(v&&std::isfinite(*v)&&*v>0&&unit&&*unit==(o.backend=="amoeba"?"cycles":"ms")){s.status="passed";s.score=*v;}}}
       }
     }else s.response=j::Object{{"reason",executionError+readError},{"exit_code",rc}};
+    if(reportTelemetry) {
+      const auto work=genericMappingStatistics();
+      const auto plans=int64_t(work.plannerCalls-evaluationWorkStart.plannerCalls);
+      const auto checks=int64_t(work.checkerCalls-evaluationWorkStart.checkerCalls);
+      const auto costs=int64_t(work.costProviderCalls-evaluationWorkStart.costProviderCalls);
+      chargedPlannerCalls+=plans;chargedCheckerCalls+=checks;chargedCostCalls+=costs;
+      double best=scored(s)?s.score:0;std::string bestKey=scored(s)?s.key:"";
+      for(const auto &old:archive)if(scored(old) && (best<=0 || old.score<best || (old.score==best && old.key<bestKey))){best=old.score;bestKey=old.key;}
+      evaluationTrace.push_back(j::Object{{"candidate_id",s.key},{"round",s.round},{"status",s.status},
+          {"score_queries",evaluations},{"raw_cost_provider_calls",chargedCostCalls},
+          {"internal_planner_calls",chargedPlannerCalls},{"legality_checks",chargedCheckerCalls},
+          {"planner_calls_delta",plans},{"checker_calls_delta",checks},{"cost_provider_calls_delta",costs},
+          {"elapsed_ms",elapsedMs()},{"best_score",best>0?j::Value(best):j::Value(nullptr)},
+          {"best_candidate",bestKey.empty()?j::Value(nullptr):j::Value(bestKey)}});
+    }
     return true;
   };
   if(archive.empty()){State base; base.p=source;base.nativeMLIR=sourceText;if(!nativeBody&&!transform(base.p,{},e))return false;base.key=stateIdentity(base);base.action="identity";if(!evaluate(base))return false;archive.push_back(base);seen.insert(base.key);if(parentEligible(base))beam.push_back(base);if(!save())return false;}
-  for(;nextRound<=o.maxRounds && !beam.empty();){
+  if(catalogueMode) {
+    buildCatalogue();if(!catalogueError.empty()){e=catalogueError;return false;}
+    for(;nextRound<=o.maxRounds && !beam.empty() && budgetStop.empty();) {
+      if(chargedPlannerCalls>=maxInternalPlannerCalls){budgetStop="internal-planner-budget";break;}
+      const int64_t roundsLeft=o.maxRounds-nextRound+1;
+      int64_t remainingQueries=o.maxCandidates-evaluations;
+      if(maxCostProviderCalls>0)remainingQueries=std::min(remainingQueries,
+          std::max<int64_t>(0,(maxCostProviderCalls-chargedCostCalls)/2));
+      if(remainingQueries<=0){budgetStop=maxCostProviderCalls>0?"cost-provider-budget":"score-query-budget";break;}
+      const int64_t roundQuota=(perRoundEvaluationQuota && reuseAlgorithm!="catalogue") ?
+          (remainingQueries+roundsLeft-1)/roundsLeft:remainingQueries;
+      const auto roundStartQueries=evaluations;
+      const auto roundStartMs=elapsedMs();
+      const auto roundDeadline=maxWallTimeMs>0 ? roundStartMs+
+          (maxWallTimeMs-roundStartMs)/((perRoundEvaluationQuota && reuseAlgorithm!="catalogue")?roundsLeft:1) : 0;
+      std::vector<State> children=beam;
+      j::Array prefix;std::string roundStop="all-admitted-actions-attempted";
+      bool stopRound=false;
+      for(const auto &parent:beam) {
+        const auto actions=nativeActionsFor(parent,nextRound);
+        if(!catalogueError.empty()){e=catalogueError;return false;}
+        for(const auto &action:actions) {
+          if(evaluations-roundStartQueries>=roundQuota){roundStop="score-query-quota";stopRound=true;break;}
+          if(maxWallTimeMs>0 && elapsedMs()>=roundDeadline) {
+            roundStop="round-wallclock-quota";
+            if(elapsedMs()>=maxWallTimeMs)budgetStop="wallclock";
+            stopRound=true;break;
+          }
+          if(chargedPlannerCalls>=maxInternalPlannerCalls){budgetStop=roundStop="internal-planner-budget";stopRound=true;break;}
+          State state;state.p=parent.p;state.nativeMLIR=parent.nativeMLIR;
+          state.parent=parent.key;state.action=action.name;state.round=nextRound;
+          state.actionChain=parent.actionChain;state.actionChain.push_back(action.name);
+          std::string reason;
+          if(!nativeTransform(state.nativeMLIR,false,reason,&action.options,&action)) {
+            prefix.push_back(j::Object{{"parent",parent.key},{"action",action.name},{"status","semantic_invalid"}});
+            attempts.push_back(j::Object{{"round",nextRound},{"parent",parent.key},{"action",action.name},
+                {"status","semantic_invalid"},{"reason",reason}});continue;
+          }
+          state.key=stateIdentity(state);
+          auto old=llvm::find_if(archive,[&](const auto &candidate){return candidate.key==state.key;});
+          if(old!=archive.end()) {
+            prefix.push_back(j::Object{{"parent",parent.key},{"action",action.name},{"candidate_id",state.key},{"status","duplicate"}});
+            attempts.push_back(j::Object{{"round",nextRound},{"parent",parent.key},{"action",action.name},
+                {"search_key",state.key},{"candidate_id",state.key},{"status","duplicate"}});
+            if(parentEligible(*old))children.push_back(*old);continue;
+          }
+          if(!evaluate(state))return false;
+          if(state.status=="budget_unmeasured") {
+            prefix.push_back(j::Object{{"parent",parent.key},{"action",action.name},{"candidate_id",state.key},{"status","budget_rejected"}});
+            roundStop=budgetStop.empty()?"score-query-budget":budgetStop;
+            attempts.push_back(j::Object{{"round",nextRound},{"parent",parent.key},{"action",action.name},
+                {"search_key",state.key},{"status",roundStop}});
+            stopRound=true;break;
+          }
+          seen.insert(state.key);archive.push_back(state);
+          prefix.push_back(j::Object{{"parent",parent.key},{"action",action.name},{"candidate_id",state.key},{"status","archived"}});
+          if(parentEligible(state))children.push_back(state);
+        }
+        if(stopRound)break;
+      }
+      beam=selectParents(std::move(children));
+      j::Array selected;
+      for(const auto &state:beam)selected.push_back(j::Object{{"search_key",state.key},{"candidate_id",state.key},
+          {"score",scored(state)?j::Value(state.score):j::Value(nullptr)},
+          {"structural_configuration",structuralConfiguration(state)},
+          {"reason",explorable(state)?"uncalibrated-exploration":"lowest evaluated score among stage-admitted candidates and carried selected parents"}});
+      selections.push_back(j::Object{{"round",nextRound},{"selected",std::move(selected)},
+          {"proposal_prefix",std::move(prefix)},{"quota_stop",roundStop},{"score_query_quota",roundQuota},
+          {"score_queries",evaluations-roundStartQueries},{"elapsed_start_ms",roundStartMs},
+          {"elapsed_end_ms",elapsedMs()},{"round_deadline_ms",roundDeadline}});
+      ++nextRound;if(!save())return false;
+    }
+    if(budgetStop.empty())budgetStop=nextRound>o.maxRounds?"round-budget":"no-eligible-parent";
+    if(!save())return false;
+  }
+  for(;!catalogueMode && nextRound<=o.maxRounds && !beam.empty();){
     std::vector<State> children;
-    for(auto &parent:beam)for(auto &action:(nativeBody ? nativeActionsFor(parent) : generateSearchActions(parent.p,preferences))){
+    for(auto &parent:beam)for(auto &action:(nativeBody ? nativeActionsFor(parent,nextRound) : generateSearchActions(parent.p,preferences))){
       State s;s.p=parent.p;s.nativeMLIR=parent.nativeMLIR;s.parent=parent.key;s.action=action.name;s.round=nextRound;
       s.actionChain=parent.actionChain;s.actionChain.push_back(action.name);
       std::string reason;
@@ -813,10 +1327,48 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     selections.push_back(j::Object{{"round",nextRound},{"selected",std::move(selected)}});++nextRound;if(!save())return false;
   }
   if(automatic && !write(o.outputDir+"/automatic-proposals.json",render(j::Object{
-      {"schema","orbit.native.automatic-proposals.v1"},{"mode",automaticMode},{"exploration_slots",explorationSlots},
+      {"schema","orbit.native.automatic-proposals.v1"},{"mode",automaticMode},{"algorithm",reuseAlgorithm},{"exploration_slots",explorationSlots},
       {"target_capability_identity",proposalCapabilities.identity},
       {"parents",std::move(automaticProposals)}}),e))return false;
   auto ranked=selectSearchBeam(archive,archive.size(),0,[](auto &a,auto &b){return a.score!=b.score?a.score<b.score:a.key<b.key;},scored,[](auto &s){return s.key;},[](auto &s){return s.action;});
   j::Array rows;for(auto &s:archive)rows.push_back(row(s));j::Array ranking;for(auto &s:ranked)ranking.push_back(s.key);
-  return write(o.outputDir+"/search.json",render(j::Object{{"schema","orbit.structured.search.v1"},{"backend",o.backend},{"score_unit",o.backend=="amoeba"?"cycles":"ms"},{"binding",binding},{"evaluations",evaluations},{"archive",std::move(rows)},{"ranking",std::move(ranking)},{"selections",std::move(selections)},{"attempts",std::move(attempts)}}),e);
+  j::Object report{{"schema","orbit.structured.search.v1"},{"backend",o.backend},{"score_unit",o.backend=="amoeba"?"cycles":"ms"},{"binding",binding},{"evaluations",evaluations},{"archive",std::move(rows)},{"ranking",std::move(ranking)},{"selections",std::move(selections)},{"attempts",j::Array(attempts)}};
+  if(reportTelemetry) {
+    int64_t checkpointPlans=0,checkpointChecks=0,checkpointCosts=0;
+    for(const auto &entry:checkpointEvaluationWork) {
+      checkpointPlans+=entry.second.plannerCalls;checkpointChecks+=entry.second.checkerCalls;
+      checkpointCosts+=entry.second.costProviderCalls;
+    }
+    int64_t candidateCacheHits=0;
+    for(const auto &attempt:attempts)if(auto object=attempt.getAsObject())candidateCacheHits+=object->getString("status")=="duplicate";
+    j::Object statistics{{"score_queries",evaluations},{"budgeted_cost_provider_calls",catalogueMode?j::Value(chargedCostCalls):j::Value(nullptr)},
+        {"raw_full_cost_provider_calls",costProviderCalls()},{"raw_cost_provider_calls",costProviderCalls()},
+        {"internal_planner_calls",catalogueMode?chargedPlannerCalls:plannerCalls()},{"legality_checks",catalogueMode?chargedCheckerCalls:checkerCalls()},
+        {"budget_enforcement",catalogueMode?"v21 policy raw-work/time quotas":"legacy behavior unchanged; requested budgets are unmatched telemetry only"},
+        {"raw_total_planner_calls",plannerCalls()},{"raw_total_checker_calls",checkerCalls()},
+        {"checkpoint_revalidation_cost_provider_calls",checkpointCosts},
+        {"checkpoint_revalidation_planner_calls",checkpointPlans},{"checkpoint_revalidation_checker_calls",checkpointChecks},
+        {"resumed_from_checkpoint",o.resume},
+        {"counter_scope","budgeted policy ledger is restored across resumes; raw counters describe this process and include separately reported checkpoint revalidation"},
+        {"generation_attempts",catalogueMode?j::Value(int64_t(catalogueDiscovery.stats.generationAttempts)):j::Value(nullptr)},
+        {"generation_stats",catalogueMode?serializeGenericReuseStats(catalogueDiscovery.stats):j::Value(nullptr)},
+        {"generation_telemetry_scope",catalogueMode?"exact bounded catalogue attempts":"legacy generation attempt count unavailable; raw planner/check/cost entry counts remain exact"},
+        {"action_cache_hits",actionCacheHits},{"action_cache_misses",actionCacheMisses},
+        {"action_cache_identity","evaluation binding (target/model/config/compiler) + canonical native source identity + expansion round"},
+        {"candidate_cache_hits",candidateCacheHits},{"generation_cache_hits",int64_t(catalogueDiscovery.stats.cacheHits)},
+        {"elapsed_ms",elapsedMs()},{"catalogue_materialization_ms",catalogueMaterializationMs},
+        {"wall_budget_overshoot_ms",maxWallTimeMs>0?std::max(0.0,elapsedMs()-maxWallTimeMs):0.0},
+        {"wall_stop_granularity","planner call, source transformation, and completed catalogue export are nonpreemptive"},
+        {"air_aie_compiles",0},{"stop_reason",budgetStop},
+        {"catalogue_id",catalogueDiscovery.catalogueId},{"catalogue_complete",catalogueDiscovery.catalogueComplete},
+        {"max_cost_provider_calls",maxCostProviderCalls},{"max_internal_planner_calls",maxInternalPlannerCalls},
+        {"max_wall_time_ms",maxWallTimeMs},{"max_compute_instances",int64_t(catalogueOptions.maxComputeInstances)},{"per_round_evaluation_quota",perRoundEvaluationQuota},
+        {"checkpoint_policy","atomic completed round-prefix; interrupted-round artifacts retained, uncommitted round may repeat after resume"}};
+    if(!write(o.outputDir+"/search-stats.json",render(j::Value(j::Object(statistics))),e) ||
+       !write(o.outputDir+"/strategy-exclusions.json",render(j::Object{
+         {"schema","orbit.search.strategy-exclusions.v21"},{"algorithm",reuseAlgorithm},
+         {"catalogue_id",catalogueDiscovery.catalogueId},{"exclusions",std::move(strategyExclusions)}}),e))return false;
+    report["stats"]=std::move(statistics);report["trace"]=j::Array(evaluationTrace);
+  }
+  return write(o.outputDir+"/search.json",render(std::move(report)),e);
 }
