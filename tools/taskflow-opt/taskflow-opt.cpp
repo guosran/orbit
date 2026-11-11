@@ -7,6 +7,7 @@
 #include "Taskflow/HeterogeneousSearch.h"
 #ifdef ORBIT_ENABLE_AIR
 #include "Taskflow/AIRBackend.h"
+#include "Taskflow/NPUIndependentShards.h"
 #endif
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "Taskflow/StaticMapping.h"
@@ -94,6 +95,9 @@ static cl::opt<std::string> heterogeneousOutput("heterogeneous-output",
     cl::desc("Export checked CPU/NPU regions and native implementations to a NEW directory"));
 static cl::opt<std::string> checkHeterogeneous("check-heterogeneous",
     cl::desc("Compare a static manifest with source/target reconstruction"));
+static cl::opt<std::string> lowerMulticore("lower-multicore-to-air",cl::desc("Write a CP-SAT-placed independent-shard AIR program to a NEW directory"));
+static cl::opt<std::string> checkMulticoreAIE("check-multicore-aie",cl::desc("Independently check final multi-core AIE for the source and target"));
+static cl::opt<int64_t> npuShards("npu-shards",cl::init(2));
 int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
                               "ORBIT independent structured Taskflow core\n");
@@ -105,7 +109,7 @@ int main(int argc, char **argv) {
 #ifdef ORBIT_ENABLE_AIR
   registry.insert<mlir::vector::VectorDialect>();
   context.appendDialectRegistry(registry);
-  if (lowerAIR || !lowerProgram.empty() || !heterogeneousOutput.empty() || airPassPipeline || (!checkAIR.empty() || !checkAIE.empty()) ||
+  if (lowerAIR || !lowerMulticore.empty() || !checkMulticoreAIE.empty() || !lowerProgram.empty() || !heterogeneousOutput.empty() || airPassPipeline || (!checkAIR.empty() || !checkAIE.empty()) ||
       !legalizeAIRChannels.empty() || !checkAIRChannels.empty()) {
     context.allowUnregisteredDialects();
     prepareGenericAIRContext(context);
@@ -188,6 +192,25 @@ int main(int argc, char **argv) {
     return true;
   };
   const bool wantsGraph=!programTimingOutput.empty() || programGraph || !programGraphOutput.empty() || !programGraphDOT.empty() || !checkProgramGraphFile.empty();
+  if(!lowerMulticore.empty() || !checkMulticoreAIE.empty()) {
+#ifdef ORBIT_ENABLE_AIR
+    auto module=parse(text);if(!module || mlir::failed(mlir::verify(*module)))return fatal("valid Taskflow source required");
+    llvm::json::Value config=llvm::json::Object{};if(!targetConfig.empty()){auto c=readJSON(targetConfig);if(!c)return fatal(llvm::toString(c.takeError()));config=std::move(*c);}
+    if(!checkMulticoreAIE.empty()) {
+      auto candidateBytes=llvm::MemoryBuffer::getFile(checkMulticoreAIE);if(!candidateBytes)return fatal(candidateBytes.getError().message());auto actual=parse((*candidateBytes)->getBuffer());if(!actual)return fatal("valid final AIE module required");llvm::json::Value receipt=nullptr;
+      bool valid=checkNPUIndependentAIE(*module,config,npuShards,*actual,receipt,error);if(!implementationOutput.empty()&&!writeJSON(implementationOutput,receipt))return fatal(error);return valid?0:fatal(error);
+    }
+    if(llvm::sys::fs::exists(lowerMulticore))return fatal("multicore output directory must be new");
+    mlir::OwningOpRef<mlir::ModuleOp> air;llvm::json::Value manifest=nullptr;if(!lowerNPUIndependentProgram(*module,config,npuShards,air,manifest,error))return fatal(error);
+    if(auto ec=llvm::sys::fs::create_directories(lowerMulticore))return fatal(ec.message());
+    auto writeModule=[&](const std::string &path,mlir::ModuleOp value,bool generic){std::error_code ec;llvm::raw_fd_ostream out(path,ec);if(ec){error=ec.message();return false;}auto flags=mlir::OpPrintingFlags();if(generic)flags.printGenericOpForm();value.print(out,flags);out<<"\n";return true;};
+    if(!writeModule(lowerMulticore+"/source.mlir",*module,false)||!writeModule(lowerMulticore+"/program.air.mlir",*air,true)||!writeJSON(lowerMulticore+"/manifest.json",manifest)||!writeJSON(lowerMulticore+"/target.json",config))return fatal(error);
+    GenericAnalysis analysis;if(!analyzeGenericProgram(*module,analysis,error))return fatal(error);llvm::json::Array buffers,outputs;for(const auto &storage:analysis.storages){if(!mlir::isa<mlir::BlockArgument>(storage.root))continue;llvm::json::Array shape;for(auto n:storage.shape)shape.push_back(n);buffers.push_back(llvm::json::Object{{"name",storage.id},{"role",storage.role},{"dtype",storage.dtype},{"shape",std::move(shape)}});if(storage.role=="output")outputs.push_back(storage.id);}
+    if(!writeJSON(lowerMulticore+"/abi.json",llvm::json::Object{{"buffers",std::move(buffers)},{"outputs",std::move(outputs)}}))return fatal(error);return 0;
+#else
+    return fatal("multicore lowering requires ORBIT_ENABLE_AIR=ON");
+#endif
+  }
   if(search && backend=="cpu-npu") {
     auto module=parse(text);if(!module)return fatal("native Taskflow source required");
     SearchOptions options{backend,evaluator,searchOutput,targetConfig,searchCheckpoint,searchRounds,searchBudget,searchWidth,searchResume};

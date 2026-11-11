@@ -53,3 +53,7 @@ The `all` mode also runs the documented NPU comparison and full M5 FFN regressio
 The original `search-joint-neighborhood` pass retains source-owned graph actions, legality, canonical deduplication, archive/beam state, production scheduling and checkpoint recovery. Common Taskflow analysis and mapping add regions, data versions, storage copies, lifetimes and transfers; direct AIR consumes the checked decisions. See [public data organization](docs/taskflow-data-organization-v8.md), [mapping](docs/taskflow-program-mapping.md), [AIR lowering](docs/taskflow-direct-air-lowering.md), and [the CGRA model boundary](docs/taskflow-cgra-model-boundary-v8.md).
 
 Model weights remain in the artifact and are evaluated by the existing C++ implementation. The legacy 4×4-PE and per-CGRA-2×2 models retain distinct contracts and namespaces. Upstream revisions and notices are recorded in [UPSTREAM_PROVENANCE.json](UPSTREAM_PROVENANCE.json).
+
+## Optional native constraint optimization
+
+The [CP-SAT v22 interface](docs/taskflow-cpsat-v22.md) adds bounded reuse/tiling composition and independently checked NPU2 shard placement using optional C++ OR-Tools. The default Core build keeps this dependency off. [Validation and solver-time scaling](https://github.com/guosran/orbit-artifact/blob/main/taskflow/docs/taskflow-cpsat-v22-validation.md) distinguish finite surrogate optimality, full planner costs and actual hardware behavior.

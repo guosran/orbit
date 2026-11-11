@@ -1,4 +1,5 @@
 #include "Taskflow/Search.h"
+#include "Taskflow/GenericConstraintSearch.h"
 #include "Taskflow/StaticEvaluation.h"
 #include "Taskflow/GenericMapping.h"
 #include "Taskflow/GenericReuse.h"
@@ -304,7 +305,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     catalogueMode=reuseAlgorithm=="strong-reuse-first" || reuseAlgorithm=="strong-tile-first" ||
         reuseAlgorithm=="alternating" || reuseAlgorithm=="joint" || reuseAlgorithm=="catalogue";
     if(!catalogueMode && reuseAlgorithm!="v19-contiguous" && reuseAlgorithm!="fixed-tiling" &&
-       reuseAlgorithm!="reuse-then-tiling" && reuseAlgorithm!="data-reuse-joint") {
+       reuseAlgorithm!="reuse-then-tiling" && reuseAlgorithm!="data-reuse-joint" && reuseAlgorithm!="cp-sat") {
       e="unknown native auto algorithm";return false;
     }
     if(reuseAlgorithm!="v19-contiguous" && automaticMode!="joint") {
@@ -378,7 +379,7 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
        entry.first!="max_wall_time_ms" && entry.first!="tile_constraints" && entry.first!="per_round_evaluation_quota") {
       e="unknown native_auto_candidates field";return false;
     }
-    reportTelemetry=catalogueMode || object->get("max_cost_provider_calls") ||
+    reportTelemetry=catalogueMode || reuseAlgorithm=="cp-sat" || object->get("max_cost_provider_calls") ||
         object->get("max_internal_planner_calls") || object->get("max_wall_time_ms");
     catalogueOptions.maxTileProposals=maxJointTiles;
     catalogueOptions.maxGroups=maxResidencyGroups;
@@ -621,6 +622,23 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
       actionCache.emplace(cacheKey,actions);return actions;
     }
     auto actions=nativeActions;
+    if(automatic && reuseAlgorithm=="cp-sat") {
+      auto module=parseNative(state.nativeMLIR);GenericAnalysis analysis;std::string diagnostic;
+      if(module && analyzeGenericProgram(*module,analysis,diagnostic)) {
+        auto domain=catalogueOptions;domain.maxTileProposals=maxJointTiles;
+        domain.maxProposals=domain.maxCatalogueConfigurations;
+        int64_t remainingTime=maxWallTimeMs>0?int64_t(std::max(0.,maxWallTimeMs-elapsedMs())):5000;
+        uint64_t remainingCalls=maxCostProviderCalls>0?uint64_t(std::max<int64_t>(0,maxCostProviderCalls-costProviderCalls()-4)):256;
+        auto result=searchGenericConstraints(analysis,staticConfig,domain,remainingTime,remainingCalls);
+        if(result.proposal) {
+          auto &p=*result.proposal;SearchAction action{"cp_sat_reuse_tile",{}};
+          action.mapping=p.mapping;action.options.tileM=p.tileSizes[0];action.options.tileN=p.tileSizes[1];action.options.tileK=p.tileSizes[2];
+          actions.push_back(std::move(action));
+        }
+        automaticProposals[state.key]=j::Array{j::Value(std::move(result.report))};
+      }
+      actionCache.emplace(cacheKey,actions);return actions;
+    }
     if(automatic) {
       auto module=parseNative(state.nativeMLIR);GenericAnalysis analysis;std::string diagnostic;
       j::Array proposals;
@@ -1146,6 +1164,12 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     if(mlir.empty())return false;
     if(!write(dir+"/plan.json",plan,e)||!write(dir+"/taskflow.mlir",mlir,e))return false;
     if(evaluations>=o.maxCandidates){s.status="budget_unmeasured";return true;}
+    if(reuseAlgorithm=="cp-sat") {
+      if(maxWallTimeMs>0 && elapsedMs()>=maxWallTimeMs)budgetStop="wallclock";
+      else if(maxCostProviderCalls>0 && costProviderCalls()+2>maxCostProviderCalls)budgetStop="cost-provider-budget";
+      else if(maxInternalPlannerCalls>0 && plannerCalls()+2>maxInternalPlannerCalls)budgetStop="internal-planner-budget";
+      if(!budgetStop.empty()){s.status="budget_unmeasured";return true;}
+    }
     if(catalogueMode) {
       if(maxWallTimeMs>0 && elapsedMs()>=maxWallTimeMs)budgetStop="wallclock";
       else if(chargedPlannerCalls>=maxInternalPlannerCalls)budgetStop="internal-planner-budget";
@@ -1309,9 +1333,14 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     if(budgetStop.empty())budgetStop=nextRound>o.maxRounds?"round-budget":"no-eligible-parent";
     if(!save())return false;
   }
-  for(;!catalogueMode && nextRound<=o.maxRounds && !beam.empty();){
+  for(;!catalogueMode && nextRound<=o.maxRounds && !beam.empty() && (reuseAlgorithm!="cp-sat"||budgetStop.empty());){
     std::vector<State> children;
     for(auto &parent:beam)for(auto &action:(nativeBody ? nativeActionsFor(parent,nextRound) : generateSearchActions(parent.p,preferences))){
+      if(reuseAlgorithm=="cp-sat") {
+        if(maxWallTimeMs>0&&elapsedMs()>=maxWallTimeMs)budgetStop="wallclock";
+        else if(maxCostProviderCalls>0&&costProviderCalls()+2>maxCostProviderCalls)budgetStop="cost-provider-budget";
+        if(!budgetStop.empty())break;
+      }
       State s;s.p=parent.p;s.nativeMLIR=parent.nativeMLIR;s.parent=parent.key;s.action=action.name;s.round=nextRound;
       s.actionChain=parent.actionChain;s.actionChain.push_back(action.name);
       std::string reason;
@@ -1341,10 +1370,10 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
     }
     int64_t candidateCacheHits=0;
     for(const auto &attempt:attempts)if(auto object=attempt.getAsObject())candidateCacheHits+=object->getString("status")=="duplicate";
-    j::Object statistics{{"score_queries",evaluations},{"budgeted_cost_provider_calls",catalogueMode?j::Value(chargedCostCalls):j::Value(nullptr)},
+    j::Object statistics{{"score_queries",evaluations},{"budgeted_cost_provider_calls",catalogueMode?j::Value(chargedCostCalls):reuseAlgorithm=="cp-sat"?j::Value(costProviderCalls()):j::Value(nullptr)},
         {"raw_full_cost_provider_calls",costProviderCalls()},{"raw_cost_provider_calls",costProviderCalls()},
         {"internal_planner_calls",catalogueMode?chargedPlannerCalls:plannerCalls()},{"legality_checks",catalogueMode?chargedCheckerCalls:checkerCalls()},
-        {"budget_enforcement",catalogueMode?"v21 policy raw-work/time quotas":"legacy behavior unchanged; requested budgets are unmatched telemetry only"},
+        {"budget_enforcement",catalogueMode?"v21 policy raw-work/time quotas":reuseAlgorithm=="cp-sat"?"v22 bounded local discovery, pricing and solve; process raw cost/time guards; planner calls are nonpreemptive":"legacy behavior unchanged; requested budgets are unmatched telemetry only"},
         {"raw_total_planner_calls",plannerCalls()},{"raw_total_checker_calls",checkerCalls()},
         {"checkpoint_revalidation_cost_provider_calls",checkpointCosts},
         {"checkpoint_revalidation_planner_calls",checkpointPlans},{"checkpoint_revalidation_checker_calls",checkpointChecks},
@@ -1364,6 +1393,11 @@ bool orbit::taskflow::runStructuredSearch(const Program &source,const SearchOpti
         {"max_cost_provider_calls",maxCostProviderCalls},{"max_internal_planner_calls",maxInternalPlannerCalls},
         {"max_wall_time_ms",maxWallTimeMs},{"max_compute_instances",int64_t(catalogueOptions.maxComputeInstances)},{"per_round_evaluation_quota",perRoundEvaluationQuota},
         {"checkpoint_policy","atomic completed round-prefix; interrupted-round artifacts retained, uncommitted round may repeat after resume"}};
+    if(reuseAlgorithm=="cp-sat") {
+      statistics["counter_scope"]="CP-SAT quotas and raw counters cover this process, including checkpoint revalidation; no restored v21 policy ledger";
+      statistics["generation_telemetry_scope"]="per-parent automatic-proposals records local discovery, pricing, model, solve and final recheck separately";
+      if(budgetStop.empty())statistics["stop_reason"]=nextRound>o.maxRounds?"round-budget":"no-eligible-parent";
+    }
     if(!write(o.outputDir+"/search-stats.json",render(j::Value(j::Object(statistics))),e) ||
        !write(o.outputDir+"/strategy-exclusions.json",render(j::Object{
          {"schema","orbit.search.strategy-exclusions.v21"},{"algorithm",reuseAlgorithm},

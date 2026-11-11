@@ -95,3 +95,6 @@ add_executable(taskflow-shared-input-test EXCLUDE_FROM_ALL ../../test/TaskflowGe
 target_link_libraries(taskflow-shared-input-test PRIVATE MLIRTaskflowStructured MLIRTaskflow MLIRParser MLIRSCFDialect)
 add_executable(taskflow-reuse-constraints-test EXCLUDE_FROM_ALL ../../test/TaskflowGeneric/reuse-constraints.cpp)
 target_link_libraries(taskflow-reuse-constraints-test PRIVATE MLIRTaskflowStructured MLIRTaskflow MLIRParser MLIRSCFDialect)
+add_executable(taskflow-cpsat-opt taskflow-cpsat-opt.cpp)
+target_compile_options(taskflow-cpsat-opt PRIVATE -fexceptions)
+target_link_libraries(taskflow-cpsat-opt PRIVATE ORBITConstraintSearch LLVMSupport)

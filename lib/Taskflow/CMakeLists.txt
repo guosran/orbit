@@ -1,9 +1,18 @@
 add_mlir_library(MLIRTaskflowStructured StructuredProgram.cpp Search.cpp
   MemoryArchitecture.cpp ProgramTargetBinding.cpp ProgramGraph.cpp AmoebaMapping.cpp HeterogeneousMapping.cpp HeterogeneousImplementation.cpp HeterogeneousSearch.cpp MechanismCost.cpp ProgramTiming.cpp ProgramMechanismCost.cpp GenericMechanismTiming.cpp GenericProgramTiming.cpp GenericProgramContrast.cpp SyncState.cpp SyncBoundaryMapping.cpp SyncCost.cpp DeviceTransferCost.cpp DeviceTransferAudit.cpp StaticAnalysis.cpp StaticContract.cpp StaticCommunication.cpp
   StaticMapper.cpp StaticChecker.cpp StaticEvaluation.cpp StaticRegion.cpp
-  StaticRegionChecker.cpp GenericAnalysis.cpp GenericReuse.cpp GenericMapping.cpp GenericCommunication.cpp ProgramDataOrganization.cpp ProgramPartition.cpp NativeTransforms.cpp PARTIAL_SOURCES_INTENDED
+  StaticRegionChecker.cpp GenericAnalysis.cpp GenericReuse.cpp GenericConstraintSearch.cpp GenericMapping.cpp GenericCommunication.cpp ProgramDataOrganization.cpp ProgramPartition.cpp NativeTransforms.cpp PARTIAL_SOURCES_INTENDED
   LINK_LIBS PUBLIC MLIRTaskflow LLVMSupport MLIRAffineDialect MLIRArithDialect
   MLIRSCFDialect MLIRSideEffectInterfaces MLIRMathDialect MLIRMemRefDialect MLIRFuncDialect MLIRParser MLIRIR MLIRSupport)
+# Optional solver library remains independent of MLIR and available as a stub.
+add_library(ORBITConstraintSearch STATIC ConstraintSearch.cpp NPUConstraintSchedule.cpp)
+target_include_directories(ORBITConstraintSearch PUBLIC ${PROJECT_SOURCE_DIR}/include)
+if(ORBIT_ENABLE_ORTOOLS)
+  target_link_libraries(ORBITConstraintSearch PUBLIC ortools::ortools)
+  target_compile_definitions(ORBITConstraintSearch PRIVATE ORBIT_HAS_ORTOOLS=1)
+endif()
+target_link_libraries(MLIRTaskflowStructured PUBLIC ORBITConstraintSearch)
+
 # These translation units contain validation exceptions within their public
 # bool/error boundary; no exception crosses into MLIR/LLVM code.
 set_source_files_properties(StaticContract.cpp StaticCommunication.cpp StaticChecker.cpp StaticRegion.cpp StaticRegionChecker.cpp

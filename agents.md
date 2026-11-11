@@ -1351,3 +1351,48 @@ model-untied pairs have resolved wrong order in both sessions. Candidate geometr
 work budget and decision freezing are distinct contributions; neither pure joint
 superiority nor fine hardware ranking is established. Final evidence lives in
 the v21 DELIVERY/RESULTS/REPRODUCE files. Preserve every failure and frozen tool.
+
+
+## v22: bounded native CP-SAT and physical independent NPU shards
+
+Optional C++ OR-Tools v9.15.6755 composes single local reuse modes with common
+tiling through the original native search. Exact cover, source/quotient DAG
+legality and exclusive retained storage are encoded; full planning/checking
+remains authoritative for capacity and complete cost. Signed local deltas are a
+surrogate. A rechecked composition never replaces a cheaper already checked
+local incumbent. Finite-domain optimality is not hardware-latency optimality.
+The default ORBIT_ENABLE_ORTOOLS=OFF Core has no OR-Tools runtime dependency.
+
+A separate physical entry partitions a proven independent outer axis, places
+static local groups on NPU2 cores and models explicit compute/DMA intervals.
+Actual x_loc/y_loc pins, source arithmetic/addresses, static allocations,
+resource ownership, full output coverage and runtime lifecycle are checked on
+final AIE. Child template graph identities stay in per-shard records. Current
+certification covers direct shim/compute streams and one/two-core examples;
+packet/memtile/inter-core dependencies fail closed. Assumed interval times do
+not guarantee timed runtime dispatch or measured overlap.
+
+Core44, combined61, preserved original Neura/CGRA and lit35 pass. Supplemental
+checks pass42 finite oracle/resource cases, six native integration/budget cases
+and15 actual multi-core AIE cases. Four hardware programs/seven variants pass
+441 final complete calls and arrays against unchanged FP32/FP64 references in
+three fresh processes per variant. One earlier paired speedup does not reproduce
+in the final campaign; stable measured acceleration is not established.
+
+Solver scaling is tracked with raw JSONL, model/solve/process/verification time,
+bounds/gaps/status, branches/conflicts and RSS. Larger synthetic cases frequently
+exhaust useful budgets. A supervisor saves independently checked baselines before
+workers and preserves external-timeout status. Native discovery/pricing are
+budgeted separately so32–128 task examples reach the solver: 8–128-task process
+times are1.22–4.78 seconds, with5.7–17.9ms solving. Domains at16+ are truncated;
+these are bounded samples, not an asymptotic guarantee. Planner calls remain
+nonpreemptive and overshoot is explicit. CP-SAT process quotas do not restore the
+v21 staged-policy budget ledger across resume.
+
+See docs/taskflow-cpsat-v22.md and companion taskflow/docs/taskflow-cpsat-v22-validation.md.
+Production code and finite compiler contracts remain here; workload generation,
+performance campaigns, plots, hardware execution and reviewable/raw evidence
+remain in orbit-artifact. Preserve all failed stack/routing/property/timeout
+pilots and all frozen original binaries. NPU sessions remain main-only under
+/tmp/npu.lock with process deadlines. This checkpoint alone does not authorize future commits
+or pushes.
