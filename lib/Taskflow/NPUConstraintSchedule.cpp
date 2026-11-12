@@ -38,8 +38,9 @@ NPUScheduleResult solveNPUConstraintSchedule(const NPUScheduleProblem &p,
   using namespace operations_research::sat;
   if (p.shards.empty() || p.tiles.empty() || p.dmaResources.empty() ||
       !std::isfinite(o.wallSeconds) || o.wallSeconds <= 0 || o.workers < 1 ||
-      o.maxVariables < 1 || o.maxConstraints < 1 || o.maxPatterns < 1 ||
-      o.maxTasks < 1 || o.maxTiles < 1)
+      o.workers > 16 || o.randomSeed < 0 || o.maxVariables < 1 ||
+      o.maxConstraints < 1 || o.maxPatterns < 1 || o.maxTasks < 1 ||
+      o.maxTiles < 1)
     return finish(ConstraintSearchStatus::InvalidInput,
                   "Invalid scheduling dimensions or budget");
   if (p.shards.size() > size_t(o.maxTasks) ||

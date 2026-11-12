@@ -21,6 +21,8 @@ struct ConstraintSearchProblem {
 };
 struct ConstraintSearchOptions {
   double wallSeconds = 1;
+  // CP-SAT supports [1,16] workers here and nonnegative signed-int seeds.
+  // The sequential SCIP backend further requires exactly one worker.
   int workers = 1, randomSeed = 0;
   int64_t maxVariables = 100000, maxConstraints = 500000, maxPatterns = 20000;
   int64_t maxTasks = 512, maxTiles = 16, maxInputEdges = 65536, maxEdges = 8192;

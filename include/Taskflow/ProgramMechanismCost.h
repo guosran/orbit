@@ -19,9 +19,20 @@ struct ProgramMechanismEvaluation {
   std::vector<std::string> assumptions;
   std::string mode, status;
 };
+// Build annotations on the existing graph without scheduling. Alternate runtime
+// contracts may replace lifecycle costs and omit logical group configuration
+// when a prepared physical program has already been loaded outside the window.
+bool buildProgramMechanismCosts(const ProgramGraph &,
+                                const ProgramMechanismModel &,
+                                ProgramMechanismEvaluation &,
+                                ProgramTimingRequest &, std::string &error,
+                                bool includeLifecycle = true,
+                                bool includeGroupConfiguration = true);
 bool evaluateProgramMechanismCost(const ProgramGraph &,
-    const ProgramMechanismModel &, ProgramMechanismEvaluation &,
-    std::string &error);
-llvm::json::Value serializeProgramMechanismCost(const ProgramMechanismEvaluation &);
-}
+                                  const ProgramMechanismModel &,
+                                  ProgramMechanismEvaluation &,
+                                  std::string &error);
+llvm::json::Value
+serializeProgramMechanismCost(const ProgramMechanismEvaluation &);
+} // namespace orbit::taskflow
 #endif

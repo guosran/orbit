@@ -23,15 +23,15 @@ bool orbit::taskflow::lowerHeterogeneousCPUImplementation(
   for (const auto &storage : source.storages) {
     auto type = dyn_cast<MemRefType>(storage.root.getType());
     if (!type || !type.hasStaticShape() || !type.getLayout().isIdentity() ||
-        !type.getElementType().isF32())
-      return fail("only static identity-layout ranked f32 memrefs are supported");
+        (!type.getElementType().isF32() && !type.getElementType().isBF16()))
+      return fail(
+          "only static identity-layout ranked f32/bf16 memrefs are supported");
   }
 
   OwningOpRef<ModuleOp> candidate = cast<ModuleOp>(child->clone());
   SmallVector<::mlir::taskflow::TaskflowTaskOp> tasks;
-  candidate->walk([&](::mlir::taskflow::TaskflowTaskOp task) {
-    tasks.push_back(task);
-  });
+  candidate->walk(
+      [&](::mlir::taskflow::TaskflowTaskOp task) { tasks.push_back(task); });
   if (tasks.size() != source.tasks.size())
     return fail("source task correspondence changed while cloning");
 
@@ -48,7 +48,8 @@ bool orbit::taskflow::lowerHeterogeneousCPUImplementation(
     SmallVector<Value> arguments;
     arguments.append(task.getWillReads().begin(), task.getWillReads().end());
     arguments.append(task.getWillWrites().begin(), task.getWillWrites().end());
-    arguments.append(task.getValueInputs().begin(), task.getValueInputs().end());
+    arguments.append(task.getValueInputs().begin(),
+                     task.getValueInputs().end());
     if (arguments.size() != body.getNumArguments())
       return fail("task body arguments do not match its actual interface");
     IRMapping mapping;
@@ -74,14 +75,17 @@ bool orbit::taskflow::lowerHeterogeneousCPUImplementation(
   });
   if (taskflowRemains)
     return fail("a Taskflow operation remains after actual-body extraction");
-  auto function = candidate->lookupSymbol<func::FuncOp>(source.function.getName());
+  auto function =
+      candidate->lookupSymbol<func::FuncOp>(source.function.getName());
   if (!function)
     return fail("child function symbol was not preserved");
   function->setAttr("llvm.emit_c_interface", UnitAttr::get(child.getContext()));
-  (*candidate)->setAttr("orbit.cpu.source_fingerprint",
-                     StringAttr::get(child.getContext(), source.bodyFingerprint));
-  (*candidate)->setAttr("orbit.cpu.lowering",
-                     StringAttr::get(child.getContext(), "actual-task-body-inline"));
+  (*candidate)
+      ->setAttr("orbit.cpu.source_fingerprint",
+                StringAttr::get(child.getContext(), source.bodyFingerprint));
+  (*candidate)
+      ->setAttr("orbit.cpu.lowering",
+                StringAttr::get(child.getContext(), "actual-task-body-inline"));
   if (failed(verify(*candidate)))
     return fail("extracted CPU module failed MLIR verification");
   plainCPU = std::move(candidate);

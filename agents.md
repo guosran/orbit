@@ -1445,3 +1445,504 @@ See docs/taskflow-program-joint-v23.md and companion
 experiments, full output arrays and measurements. Frozen prior tools/failures
 remain preserved. NPU work stays main-only under/tmp/npu.lock with deadlines.
 This checkpoint does not authorize future commits or pushes.
+
+## v24: 600-second joint search and paired small NPU workloads
+
+The unchanged v23 compiler is now measured with a 600-second entry quota in
+companion `program_joint_speedup_v24.py` (about 540 seconds maximum CP-SAT time
+under the existing 10% reserve). Four static FP32 pointwise chain fixtures have
+4/8 source tasks, shapes16x64/17x64/65x64 and explicit light/heavy arithmetic.
+The same-domain checked greedy serial baseline and selected plan each compile,
+pass final AIE checks and execute in two locked main-agent process sessions.
+Three seeds and30 hot pairs/session retain complete arrays and unchanged1e-5
+FP32/FP64 checks.624 calls/624 arrays/1248 references pass; independent audit
+checks source arithmetic, artifact identities, order, synchronizations and paired
+summary values. No production compiler changes or broad core re-test is implied.
+
+Heavy4-task speedup is1.82x/1.55x,8-task17-row1.64x/1.77x and8-task65-row
+1.69x/1.62x across the two sessions, measured at the host runner boundary.
+The light control is0.998x/1.009x with no stable improvement. Three heavier cases
+win all180 hot pairs, but these are same-day process sessions without locked
+clocks. There are no device cycle traces; host wait and synchronization remain
+inside timing. This supersedes older no-speedup evidence only for these fixtures,
+not Qwen/GEMM/attention or general compiler behavior.
+
+Four-task models prove optimal in1.0/6.6 seconds.8-task models run about540s and
+return FEASIBLE with92.6%/99.3% gaps; extra budget yields useful incumbents with
+weak proofs. Source task counts differ from partition instances:17-row variants
+have32/16/8 instances (selected16);65-row variants64/32 (selected64). The65-row
+solution has15 vs8 groups, the same8 configurations and58368 vs33280 transfer
+bytes, so its speedup accompanies additional communication. The saved serial
+baseline is not a strongest staged-search comparison. Offline solver amortization
+and full timing boundaries are explicit in the report.
+
+See companion `taskflow/docs/taskflow-program-joint-speedup-v24.md`, curated
+`taskflow/evidence/program-joint-speedup-v24`, and raw
+`results/taskflow/program-joint-speedup-v24`. Preserve original prepare records,
+all prior failed/pilot artifacts and frozen compilers. Device work stays main-only
+under/tmp/npu.lock with external deadlines.
+
+## Public graph search v25
+
+The new `cp-sat-all` entry composes existing source actions and public graph
+choices in `ProgramAllSearch.cpp`, independently of the restricted v23 domain.
+`ProgramSearch` is a CP-SAT branch-and-check master: coverage is its proposal
+objective; complete checked graph cost ranks candidates. Do not describe its
+coverage objective as latency or claim a finite-domain optimum without complete
+known feasibility/cost coverage. See `docs/taskflow-public-program-search-v25.md`.
+
+Source initialization distribution changes task count. Preserve the explicit
+source-origin lineage when expanding placements/routes/priorities/groups. Use
+`rebindProgramGraph` to preserve actual native source instances/versions and
+`refreshProgramGraphSchedule` to reconstruct schedule witnesses; do not finalize
+a tiled graph through the whole-task adapter. Output transfers need execution
+group ownership derived from their actual selected source copy.
+
+`resourceCount` is capacity reservation, not computational replication. Partition
+host slicing/assembly/control remains unpriced. `best.mlir` is only source plus
+source attributes; the complete selected graph/timing is in `best.json`.
+`physical_realization_checked=false` must remain explicit until the actual NPU
+lowering consumes and validates all selected decisions. Preserve frozen v23/v24
+evidence and do not call analytical improvements measured hardware speedups.
+
+v25 frozen experiment evidence is now in
+`../orbit-artifact/results/taskflow/public-program-search-v25-r3` and curated in
+`../orbit-artifact/taskflow/evidence/public-program-search-v25`; report:
+`../orbit-artifact/taskflow/docs/taskflow-public-program-search-v25.md`.
+Each of GEMM-scale (2 tasks), chain4-heavy and chain8-tail used a 600-second shared
+quota and checked 5193/2421/2740 assignments. All generated non-singleton local
+choices were proposed (48/48, 61/61, 77/77); combinations were not exhausted.
+Analytical baseline/best ratios were 1.0038/1.0069/1.0935, with explicit assumed
+mechanism coefficients; these are not new NPU measurements. CP time was
+578.9/115.1/194.0 seconds; callback time 20.5/483.2/403.5 seconds. Peak process
+RSS 134.8/2475.0/1650.8 MiB. Independent trace/precedence/capacity audit passed.
+
+Do not call this unrestricted full-chip NPU optimization: scaling cases used the
+existing single-core target binding; resource/count/shape singleton constraints
+remain visible. Whole-task 4-case contracts prove count/shape/resource-demand and
+explicit route replacement compose correctly, including input placements ordered
+[2,0,1]. Independent per-replica placement and complete selected-plan lowering
+still need work. Solver ON/OFF and affected legacy search regressions pass.
+
+## Optimality references v26
+
+The user's oracle goal is now implemented as explicit finite-domain references,
+not a comparison to an arbitrary default planner. Eight benchmark instances in
+`test/TaskflowGeneric/fixtures/oracle-v26` exhaust64–1536compatible choices in
+0.63–43.60seconds and return OPTIMAL with all feasibility/cost known. Independent
+solver-OFF enumeration checks all5208points/2612feasible, exactly matching every
+cost and all eight minima. Full abstraction/NPU hardware optimality is not proved.
+
+`ProgramBeamSearch` reuses `selectSearchBeam` on the same frozen public domain;
+it is explicitly an adapter, not unmodified legacy ORBIT search. Beam never
+claims optimality. Gap iscost/oracle-1; CP uses an oracle proof quota, so this is
+not a same-budget CP-versus-beam speed claim. Preserve zero-gap controls and the
+GEMM2ns interaction witness. K candidate reordering changes start, scan order and
+tie-breaking; it is not the default planner. Configuration identity must be paired
+with frozen compiler SHA. Cheap relations accept null bindings neutrally and the
+complete checker decides actual legality; explicit replacements reset only their
+own stale automatic truncation flags. Identity and compound/null tests cover it.
+
+Report: `../orbit-artifact/taskflow/docs/taskflow-optimality-reference-v26.md`.
+Raw: `../orbit-artifact/results/taskflow/optimality-reference-v26-r1`.
+Curated: `../orbit-artifact/taskflow/evidence/optimality-reference-v26`.
+ON/OFF public-search contracts pass, including11beam and8identity cases. No new
+hardware work, commit or push was performed. Preserve frozen v23/v24/v25 tools.
+
+## Public graph NPU replay v27 and invocation regions v28
+
+Frozen v26 baseline/optimum public graphs now have exact replay, direct AIR
+lowering, and an independent final-AIE checker. v27 formal hardware evidence is
+`../orbit-artifact/results/taskflow/public-optimum-npu-v27-r1`; report
+`docs/taskflow-public-program-npu-v27.md`. Four pairs, two processes each, show
+no stable end-to-end speedup. Preserve trap session1 ratio0.833526x. Formal paired
+624calls/780arrays plus6unpaired correctness calls give630calls/792arrays and
+1584FP32/FP64 comparisons, all independently audited. The original v26 model
+optimum is not a physical runtime optimum. Capacity/BD/cross-core limitations
+remain explicit; no fallback baseline or silent replan is allowed.
+
+`ProgramInvocationCost`/`ProgramInvocationEvaluation` now price checked execution
+regions with per-call/per-BO/per-byte API costs, explicit bound/unbound runtime
+identity, optional application reset, and final output copy. Input edges do not
+multiply launches. Logical execution groups do not imply physical invocations.
+Body events and lifecycle costs have exclusive ownership. Device setup and
+teardown are separate runtime costs once per NPU region, ordered after submit /
+before source body and after body / before completion. Prepared context/ELF
+objects do NOT imply free per-run firmware configuration. Actual final ELF has
+83controlops versus13innerDMAops, including pre/post distinct empty-PDI loads;
+reproducible audit: `../orbit-artifact/results/taskflow/invocation-device-setup-v28-r2`.
+Instruction counts are not duration or device cycles; setup/teardown latency is
+still unknown. Never turn missing prices into zero.
+
+`ProgramHeterogeneousSearch` composes existing HeterogeneousMapping taskDevices
+and cuts in the public finite search engine. The3task contract covers32raw
+assignments/18regiongraphs. Current region implementation is serial/resident,
+not asynchronous heterogeneous execution, and has not combined CPU/NPU cuts
+with every tiled/native dimension in one joint domain. CLI:
+`--heterogeneous-program-search`, `--heterogeneous-program-assignment`, and
+`--public-program-runtime-model` for exact old-graph repricing. Unsupported ABI
+pricing is unknown and must prevent an exhaustive optimality proof.
+
+v28r1 calibration and oracle evidence remain frozen diagnostics. Its5208points
+exhausted in80.06s with peak235MiB:4finite model proofs and4unproved domains with
+1056partial/reusable-host-ABI unknowns. That evaluator omitted physical
+setup/teardown; its proofs do not certify the corrected complete model. Its
+independent heldout full-wall error was42.75%; conditional2.10% uses observed
+wait and is NOT independent end-to-end accuracy. Preserve both findings.
+
+v28r2 buffers evidence outside hot-call loops. Two calibration rounds total
+552NPUcalls/736arrays/1472FP32-FP64 comparisons pass, plus161unique memory arrays
+(reused hash-exact inr2, not a second memory experiment). r2 hot240calls each
+used1poll; r1 often used multiple polls. This does not isolate power/queueing as
+the cause. Formal corrected profile keeps setup/teardown null;8frozen-candidate
+full scores remain unknown. Separate zero-reset ASSUMED sensitivity gives10.07%
+independent wall error; it is not a calibrated hardware oracle. Poll completion
+adds only detection tail to the source+DMA+setup+teardown interval, never the
+whole measured wait on top of device work.
+
+Final corrected ON compiler SHA f57eac3b207dc8678b89d01ce01e6b2cd5003f2d196d543454c049ace1605cd0;
+OFF fc4b5514bde6b1b77cbbf8c0c6389427954c6335170c02095fed7365cd4db6eb.
+Stable copies are in the device-setup audit's tools/. ON/OFF validation passes:
+invocation costs96, heterogeneous58/56, CLI227/192, and affected public/native
+search, graph, timing, identity/replay regressions. Report:
+`docs/taskflow-invocation-regions-v28.md`; raw `invocation-calibration-v28-r{1,2}`.
+Preserve frozen v23–v28 evidence, source-r1/source-r2 snapshots, and unpaired
+controls. No new commit/push was performed. Unrelated docs/presentations edits
+remain outside this task.
+
+## Complete region invocation model and board validation v29
+
+v29 replaces unidentifiable additive setup/body/wait pricing with an exclusive
+complete region invocation model on the existing ProgramGraph/ProgramTiming
+ownership abstraction. `ProgramRegionCompositeCost` owns launch, BO sync, actual
+firmware setup, source body/DMA, teardown and native completion once per region.
+Application input reset, serial orchestration and final output copy are separate
+once-only costs. Never append v28 body/lifecycle fees to a composite region.
+This calibrated composite does not identify pure device cycles or setup latency.
+
+The exact runtime is `orbit.serial-prepared-bound-native-wait2.v29`: prepared
+contexts/ELFs/BOs and CPU descriptors, raw run creation/binding/start and native
+`wait2()` inside each invocation, no polling fallback or asynchronous overlap.
+Implementation/control/source identities and closed calibration feature ranges
+are required; missing evidence or out-of-domain prices remain unknown. Model
+identity hashes the complete JSON, not its declared display identifier.
+
+Raw: `../orbit-artifact/results/taskflow/region-validation-v29-r1`.
+Final protocol is `../orbit-artifact/taskflow/protocols/invocation-regions-v29-r2.json`,
+SHA `3cb2e1b4afdb490f92baa7fe8db74222a44b592effd6b3fe4f163f3230bfb0d0`.
+Training N=16/256/1024; untouched heldout N=64/512. Every shape covers all32 raw
+CPU/NPU placement/cut choices and18 canonical region graphs of the actual
+three-task FP32 fixture. All90 plans were compiled and measured in3 fresh
+processes with3 warmups and15 hot calls per plan/process. All4860 complete
+program calls,5670 NPU region invocations,4860 saved output arrays and9720
+independently regenerated FP32/FP64 comparisons pass. Retain the pilot's unit
+correction: its raw ns values were correct, its original CLI ms label was not.
+
+Frozen model SHA `450b87c994ccf50aa1d53d452b0e2f363b1435621bd4fd75b196d3b5cd9fdb72`.
+Independent guarded training-only refit opens162 training paths and zero heldout
+timings, reproducing exact model bytes. Independent heldout acceptance passes:
+36 group median absolute relative error5.34935%, P90 19.69194% under preregistered
+10%/20% gates;247/247 eligible pairwise signs correct; selection regret0 for both
+heldout shapes. P90 is close to its limit, and individual groups/calls may exceed
+20%; this is a group-median validation, not an all-call accuracy bound.
+
+C++ CP-SAT evaluates32 assignments per shape, all feasibility/cost known, and
+proves the same minimum as independent finite enumeration. The model-selected
+all-CPU/no-cut plan is also the independently measured fastest of all18 plans at
+both heldout shapes. Primary all-CPU baseline ratios are1.00x in every process:
+there is no optimizer acceleration over that baseline. Additional all-NPU
+references are75.52x/78.07x slower in per-process-ratio medians; those ratios
+describe avoiding NPU calls and must never replace the primary baseline.
+
+Frozen v29 search compiler SHA
+`0630e946288ffe36b3ae2c73d952750e4f27e3d0346becd56c8acf35e428c281`.
+This board validation certifies only the resident serial two-device placement/
+cut domain of this source family. It has not combined every native tiling,
+residency, fusion and resource dimension, and is not an unrestricted hardware
+optimum or an inference benchmark. Preserve all v27/v28 failures/unknowns and
+all v29 raw outputs, protocol versions and holdout results. Any model revision
+after observing this holdout requires a new version and untouched workloads.
+No commit or push was performed for v29. Unrelated docs/presentations remain
+outside the task.
+
+Final affected ON/OFF regressions all pass: invocation CLI227/192, invocation
+cost96/96, heterogeneous search58/56, composite48/48, full public-search suites,
+and ON public-graph-AIR5cases. `git diff --check` passes. The original raw
+`tools/taskflow-opt` remains the f57e v28 export compiler; v29 search used the
+0630 compiler above, separately preserved in `raw/source-r1/tools/taskflow-opt`.
+Keep those two stage identities distinct. Protocol deviation: clock-pair
+baseline was omitted during acquisition; later host-only diagnostic is saved
+in `timer-diagnostic-post-validation-r1` (3x10000 pairs, median60ns, P90 70ns),
+explicitly after validation, never subtracted or used to fit/accept the model.
+Individual group errors exceed20% for4/36 groups (maximum30.35%); per-process
+P90 errors are20.23%,19.69%,24.97%. Preserve these limits alongside the passing
+preregistered aggregate gate.
+
+Search records take858–990ms total per shape, including838–968ms callbacks and
+18–20ms CP-SAT. Recorded process-lifetime peakRSS is226212KiB (~220.9MiB), not
+solver-exclusive memory. All32 tuples are checked (15variables/52constraints);
+this five-binary-variable experiment does not establish large-domain scaling.
+Snapshot/solver audit: `raw/source-r1/{snapshot,solver-analysis,sha256-manifest}.json`.
+
+## Official PolyBench LARGE native search and board validation v30
+
+User authorized ten-minute searches and suggested PolyBench LARGE. Raw root:
+`../orbit-artifact/results/taskflow/polybench-large-v30-r1`; report
+`docs/taskflow-polybench-large-v30.md`. Official PolyBench/C4.2.1-beta archive
+SHA426519ee8443a5f2175de6a3e9328cda8917a5e33053d0e8f59855ab56d689a4.
+Actual ATAX LARGE M1900/N2100, explicit upstream DATA_TYPE_IS_FLOAT, not default
+double:7.98M multiply-add pairs/15.96MFLOPs, full15,984,400 logical FP32 bytes.
+CPU original-C/transformed-source all4000tmp/y values bitwise equal; NPU checks
+complete external y only, not device tmp. Four serial stages reuse one core.
+Actual ELF main loops call software __mulsf3, with vadd.f additions; no device
+cycles identify the individual launch/helper/DMA fractions of ~550ms.
+
+The prepared full call includes A/x reset, four BO TO syncs, raw run creation/
+binding/start/nativewait2, y FROM sync and copy, as one exclusive owner. No
+polling/fallback/body-wait double charging. Frozen protocolSHA61218935e64df3dc
+ff56df3932632d604a445166589e26db07f49b55d40bdbb7. Training5tiles×3processes,
+onewarm/threehot =60calls; untouched heldout448x10/56x100×3 =24calls. All84formal
+calls/168FP32-FP64comparisons independently pass. Excluded pilot4calls and
+exact selected-image replay4calls also pass, total92calls/184comparisons.
+
+Frozen modelSHA4f602f8253e57e5656db6c65100ae02d5b0cbdb30cff330eeaa1568b1e7297ca.
+Predeclared NNLS command_count/source_phase_count/dma_bytes terms produce
+[550.5231942,0,0]ms: constant predictions, no tiling discrimination. Independent
+guarded training-only replay reproduces exact model/input/fit bytes; no pilot
+or heldout labels. Numerical rank3 is not physical mechanism identification.
+Before heldout, C++predictions + selection freezeSHA5b180bafe34a814a1be5f7e1a
+5587c3ebef8a86ea9ceec6622d8dab0716b332a. Independent heldout APE1.233983% and
+0.585314%, both pass20%gate; observed pairgap0.656774% leaves zero eligible
+>=5% ranking pairs: INCONCLUSIVE, not ranking validation. Never refit this
+model against those heldout labels; a revision needs new untouched validation.
+
+Existing C++cp-sat-all search-calibrated-r2 exhausts8tile tuples,5feasible/
+3capacityreject/zero unknown. Finite-model OPTIMAL, all5costs550.5231942ms.
+99.162577s total,98.532644s callbacks,6.967245ms CP,0.400540ms build; peak process
+RSS13,304,040KiB(~12.69GiB), not CP-only. Fixed baseline is first executable
+NPU512x10, NOT unchanged legacy ORBIT. Selection allzero retains baseline:
+1.00x plan speedup. Exact selected-source recompilation gives byte-identical
+baseline ELF SHA c55bff32e34674f8fb5c10bea1701d422ab4e604756bdd7f7bdbf576a9ab4b4a.
+Extra selected replay549.696716ms is a diagnostic, not a new denominator.
+Measured trainingbest112x10 median per-processratio1.037392x is not CP-selected
+and fails all-process>1.05x stable-acceleration gate. CPU kernel-only3.72ms
+exploration has a different boundary, never a formal speedup denominator.
+
+search-all-native-r1 declares29dims/15nonsingletons/3,359,232admittedtuples.
+600s soft budget cannot preempt a callback:114completed at597.964510s;115th
+entered candidate-95 but did not return before external660s hardguard exit124.
+No final search.json/fulltrace/time-vreceipt. Preserve incumbent only; no
+exhaustion/UNSAT/proof, total CP time and feasible/unknown breakdown unavailable.
+Monitor observed VmHWM13,117,668KiB(~12.51GiB), sampled process highwater not final
+CP-only memory. Scopeaudit distinguishes rejection of a rebound concretegraph
+from proving all native implementations of a highlevel choice impossible.
+Default native count/shape/resource bindings are singletons: no CPU placement
+or actual multicoreparallelism. This is NOT the requested full-abstraction
+hardware oracle; gaps include executable native choices, ranking costs and
+bounded/cancellable materialization, then composition with CPU/NPU regions.
+
+Direct --native-cost-features-output avoids a fulltimeline for feature export.
+ProgramTiming single-exclusive-owner projects internal buffer edges to self
+after coverage checks; independent phase-pool sweep retains capacity checking,
+multi-owner dependency behavior and unknown prices. Preserve prior~20.5GiB
+timeline SIGKILLs as pre-CP failures, packet-ID/repeat-count/channel failures,
+both fingerprint diagnostic searches and metadata postprocessing failure.
+Final GenericAnalysis strips only internal orbit.search_origin on cloned
+parentmodule ifneeded; otherwise preserves original print. Actualsource and
+lineage-source analysis reproduce historical plain analysis bytes exactly;
+no model whitelist widening. Frozen searchtoolSHA0a82a36f4728f55772c1996fb490c
+759dc24edbea167f595161a61a02314b0bf. Old0630physical/510feature tools untouched.
+
+Final r3 ON/OFF regressions pass timing93/helper13/nativeCLI6+2 each, invocation
+227/192 and affected publicsearch including graph42. Sources/producers/audits
+are preserved under raw/source-r1 and versioned roots. No newcommit/push in
+thiscycle; unrelated docs/presentations remains untouched.
+
+## v31 review, LLVM format and direct SCIP checkpoint
+
+User explicitly requested parallel agents for review distillation and cleanup,
+LLVM clang-format, and explanatory comments. `docs/review-guidelines-from-guosran-prs.md`
+distills 12 rules with 47 verified source-comment links. Strict guosran authorship
+is 25 Neura + 6 Amoeba PRs; 3 Copilot-authored results are supplementary. All 105
+comment/review pages terminate with a short page, gaps=[]; strict events1077
+(74 conversation,620 inline,383 reviews), human500/author523/bot54, nonempty
+human378. Raw values and full bodies, coverage and evidence index are preserved
+under orbit-artifact/results/taskflow/review-cleanup-v31-r1/comments. No GitHub
+messages were posted. Final search verification retains the same PR inventory.
+
+`.clang-format` is BasedOnStyle:LLVM. clang-format23.1.5 checks all290 owned
+.h/.cpp/handwritten.inc files under include/lib/tools/test;224 initially changed.
+Use python3 scripts/check-cpp-format.py --clang-format PATH. Thirdparty/generated
+and frozen experiments are excluded. Before-format files and a format-only patch
+are archived separately from semantic changes. Legacy Neura is OFF in these
+regression builds; its extra changes are formatting only, with no new board run.
+
+Applied correctness fixes separate structural route support from pricing and
+generation completeness. Missing supported prices cannot prove infeasible or
+full-domain optimal. Partial bandwidth override is honored. Missing capacity of
+an otherwise usable local place rejects explicitly; unused unknown memories and
+caller-owned host BO capacity remain separately scoped. Integer ns and checked
+sums are bounded by2^53-1 before double-valued public schedules. Native schema/
+calibration failure is not physical infeasibility; discovery consuming a valid
+budget returns UNKNOWN. Buffered evidence close errors propagate; /dev/full
+tests exercise candidateMLIR,bestMLIR,evaluationJSON without destructor abort.
+
+Optional ORBIT_ENABLE_SCIP defaultsOFF, links SCIP::libscip, exposes
+ProgramJointMILP.h and --joint-solver=scip alongside cp-sat. Both use the declared
+ProgramJointDomain and independent materialize/check. SCIP's exact start-anchor
+cumulative encoding is quadratic; large model caps return RESOURCE_LIMIT with
+checked baseline, not an infeasibility proof. Sequential workers=1 only.
+Both backends reserve10% remaining backend wall budget for finishing/checking.
+Pipeline receipt separates build/solve/later evidence; external wall includes
+the final receipt and teardown. Domain remains supported NPU-only row-slice,
+identity-grid pointwise, not arbitrary GEMM/full CPU-NPU placement/hardware oracle.
+
+Final ON joint36+28+86, OFF25+28+86, nativeerrors27 each, legacyjoint23 each and
+timing93 each pass after naming/comment/fixture formatting. Broader core/public
+search/replay,heterogeneous,invocation,region/nativecost regressions pass.
+See docs/orbit-review-cleanup-v31.md and archived final-validation.json.
+
+docs/taskflow-joint-solver-comparison-v31.md records serial synthetic-cost scale
+experiments with frozen tool41e3d599eba9b46d39b03f3bc4f1d69c1688ef8200aa5416fb1d3ce468509061.
+Four-instance case CP72ms/SCIP12.56s bothOPTIMAL55ns; eight-instance CP23.1s
+OPTIMAL102ns while original MILP hits100kvarcap during construction. Sixteen
+instances at600s pipeline quota: actual CPsolve539.96s FEASIBLE196/bound57,
+gap70.918%; independent per-slice certificate proves196 without changing CPstatus.
+SeparateK4/160kvar case builds130130vars/389753constraints; CP706msOPTIMAL102,
+SCIP53.94sTIMELIMIT with no incumbent, retainscheckedbaseline102. A fixed-baseline
+diagnostic admits that exact witness with auxiliary constraints retained; it is
+not a free-search performance result or full-domain proof. CP receives hints;
+SCIP currently has external fallback/horizon but no primal warm-start. No new
+hardware speedup claim. Source/readability changes after freeze are recorded.
+No new commit/push in this cycle; unrelated presentations remain untouched.
+
+## v32 in-progress integration checkpoint (2026-11-12)
+
+The user requested completion of the joint-search, actual-NPU, review and push
+work, not just a formatting checkpoint. See docs/taskflow-public-search-scope-v32.md
+for the remaining abstraction/optimality limits, docs/taskflow-full-build-v32.md
+for independent full Neura/AIR ON/OFF builds, and
+ docs/taskflow-runtime-validation-v32.md for typed CPU/NPU phases and calibration.
+These are checkpoints; do not call all work complete or claim a hardware oracle.
+
+A real four-placement BF16 GEMM/ReLU search exposed a pinned LLVM JSON bug:
+parse/copy/erase/copy could resurrect an erased ObjectKey and read a destroyed
+Value. JSONUtils.h reconstructs owned objects/arrays instead of copying DenseMap
+tombstones. Production JSON erase/filter sites in Taskflow and Neura use it;
+the frozen LLVM installation is unchanged. Pure LLVM regression has six checks;
+the real four-placement pilot now exports all four candidates, with zero unknown
+feasibility and four honestly unknown costs before calibration. The stale Neura
+retimer fixture used 2x2 mapping for the declared 4x4 mapper; only its attributes
+were corrected, retaining production geometry validation.
+
+Selected NPU event ranges now have exact union/local-copy-frontier checks and
+multiple physical configurations. The executor syncs BOs once before and once
+after the sequence, preserving device scratch between serial native wait2 calls.
+Cost features include configuration_count; multi-configuration submit and wait
+must explicitly price it. Executor CPU18, cost52 and projection27 checks pass;
+calibration train/holdout and process-aggregation CPU12 checks pass. No actual
+calibrated v32 model or complete finite-domain hardware optimum exists yet.
+
+Do not reuse the initial 64 two-K coalesced ELF as a correct implementation.
+Host-address concatenation alone did not preserve packet boundaries: its output
+matched B0@B1 exactly because a 2048-element packet filled consecutive 1024-element
+A/B core BDs. Single-K32 with the same external kernel passed noncommuting random
+inputs. Runtime packet-r3 emits one packet per selected input transfer with
+completion before the next input starts. Root board diagnostics passed random
+64 inputs7/7 and structured inputs3/3, about1.35ms for the five-config sequence.
+These are diagnostics, not the final typed-executor calibration or a speedup.
+Route/channel/destination-storage proof tightening and formal full-pipeline runs
+remain in progress. Raw evidence is under orbit-artifact/results/taskflow/
+full-joint-v32-r1; packet-boundary-diagnostic-r1 preserves the failed artifacts.
+
+No new commit/push at this checkpoint. Preserve unrelated docs/presentations/.
+
+The exact-format-only subset was subsequently committed and pushed as
+ af204ecb275fd31271108d46c3d739c4189efb83 (168 existing C++ files, .clang-format,
+format-check script). Each staged C++ blob was verified byte-for-byte against
+clang-format applied to its prior HEAD blob. Remote refs/heads/main was checked
+at that hash. Remaining semantic changes and their final hardware/model evidence
+are still uncommitted at this checkpoint; the whole task is not complete.
+
+### v32 continued integration (pre-final calibration)
+
+The direct CLI now makes explicit tile M/N/K override inherited target tile
+defaults via owned JSON reconstruction. Its real matrix export regression
+checks equal parent/physical graphs for explicit16 with default16/default32,
+a different default-only32 graph, and rejection of partial zero tiles.
+Per-task implementation, module-level generated-initializer provenance and
+implementation-resolved work are integrated. ON/OFF typed75, new direct mixed
+price guard9, legacy directcost77, cost53, projection27 and CLI6 pass.
+The guard added after frozen r4 does not retroactively change that binary.
+
+Frozen r3/preparation-r5 formally passed CPU/NPU GEMM16/32/64 in three fresh
+processes, 18 calls each. Those are numerical and timing diagnostics, not a
+calibrated CP hardware result. CPU affinity was not fixed; this HX370 exposes
+5.15GHz max on cores0..3 and3.29GHz on cores4..11. Preparation-r6 freezes a
+CPU0 affinity policy with5 warmups/31 hot calls/3 processes and12 declared
+source/device/tile designs. No r6 measurement has started: compilation caught
+missing duplicated-A runtime input at64 tile16x16x64 and missing packet flag
+on a valid circuit-only ReLU input in96's final configuration. Strict checks
+rejected both before any device execution. Original K3 AIR is legal but the
+installed AIR flow-order pass moves a definition after its user; use the
+retained failure evidence, never patch installed vendor runtime silently.
+
+Backend fixes for preserve-shim-order, narrowly bounded static input-loop
+inventory and unique circuit routes are in progress. Final runtime is rebuilt
+from selected transfers and remains loop-free with full exact coverage. A new
+compiler freeze and complete numerical validation are required after these
+changes. Raw experiments remain under full-joint-v32-r1; no model accuracy,
+full abstraction optimum or CP-SAT hardware speedup is established yet.
+
+### v32 r7 hardware counterexample and r8 repair checkpoint
+
+Preparation-r7 compiled all 12 cases and matched native feature graph IDs.
+Its first measurement round passed nine cases, then GEMM64 tile16x16x64
+hit the 45-second timeout. No r7 calibration fit or complete measurement
+campaign exists. A separately retained GEMM16 recovery probe passed 3/3
+calls without a device reset. Static route/coverage proof did not certify
+core locks or arithmetic; an audit found two C exports sharing a buffer
+with releases after the second computation. The initial retained-A-lock
+hypothesis was not established.
+
+The reviewed repair splits repeated host input rectangles only at proved
+empty-local-copy frontiers, preserves every event and DMA, and rejects old
+unsafe selected runtime contracts. Counts change 64 tile16K64 12->17 and
+48 tile16K48 7->9; 64 tile32 K2 remains5. Runtime11, matrix16 contracts34
+and matrix64 contracts54 pass. Frozen r8 taskflow-opt SHA256 is
+`e9d04f4275897596c6db8a16b008aec9716871e05201b081d4fb0d75a6764592`.
+The repaired64 actual compilation/pilots are pending at this checkpoint.
+
+Separate old-compiler shared-weight MLP diagnostics are not accepted
+speedups: four-layer whole-program lowering exceeded tile program memory
+by4160 bytes, and two-layer lowering ran3 calls but failed numeric checks
+(maximum error0.00012207031). Inputs and independent sequentialFP32/BF16RNE
+references are retained in /tmp/orbit-mlp-numerical-v32-r1; no tolerance was
+relaxed. Rounding semantics are under investigation.
+
+### v32 r9 validated checkpoint
+
+Frozen compiler b7b7d4849ed07439ad2b30114899224432acbab6e892bba04383af9c350105e8
+adds one-host-output configuration isolation, explicit optional total prepared
+NPU-context capacity, integer BF16 RNE lowering, and corrected solver option /
+unknown-price proof scope. New GEMM calibration used 12 source-selected cases,
+36 fresh processes, 1296 numerically checked calls; every call passed. Exact
+selected graph/ABI/runtime/ELF identities were checked. Train-only model hash
+67a8c4e112daa0ba1648583ea3e46fa865a4de0bccc135fad9f90eac205bcb4b
+passed the preregistered aggregate20% median error gate at16.44%, but CPU48
+alone has29.40% error (NPU48 3.49%); report that limitation. Heldout CPU/NPU
+ranking is correct with strictly separated process-median intervals. No
+CP/ORBIT speedup or complete-abstract optimum follows from this calibration.
+
+ON/OFF full default builds and required CPU suites pass, including Neura35,
+cost56, runtime19, static runtime11, typed implementation80, BF16 RNE and exact
+solver65/39. OFF initially reused one stale runtime build object; it was rebuilt
+and the unchanged test passed. Format check covers312 owned C++ files.
+
+MLP2 original RNE reference remains authoritative. The new emitted arithmetic
+compiled through AIR, then pinned MLIR rejected the vendor's default overflow
+property on arith.trunci. The failure is retained; a narrowly scoped structural
+compatibility reader is being reviewed for a separate compiler revision. Do
+not reuse r9 prices under a different compiler/runtime identity. Raw r9 evidence
+and honest status: docs/taskflow-npu-calibration-r9-v32.md. Complete abstraction
+coverage and MLP hardware/speedup acceptance remain unfinished.

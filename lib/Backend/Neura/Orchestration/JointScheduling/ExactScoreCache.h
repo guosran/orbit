@@ -13,8 +13,9 @@
 #ifndef AMOEBA_EXACT_SCORE_CACHE_H
 #define AMOEBA_EXACT_SCORE_CACHE_H
 
-#include "llvm/ADT/StringRef.h"
+#include "Taskflow/JSONUtils.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/LineIterator.h"
@@ -30,10 +31,10 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <system_error>
-#include <utility>
 #include <sys/file.h>
+#include <system_error>
 #include <unistd.h>
+#include <utility>
 
 namespace mlir {
 namespace amoeba {
@@ -88,8 +89,7 @@ public:
   bool begin(llvm::StringRef cacheDirectory, llvm::StringRef exactKey,
              llvm::StringRef architecturePath, llvm::StringRef graphVariantId,
              llvm::StringRef sourceGraphId, llvm::StringRef stage,
-             llvm::StringRef outputPath,
-             std::string &error) {
+             llvm::StringRef outputPath, std::string &error) {
     return begin(cacheDirectory, exactKey, architecturePath, graphVariantId,
                  sourceGraphId, stage, outputPath,
                  ExactScoreCacheMigrationOptions{}, error);
@@ -123,8 +123,8 @@ public:
 
     std::error_code ec = llvm::sys::fs::create_directories(cacheDirectory_);
     if (ec) {
-      error = "cannot create score cache directory " + cacheDirectory_ +
-              ": " + ec.message();
+      error = "cannot create score cache directory " + cacheDirectory_ + ": " +
+              ec.message();
       reset();
       return false;
     }
@@ -183,8 +183,7 @@ public:
           break;
         std::string validationError;
         if (!validateLegacyProductionScore(
-                legacyScore, migrationContract_,
-                migrationEffectiveIterations_,
+                legacyScore, migrationContract_, migrationEffectiveIterations_,
                 migrationExplicitLegacyMaxIterations_, legacyProof,
                 validationError))
           break;
@@ -250,8 +249,7 @@ public:
           isCompleteScore(cached)) {
         if (!materialize(cached, architecturePath_, graphVariantId_,
                          sourceGraphId_, stage_, outputPath_,
-                         /*peerImported=*/false,
-                         error)) {
+                         /*peerImported=*/false, error)) {
           release();
           return false;
         }
@@ -267,9 +265,8 @@ public:
       owner_ = true;
       if (!materialize(legacyScore, architecturePath_, graphVariantId_,
                        sourceGraphId_, stage_, outputPath_,
-                       /*peerImported=*/false, &legacyProof,
-                       migrationContract_, migrationProofReason_,
-                       legacySourceEntry, error)) {
+                       /*peerImported=*/false, &legacyProof, migrationContract_,
+                       migrationProofReason_, legacySourceEntry, error)) {
         release();
         return false;
       }
@@ -288,16 +285,14 @@ public:
       migrationRecord["budget_before"] = legacyProof.budgetBefore;
       migrationRecord["budget_after"] = legacyProof.budgetAfter;
       migrationRecord["budget_before_kind"] =
-          legacyProof.legacyUpperBoundDeclared
-              ? "explicit-legacy-upper-bound"
-              : "recorded-fixed-point-budget";
+          legacyProof.legacyUpperBoundDeclared ? "explicit-legacy-upper-bound"
+                                               : "recorded-fixed-point-budget";
       migrationRecord["success_prefix_only"] = true;
       migrationRecord["key_match"] = "byte-exact-legacy-key";
       migrationRecord["legacy_key_byte_exact"] = true;
       migrationRecord["legacy_key_length"] =
           static_cast<int64_t>(migrationLegacyKey_.size());
-      migrationRecord["new_key_length"] =
-          static_cast<int64_t>(key_.size());
+      migrationRecord["new_key_length"] = static_cast<int64_t>(key_.size());
       migrationRecord["proof_reason"] = migrationProofReason_;
       migrationRecord["production_scheduler_contract"] = migrationContract_;
       if (legacyProof.legacyUpperBoundDeclared)
@@ -307,8 +302,7 @@ public:
       evidenceStream.flush();
       if (!writeTextAtomically(entryPath_ + "/migration.json", evidence,
                                error) ||
-          !writeTextAtomically(entryPath_ + "/status", "complete\n",
-                               error)) {
+          !writeTextAtomically(entryPath_ + "/status", "complete\n", error)) {
         release();
         return false;
       }
@@ -381,8 +375,7 @@ public:
     }
     if (!materialize(peerScore, architecturePath_, graphVariantId_,
                      sourceGraphId_, stage_, outputPath_,
-                     /*peerImported=*/true,
-                     error))
+                     /*peerImported=*/true, error))
       return false;
     return publish(outputPath_, error);
   }
@@ -440,8 +433,8 @@ private:
     }
     ec = llvm::sys::fs::rename(temporary, path);
     if (ec) {
-      error = "cannot publish score cache file " + path.str() + ": " +
-              ec.message();
+      error =
+          "cannot publish score cache file " + path.str() + ": " + ec.message();
       llvm::sys::fs::remove(temporary);
       return false;
     }
@@ -618,8 +611,7 @@ private:
       error = "legacy score carries a global-cutoff result";
       return false;
     }
-    if (headerObject.getInteger("max_makespan") !=
-            std::optional<int64_t>(0) ||
+    if (headerObject.getInteger("max_makespan") != std::optional<int64_t>(0) ||
         (footerObject.get("max_makespan") &&
          footerObject.getInteger("max_makespan") !=
              std::optional<int64_t>(0)) ||
@@ -646,15 +638,16 @@ private:
       }
     }
 
-    auto headerIterations = headerObject.getInteger(
-        "production_fixed_point_max_iterations");
-    auto footerIterations = footerObject.getInteger(
-        "production_fixed_point_max_iterations");
+    auto headerIterations =
+        headerObject.getInteger("production_fixed_point_max_iterations");
+    auto footerIterations =
+        footerObject.getInteger("production_fixed_point_max_iterations");
     if (headerIterations || footerIterations) {
       if (!headerIterations || !footerIterations ||
           *headerIterations != *footerIterations || *headerIterations <= 0 ||
           *headerIterations > effectiveIterations) {
-        error = "legacy score fixed-point budget is missing, inconsistent, or newer";
+        error = "legacy score fixed-point budget is missing, inconsistent, or "
+                "newer";
         return false;
       }
       proof.budgetBefore = *headerIterations;
@@ -667,7 +660,8 @@ private:
     // named local compatibility declaration for the known legacy upper bound
     // 64, and only when the current effective budget is also 64.
     if (explicitLegacyMaxIterations != 64 || effectiveIterations != 64) {
-      error = "legacy score omits its fixed-point budget without the explicit 64 compatibility declaration";
+      error = "legacy score omits its fixed-point budget without the explicit "
+              "64 compatibility declaration";
       return false;
     }
     proof.budgetBefore = explicitLegacyMaxIterations;
@@ -678,22 +672,22 @@ private:
 
   static bool materialize(llvm::StringRef cached, llvm::StringRef architecture,
                           llvm::StringRef graphVariantId,
-                          llvm::StringRef sourceGraphId,
-                          llvm::StringRef stage,
+                          llvm::StringRef sourceGraphId, llvm::StringRef stage,
                           llvm::StringRef output, bool peerImported,
                           std::string &error) {
     return materialize(cached, architecture, graphVariantId, sourceGraphId,
-                       stage, output, peerImported, nullptr, "", "", "",
-                       error);
+                       stage, output, peerImported, nullptr, "", "", "", error);
   }
 
-  static bool materialize(
-      llvm::StringRef cached, llvm::StringRef architecture,
-      llvm::StringRef graphVariantId, llvm::StringRef sourceGraphId,
-      llvm::StringRef stage, llvm::StringRef output, bool peerImported,
-      const ExactScoreCacheMigrationProof *migration,
-      llvm::StringRef migrationContract, llvm::StringRef migrationReason,
-      llvm::StringRef migrationSourceEntry, std::string &error) {
+  static bool materialize(llvm::StringRef cached, llvm::StringRef architecture,
+                          llvm::StringRef graphVariantId,
+                          llvm::StringRef sourceGraphId, llvm::StringRef stage,
+                          llvm::StringRef output, bool peerImported,
+                          const ExactScoreCacheMigrationProof *migration,
+                          llvm::StringRef migrationContract,
+                          llvm::StringRef migrationReason,
+                          llvm::StringRef migrationSourceEntry,
+                          std::string &error) {
     llvm::MemoryBufferRef buffer(cached, "cached-score");
     llvm::line_iterator lines(buffer, true);
     std::string rewritten;
@@ -717,8 +711,11 @@ private:
         object["source_graph_id"] = sourceGraphId.str();
         if (!stage.empty())
           object["stage"] = stage.str();
-        else
-          object.erase("stage");
+        else {
+          auto filtered = orbit::taskflow::copyJSONWithoutFields(
+              llvm::json::Value(std::move(object)), {"stage"});
+          object = std::move(*filtered.getAsObject());
+        }
         object["score_cache_enabled"] = true;
         object["score_cache_hit"] = true;
         object["score_cache_reused"] = true;
@@ -734,8 +731,7 @@ private:
               migrationSourceEntry.str();
           object["score_cache_migration_budget_before"] =
               migration->budgetBefore;
-          object["score_cache_migration_budget_after"] =
-              migration->budgetAfter;
+          object["score_cache_migration_budget_after"] = migration->budgetAfter;
           object["score_cache_migration_budget_before_kind"] =
               migration->legacyUpperBoundDeclared
                   ? "explicit-legacy-upper-bound"

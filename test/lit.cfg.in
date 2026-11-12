@@ -6,8 +6,10 @@ config.test_format = lit.formats.ShTest(True)
 config.suffixes = ['.mlir']
 config.test_source_root = r'@CMAKE_SOURCE_DIR@/test'
 config.test_exec_root = r'@CMAKE_BINARY_DIR@/test'
+config.environment['PATH'] = (r'@LLVM_TOOLS_BINARY_DIR@' + os.pathsep +
+                              config.environment.get('PATH', os.environ.get('PATH', '')))
 # These source fixtures are inputs to Python regression runners, not lit tests.
-config.excludes = ['samples', 'benchmark', 'common-parent-profile-retimer.mlir',
+config.excludes = ['samples', 'benchmark', 'fixtures', 'common-parent-profile-retimer.mlir',
                    'nested-terminal-output-lineage.mlir']
 
 # Tool substitutions from CMake

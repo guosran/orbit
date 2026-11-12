@@ -6,6 +6,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
@@ -559,7 +560,26 @@ bool orbit::taskflow::analyzeGenericProgram(ModuleOp module, GenericAnalysis &a,
     }
   std::string text;
   llvm::raw_string_ostream os(text);
-  fn.print(os);
+  // Keep the historical print path byte-for-byte for ordinary sources. An
+  // unattached function clone can print differently because its parent alias/
+  // SSA context is missing. Search lineage is nonsemantic; remove only that
+  // marker on a complete parent-module clone, never on the caller's live IR.
+  bool hasSearchOrigin = false;
+  fn.walk([&](Operation *op) {
+    hasSearchOrigin |= op->hasAttr("orbit.search_origin");
+  });
+  if (!hasSearchOrigin) {
+    fn.print(os);
+  } else {
+    OwningOpRef<ModuleOp> fingerprintModule(cast<ModuleOp>(module->clone()));
+    fingerprintModule.get().walk(
+        [](Operation *op) { op->removeAttr("orbit.search_origin"); });
+    auto fingerprintFn =
+        fingerprintModule.get().lookupSymbol<func::FuncOp>(fn.getSymName());
+    if (!fingerprintFn)
+      return fail(e, "source fingerprint clone lost its function");
+    fingerprintFn.print(os);
+  }
   a.bodyFingerprint = staticFingerprint(llvm::json::Value(text));
   return true;
 }

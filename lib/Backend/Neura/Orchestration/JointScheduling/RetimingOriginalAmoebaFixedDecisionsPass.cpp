@@ -5,27 +5,28 @@
 //===----------------------------------------------------------------------===//
 
 #include "RetimingOriginalAmoebaFixedDecisionsPass.h"
+#include "Taskflow/JSONUtils.h"
 
 #include "AnalyticalMLPInference.h"
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
-#include "CommonAmoebaParentProfiles.h"
-#include "CommonMapperReplayWrapper.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
+#include "CommonAmoebaParentProfiles.h"
+#include "CommonMapperReplayWrapper.h"
+#include "NeighborhoodReplaySelection.h"
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "OriginalAmoebaFixedDecisionRetimer.h"
 #include "OriginalAmoebaProfileCostAdapter.h"
-#include "NeighborhoodReplaySelection.h"
 #include "ProductionFixedScheduleCommunication.h"
 #include "SpatialTaskCandidateSpace.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -264,8 +265,8 @@ static bool readReplicaProfileEvidenceManifest(
     return false;
   }
 
-  std::map<std::pair<std::string, unsigned>,
-           OriginalReplicaProfileEvidenceRef> parsedRecords;
+  std::map<std::pair<std::string, unsigned>, OriginalReplicaProfileEvidenceRef>
+      parsedRecords;
   std::set<std::string> childNames;
   std::string commonModule;
   for (const llvm::json::Value &rawRecord : *rawRecords) {
@@ -282,8 +283,8 @@ static bool readReplicaProfileEvidenceManifest(
                            : expectedReplicaCounts.end();
     if (!record || record->size() != 7 || !parent || parent->empty() ||
         expected == expectedReplicaCounts.end() || !replica || *replica < 0 ||
-        *replica >= expected->second || !child || child->empty() ||
-        !function || *function != expectedFunction || !materialized ||
+        *replica >= expected->second || !child || child->empty() || !function ||
+        *function != expectedFunction || !materialized ||
         materialized->empty() || !profile || profile->empty() || !body ||
         body->empty()) {
       error = "replica profile evidence record is malformed or names an "
@@ -303,8 +304,7 @@ static bool readReplicaProfileEvidenceManifest(
     if (commonModule != reference.materializedModule ||
         !childNames.insert(reference.materializedTask).second ||
         !parsedRecords
-             .emplace(std::make_pair(reference.parentTask,
-                                     reference.replicaId),
+             .emplace(std::make_pair(reference.parentTask, reference.replicaId),
                       std::move(reference))
              .second) {
       error = "replica profile evidence repeats a child/replica or refers to "
@@ -323,9 +323,9 @@ static bool readReplicaProfileEvidenceManifest(
   for (const auto &entry : expectedReplicaCounts)
     for (unsigned replicaId = 0; replicaId < entry.second; ++replicaId)
       if (!parsedRecords.count({entry.getKey().str(), replicaId})) {
-        error = "replica profile evidence omits parent=" +
-                entry.getKey().str() + " replica_id=" +
-                std::to_string(replicaId);
+        error =
+            "replica profile evidence omits parent=" + entry.getKey().str() +
+            " replica_id=" + std::to_string(replicaId);
         return false;
       }
   if (commonModule.empty()) {
@@ -337,8 +337,7 @@ static bool readReplicaProfileEvidenceManifest(
   return true;
 }
 
-static bool readCanonicalModuleWitness(StringRef costPath,
-                                       std::string &witness,
+static bool readCanonicalModuleWitness(StringRef costPath, std::string &witness,
                                        std::string &error) {
   auto buffer = llvm::MemoryBuffer::getFile(costPath);
   if (!buffer) {
@@ -355,8 +354,8 @@ static bool readCanonicalModuleWitness(StringRef costPath,
   const llvm::json::Object *root = parsed->getAsObject();
   const llvm::json::Object *binding =
       root ? root->getObject("original_amoeba_profile_binding") : nullptr;
-  auto bound = binding ? binding->getString("canonical_module_witness")
-                       : std::nullopt;
+  auto bound =
+      binding ? binding->getString("canonical_module_witness") : std::nullopt;
   if (!root || !binding || !bound || bound->empty()) {
     error = "multi-replica retiming requires the exact canonical source module "
             "in the original profile binding";
@@ -367,10 +366,10 @@ static bool readCanonicalModuleWitness(StringRef costPath,
 }
 
 static bool verifyEvidenceMaterializedModule(StringRef path,
-                                            StringRef expectedFunction,
-                                            MLIRContext *context,
-                                            StringRef currentModuleWitness,
-                                            std::string &error) {
+                                             StringRef expectedFunction,
+                                             MLIRContext *context,
+                                             StringRef currentModuleWitness,
+                                             std::string &error) {
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
     error = "cannot read replica evidence materialized module " + path.str() +
@@ -378,8 +377,8 @@ static bool verifyEvidenceMaterializedModule(StringRef path,
     return false;
   }
   ParserConfig parserConfig(context);
-  OwningOpRef<ModuleOp> evidenceModule = parseSourceString<ModuleOp>(
-      (*buffer)->getBuffer(), parserConfig, path);
+  OwningOpRef<ModuleOp> evidenceModule =
+      parseSourceString<ModuleOp>((*buffer)->getBuffer(), parserConfig, path);
   if (!evidenceModule) {
     error = "replica evidence materialized module could not be parsed";
     return false;
@@ -388,8 +387,7 @@ static bool verifyEvidenceMaterializedModule(StringRef path,
       selectTaskFunction(*evidenceModule, expectedFunction, error);
   if (failed(evidenceFunction))
     return false;
-  if (neighborhoodReplaySourceText(*evidenceModule) !=
-      currentModuleWitness) {
+  if (neighborhoodReplaySourceText(*evidenceModule) != currentModuleWitness) {
     error = "replica evidence materialized module differs from the exact "
             "current retimer input";
     return false;
@@ -427,10 +425,9 @@ static bool sourceDomainVolume(ArrayRef<SourceDomainBound> bounds,
                                std::string &error) {
   volume = 1;
   for (const SourceDomainBound &bound : bounds) {
-    const __int128 wideExtent = static_cast<__int128>(bound.upper) -
-                                static_cast<__int128>(bound.lower);
-    if (wideExtent < 1 ||
-        wideExtent > std::numeric_limits<int64_t>::max()) {
+    const __int128 wideExtent =
+        static_cast<__int128>(bound.upper) - static_cast<__int128>(bound.lower);
+    if (wideExtent < 1 || wideExtent > std::numeric_limits<int64_t>::max()) {
       error = label.str() + " volume is invalid or overflows signed 64-bit";
       return false;
     }
@@ -444,8 +441,8 @@ static bool sourceDomainVolume(ArrayRef<SourceDomainBound> bounds,
   return true;
 }
 
-static llvm::json::Array sourceDomainBoundsJson(
-    ArrayRef<SourceDomainBound> bounds) {
+static llvm::json::Array
+sourceDomainBoundsJson(ArrayRef<SourceDomainBound> bounds) {
   llvm::json::Array result;
   for (const SourceDomainBound &bound : bounds)
     result.push_back(llvm::json::Object{{"ordinal", bound.ordinal},
@@ -460,8 +457,7 @@ static bool readReplicaProfileAndBody(
     ArrayRef<std::string> expectedProfileTasks,
     ArrayRef<std::string> expectedBodyTasks, int64_t expectedTrip,
     StringRef expectedPlacedShape, int64_t expectedCgraCount,
-    int64_t runtimeIICeiling,
-    Operation *currentTask,
+    int64_t runtimeIICeiling, Operation *currentTask,
     const OriginalAmoebaProfileBodyEvidence &originalParentBody,
     OriginalReplicaProfileEvidence &result, std::string &error) {
   OriginalAmoebaProfileBodyExport bodyExport;
@@ -479,12 +475,13 @@ static bool readReplicaProfileAndBody(
       childBody.normalizedMapperBody !=
           originalParentBody.normalizedMapperBody) {
     error = "replica body export trip count or normalized body differs from "
-            "the canonical parent for task=" + reference.materializedTask;
+            "the canonical parent for task=" +
+            reference.materializedTask;
     return false;
   }
   std::string currentBody;
   if (!computeOriginalAmoebaNormalizedMapperBody(currentTask, currentBody,
-                                                error) ||
+                                                 error) ||
       currentBody != childBody.normalizedMapperBody) {
     if (error.empty())
       error = "replica body export does not exactly match current task=" +
@@ -500,8 +497,8 @@ static bool readReplicaProfileAndBody(
   }
   auto parsed = llvm::json::parse((*buffer)->getBuffer());
   if (!parsed) {
-    error = "invalid replica profile JSON: " +
-            llvm::toString(parsed.takeError());
+    error =
+        "invalid replica profile JSON: " + llvm::toString(parsed.takeError());
     return false;
   }
   const llvm::json::Object *root = parsed->getAsObject();
@@ -515,12 +512,13 @@ static bool readReplicaProfileAndBody(
       root ? root->getInteger("expected_candidate_count") : std::nullopt;
   auto completedCandidates =
       root ? root->getInteger("completed_candidate_count") : std::nullopt;
-  if (!root || !tasks || !attempts || !format || *format != kProfileFileFormat ||
-      !function || *function != reference.function || !taskCount ||
-      *taskCount != static_cast<int64_t>(tasks->size()) || !expectedCandidates ||
-      !completedCandidates ||
-      *expectedCandidates != *taskCount *
-                                 static_cast<int64_t>(kOriginalProfileShapes.size()) ||
+  if (!root || !tasks || !attempts || !format ||
+      *format != kProfileFileFormat || !function ||
+      *function != reference.function || !taskCount ||
+      *taskCount != static_cast<int64_t>(tasks->size()) ||
+      !expectedCandidates || !completedCandidates ||
+      *expectedCandidates !=
+          *taskCount * static_cast<int64_t>(kOriginalProfileShapes.size()) ||
       *completedCandidates != *expectedCandidates ||
       *expectedCandidates != static_cast<int64_t>(attempts->size())) {
     error = "replica profile format or completed candidate count is invalid";
@@ -531,7 +529,8 @@ static bool readReplicaProfileAndBody(
   for (const llvm::json::Value &rawTask : *tasks) {
     const llvm::json::Object *task = rawTask.getAsObject();
     auto name = task ? task->getString("task") : std::nullopt;
-    if (!task || !name || name->empty() || !taskNames.insert(name->str()).second) {
+    if (!task || !name || name->empty() ||
+        !taskNames.insert(name->str()).second) {
       error = "replica profile task list is malformed or duplicated";
       return false;
     }
@@ -565,21 +564,22 @@ static bool readReplicaProfileAndBody(
   std::map<std::string, const llvm::json::Object *> rowsByShape;
   for (const llvm::json::Value &rawProfile : *profiles) {
     const llvm::json::Object *profile = rawProfile.getAsObject();
-    auto shape = profile ? profile->getString("composed_cgra_shape")
-                         : std::nullopt;
-    auto count = profile ? profile->getInteger("composed_cgra_count")
-                         : std::nullopt;
-    auto succeeded = profile ? profile->getBoolean("mapper_succeeded")
-                             : std::nullopt;
+    auto shape =
+        profile ? profile->getString("composed_cgra_shape") : std::nullopt;
+    auto count =
+        profile ? profile->getInteger("composed_cgra_count") : std::nullopt;
+    auto succeeded =
+        profile ? profile->getBoolean("mapper_succeeded") : std::nullopt;
     int64_t rows = 0, cols = 0;
     if (!profile || !shape ||
-        !llvm::any_of(kOriginalProfileShapes, [&](StringRef expected) {
-          return expected == *shape;
-        }) || !count || !parseShape(*shape, rows, cols) ||
-        *count != rows * cols || !succeeded || !*succeeded ||
+        !llvm::any_of(kOriginalProfileShapes,
+                      [&](StringRef expected) { return expected == *shape; }) ||
+        !count || !parseShape(*shape, rows, cols) || *count != rows * cols ||
+        !succeeded || !*succeeded ||
         !rowsByShape.emplace(shape->str(), profile).second) {
       error = "replica profile contains malformed, duplicate, or unsupported "
-              "shape rows for task=" + reference.materializedTask;
+              "shape rows for task=" +
+              reference.materializedTask;
       return false;
     }
   }
@@ -601,13 +601,15 @@ static bool readReplicaProfileAndBody(
         !parseShape(*shape, rows, cols) || *count != rows * cols || !created ||
         !succeeded || !attemptsByShape.emplace(shape->str(), attempt).second) {
       error = "replica profile candidate-attempt inventory is malformed or "
-              "duplicated for task=" + reference.materializedTask;
+              "duplicated for task=" +
+              reference.materializedTask;
       return false;
     }
   }
   if (attemptsByShape.size() != kOriginalProfileShapes.size()) {
     error = "replica profile does not contain all eight explicit candidate "
-            "attempts for task=" + reference.materializedTask;
+            "attempts for task=" +
+            reference.materializedTask;
     return false;
   }
   for (StringRef shape : kOriginalProfileShapes) {
@@ -618,19 +620,19 @@ static bool readReplicaProfileAndBody(
     const bool hasRow = row != rowsByShape.end();
     if (created != hasRow ||
         succeeded !=
-            (created && hasRow &&
-             row->second->getBoolean("mapper_succeeded") &&
+            (created && hasRow && row->second->getBoolean("mapper_succeeded") &&
              *row->second->getBoolean("mapper_succeeded"))) {
       error = "replica candidate attempt and emitted profile row disagree for "
-              "task=" + reference.materializedTask + " shape=" + shape.str();
+              "task=" +
+              reference.materializedTask + " shape=" + shape.str();
       return false;
     }
   }
   auto selected = rowsByShape.find(expectedPlacedShape.str());
   if (selected == rowsByShape.end()) {
     error = "replica profile omits the actual placed orientation " +
-            expectedPlacedShape.str() + " for task=" +
-            reference.materializedTask;
+            expectedPlacedShape.str() +
+            " for task=" + reference.materializedTask;
     return false;
   }
   const llvm::json::Object &profile = *selected->second;
@@ -644,13 +646,14 @@ static bool readReplicaProfileAndBody(
   int64_t formulaLatency = 0;
   if (!succeeded || !*succeeded || !count || *count != expectedCgraCount ||
       !compiledII || *compiledII < 1 || *compiledII > runtimeIICeiling ||
-      !steps || *steps < 1 || !sampleTrip ||
-      *sampleTrip != expectedTrip || !operations || *operations < 1 ||
-      !latency || *latency < 1 ||
+      !steps || *steps < 1 || !sampleTrip || *sampleTrip != expectedTrip ||
+      !operations || *operations < 1 || !latency || *latency < 1 ||
       !checkedProfileDuration(*compiledII, *sampleTrip, *steps,
-                              formulaLatency) || formulaLatency != *latency) {
+                              formulaLatency) ||
+      formulaLatency != *latency) {
     error = "actual-orientation replica profile failed or disagrees with "
-            "current body trip count for task=" + reference.materializedTask;
+            "current body trip count for task=" +
+            reference.materializedTask;
     return false;
   }
   result.body = childBody;
@@ -739,10 +742,11 @@ static bool closeDirectValue(double lhs, double rhs) {
              1.0e-5 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
 }
 
-static bool verifyDiagnosticOverrideObject(
-    const llvm::json::Object *overrideMetadata,
-    StringRef trainingArchitectureText, StringRef runtimeArchitectureText,
-    std::string &error) {
+static bool
+verifyDiagnosticOverrideObject(const llvm::json::Object *overrideMetadata,
+                               StringRef trainingArchitectureText,
+                               StringRef runtimeArchitectureText,
+                               std::string &error) {
   llvm::json::Object expected;
   if (!makePerCgra2x2DiagnosticOverrideMetadata(
           trainingArchitectureText, runtimeArchitectureText, expected, error))
@@ -761,15 +765,14 @@ static bool verifyDiagnosticOverrideObject(
       overrideMetadata->getString("training_architecture_exact_yaml_text");
   auto runtimeArchitecture =
       overrideMetadata->getString("runtime_architecture_exact_yaml_text");
-  if (!schema || *schema != kPerCgra2x2DiagnosticSchema ||
-      !trainingCeiling || *trainingCeiling != 20 || !runtimeCeiling ||
-      *runtimeCeiling != 23 || !extrapolation || !*extrapolation || !formal ||
-      *formal || !outputRule || *outputRule != kPerCgra2x2DiagnosticOutputRule ||
-      !trainingArchitecture ||
+  if (!schema || *schema != kPerCgra2x2DiagnosticSchema || !trainingCeiling ||
+      *trainingCeiling != 20 || !runtimeCeiling || *runtimeCeiling != 23 ||
+      !extrapolation || !*extrapolation || !formal || *formal || !outputRule ||
+      *outputRule != kPerCgra2x2DiagnosticOutputRule || !trainingArchitecture ||
       *trainingArchitecture != trainingArchitectureText ||
-      !runtimeArchitecture ||
-      *runtimeArchitecture != runtimeArchitectureText) {
-    error = "II23 diagnostic override differs from exact training/runtime contract";
+      !runtimeArchitecture || *runtimeArchitecture != runtimeArchitectureText) {
+    error =
+        "II23 diagnostic override differs from exact training/runtime contract";
     return false;
   }
   return true;
@@ -779,8 +782,7 @@ static bool verifyDirectOriginalProfileBinding(
     StringRef costPath, StringRef bodyExportPath, func::FuncOp function,
     StringRef graphVariant, ArrayRef<TaskMetadata> tasks,
     ArrayRef<OriginalTraceTask> traces, int64_t perCgraRows,
-    int64_t perCgraCols, int64_t runtimeIICeiling,
-    std::string &error) {
+    int64_t perCgraCols, int64_t runtimeIICeiling, std::string &error) {
   auto buffer = llvm::MemoryBuffer::getFile(costPath);
   if (!buffer) {
     error = "cannot read direct-model original cost catalogue " +
@@ -859,14 +861,12 @@ static bool verifyDirectOriginalProfileBinding(
   auto overlapAudit =
       metadata->getBoolean("amoeba_benchmark_overlap_audit_complete");
   auto oldLabels = metadata->getBoolean("old_4x4_labels_reused");
-  auto wholeProgramClaim =
-      metadata->getBoolean("supports_whole_program_latency_or_throughput_claim");
-  auto coverageStatus =
-      metadata->getString("iteration_domain_coverage_status");
+  auto wholeProgramClaim = metadata->getBoolean(
+      "supports_whole_program_latency_or_throughput_claim");
+  auto coverageStatus = metadata->getString("iteration_domain_coverage_status");
   auto bindingCoverageStatus =
       binding->getString("source_iteration_domain_coverage_status");
-  auto unsupportedPolicy =
-      metadata->getString("unsupported_prediction_policy");
+  auto unsupportedPolicy = metadata->getString("unsupported_prediction_policy");
   auto modelIntervalMaxII = metadata->getNumber("model_interval_max_ii");
   auto diagnosticOnly = metadata->getBoolean("diagnostic_only");
   auto metadataFormal = metadata->getBoolean("formal");
@@ -899,8 +899,7 @@ static bool verifyDirectOriginalProfileBinding(
       *bodyFormat != "amoeba-pre-mapper-task-bodies-v1" || !profileFormat ||
       *profileFormat != kProfileFileFormat || !functionSignature ||
       !resultSignature || !profilePath || profilePath->empty() ||
-      !architecturePath || architecturePath->empty() ||
-      !architectureContract ||
+      !architecturePath || architecturePath->empty() || !architectureContract ||
       *architectureContract !=
           "neura-architecture-v1:amoeba_4x4_cgra_2x2_context6" ||
       !architectureText || architectureText->empty() || !sourceRepository ||
@@ -940,13 +939,14 @@ static bool verifyDirectOriginalProfileBinding(
       !*candidateOnly || !overlapAudit || *overlapAudit || !oldLabels ||
       *oldLabels || !wholeProgramClaim || *wholeProgramClaim ||
       !coverageStatus || *coverageStatus != expectedCoverageStatus ||
-      !bindingCoverageStatusMatches ||
-      !modelIntervalMaxII || *modelIntervalMaxII != 20.0 ||
-      !unsupportedPolicy ||
+      !bindingCoverageStatusMatches || !modelIntervalMaxII ||
+      *modelIntervalMaxII != 20.0 || !unsupportedPolicy ||
       *unsupportedPolicy !=
           (runtimeIICeiling == 23
-               ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling-v1")
-               : StringRef("analytical-lower-bound-exceeds-model-ceiling-v1")) ||
+               ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-"
+                           "ceiling-v1")
+               : StringRef(
+                     "analytical-lower-bound-exceeds-model-ceiling-v1")) ||
       !coverageVerified || !*coverageVerified || !bodyEquivalenceChecked ||
       !*bodyEquivalenceChecked || !bindingCoverageVerified ||
       !*bindingCoverageVerified || !bindingBodyVerified ||
@@ -960,7 +960,8 @@ static bool verifyDirectOriginalProfileBinding(
     if (metadataDiagnosticOverride || bindingDiagnosticOverride ||
         (diagnosticOnly && *diagnosticOnly) ||
         (metadataFormal && !*metadataFormal)) {
-      error = "training-II20 catalogue carries an unexpected diagnostic override";
+      error =
+          "training-II20 catalogue carries an unexpected diagnostic override";
       return false;
     }
   } else if (runtimeIICeiling != 23 || !diagnosticOnly || !*diagnosticOnly ||
@@ -971,13 +972,15 @@ static bool verifyDirectOriginalProfileBinding(
   if (runtimeIICeiling == 23) {
     ModuleOp parentModule = function->getParentOfType<ModuleOp>();
     if (!metadataCanonicalWitness ||
-        *metadataCanonicalWitness != neighborhoodReplaySourceText(parentModule)) {
+        *metadataCanonicalWitness !=
+            neighborhoodReplaySourceText(parentModule)) {
       error = "II23 direct-model catalogue witness does not match the exact "
               "current canonical module";
       return false;
     }
   } else if (metadataCanonicalWitness) {
-    error = "training-II20 catalogue carries an unbound canonical module witness";
+    error =
+        "training-II20 catalogue carries an unbound canonical module witness";
     return false;
   }
 
@@ -1011,15 +1014,12 @@ static bool verifyDirectOriginalProfileBinding(
   auto bundleNamespace =
       bundle ? bundle->getString("model_namespace") : std::nullopt;
   auto bundleArchitectureText =
-      bundleArchitecture
-          ? bundleArchitecture->getString("exact_yaml_text")
-          : std::nullopt;
+      bundleArchitecture ? bundleArchitecture->getString("exact_yaml_text")
+                         : std::nullopt;
   auto bundleFeatureContract =
-      bundleFeatures ? bundleFeatures->getString("contract_id")
-                     : std::nullopt;
+      bundleFeatures ? bundleFeatures->getString("contract_id") : std::nullopt;
   auto bundleExtractor =
-      bundleFeatures ? bundleFeatures->getString("extractor")
-                     : std::nullopt;
+      bundleFeatures ? bundleFeatures->getString("extractor") : std::nullopt;
   auto bundleShapeProtocol =
       bundleFeatures ? bundleFeatures->getString("shape_protocol_id")
                      : std::nullopt;
@@ -1029,7 +1029,8 @@ static bool verifyDirectOriginalProfileBinding(
       !bundleFeatureContract ||
       *bundleFeatureContract != kPerCgra2x2FeatureContractId ||
       !bundleExtractor || *bundleExtractor != *featureExtractor ||
-      !bundleShapeProtocol || *bundleShapeProtocol != kPerCgra2x2ShapeProtocolId ||
+      !bundleShapeProtocol ||
+      *bundleShapeProtocol != kPerCgra2x2ShapeProtocolId ||
       !bundleSourceModel || !sourceModelBinding->getString("repository") ||
       !bundleSourceModel->getString("repository") ||
       *sourceModelBinding->getString("repository") !=
@@ -1052,9 +1053,8 @@ static bool verifyDirectOriginalProfileBinding(
             "namespace, architecture, or pinned source provenance";
     return false;
   }
-  if (!validatePerCgra2x2RuntimeContract(runtimeIICeiling,
-                                          *bundleArchitectureText,
-                                          *architectureText, error))
+  if (!validatePerCgra2x2RuntimeContract(
+          runtimeIICeiling, *bundleArchitectureText, *architectureText, error))
     return false;
   if (runtimeIICeiling == 23) {
     if (!verifyDiagnosticOverrideObject(metadataDiagnosticOverride,
@@ -1077,9 +1077,8 @@ static bool verifyDirectOriginalProfileBinding(
   const llvm::json::Array *metadataSeeds =
       metadataEnsemble ? metadataEnsemble->getArray("member_seeds") : nullptr;
   if (!boundMembers || boundMembers->size() != expectedSeeds.size() ||
-      !metadataEnsemble ||
-      metadataEnsemble->getInteger("member_count") != 4 || !metadataSeeds ||
-      metadataSeeds->size() != expectedSeeds.size() ||
+      !metadataEnsemble || metadataEnsemble->getInteger("member_count") != 4 ||
+      !metadataSeeds || metadataSeeds->size() != expectedSeeds.size() ||
       metadataEnsemble->getString("reduction") !=
           std::optional<StringRef>("arithmetic_mean") ||
       metadataEnsemble->getString("uncertainty") !=
@@ -1092,15 +1091,14 @@ static bool verifyDirectOriginalProfileBinding(
         (*bundleMembers)[index].getAsObject();
     const llvm::json::Object *boundMember =
         (*boundMembers)[index].getAsObject();
-    auto bundleIndex = bundleMember
-                           ? bundleMember->getInteger("member_index")
-                           : std::nullopt;
-    auto bundleSeed = bundleMember ? bundleMember->getInteger("seed")
-                                   : std::nullopt;
-    auto boundIndex = boundMember ? boundMember->getInteger("member_index")
-                                  : std::nullopt;
-    auto boundSeed = boundMember ? boundMember->getInteger("seed")
-                                 : std::nullopt;
+    auto bundleIndex =
+        bundleMember ? bundleMember->getInteger("member_index") : std::nullopt;
+    auto bundleSeed =
+        bundleMember ? bundleMember->getInteger("seed") : std::nullopt;
+    auto boundIndex =
+        boundMember ? boundMember->getInteger("member_index") : std::nullopt;
+    auto boundSeed =
+        boundMember ? boundMember->getInteger("seed") : std::nullopt;
     auto metadataSeed = (*metadataSeeds)[index].getAsInteger();
     if (!bundleMember || !boundMember || !bundleIndex ||
         *bundleIndex != index || !bundleSeed ||
@@ -1131,12 +1129,13 @@ static bool verifyDirectOriginalProfileBinding(
     if (!entry || !task || !rows || !cols || *rows <= 0 || *cols <= 0 ||
         !directCosts.emplace(DirectCostKey{task->str(), *rows, *cols}, entry)
              .second) {
-      error = "direct cost catalogue has a malformed or duplicate task/shape row";
+      error =
+          "direct cost catalogue has a malformed or duplicate task/shape row";
       return false;
     }
   }
-  static constexpr std::array<std::pair<int64_t, int64_t>, 8> kCgraShapes =
-      {{{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
+  static constexpr std::array<std::pair<int64_t, int64_t>, 8> kCgraShapes = {
+      {{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
   if (directCosts.size() != tasks.size() * kCgraShapes.size() ||
       boundTasks->size() != tasks.size()) {
     error = "direct cost catalogue must contain all eight model shapes per "
@@ -1156,8 +1155,8 @@ static bool verifyDirectOriginalProfileBinding(
     const OriginalAmoebaProfileBodyEvidence &body = bodyIt->second;
     std::string currentBody;
     std::string bodyError;
-    if (!computeOriginalAmoebaNormalizedMapperBody(
-            task.op.operator->(), currentBody, bodyError) ||
+    if (!computeOriginalAmoebaNormalizedMapperBody(task.op.operator->(),
+                                                   currentBody, bodyError) ||
         currentBody != body.normalizedMapperBody) {
       error = bodyError.empty()
                   ? "direct profile body export differs from current task=" +
@@ -1181,12 +1180,10 @@ static bool verifyDirectOriginalProfileBinding(
     auto materialized = record->getInteger("materialized_operation_count");
     auto estimatedLatency = record->getInteger("estimated_latency");
     auto mapperSucceeded = record->getBoolean("mapper_succeeded");
-    auto domainStatus =
-        record->getString("source_iteration_domain_status");
+    auto domainStatus = record->getString("source_iteration_domain_status");
     auto domainComplete =
         record->getBoolean("source_iteration_domain_complete");
-    auto sourceWorkCount =
-        record->getInteger("source_iteration_work_count");
+    auto sourceWorkCount = record->getInteger("source_iteration_work_count");
     auto sourceMultiplicity =
         record->getInteger("source_iteration_multiplicity");
     const llvm::json::Array *expandedExtents =
@@ -1206,8 +1203,8 @@ static bool verifyDirectOriginalProfileBinding(
         *materialized != trace.materializedOperationCount ||
         !estimatedLatency || *estimatedLatency != trace.fullMapperDuration ||
         !mapperSucceeded || !*mapperSucceeded || !domainStatus ||
-        *domainStatus != task.sourceIterationDomainStatus ||
-        !domainComplete || !*domainComplete || !sourceWorkCount ||
+        *domainStatus != task.sourceIterationDomainStatus || !domainComplete ||
+        !*domainComplete || !sourceWorkCount ||
         *sourceWorkCount != task.sourceIterationWorkCount ||
         trace.placement.selectedRows >
             std::numeric_limits<int64_t>::max() / perCgraRows ||
@@ -1216,7 +1213,8 @@ static bool verifyDirectOriginalProfileBinding(
         *mapperRows != trace.placement.selectedRows * perCgraRows ||
         *mapperCols != trace.placement.selectedCols * perCgraCols) {
       error = "direct cost selected profile/body evidence disagrees with the "
-              "current original trace for task=" + task.name;
+              "current original trace for task=" +
+              task.name;
       return false;
     }
     if (runtimeIICeiling == 23) {
@@ -1224,21 +1222,25 @@ static bool verifyDirectOriginalProfileBinding(
           *sourceMultiplicity != task.sourceIterationMultiplicity ||
           !expandedExtents ||
           expandedExtents->size() != task.expandedInternalExtents.size()) {
-        error = "II23 direct profile binding omits complete static-internal source facts for task=" +
+        error = "II23 direct profile binding omits complete static-internal "
+                "source facts for task=" +
                 task.name;
         return false;
       }
-      for (auto [extentIndex, extentValue] : llvm::enumerate(*expandedExtents)) {
+      for (auto [extentIndex, extentValue] :
+           llvm::enumerate(*expandedExtents)) {
         auto extent = extentValue.getAsInteger();
         if (!extent || *extent != task.expandedInternalExtents[extentIndex]) {
-          error = "direct profile binding has stale static-internal source extents for task=" +
+          error = "direct profile binding has stale static-internal source "
+                  "extents for task=" +
                   task.name;
           return false;
         }
       }
     } else if (record->get("source_iteration_multiplicity") ||
                record->get("expanded_internal_extents")) {
-      error = "training-II20 profile binding has unexpected internal-expansion facts";
+      error = "training-II20 profile binding has unexpected internal-expansion "
+              "facts";
       return false;
     }
 
@@ -1246,7 +1248,8 @@ static bool verifyDirectOriginalProfileBinding(
         record->getArray("direct_shape_predictions");
     if (!shapePredictions || shapePredictions->size() != kCgraShapes.size()) {
       error = "direct body binding does not contain all eight oriented shapes "
-              "for task=" + task.name;
+              "for task=" +
+              task.name;
       return false;
     }
     for (auto [shapeIndex, rawShape] : llvm::enumerate(*shapePredictions)) {
@@ -1256,24 +1259,24 @@ static bool verifyDirectOriginalProfileBinding(
       const int64_t expectedCols = cgraCols * perCgraCols;
       const llvm::json::Object *entry =
           directCosts[DirectCostKey{task.name, expectedRows, expectedCols}];
-      auto boundRows = shape ? shape->getInteger("mapper_tile_rows")
-                             : std::nullopt;
-      auto boundCols = shape ? shape->getInteger("mapper_tile_cols")
-                             : std::nullopt;
-      auto boundCgraRows = shape ? shape->getInteger("cgra_rows")
-                                 : std::nullopt;
-      auto boundCgraCols = shape ? shape->getInteger("cgra_cols")
-                                 : std::nullopt;
-      auto supportStatus = shape ? shape->getString("support_status")
-                                 : std::nullopt;
-      auto lowerBound = shape ? shape->getNumber("analytical_lower_bound")
-                              : std::nullopt;
+      auto boundRows =
+          shape ? shape->getInteger("mapper_tile_rows") : std::nullopt;
+      auto boundCols =
+          shape ? shape->getInteger("mapper_tile_cols") : std::nullopt;
+      auto boundCgraRows =
+          shape ? shape->getInteger("cgra_rows") : std::nullopt;
+      auto boundCgraCols =
+          shape ? shape->getInteger("cgra_cols") : std::nullopt;
+      auto supportStatus =
+          shape ? shape->getString("support_status") : std::nullopt;
+      auto lowerBound =
+          shape ? shape->getNumber("analytical_lower_bound") : std::nullopt;
       auto shapeRec = shape ? shape->getNumber("rec_mii") : std::nullopt;
       auto shapeRes = shape ? shape->getNumber("res_mii") : std::nullopt;
       auto shapeStartup =
           shape ? shape->getNumber("startup_cycles") : std::nullopt;
-      auto entryStatus = entry ? entry->getString("support_status")
-                               : std::nullopt;
+      auto entryStatus =
+          entry ? entry->getString("support_status") : std::nullopt;
       auto entryLowerBound =
           entry ? entry->getNumber("analytical_lower_bound") : std::nullopt;
       if (!shape || !entry || !boundRows || *boundRows != expectedRows ||
@@ -1284,7 +1287,8 @@ static bool verifyDirectOriginalProfileBinding(
           !std::isfinite(*lowerBound) || !entryLowerBound ||
           !closeDirectValue(*lowerBound, *entryLowerBound)) {
         error = "direct shape prediction does not match the exact model "
-                "domain for task=" + task.name;
+                "domain for task=" +
+                task.name;
         return false;
       }
       if (*supportStatus == "unsupported") {
@@ -1296,15 +1300,16 @@ static bool verifyDirectOriginalProfileBinding(
         auto shapeInterval = shape->getNumber("model_interval_max_ii");
         const StringRef expectedReason =
             runtimeIICeiling == 23
-                ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling")
+                ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-"
+                            "ceiling")
                 : StringRef("analytical-lower-bound-exceeds-model-ceiling");
         if (*lowerBound <= runtimeIICeiling || !reason ||
             *reason != expectedReason ||
             (runtimeIICeiling == 23 &&
              (!shapeStatus || *shapeStatus != "unsupported-model-domain")) ||
-            !status || *status != "unsupported-model-domain" ||
-            !entryReason || *entryReason != *reason || !interval ||
-            *interval != 20.0 || !shapeInterval || *shapeInterval != 20.0 ||
+            !status || *status != "unsupported-model-domain" || !entryReason ||
+            *entryReason != *reason || !interval || *interval != 20.0 ||
+            !shapeInterval || *shapeInterval != 20.0 ||
             entry->get("predicted_ii") ||
             entry->get("direct_ensemble_members")) {
           error = "unsupported direct prediction is not explicitly fail-closed";
@@ -1324,7 +1329,8 @@ static bool verifyDirectOriginalProfileBinding(
               !shapeRuntimeCeiling || *shapeRuntimeCeiling != 23 ||
               !shapeExtrapolation ||
               *shapeExtrapolation != "outside-diagnostic-runtime-domain") {
-            error = "unsupported II23 row omits exact training/runtime-domain facts";
+            error = "unsupported II23 row omits exact training/runtime-domain "
+                    "facts";
             return false;
           }
         } else if (entry->get("training_ceiling_ii") ||
@@ -1380,19 +1386,16 @@ static bool verifyDirectOriginalProfileBinding(
         auto boundMemberIndex = boundMember
                                     ? boundMember->getInteger("member_index")
                                     : std::nullopt;
-        auto costMemberIndex = costMember
-                                   ? costMember->getInteger("member_index")
-                                   : std::nullopt;
-        auto boundSeed = boundMember ? boundMember->getInteger("seed")
-                                     : std::nullopt;
-        auto costSeed = costMember ? costMember->getInteger("seed")
-                                   : std::nullopt;
+        auto costMemberIndex =
+            costMember ? costMember->getInteger("member_index") : std::nullopt;
+        auto boundSeed =
+            boundMember ? boundMember->getInteger("seed") : std::nullopt;
+        auto costSeed =
+            costMember ? costMember->getInteger("seed") : std::nullopt;
         auto boundPrediction =
-            boundMember ? boundMember->getNumber("predicted_ii")
-                        : std::nullopt;
+            boundMember ? boundMember->getNumber("predicted_ii") : std::nullopt;
         auto costPrediction =
-            costMember ? costMember->getNumber("predicted_ii")
-                       : std::nullopt;
+            costMember ? costMember->getNumber("predicted_ii") : std::nullopt;
         if (!boundMember || !costMember || !boundMemberIndex ||
             *boundMemberIndex != memberIndex || !costMemberIndex ||
             *costMemberIndex != memberIndex || !boundSeed ||
@@ -1400,8 +1403,7 @@ static bool verifyDirectOriginalProfileBinding(
             *costSeed != expectedSeeds[memberIndex] || !boundPrediction ||
             !costPrediction ||
             !closeDirectValue(*boundPrediction, *costPrediction) ||
-            !std::isfinite(*costPrediction) ||
-            *costPrediction < *lowerBound ||
+            !std::isfinite(*costPrediction) || *costPrediction < *lowerBound ||
             *costPrediction > runtimeIICeiling) {
           error = "direct ensemble member value or provenance is invalid for " +
                   task.name;
@@ -1418,19 +1420,20 @@ static bool verifyDirectOriginalProfileBinding(
         auto shapeRuntimeCeiling = shape->getInteger("runtime_ceiling_ii");
         auto shapeExtrapolation = shape->getString("extrapolation_status");
         const bool extrapolated =
-            *lowerBound > 20.0 ||
-            llvm::any_of(memberValues,
-                         [](double value) { return value > 20.0; });
-        const StringRef expectedLabel =
-            extrapolated ? "out-of-training-ceiling"
-                         : "within-training-ceiling";
+            *lowerBound > 20.0 || llvm::any_of(memberValues, [](double value) {
+              return value > 20.0;
+            });
+        const StringRef expectedLabel = extrapolated
+                                            ? "out-of-training-ceiling"
+                                            : "within-training-ceiling";
         if (!entryTrainingCeiling || *entryTrainingCeiling != 20 ||
             !entryRuntimeCeiling || *entryRuntimeCeiling != 23 ||
             !shapeTrainingCeiling || *shapeTrainingCeiling != 20 ||
             !shapeRuntimeCeiling || *shapeRuntimeCeiling != 23 ||
             !entryExtrapolation || *entryExtrapolation != expectedLabel ||
             !shapeExtrapolation || *shapeExtrapolation != expectedLabel) {
-          error = "supported II23 row has stale training/runtime extrapolation labels";
+          error = "supported II23 row has stale training/runtime extrapolation "
+                  "labels";
           return false;
         }
       } else if (entry->get("training_ceiling_ii") ||
@@ -1454,7 +1457,8 @@ static bool verifyDirectOriginalProfileBinding(
           !closeDirectValue(*entryRes, *shapeRes) ||
           !closeDirectValue(*entryStartup, *shapeStartup)) {
         error = "direct ensemble mean/std or shape facts do not match member "
-                "values for task=" + task.name;
+                "values for task=" +
+                task.name;
         return false;
       }
     }
@@ -1468,8 +1472,7 @@ static bool verifyOriginalProfileBinding(
     ArrayRef<OriginalTraceTask> traces, int64_t perCgraRows,
     int64_t perCgraCols, int64_t runtimeIICeiling,
     StringRef expectedCanonicalModuleWitness,
-    OriginalAmoebaProfileBodyExport &bodyExport,
-    std::string &error) {
+    OriginalAmoebaProfileBodyExport &bodyExport, std::string &error) {
   if (bodyExportPath.empty()) {
     error = "profile-body-export-file is required to bind selected costs to "
             "the original normalized mapper bodies";
@@ -1513,18 +1516,16 @@ static bool verifyOriginalProfileBinding(
        *directModelNamespace == kPerCgra2x2ModelNamespace) ||
       (directModelSchema && *directModelSchema == kPerCgra2x2EnsembleSchema);
   if (declaresDirect2x2) {
-    if (!directNamespace ||
-        *directNamespace != kPerCgra2x2ModelNamespace ||
+    if (!directNamespace || *directNamespace != kPerCgra2x2ModelNamespace ||
         !directModelNamespace ||
         *directModelNamespace != kPerCgra2x2ModelNamespace ||
-        !directModelSchema ||
-        *directModelSchema != kPerCgra2x2EnsembleSchema) {
+        !directModelSchema || *directModelSchema != kPerCgra2x2EnsembleSchema) {
       error = "direct 2x2 original profile catalogue has a mixed or missing "
               "model namespace/schema";
       return false;
     }
-    const bool hasMultiReplicaParent = llvm::any_of(
-        tasks, [](const TaskMetadata &task) {
+    const bool hasMultiReplicaParent =
+        llvm::any_of(tasks, [](const TaskMetadata &task) {
           auto active = task.op->getAttrOfType<IntegerAttr>("active_replicas");
           return active && active.getInt() > 1;
         });
@@ -1637,8 +1638,7 @@ static bool verifyOriginalProfileBinding(
       *metadataGraph != graphVariant || !metadataStatus ||
       *metadataStatus != "exploratory" || !metadataReady || *metadataReady ||
       !domainCoverageStatus ||
-      *domainCoverageStatus !=
-          kOriginalAmoebaSourceDomainCoverageStatus ||
+      *domainCoverageStatus != kOriginalAmoebaSourceDomainCoverageStatus ||
       !domainCoverageVerified || !*domainCoverageVerified ||
       !bindingDomainCoverageVerified || !*bindingDomainCoverageVerified ||
       !bodyEquivalenceChecked || !*bodyEquivalenceChecked ||
@@ -1772,8 +1772,7 @@ static bool verifyOriginalProfileBinding(
         record->getString("source_iteration_domain_status");
     auto sourceDomainComplete =
         record->getBoolean("source_iteration_domain_complete");
-    auto sourceWorkCount =
-        record->getInteger("source_iteration_work_count");
+    auto sourceWorkCount = record->getInteger("source_iteration_work_count");
     if (!recordTask || *recordTask != task.name || !taskSignature ||
         *taskSignature != body.taskSignature || !counterSignature ||
         *counterSignature != body.counterSignature || !kernelSignature ||
@@ -1789,8 +1788,7 @@ static bool verifyOriginalProfileBinding(
         !estimatedLatency || *estimatedLatency != trace.fullMapperDuration ||
         !mapperSucceeded || !*mapperSucceeded || !sourceDomainStatus ||
         *sourceDomainStatus != task.sourceIterationDomainStatus ||
-        !sourceDomainComplete || !*sourceDomainComplete ||
-        !sourceWorkCount ||
+        !sourceDomainComplete || !*sourceDomainComplete || !sourceWorkCount ||
         *sourceWorkCount != task.sourceIterationWorkCount) {
       error = "cost catalog selected profile/body evidence disagrees with the "
               "body export or current Taskflow trace for task=" +
@@ -1972,9 +1970,9 @@ static bool readTaskTrace(TaskflowTaskOp task, unsigned taskIndex,
         *row >= replica.row + replica.rows || *col < replica.col ||
         *col >= replica.col + replica.cols)
       return fail("placement cell lies outside its recorded replica rectangle");
-    replica.occupiedCells.push_back(
-        {static_cast<int>(*row), static_cast<int>(*col),
-         static_cast<unsigned>(*placedReplica)});
+    replica.occupiedCells.push_back({static_cast<int>(*row),
+                                     static_cast<int>(*col),
+                                     static_cast<unsigned>(*placedReplica)});
     replica.contextIds.push_back(*context);
     trace.originalOccupiedCells.push_back(
         {static_cast<int>(*row), static_cast<int>(*col),
@@ -1983,7 +1981,8 @@ static bool readTaskTrace(TaskflowTaskOp task, unsigned taskIndex,
   }
   for (OriginalReplicaTrace &replica : replicas) {
     if (replica.cgraCount == 0 ||
-        replica.occupiedCells.size() != static_cast<size_t>(replica.cgraCount) ||
+        replica.occupiedCells.size() !=
+            static_cast<size_t>(replica.cgraCount) ||
         replica.cgraCount != replica.rows * replica.cols)
       return fail("replica placement omits exact shape cells");
     std::set<std::pair<int, int>> cells;
@@ -1998,7 +1997,8 @@ static bool readTaskTrace(TaskflowTaskOp task, unsigned taskIndex,
   }
   if (commonStart != *schedulerStart || commonEnd != *schedulerEnd ||
       commonDuration != commonEnd - commonStart)
-    return fail("replica placement intervals disagree with original task times");
+    return fail(
+        "replica placement intervals disagree with original task times");
 
   auto orchestration =
       task->getAttrOfType<DictionaryAttr>("task_orchestration_info");
@@ -2056,16 +2056,17 @@ struct OriginalScheduleInventory {
   int64_t internalTimeScale = 0;
 };
 
-static bool readOriginalScheduleInventory(
-    func::FuncOp function, ArrayRef<TaskMetadata> tasks,
-    OriginalScheduleInventory &inventory, std::string &error,
-    bool commonProfileDuration = false) {
+static bool readOriginalScheduleInventory(func::FuncOp function,
+                                          ArrayRef<TaskMetadata> tasks,
+                                          OriginalScheduleInventory &inventory,
+                                          std::string &error,
+                                          bool commonProfileDuration = false) {
   auto fail = [&](StringRef reason) {
     error = "original throughput-guided schedule inventory: " + reason.str();
     return false;
   };
-  auto strategy = dyn_cast_or_null<DictionaryAttr>(
-      function->getAttr(kOriginalSummaryAttr));
+  auto strategy =
+      dyn_cast_or_null<DictionaryAttr>(function->getAttr(kOriginalSummaryAttr));
   auto strategyName = getString(strategy, "strategy");
   auto pipelineInterval = getInteger(strategy, "pipeline_interval");
   auto internalTimeUnit =
@@ -2081,10 +2082,12 @@ static bool readOriginalScheduleInventory(
       internalTimeUnit.getValue() != "scaled-internal-placement-slots" ||
       !internalTimeScale || internalTimeScale.getInt() < 1 ||
       !functionDispatch || !functionSchedule)
-    return fail("required dispatch, time-unit, pipeline, or schedule attrs are missing");
+    return fail("required dispatch, time-unit, pipeline, or schedule attrs are "
+                "missing");
   if (functionDispatch.size() != tasks.size() ||
       functionSchedule.size() != tasks.size())
-    return fail("parent dispatch and schedule do not cover every source task exactly once");
+    return fail("parent dispatch and schedule do not cover every source task "
+                "exactly once");
 
   llvm::StringMap<unsigned> taskIndices;
   for (unsigned index = 0; index < tasks.size(); ++index)
@@ -2114,7 +2117,8 @@ static bool readOriginalScheduleInventory(
         *index >= static_cast<int64_t>(tasks.size()) ||
         inventory.dispatchNames[*index] != *name ||
         !scheduleInfoByTask.emplace(name->str(), record).second)
-      return fail("parent schedule records are malformed or inconsistent with dispatch");
+      return fail("parent schedule records are malformed or inconsistent with "
+                  "dispatch");
   }
   if (scheduleInfoByTask.size() != tasks.size())
     return fail("parent function-level scheduler trace omits a source task");
@@ -2123,10 +2127,12 @@ static bool readOriginalScheduleInventory(
   for (unsigned index = 0; index < tasks.size(); ++index) {
     TaskflowTaskOp task = tasks[index].op;
     auto found = scheduleInfoByTask.find(tasks[index].name);
-    auto taskInfo = task->getAttrOfType<DictionaryAttr>(kOriginalScheduleInfoAttr);
+    auto taskInfo =
+        task->getAttrOfType<DictionaryAttr>(kOriginalScheduleInfoAttr);
     if (found == scheduleInfoByTask.end() || !taskInfo ||
         found->second != taskInfo)
-      return fail("task-level and function-level parent schedule records differ");
+      return fail(
+          "task-level and function-level parent schedule records differ");
     auto dispatchIndex = getInteger(taskInfo, "dispatch_index");
     if (!dispatchIndex || *dispatchIndex < 0 ||
         *dispatchIndex >= static_cast<int64_t>(tasks.size()) ||
@@ -2136,7 +2142,8 @@ static bool readOriginalScheduleInventory(
                        inventory.traces[index], error, commonProfileDuration))
       return false;
     if (inventory.traces[index].sampleTripCount != tasks[index].tripCount)
-      return fail("parent profile sample trip differs from compiler-inferred macro trip");
+      return fail("parent profile sample trip differs from compiler-inferred "
+                  "macro trip");
   }
   inventory.pipelineInterval = *pipelineInterval;
   inventory.internalTimeUnit = internalTimeUnit.getValue().str();
@@ -2178,10 +2185,9 @@ static bool readMaterializedDecisions(
     auto counterOrdinal = getInteger(decision, "selected_counter_ordinal");
     auto originalDomain =
         decision ? decision.getAs<ArrayAttr>("original_domain") : ArrayAttr();
-    auto schedulerRecord = decision
-                               ? decision.getAs<DictionaryAttr>(
-                                     "scheduler_record")
-                               : DictionaryAttr();
+    auto schedulerRecord =
+        decision ? decision.getAs<DictionaryAttr>("scheduler_record")
+                 : DictionaryAttr();
     auto replicas =
         decision ? decision.getAs<ArrayAttr>("replicas") : ArrayAttr();
     if (!decision || decision.size() != 8 || !schema ||
@@ -2191,17 +2197,19 @@ static bool readMaterializedDecisions(
         *outputAxis < 0 || !counterOrdinal || *counterOrdinal < 0 ||
         !originalDomain || !schedulerRecord || !replicas ||
         replicas.size() != static_cast<size_t>(*replicaCount))
-      return fail("function parent decision record has an invalid exact schema");
+      return fail(
+          "function parent decision record has an invalid exact schema");
     auto parent = sourceByName.find(parentName->str());
     auto trace = sourceTraces.find(parentName->str());
-    auto parentActive = parent == sourceByName.end()
-                            ? IntegerAttr()
-                            : parent->second->op->getAttrOfType<IntegerAttr>(
-                                  "active_replicas");
-    auto parentSchedule = parent == sourceByName.end()
-                              ? DictionaryAttr()
-                              : parent->second->op->getAttrOfType<DictionaryAttr>(
-                                    kOriginalScheduleInfoAttr);
+    auto parentActive =
+        parent == sourceByName.end()
+            ? IntegerAttr()
+            : parent->second->op->getAttrOfType<IntegerAttr>("active_replicas");
+    auto parentSchedule =
+        parent == sourceByName.end()
+            ? DictionaryAttr()
+            : parent->second->op->getAttrOfType<DictionaryAttr>(
+                  kOriginalScheduleInfoAttr);
     MaterializedParentDecision parsed;
     parsed.parentTask = parentName->str();
     parsed.replicaCount = static_cast<unsigned>(*replicaCount);
@@ -2219,9 +2227,9 @@ static bool readMaterializedDecisions(
                       : error);
     if (static_cast<size_t>(*counterOrdinal) >=
         parsed.decodedOriginalDomain.size())
-      return fail("selected source counter ordinal is outside the original rank");
-    parsed.sourceMultiplicity =
-        parent->second->sourceIterationMultiplicity;
+      return fail(
+          "selected source counter ordinal is outside the original rank");
+    parsed.sourceMultiplicity = parent->second->sourceIterationMultiplicity;
     parsed.sourceWorkCount = parent->second->sourceIterationWorkCount;
     parsed.expandedInternalExtents.assign(
         parent->second->expandedInternalExtents.begin(),
@@ -2230,8 +2238,7 @@ static bool readMaterializedDecisions(
     int64_t extentMultiplicity = 1;
     for (int64_t extent : parsed.expandedInternalExtents) {
       if (extent < 1 ||
-          extentMultiplicity >
-              std::numeric_limits<int64_t>::max() / extent)
+          extentMultiplicity > std::numeric_limits<int64_t>::max() / extent)
         return fail("parent expanded internal extent product is invalid");
       extentMultiplicity *= extent;
     }
@@ -2246,9 +2253,9 @@ static bool readMaterializedDecisions(
             std::numeric_limits<int64_t>::max() / parsed.sourceMultiplicity ||
         parentDomainVolume * parsed.sourceMultiplicity !=
             parsed.sourceWorkCount)
-      return fail(error.empty()
-                      ? "parent source bounds, macro trip count, and work count disagree"
-                      : error);
+      return fail(error.empty() ? "parent source bounds, macro trip count, and "
+                                  "work count disagree"
+                                : error);
 
     for (Attribute rawReplica : replicas) {
       auto replica = dyn_cast<DictionaryAttr>(rawReplica);
@@ -2256,8 +2263,8 @@ static bool readMaterializedDecisions(
       auto childName = getString(replica, "task_name");
       auto shape = replica ? replica.getAs<DictionaryAttr>("replica_shape")
                            : DictionaryAttr();
-      auto placements = replica ? replica.getAs<ArrayAttr>("placements")
-                                : ArrayAttr();
+      auto placements =
+          replica ? replica.getAs<ArrayAttr>("placements") : ArrayAttr();
       auto partitionBounds =
           replica ? replica.getAs<ArrayAttr>("partition_bounds") : ArrayAttr();
       auto sourceWork = getInteger(replica, "source_work_count");
@@ -2302,30 +2309,28 @@ static bool readMaterializedDecisions(
           ArrayRef<int64_t>(childTask.expandedInternalExtents) !=
               ArrayRef<int64_t>(parsed.expandedInternalExtents) ||
           childTask.sourceIterationWorkCount < 1 ||
-          childTask.tripCount >
-              std::numeric_limits<int64_t>::max() /
-                  childTask.sourceIterationMultiplicity)
-        return fail("child partition volume, actual trip, multiplicity, and source work disagree");
-      expectedChildWork = childTask.tripCount *
-                          childTask.sourceIterationMultiplicity;
-      if (
-          expectedChildWork != childTask.sourceIterationWorkCount ||
+          childTask.tripCount > std::numeric_limits<int64_t>::max() /
+                                    childTask.sourceIterationMultiplicity)
+        return fail("child partition volume, actual trip, multiplicity, and "
+                    "source work disagree");
+      expectedChildWork =
+          childTask.tripCount * childTask.sourceIterationMultiplicity;
+      if (expectedChildWork != childTask.sourceIterationWorkCount ||
           *sourceWork != expectedChildWork)
-        return fail("child partition volume, actual trip, multiplicity, and source work disagree");
-      if (!llvm::all_of(decodedBounds,
-                        [&](const SourceDomainBound &bound) {
-                          const SourceDomainBound &whole =
-                              parsed.decodedOriginalDomain[bound.ordinal];
-                          return bound.lower >= whole.lower &&
-                                 bound.upper <= whole.upper &&
-                                 bound.step == whole.step &&
-                                 (bound.lower - whole.lower) % whole.step == 0 &&
-                                 (bound.upper - whole.lower) % whole.step == 0 &&
-                                 (bound.ordinal == *counterOrdinal ||
-                                  (bound.lower == whole.lower &&
-                                   bound.upper == whole.upper));
-                        }))
-        return fail("child partition escapes parent bounds or changes a nonselected axis");
+        return fail("child partition volume, actual trip, multiplicity, and "
+                    "source work disagree");
+      if (!llvm::all_of(decodedBounds, [&](const SourceDomainBound &bound) {
+            const SourceDomainBound &whole =
+                parsed.decodedOriginalDomain[bound.ordinal];
+            return bound.lower >= whole.lower && bound.upper <= whole.upper &&
+                   bound.step == whole.step &&
+                   (bound.lower - whole.lower) % whole.step == 0 &&
+                   (bound.upper - whole.lower) % whole.step == 0 &&
+                   (bound.ordinal == *counterOrdinal ||
+                    (bound.lower == whole.lower && bound.upper == whole.upper));
+          }))
+        return fail("child partition escapes parent bounds or changes a "
+                    "nonselected axis");
 
       auto realization = childTask.op->getAttrOfType<DictionaryAttr>(
           kOriginalPartitionRealizationAttr);
@@ -2336,11 +2341,12 @@ static bool readMaterializedDecisions(
       auto realizationSchema = getString(realization, "schema");
       auto realizationStatus = getString(realization, "status");
       auto realizationOrigin = getString(realization, "origin");
-      auto noF45Bounds = realization
-                             ? realization.getAs<BoolAttr>(
-                                   "f45_axis_and_bounds_present")
-                             : BoolAttr();
-      auto realizationAxis = getInteger(realization, "selected_counter_ordinal");
+      auto noF45Bounds =
+          realization
+              ? realization.getAs<BoolAttr>("f45_axis_and_bounds_present")
+              : BoolAttr();
+      auto realizationAxis =
+          getInteger(realization, "selected_counter_ordinal");
       auto realizationOutput = getInteger(realization, "selected_output_axis");
       auto realizationCount = getInteger(realization, "original_replica_count");
       auto realizationId = getInteger(realization, "replica_id");
@@ -2353,22 +2359,20 @@ static bool readMaterializedDecisions(
       auto realizationWork = getInteger(realization, "source_work_count");
       auto realizationMultiplicity =
           getInteger(realization, "internal_multiplicity");
-      auto decisionScheduler = childDecision
-                                   ? childDecision.getAs<DictionaryAttr>(
-                                         "scheduler_record")
-                                   : DictionaryAttr();
-      auto decisionShape = childDecision
-                               ? childDecision.getAs<DictionaryAttr>(
-                                     "replica_shape")
-                               : DictionaryAttr();
-      auto decisionPlacements = childDecision
-                                    ? childDecision.getAs<ArrayAttr>(
-                                          "placements")
-                                    : ArrayAttr();
-      auto decisionBinding =
-          getString(realization, "decision_binding");
+      auto decisionScheduler =
+          childDecision
+              ? childDecision.getAs<DictionaryAttr>("scheduler_record")
+              : DictionaryAttr();
+      auto decisionShape =
+          childDecision ? childDecision.getAs<DictionaryAttr>("replica_shape")
+                        : DictionaryAttr();
+      auto decisionPlacements =
+          childDecision ? childDecision.getAs<ArrayAttr>("placements")
+                        : ArrayAttr();
+      auto decisionBinding = getString(realization, "decision_binding");
       if (!realization || realization.size() != 13 || !realizationSchema ||
-          *realizationSchema != "amoeba-source-certified-replica-realization-v1" ||
+          *realizationSchema !=
+              "amoeba-source-certified-replica-realization-v1" ||
           !realizationStatus ||
           *realizationStatus != "verified-source-certified-realization-v1" ||
           !realizationOrigin ||
@@ -2382,35 +2386,38 @@ static bool readMaterializedDecisions(
           realizationBounds != partitionBounds || !realizationWork ||
           *realizationWork != *sourceWork || !realizationMultiplicity ||
           *realizationMultiplicity != parsed.sourceMultiplicity ||
-          !decisionBinding || *decisionBinding !=
-                                  "amoeba.task_scheduler_schedule_info" ||
+          !decisionBinding ||
+          *decisionBinding != "amoeba.task_scheduler_schedule_info" ||
           !childDecision || childDecision.size() != 3 ||
           decisionScheduler != schedulerRecord || decisionShape != shape ||
           decisionPlacements != placements || childPlacements != placements)
-        return fail("child realization attrs differ from its complete parent decision manifest");
+        return fail("child realization attrs differ from its complete parent "
+                    "decision manifest");
 
       const OriginalReplicaTrace &sourceReplica =
           trace->second.replicas[*replicaId];
       if (sourceReplica.shape != *shapeName ||
           sourceReplica.cgraCount != *shapeCount ||
           sourceReplica.row != *shapeRow || sourceReplica.col != *shapeCol ||
-          sourceReplica.rows != *shapeRows || sourceReplica.cols != *shapeCols ||
+          sourceReplica.rows != *shapeRows ||
+          sourceReplica.cols != *shapeCols ||
           sourceReplica.occupiedCells.size() != placements.size() ||
           sourceReplica.contextIds.size() != placements.size())
-        return fail("child shape, placement, or context inventory differs from original replica id");
+        return fail("child shape, placement, or context inventory differs from "
+                    "original replica id");
       for (auto [index, rawPlacement] : llvm::enumerate(placements)) {
         auto placement = dyn_cast<DictionaryAttr>(rawPlacement);
         auto row = getInteger(placement, "row");
         auto col = getInteger(placement, "col");
         auto replica = getInteger(placement, "replica_id");
         auto context = getInteger(placement, "context_id");
-        if (!placement || !row || !col || !replica ||
-            *replica != *replicaId || !context || *context < 0 ||
-            *context >= 6 ||
+        if (!placement || !row || !col || !replica || *replica != *replicaId ||
+            !context || *context < 0 || *context >= 6 ||
             *row != sourceReplica.occupiedCells[index].row ||
             *col != sourceReplica.occupiedCells[index].col ||
             *context != sourceReplica.contextIds[index])
-          return fail("child placement records do not preserve original cells, contexts, and replica order");
+          return fail("child placement records do not preserve original cells, "
+                      "contexts, and replica order");
       }
 
       MaterializedReplicaDecision parsedReplica;
@@ -2421,18 +2428,18 @@ static bool readMaterializedDecisions(
       parsedReplica.partitionBounds = partitionBounds;
       parsedReplica.sourceWorkCount = *sourceWork;
       parsedReplica.tripCount = childTask.tripCount;
-      parsedReplica.sourceMultiplicity =
-          childTask.sourceIterationMultiplicity;
+      parsedReplica.sourceMultiplicity = childTask.sourceIterationMultiplicity;
       parsedReplica.expandedInternalExtents.assign(
           childTask.expandedInternalExtents.begin(),
           childTask.expandedInternalExtents.end());
       parsedReplica.decodedPartitionBounds = std::move(decodedBounds);
-      if (!childLineage.emplace(parsedReplica.taskName,
-                                std::make_pair(parsed.parentTask,
-                                               parsedReplica.replicaId))
+      if (!childLineage
+               .emplace(
+                   parsedReplica.taskName,
+                   std::make_pair(parsed.parentTask, parsedReplica.replicaId))
                .second ||
-          !parsed.replicas.emplace(parsedReplica.replicaId,
-                                   std::move(parsedReplica))
+          !parsed.replicas
+               .emplace(parsedReplica.replicaId, std::move(parsedReplica))
                .second)
         return fail("child task or replica identity is duplicated");
     }
@@ -2450,7 +2457,8 @@ static bool readMaterializedDecisions(
         partitionAxisLower = bound.lower;
       if (bound.upper <= bound.lower ||
           (replicaId > 0 && bound.lower != partitionAxisUpper))
-        return fail("ordered child intervals do not form a contiguous source partition");
+        return fail("ordered child intervals do not form a contiguous source "
+                    "partition");
       partitionAxisUpper = bound.upper;
       if (childWorkTotal >
           std::numeric_limits<int64_t>::max() - found->second.sourceWorkCount)
@@ -2461,24 +2469,29 @@ static bool readMaterializedDecisions(
         parsed.decodedOriginalDomain[parsed.selectedCounterOrdinal];
     const int64_t axisExtent = wholeAxis.upper - wholeAxis.lower;
     if (axisExtent % parsed.replicaCount != 0)
-      return fail("selected source counter extent is not divisible by replica count");
+      return fail(
+          "selected source counter extent is not divisible by replica count");
     const int64_t expectedWidth = axisExtent / parsed.replicaCount;
     if (partitionAxisLower != wholeAxis.lower ||
         partitionAxisUpper != wholeAxis.upper ||
-        llvm::any_of(parsed.replicas, [&](const auto &entry) {
-          const SourceDomainBound &bound =
-              entry.second.decodedPartitionBounds[parsed.selectedCounterOrdinal];
-          return bound.upper - bound.lower != expectedWidth ||
-                 bound.lower != wholeAxis.lower +
-                                    static_cast<int64_t>(entry.first) *
-                                        expectedWidth;
-        }) ||
+        llvm::any_of(
+            parsed.replicas,
+            [&](const auto &entry) {
+              const SourceDomainBound &bound =
+                  entry.second
+                      .decodedPartitionBounds[parsed.selectedCounterOrdinal];
+              return bound.upper - bound.lower != expectedWidth ||
+                     bound.lower !=
+                         wholeAxis.lower +
+                             static_cast<int64_t>(entry.first) * expectedWidth;
+            }) ||
         !sourceDomainVolume(parsed.decodedOriginalDomain, parentDomainVolume,
                             "parent original_domain", error) ||
         childWorkTotal != parsed.sourceWorkCount ||
         parentDomainVolume * parsed.sourceMultiplicity !=
             parsed.sourceWorkCount)
-      return fail("child intervals do not exactly cover parent macro/source work");
+      return fail(
+          "child intervals do not exactly cover parent macro/source work");
     if (!decisions.emplace(parsed.parentTask, std::move(parsed)).second)
       return fail("parent task decision is duplicated");
   }
@@ -2487,20 +2500,23 @@ static bool readMaterializedDecisions(
   for (const TaskMetadata &sourceTask : sourceTasks) {
     auto decision = decisions.find(sourceTask.name);
     if (decision == decisions.end()) {
-      auto activeReplicas = sourceTask.op->getAttrOfType<IntegerAttr>(
-          "active_replicas");
+      auto activeReplicas =
+          sourceTask.op->getAttrOfType<IntegerAttr>("active_replicas");
       if (!activeReplicas || activeReplicas.getInt() != 1)
-        return fail("scheduled multi-replica parent has no materialized child partition: " +
+        return fail("scheduled multi-replica parent has no materialized child "
+                    "partition: " +
                     sourceTask.name);
       auto current = currentByName.find(sourceTask.name);
       if (current == currentByName.end())
         return fail("unreplicated parent task disappeared from current module");
       expectedCurrentNames.insert(sourceTask.name);
     } else {
-      if (sourceTask.sourceIterationWorkCount != decision->second.sourceWorkCount ||
+      if (sourceTask.sourceIterationWorkCount !=
+              decision->second.sourceWorkCount ||
           sourceTask.sourceIterationMultiplicity !=
               decision->second.sourceMultiplicity)
-        return fail("materialized decision source facts differ from canonical parent task");
+        return fail("materialized decision source facts differ from canonical "
+                    "parent task");
       for (const auto &replica : decision->second.replicas)
         expectedCurrentNames.insert(replica.second.taskName);
     }
@@ -2511,15 +2527,17 @@ static bool readMaterializedDecisions(
   if (expectedCurrentNames != actualCurrentNames ||
       childLineage.size() + (sourceTasks.size() - decisions.size()) !=
           currentTasks.size())
-    return fail("parent and expanded child task inventories are not an exact permutation");
+    return fail("parent and expanded child task inventories are not an exact "
+                "permutation");
   return true;
 }
 
-static bool makeExpandedReplicaTrace(
-    unsigned taskIndex, const OriginalTraceTask &parentTrace,
-    const MaterializedReplicaDecision &replica,
-    const OriginalReplicaProfileEvidence &profile,
-    OriginalTraceTask &trace, std::string &error) {
+static bool
+makeExpandedReplicaTrace(unsigned taskIndex,
+                         const OriginalTraceTask &parentTrace,
+                         const MaterializedReplicaDecision &replica,
+                         const OriginalReplicaProfileEvidence &profile,
+                         OriginalTraceTask &trace, std::string &error) {
   auto shape = getString(replica.shape, "shape");
   auto count = getInteger(replica.shape, "cgra_count");
   auto row = getInteger(replica.shape, "row");
@@ -2528,8 +2546,8 @@ static bool makeExpandedReplicaTrace(
   auto cols = getInteger(replica.shape, "placement_cols");
   int64_t parsedRows = 0, parsedCols = 0;
   if (!shape || !count || !row || !col || !rows || !cols ||
-      !parseShape(*shape, parsedRows, parsedCols) ||
-      parsedRows != *rows || parsedCols != *cols || *count != *rows * *cols ||
+      !parseShape(*shape, parsedRows, parsedCols) || parsedRows != *rows ||
+      parsedCols != *cols || *count != *rows * *cols ||
       profile.selectedShape != *shape || profile.cgraCount != *count ||
       profile.sampleTripCount != replica.tripCount ||
       parentTrace.replicas.size() <= replica.replicaId) {
@@ -2613,7 +2631,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       llvm::cl::init("")};
   Option<std::string> replicaProfileEvidenceFile{
       *this, "replica-profile-evidence-file",
-      llvm::cl::desc("Exact profiles and body exports for materialized replicas."),
+      llvm::cl::desc(
+          "Exact profiles and body exports for materialized replicas."),
       llvm::cl::init("")};
   Option<std::string> commonParentProfileFile{
       *this, "common-parent-profile-file",
@@ -2621,11 +2640,13 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       llvm::cl::init("")};
   Option<std::string> commonCanonicalModuleFile{
       *this, "common-canonical-module-file",
-      llvm::cl::desc("Exact pre-F45 canonical module used for common profiles."),
+      llvm::cl::desc(
+          "Exact pre-F45 canonical module used for common profiles."),
       llvm::cl::init("")};
   Option<std::string> commonSourceRepository{
       *this, "common-source-repository",
-      llvm::cl::desc("Optional source repository provenance for common profiles."),
+      llvm::cl::desc(
+          "Optional source repository provenance for common profiles."),
       llvm::cl::init("")};
   Option<std::string> commonSourceCommit{
       *this, "common-source-commit",
@@ -2633,8 +2654,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       llvm::cl::init("")};
   Option<bool> originalF45ReplicaScaling{
       *this, "original-f45-replica-scaling",
-      llvm::cl::desc("Preserve original F45 replica duration estimation without "
-                     "claiming actual split-child mapper profiles."),
+      llvm::cl::desc(
+          "Preserve original F45 replica duration estimation without "
+          "claiming actual split-child mapper profiles."),
       llvm::cl::init(false)};
   Option<bool> rescheduleWithProductionScheduler{
       *this, "reschedule-with-production-scheduler",
@@ -2674,12 +2696,12 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       return signalPassFailure();
     }
     if (useCommonParentProfile &&
-        (!rescheduleWithProductionScheduler ||
-         !originalF45ReplicaScaling || !bodyExportFile.empty() ||
-         !replicaProfileEvidenceFile.empty() ||
+        (!rescheduleWithProductionScheduler || !originalF45ReplicaScaling ||
+         !bodyExportFile.empty() || !replicaProfileEvidenceFile.empty() ||
          commonSourceRepository.empty() != commonSourceCommit.empty())) {
       module.emitError()
-          << "common parent profiles require production-scheduler rescheduling, "
+          << "common parent profiles require production-scheduler "
+             "rescheduling, "
              "explicit original-F45 replica scaling, no legacy body/child "
              "profile files, and paired optional source repository/commit";
       return signalPassFailure();
@@ -2697,8 +2719,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         function->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     const bool assignedOriginalGraphId = !graphId || graphId.getValue().empty();
     if (assignedOriginalGraphId) {
-      graphId = StringAttr::get(module.getContext(),
-                                kOriginalBaselineGraphVariantId);
+      graphId =
+          StringAttr::get(module.getContext(), kOriginalBaselineGraphVariantId);
       if (!useCommonParentProfile)
         function->setAttr("amoeba.graph_variant_id", graphId);
     }
@@ -2706,11 +2728,11 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     FailureOr<llvm::SmallVector<TaskMetadata>> collectedCurrent =
         useCommonParentProfile
             ? collectAnalyticalTaskMetadataForSourcePartitionProof(function,
-                                                                    error)
+                                                                   error)
             : collectAnalyticalTaskMetadata(function, error);
     if (failed(collectedCurrent) || collectedCurrent->empty()) {
       function.emitError() << (error.empty() ? "no static Taskflow tasks"
-                                              : error);
+                                             : error);
       return signalPassFailure();
     }
     llvm::SmallVector<TaskMetadata> currentTasks = std::move(*collectedCurrent);
@@ -2721,7 +2743,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         (hasReplicaEvidence || hasDecisionManifest)) {
       function.emitError()
           << "production-scheduler rescheduling currently accepts only the "
-             "original parent task inventory, not materialized replica children";
+             "original parent task inventory, not materialized replica "
+             "children";
       return signalPassFailure();
     }
     if (rescheduleWithProductionScheduler && !originalF45ReplicaScaling) {
@@ -2755,8 +2778,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         return signalPassFailure();
       }
       ParserConfig parserConfig(module.getContext());
-      canonicalSourceModule = parseSourceString<ModuleOp>(
-          canonicalModuleWitness, parserConfig, "canonical-original-source.mlir");
+      canonicalSourceModule =
+          parseSourceString<ModuleOp>(canonicalModuleWitness, parserConfig,
+                                      "canonical-original-source.mlir");
       if (!canonicalSourceModule) {
         function.emitError()
             << "bound canonical source module witness could not be parsed";
@@ -2790,8 +2814,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       return signalPassFailure();
     }
 
-    const bool hasScheduledReplicaInventory = llvm::any_of(
-        sourceTasks, [](const TaskMetadata &task) {
+    const bool hasScheduledReplicaInventory =
+        llvm::any_of(sourceTasks, [](const TaskMetadata &task) {
           auto active = task.op->getAttrOfType<IntegerAttr>("active_replicas");
           return active && active.getInt() > 1;
         });
@@ -2818,7 +2842,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
 
     OriginalScheduleInventory sourceSchedule;
     if (!readOriginalScheduleInventory(sourceFunction, sourceTasks,
-                                       sourceSchedule, error, useCommonParentProfile)) {
+                                       sourceSchedule, error,
+                                       useCommonParentProfile)) {
       sourceFunction.emitError() << error;
       return signalPassFailure();
     }
@@ -2828,9 +2853,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           ::mlir::neura::getArchitecture().getPerCgraRows();
       const int64_t commonPerCgraCols =
           ::mlir::neura::getArchitecture().getPerCgraColumns();
-      if (sourceTasks.size() != currentTasks.size() || sourceFunction != function) {
-        function.emitError()
-            << "common parent profiles require the unchanged original F45 task inventory";
+      if (sourceTasks.size() != currentTasks.size() ||
+          sourceFunction != function) {
+        function.emitError() << "common parent profiles require the unchanged "
+                                "original F45 task inventory";
         return signalPassFailure();
       }
       llvm::SmallVector<CommonAmoebaF45TaskChoice> choices;
@@ -2847,13 +2873,13 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               << "original F45 selected mapper rectangle is invalid";
           return signalPassFailure();
         }
-        choices.push_back(
-            {task.name, trace.selectedShape, trace.selectedCount,
-             trace.placement.selectedRows * commonPerCgraRows,
-             trace.placement.selectedCols * commonPerCgraCols,
-             static_cast<int64_t>(trace.placement.activeReplicas),
-             task.tripCount, trace.compiledII, trace.steps,
-             trace.materializedOperationCount, trace.profileDuration});
+        choices.push_back({task.name, trace.selectedShape, trace.selectedCount,
+                           trace.placement.selectedRows * commonPerCgraRows,
+                           trace.placement.selectedCols * commonPerCgraCols,
+                           static_cast<int64_t>(trace.placement.activeReplicas),
+                           task.tripCount, trace.compiledII, trace.steps,
+                           trace.materializedOperationCount,
+                           trace.profileDuration});
       }
       if (!verifyCommonAmoebaParentProfiles(
               commonParentProfileFile.getValue(),
@@ -2871,9 +2897,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           collectAnalyticalTaskMetadata(function, error);
       if (failed(reboundTasks) || reboundTasks->size() != sourceTasks.size()) {
         function.emitError()
-            << (error.empty()
-                    ? "source-binding refresh changed the current task inventory"
-                    : error);
+            << (error.empty() ? "source-binding refresh changed the current "
+                                "task inventory"
+                              : error);
         return signalPassFailure();
       }
       currentTasks = std::move(*reboundTasks);
@@ -2909,7 +2935,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     std::map<std::string, MaterializedParentDecision> materializedDecisions;
     std::map<std::string, std::pair<std::string, unsigned>> childLineage;
     std::map<std::pair<std::string, unsigned>,
-             OriginalReplicaProfileEvidenceRef> replicaEvidenceRecords;
+             OriginalReplicaProfileEvidenceRef>
+        replicaEvidenceRecords;
     std::string evidenceMaterializedModule;
     std::map<std::string, std::vector<std::string>> profileTasksByFile;
     std::map<std::string, std::vector<std::string>> bodyTasksByFile;
@@ -2923,8 +2950,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         auto count = getInteger(decision, "original_replica_count");
         if (!decision || !parent || parent->empty() || !count || *count < 2 ||
             *count > 4 ||
-            !expectedReplicaCounts.try_emplace(parent->str(),
-                                                static_cast<unsigned>(*count))
+            !expectedReplicaCounts
+                 .try_emplace(parent->str(), static_cast<unsigned>(*count))
                  .second) {
           function.emitError()
               << "materialized parent manifest has invalid replica identities";
@@ -2936,19 +2963,18 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               replicaProfileEvidenceFile.getValue(), functionName.getValue(),
               expectedReplicaCounts, replicaEvidenceRecords,
               evidenceMaterializedModule, error) ||
-          !verifyEvidenceMaterializedModule(evidenceMaterializedModule,
-                                            functionName.getValue(),
-                                            module.getContext(),
-                                            currentInputModuleWitness, error) ||
+          !verifyEvidenceMaterializedModule(
+              evidenceMaterializedModule, functionName.getValue(),
+              module.getContext(), currentInputModuleWitness, error) ||
           failed(verifySourceIterationDomainPartition(sourceFunction, function,
-                                                       error)) ||
+                                                      error)) ||
           !readMaterializedDecisions(function, currentTasks, sourceTasks,
                                      sourceTraceByName, materializedDecisions,
                                      childLineage, error)) {
         function.emitError()
-            << (error.empty()
-                    ? "materialized replica source proof or inventory is incomplete"
-                    : error);
+            << (error.empty() ? "materialized replica source proof or "
+                                "inventory is incomplete"
+                              : error);
         return signalPassFailure();
       }
       std::set<std::string> allEvidenceChildren;
@@ -2995,8 +3021,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         return signalPassFailure();
       }
       if (task.tripCount < 1) {
-        task.op.emitError()
-            << "compiler-inferred actual trip count is invalid";
+        task.op.emitError() << "compiler-inferred actual trip count is invalid";
         return signalPassFailure();
       }
       retimerTasks[index].name = task.name;
@@ -3012,14 +3037,14 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           dispatchNames.push_back(parentName);
           continue;
         }
-        for (unsigned replicaId = 0;
-             replicaId < decision->second.replicaCount; ++replicaId)
+        for (unsigned replicaId = 0; replicaId < decision->second.replicaCount;
+             ++replicaId)
           dispatchNames.push_back(
               decision->second.replicas.at(replicaId).taskName);
       }
       if (dispatchNames.size() != tasks.size()) {
-        function.emitError()
-            << "expanded dispatch order does not cover every materialized child";
+        function.emitError() << "expanded dispatch order does not cover every "
+                                "materialized child";
         return signalPassFailure();
       }
       for (const std::string &name : dispatchNames) {
@@ -3067,7 +3092,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     }
 
     OriginalAmoebaProfileBodyExport bodyExport;
-    if (!useCommonParentProfile && !verifyOriginalProfileBinding(
+    if (!useCommonParentProfile &&
+        !verifyOriginalProfileBinding(
             parentCostFile.getValue(), bodyExportFile.getValue(),
             sourceFunction, graphId.getValue(), sourceTasks,
             sourceSchedule.traces, perCgraRows, perCgraCols,
@@ -3098,8 +3124,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             parentBody == bodyExport.tasks.end() ||
             profileTaskNames == profileTasksByFile.end() ||
             bodyTaskNames == bodyTasksByFile.end()) {
-          function.emitError()
-              << "replica evidence cannot bind to its parent, child, or profile file";
+          function.emitError() << "replica evidence cannot bind to its parent, "
+                                  "child, or profile file";
           return signalPassFailure();
         }
         const MaterializedReplicaDecision &replica =
@@ -3116,8 +3142,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                 replica.tripCount, *shape, *count, diagnosticIICeiling,
                 tasks[currentTask->second].op.getOperation(),
                 parentBody->second, evidence, error) ||
-            !childEvidence.emplace(reference.materializedTask,
-                                   std::move(evidence))
+            !childEvidence
+                 .emplace(reference.materializedTask, std::move(evidence))
                  .second) {
           function.emitError()
               << (error.empty() ? "replica profile evidence is duplicated"
@@ -3142,9 +3168,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                   currentTask.op.operator->(), currentBody, error) ||
               currentBody != body->second.normalizedMapperBody) {
             function.emitError()
-                << (error.empty()
-                        ? "unreplicated current body differs from its canonical parent"
-                        : error);
+                << (error.empty() ? "unreplicated current body differs from "
+                                    "its canonical parent"
+                                  : error);
             return signalPassFailure();
           }
           traces[index] = parentTrace->second;
@@ -3159,14 +3185,14 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           if (parentTrace == sourceTraceByName.end() ||
               decision == materializedDecisions.end() ||
               evidence == childEvidence.end() ||
-              !makeExpandedReplicaTrace(
-                  index, parentTrace->second,
-                  decision->second.replicas.at(replicaId), evidence->second,
-                  traces[index], error)) {
+              !makeExpandedReplicaTrace(index, parentTrace->second,
+                                        decision->second.replicas.at(replicaId),
+                                        evidence->second, traces[index],
+                                        error)) {
             function.emitError()
-                << (error.empty()
-                        ? "expanded replica is missing a parent trace or mapper profile"
-                        : error);
+                << (error.empty() ? "expanded replica is missing a parent "
+                                    "trace or mapper profile"
+                                  : error);
             return signalPassFailure();
           }
           parentTaskNames[index] = parentName;
@@ -3223,10 +3249,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                                   : neighborhoodReplaySourceText(module))
             : std::string();
     if (!useCommonParentProfile &&
-        !costs.load(parentCostFile.getValue(), function.getSymName(), sourceTasks,
-                    sourceRepository, sourceCommit, catalogArchitecturePath,
-                    graphId.getValue(), error, diagnosticIICeiling == 23,
-                    costCanonicalModuleWitness)) {
+        !costs.load(parentCostFile.getValue(), function.getSymName(),
+                    sourceTasks, sourceRepository, sourceCommit,
+                    catalogArchitecturePath, graphId.getValue(), error,
+                    diagnosticIICeiling == 23, costCanonicalModuleWitness)) {
       function.emitError()
           << (error.empty()
                   ? "cost catalogue loader rejected input without diagnostic"
@@ -3260,23 +3286,24 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       double selectedStartup = 0.0;
       std::optional<int64_t> duration;
       if (useCommonParentProfile) {
-        auto taskProfileIndex = commonProfiles.taskIndices.find(tasks[index].name);
+        auto taskProfileIndex =
+            commonProfiles.taskIndices.find(tasks[index].name);
         if (taskProfileIndex == commonProfiles.taskIndices.end() ||
             taskProfileIndex->second >= commonProfiles.tasks.size()) {
           tasks[index].op.emitError()
               << "common parent profile omits the current source task";
           return signalPassFailure();
         }
-        auto profile = commonProfiles.tasks[taskProfileIndex->second]
-                           .profilesByShape.find(trace.selectedShape);
+        auto profile =
+            commonProfiles.tasks[taskProfileIndex->second].profilesByShape.find(
+                trace.selectedShape);
         if (profile == commonProfiles.tasks[taskProfileIndex->second]
                            .profilesByShape.end()) {
           tasks[index].op.emitError()
               << "common parent profile omits the selected F45 shape";
           return signalPassFailure();
         }
-        const CommonAmoebaMapperShapeProfile &selectedProfile =
-            profile->second;
+        const CommonAmoebaMapperShapeProfile &selectedProfile = profile->second;
         trace.compiledII = selectedProfile.compiledII;
         trace.steps = selectedProfile.steps;
         trace.materializedOperationCount =
@@ -3287,17 +3314,17 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         duration = computeMappedDuration(trace.compiledII, selectedStartup,
                                          tasks[index].tripCount, costError);
         if (duration && *duration != selectedProfile.estimatedLatency) {
-          tasks[index].op.emitError()
-              << "common parent profile duration differs from its checked formula";
+          tasks[index].op.emitError() << "common parent profile duration "
+                                         "differs from its checked formula";
           return signalPassFailure();
         }
       } else {
         cost = costs.get(choice, costError);
         if (!cost || !cost->supported) {
           tasks[index].op.emitError()
-              << (costError.empty()
-                      ? "selected original shape has no supported bound startup cost"
-                      : costError);
+              << (costError.empty() ? "selected original shape has no "
+                                      "supported bound startup cost"
+                                    : costError);
           return signalPassFailure();
         }
         selectedStartup = cost->startupCycles;
@@ -3412,9 +3439,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         task->removeAttr("amoeba.exact_replay_mapped_timing");
         task->setAttr("amoeba.joint_shape_orientation_fixed",
                       builder.getUnitAttr());
-        task->setAttr("amoeba.aggregate_active_replicas",
-                      builder.getI32IntegerAttr(
-                          traces[index].placement.activeReplicas));
+        task->setAttr(
+            "amoeba.aggregate_active_replicas",
+            builder.getI32IntegerAttr(traces[index].placement.activeReplicas));
         task->setAttr("cgra_shape",
                       builder.getStringAttr(traces[index].selectedShape));
         task->setAttr("cgra_count",
@@ -3456,15 +3483,15 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         int context;
       };
       std::vector<const taskflow::TaskScheduleEntry *> entries(tasks.size(),
-                                                                nullptr);
+                                                               nullptr);
       std::vector<std::vector<Cell>> cells(tasks.size());
       for (const taskflow::TaskScheduleEntry &entry :
            productionScheduler.getScheduleEntries()) {
         auto task = cast<TaskflowTaskOp>(entry.task);
         auto found = taskIndices.find(task.getTaskName());
         if (found == taskIndices.end() || entries[found->second]) {
-          function.emitError()
-              << "common scheduler entries do not match the source task inventory";
+          function.emitError() << "common scheduler entries do not match the "
+                                  "source task inventory";
           return signalPassFailure();
         }
         const unsigned index = found->second;
@@ -3477,10 +3504,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           return signalPassFailure();
         }
         entries[index] = &entry;
-        auto info = task->getAttrOfType<DictionaryAttr>(
-            "task_orchestration_info");
-        auto positions = info ? info.getAs<ArrayAttr>("cgra_positions")
-                              : ArrayAttr();
+        auto info =
+            task->getAttrOfType<DictionaryAttr>("task_orchestration_info");
+        auto positions =
+            info ? info.getAs<ArrayAttr>("cgra_positions") : ArrayAttr();
         if (!positions || positions.size() != entry.positions.size()) {
           task.emitError()
               << "common scheduler IR result omits its complete cell inventory";
@@ -3496,20 +3523,18 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           auto [entryRow, entryCol] = entry.positions[cellIndex];
           if (!position || !row || !col || !replica || !context ||
               *row != entryRow || *col != entryCol || *context < 0 ||
-              *replica < 0 ||
-              *replica != entry.replicaIds[cellIndex] ||
+              *replica < 0 || *replica != entry.replicaIds[cellIndex] ||
               *replica >= traces[index].placement.activeReplicas ||
-              !uniqueCells.emplace(static_cast<int>(*row),
-                                   static_cast<int>(*col))
+              !uniqueCells
+                   .emplace(static_cast<int>(*row), static_cast<int>(*col))
                    .second) {
             task.emitError()
                 << "common scheduler cell or replica identity is malformed";
             return signalPassFailure();
           }
-          cells[index].push_back({static_cast<int>(*row),
-                                  static_cast<int>(*col),
-                                  static_cast<int>(*replica),
-                                  static_cast<int>(*context)});
+          cells[index].push_back(
+              {static_cast<int>(*row), static_cast<int>(*col),
+               static_cast<int>(*replica), static_cast<int>(*context)});
         }
         for (unsigned replica = 0;
              replica < traces[index].placement.activeReplicas; ++replica) {
@@ -3525,7 +3550,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             }
           const int rows = traces[index].placement.selectedRows;
           const int cols = traces[index].placement.selectedCols;
-          if (region.size() != static_cast<size_t>(traces[index].selectedCount) ||
+          if (region.size() !=
+                  static_cast<size_t>(traces[index].selectedCount) ||
               maxRow - minRow + 1 != rows || maxCol - minCol + 1 != cols) {
             task.emitError()
                 << "common scheduler changed the selected per-replica "
@@ -3554,16 +3580,16 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         auto producer = taskIndices.find(edge.producer.getTaskName());
         auto consumer = taskIndices.find(edge.consumer.getTaskName());
         if (producer == taskIndices.end() || consumer == taskIndices.end()) {
-          function.emitError()
-              << "typed communication dependency escapes the source task inventory";
+          function.emitError() << "typed communication dependency escapes the "
+                                  "source task inventory";
           return signalPassFailure();
         }
         const unsigned producerIndex = producer->second;
         const unsigned consumerIndex = consumer->second;
         typedDependencyPairs.emplace(producerIndex, consumerIndex);
-        latestDependencyReady[consumerIndex] = std::max(
-            latestDependencyReady[consumerIndex],
-            entries[producerIndex]->endCycle);
+        latestDependencyReady[consumerIndex] =
+            std::max(latestDependencyReady[consumerIndex],
+                     entries[producerIndex]->endCycle);
       }
       for (const auto &transfer : (*network)->getCommittedTransfers()) {
         auto producer = taskIndices.find(
@@ -3571,8 +3597,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         auto consumer = taskIndices.find(
             cast<TaskflowTaskOp>(transfer.consumer).getTaskName());
         if (producer == taskIndices.end() || consumer == taskIndices.end()) {
-          function.emitError()
-              << "committed communication transfer escapes the source task inventory";
+          function.emitError() << "committed communication transfer escapes "
+                                  "the source task inventory";
           return signalPassFailure();
         }
         latestDependencyReady[consumer->second] = std::max(
@@ -3582,7 +3608,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       for (unsigned index = 0; index < tasks.size(); ++index) {
         if (latestDependencyReady[index] > entries[index]->startCycle) {
           tasks[index].op.emitError()
-              << "common scheduler starts before the latest typed dependency or route is ready";
+              << "common scheduler starts before the latest typed dependency "
+                 "or route is ready";
           return signalPassFailure();
         }
         idleCycles[index] =
@@ -3598,8 +3625,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           item["end_cycle"] = entries[index]->endCycle;
           item["duration_cycles"] = durations[index];
           item["idle_cycles"] = idleCycles[index];
-          item["active_replicas"] = static_cast<int64_t>(cells[index].empty()
-              ? 0 : traces[index].placement.activeReplicas);
+          item["active_replicas"] = static_cast<int64_t>(
+              cells[index].empty() ? 0
+                                   : traces[index].placement.activeReplicas);
           item["selected_profile_shape"] = traces[index].selectedShape;
           item["selected_cgra_count"] = traces[index].selectedCount;
           item["selected_rows"] = traces[index].placement.selectedRows;
@@ -3616,10 +3644,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                   primaryRow = std::min(primaryRow, cell.row);
                   primaryCol = std::min(primaryCol, cell.col);
                 }
-                llvm::json::Object cellJson{
-                    {"row", cell.row}, {"col", cell.col},
-                    {"replica_id", cell.replica},
-                    {"context_id", cell.context}};
+                llvm::json::Object cellJson{{"row", cell.row},
+                                            {"col", cell.col},
+                                            {"replica_id", cell.replica},
+                                            {"context_id", cell.context}};
                 occupiedCells.push_back(llvm::json::Object(cellJson));
                 replicaCells.push_back(std::move(cellJson));
               }
@@ -3671,9 +3699,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         item["original_scheduler_duration_internal"] = trace.schedulerDuration;
         item["original_profile_duration_cycles"] = trace.profileDuration;
         if (trace.placement.activeReplicas > 1) {
-          if (trace.replicas.empty() ||
-              trace.originalOccupiedCells.size() !=
-                  trace.originalContextIds.size()) {
+          if (trace.replicas.empty() || trace.originalOccupiedCells.size() !=
+                                            trace.originalContextIds.size()) {
             sourceTask.op.emitError()
                 << "original source trace omits its complete replica geometry";
             return signalPassFailure();
@@ -3686,7 +3713,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           for (auto [cellIndex, cell] :
                llvm::enumerate(trace.originalOccupiedCells))
             originalCells.push_back(llvm::json::Object{
-                {"row", cell.row}, {"col", cell.col},
+                {"row", cell.row},
+                {"col", cell.col},
                 {"replica_id", static_cast<int64_t>(cell.replicaId)},
                 {"context_id", trace.originalContextIds[cellIndex]}});
           item["actual_cells"] = std::move(originalCells);
@@ -3702,14 +3730,18 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             for (auto [cellIndex, cell] :
                  llvm::enumerate(replica.occupiedCells))
               replicaCells.push_back(llvm::json::Object{
-                  {"row", cell.row}, {"col", cell.col},
+                  {"row", cell.row},
+                  {"col", cell.col},
                   {"replica_id", static_cast<int64_t>(replica.replicaId)},
                   {"context_id", replica.contextIds[cellIndex]}});
             originalReplicas.push_back(llvm::json::Object{
                 {"replica_id", static_cast<int64_t>(replica.replicaId)},
-                {"shape", replica.shape}, {"cgra_count", replica.cgraCount},
-                {"row", replica.row}, {"col", replica.col},
-                {"rows", replica.rows}, {"cols", replica.cols},
+                {"shape", replica.shape},
+                {"cgra_count", replica.cgraCount},
+                {"row", replica.row},
+                {"col", replica.col},
+                {"rows", replica.rows},
+                {"cols", replica.cols},
                 {"actual_cells", std::move(replicaCells)},
                 {"context_ids", integerArray(replica.contextIds)}});
           }
@@ -3723,7 +3755,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               {"compiled_ii", trace.compiledII},
               {"sample_trip_count", trace.sampleTripCount},
               {"steps", trace.steps},
-              {"materialized_operation_count", trace.materializedOperationCount},
+              {"materialized_operation_count",
+               trace.materializedOperationCount},
               {"rounding_rule",
                "ceil-full-parent-duration-over-original-active-replicas-v1"},
               {"status", "verified"}};
@@ -3735,7 +3768,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           for (auto [cellIndex, cell] :
                llvm::enumerate(trace.placement.occupiedCells))
             originalCells.push_back(llvm::json::Object{
-                {"row", cell.row}, {"col", cell.col},
+                {"row", cell.row},
+                {"col", cell.col},
                 {"replica_id", static_cast<int64_t>(cell.replicaId)},
                 {"context_id", trace.originalContextIds[cellIndex]}});
           item["actual_cells"] = std::move(originalCells);
@@ -3766,8 +3800,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
             link.bandwidth_bits_per_cycle >
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-          function.emitError()
-              << "network contract exceeds signed 64-bit JSON";
+          function.emitError() << "network contract exceeds signed 64-bit JSON";
           return signalPassFailure();
         }
         networkLinks.push_back(llvm::json::Object{
@@ -3810,8 +3843,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             function.emitError() << "edge payload exceeds signed 64-bit JSON";
             return signalPassFailure();
           }
-          dependency["payload_bits"] =
-              static_cast<int64_t>(*edge.payload_bits);
+          dependency["payload_bits"] = static_cast<int64_t>(*edge.payload_bits);
         } else {
           dependency["payload_bits"] = nullptr;
         }
@@ -3855,18 +3887,16 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           return signalPassFailure();
         }
         llvm::json::Object route{
-            {"route_id", tasks[producerIndex].name + "->" +
-                             tasks[consumerIndex].name},
+            {"route_id",
+             tasks[producerIndex].name + "->" + tasks[consumerIndex].name},
             {"producer", tasks[producerIndex].name},
             {"consumer", tasks[consumerIndex].name},
             {"payload_bits", static_cast<int64_t>(transfer.payloadBits)},
             {"path_latency_cycles",
              static_cast<int64_t>(transfer.pathLatencyCycles)},
             {"bottleneck_bandwidth_bits_per_cycle",
-             static_cast<int64_t>(
-                 transfer.bottleneckBandwidthBitsPerCycle)},
-            {"transfer_cycles",
-             static_cast<int64_t>(transfer.transferCycles)},
+             static_cast<int64_t>(transfer.bottleneckBandwidthBitsPerCycle)},
+            {"transfer_cycles", static_cast<int64_t>(transfer.transferCycles)},
             {"source_row", transfer.source.row},
             {"source_col", transfer.source.column},
             {"destination_row", transfer.destination.row},
@@ -3891,9 +3921,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                    "with its ready cycle";
             return signalPassFailure();
           }
-          llvm::json::Object interval{
-              {"start_cycle", link.startCycle},
-              {"end_cycle", link.endCycle}};
+          llvm::json::Object interval{{"start_cycle", link.startCycle},
+                                      {"end_cycle", link.endCycle}};
           if (link.localChannel) {
             interval["resource_kind"] = "local_channel";
             interval["row"] = link.localCoordinate.row;
@@ -3918,8 +3947,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         const OriginalTraceTask &trace = traces[index];
         if (useCommonParentProfile) {
           const CommonAmoebaMapperShapeProfile &profile =
-              commonProfiles.tasks[index]
-                  .profilesByShape.at(trace.selectedShape);
+              commonProfiles.tasks[index].profilesByShape.at(
+                  trace.selectedShape);
           profileBindings.push_back(llvm::json::Object{
               {"schema", kCommonAmoebaParentProfileBindingSchema.str()},
               {"task", task.name},
@@ -3928,8 +3957,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                task.sourceIterationDomainStatus},
               {"source_iteration_domain_complete",
                task.sourceIterationDomainComplete},
-              {"source_iteration_work_count",
-               task.sourceIterationWorkCount},
+              {"source_iteration_work_count", task.sourceIterationWorkCount},
               {"selected_profile_shape", trace.selectedShape},
               {"selected_cgra_count", trace.selectedCount},
               {"selected_mapper_tile_rows", profile.mapperTileRows},
@@ -3939,16 +3967,15 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               {"sample_trip_count", profile.sampleTripCount},
               {"materialized_operation_count",
                profile.materializedOperationCount},
-              {"structural_startup_cycles",
-               profile.structuralStartupCycles},
+              {"structural_startup_cycles", profile.structuralStartupCycles},
               {"common_parent_full_mapped_duration_cycles",
                fullParentMappedDurations[index]},
               {"f45_source_scheduler_duration_cycles", trace.profileDuration},
               {"mapped_duration_cycles", durations[index]},
               {"original_active_replicas",
                static_cast<int64_t>(trace.placement.activeReplicas)},
-              {"replica_duration_rule",
-               "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+              {"replica_duration_rule", "ceil-full-parent-mapped-duration-over-"
+                                        "original-active-replicas-v1"},
               {"pre_mapper_wrapper_byte_count",
                static_cast<int64_t>(profile.preMapperWrapperBytes.size())},
               {"pre_mapper_wrapper_bytes", profile.preMapperWrapperBytes},
@@ -3968,14 +3995,15 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               {"compiled_ii", trace.compiledII},
               {"steps", trace.steps},
               {"sample_trip_count", trace.sampleTripCount},
-              {"materialized_operation_count", trace.materializedOperationCount},
+              {"materialized_operation_count",
+               trace.materializedOperationCount},
               {"profile_duration_cycles", trace.profileDuration},
               {"catalog_startup_cycles", startupCycles[index]},
               {"full_parent_mapped_duration_cycles",
                fullParentMappedDurations[index]},
               {"mapped_duration_cycles", durations[index]},
-              {"replica_duration_rule",
-               "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
+              {"replica_duration_rule", "ceil-full-parent-mapped-duration-over-"
+                                        "original-active-replicas-v1"},
               {"original_active_replicas",
                static_cast<int64_t>(trace.placement.activeReplicas)},
               {"mapper_succeeded", true},
@@ -3995,12 +4023,12 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       llvm::json::Object replicaTimingPolicy{
           {"schema", "amoeba-original-f45-replica-scaling-v1"},
           {"duration_formula", useCommonParentProfile
-                                    ? "ceil(ceil(structural_startup_cycles + "
-                                      "compiled_ii * (actual_mapper_firings - "
-                                      "1)) / original_active_replicas)"
-                                    : "ceil(ceil(catalog_startup_cycles + "
-                                      "compiled_ii * (source_macro_firings - "
-                                      "1)) / original_active_replicas)"},
+                                   ? "ceil(ceil(structural_startup_cycles + "
+                                     "compiled_ii * (actual_mapper_firings - "
+                                     "1)) / original_active_replicas)"
+                                   : "ceil(ceil(catalog_startup_cycles + "
+                                     "compiled_ii * (source_macro_firings - "
+                                     "1)) / original_active_replicas)"},
           {"replica_duration_rule",
            "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
           {"child_mapper_profiles_used", false},
@@ -4016,11 +4044,14 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             {"candidate_id", commonProfiles.candidateId},
             {"candidate_scope", commonProfiles.candidateScope},
             {"profile_provenance", commonProfiles.profileProvenance},
-            {"canonical_witness_format", "mlir-generic-print-use-local-scope-v1"},
+            {"canonical_witness_format",
+             "mlir-generic-print-use-local-scope-v1"},
             {"canonical_module_witness_byte_count",
-             static_cast<int64_t>(commonProfiles.canonicalModuleWitness.size())},
+             static_cast<int64_t>(
+                 commonProfiles.canonicalModuleWitness.size())},
             {"canonical_function_witness_byte_count",
-             static_cast<int64_t>(commonProfiles.canonicalFunctionWitness.size())},
+             static_cast<int64_t>(
+                 commonProfiles.canonicalFunctionWitness.size())},
             {"architecture_spec_path", commonProfiles.architectureSpecPath},
             {"architecture_spec_text", commonProfiles.architectureSpecText},
             {"grid_rows", commonProfiles.gridRows},
@@ -4028,11 +4059,14 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             {"per_cgra_tile_rows", commonProfiles.perCgraTileRows},
             {"per_cgra_tile_cols", commonProfiles.perCgraTileCols},
             {"semantic_module_binding_status",
-             "verified-pre-f45-canonical-after-exact-scheduler-annotation-projection-v1"},
+             "verified-pre-f45-canonical-after-exact-scheduler-annotation-"
+             "projection-v1"},
             {"source_iteration_binding_refresh_status",
-             "refreshed-after-canonical-taskflow-and-mapper-wrapper-verification"},
+             "refreshed-after-canonical-taskflow-and-mapper-wrapper-"
+             "verification"},
             {"parent_replica_duration_policy",
-             "ceil-full-common-parent-mapped-duration-over-original-active-replicas-v1"},
+             "ceil-full-common-parent-mapped-duration-over-original-active-"
+             "replicas-v1"},
             {"child_mapper_profiles_used", false}};
         if (!commonSourceRepository.empty()) {
           binding["source_repository"] = commonSourceRepository.getValue();
@@ -4047,7 +4081,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           {"graph_variant_id", graphId.getValue().str()},
           {"candidate_id", "candidate-0"},
           {"candidate_origin", "original-amoeba-throughput-guided"},
-          {"valid", true}, {"diagnostic_only", true}, {"formal_go", false},
+          {"valid", true},
+          {"diagnostic_only", true},
+          {"formal_go", false},
           {"scheduler", llvm::json::Object(schedulerContract)},
           {"shared_scheduler_resource_only", true},
           {"production_scheduler_decisions",
@@ -4064,10 +4100,11 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
            "original-amoeba-resource-choices-rescheduled-by-common-orbit-"
            "production-scheduler; placements-and-dispatch-are-new"},
           {"required_external_evidence",
-           llvm::json::Array{"mapper-profiles-from-equivalent-correct-original-flow",
-                             "native-simulation-and-independent-trace"}},
-          {"mapper_success_evidence",
-           "source-inferred-success-only-profile-info; all-one-fallback-rejected"},
+           llvm::json::Array{
+               "mapper-profiles-from-equivalent-correct-original-flow",
+               "native-simulation-and-independent-trace"}},
+          {"mapper_success_evidence", "source-inferred-success-only-profile-"
+                                      "info; all-one-fallback-rejected"},
           {"explicit_mapper_succeeded_attribute_present", false},
           {"duration_source",
            "ceil-full-parent-mapped-duration-over-original-active-replicas-v1"},
@@ -4081,16 +4118,19 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
           {"original_pipeline_interval", sourceSchedule.pipelineInterval},
           {"original_internal_time_unit", sourceSchedule.internalTimeUnit},
           {"original_internal_time_scale", sourceSchedule.internalTimeScale},
-          {"grid_rows", gridRows}, {"grid_cols", gridCols},
+          {"grid_rows", gridRows},
+          {"grid_cols", gridCols},
           {"original_decisions", std::move(originalDecisionsJson)},
           {"task_costs", std::move(taskCostsJson)},
           {"dispatch_order", buildDispatch()},
           {"task_schedule", buildSchedule()}};
       if (useCommonParentProfile) {
-        result.erase("body_equivalence_checked");
-        result.erase("body_equivalence_status");
-        result.erase("selected_profile_body_binding_schema");
-        result.erase("selected_profile_body_binding_verified");
+        auto filtered = orbit::taskflow::copyJSONWithoutFields(
+            llvm::json::Value(std::move(result)),
+            {"body_equivalence_checked", "body_equivalence_status",
+             "selected_profile_body_binding_schema",
+             "selected_profile_body_binding_verified"});
+        result = std::move(*filtered.getAsObject());
         result["common_mapper_profile_binding"] = makeCommonProfileBinding();
         result["common_mapper_profile_binding_verified"] = true;
         result["mapper_success_evidence"] =
@@ -4106,8 +4146,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         result["cost_catalog_architecture_path"] =
             costs.architecturePath().str();
       }
-      result["replica_timing_policy"] =
-          llvm::json::Object(replicaTimingPolicy);
+      result["replica_timing_policy"] = llvm::json::Object(replicaTimingPolicy);
       llvm::json::Object fixedTrace{
           {"schema", "amoeba-fixed-decision-trace-v1"},
           {"candidate_id", "candidate-0"},
@@ -4179,9 +4218,9 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
     OriginalAmoebaFixedDecisionResult retimed;
     if (!retimeOriginalAmoebaFixedDecisions(
             gridRows, gridCols, retimerTasks,
-            useOriginalF45ReplicaScaling ? fullParentMappedDurations : durations,
-            placements,
-            dispatchOrder, communication, retimed,
+            useOriginalF45ReplicaScaling ? fullParentMappedDurations
+                                         : durations,
+            placements, dispatchOrder, communication, retimed,
             useOriginalF45ReplicaScaling)) {
       function.emitError() << (retimed.rejection.empty()
                                    ? "original fixed-decision retiming failed"
@@ -4278,12 +4317,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       dependenciesJson.push_back(std::move(dependency));
     }
     for (const auto &transfer : (*network)->getCommittedTransfers()) {
-      auto producerOperation =
-          std::find(taskOperations.begin(), taskOperations.end(),
-                    transfer.producer);
-      auto consumerOperation =
-          std::find(taskOperations.begin(), taskOperations.end(),
-                    transfer.consumer);
+      auto producerOperation = std::find(
+          taskOperations.begin(), taskOperations.end(), transfer.producer);
+      auto consumerOperation = std::find(
+          taskOperations.begin(), taskOperations.end(), transfer.consumer);
       if (producerOperation == taskOperations.end() ||
           consumerOperation == taskOperations.end() || transfer.links.empty() ||
           transfer.payloadBits >
@@ -4307,8 +4344,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       const ExactSchedulePlacement &consumerPlacement =
           retimed.placements[consumerIndex];
       llvm::json::Object route;
-      route["route_id"] = tasks[producerIndex].name + "->" +
-                          tasks[consumerIndex].name;
+      route["route_id"] =
+          tasks[producerIndex].name + "->" + tasks[consumerIndex].name;
       route["producer"] = tasks[producerIndex].name;
       route["consumer"] = tasks[consumerIndex].name;
       route["payload_bits"] = static_cast<int64_t>(transfer.payloadBits);
@@ -4380,10 +4417,8 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
       profileBinding["static_trip_count"] = task.tripCount;
       profileBinding["task_signature"] = body.taskSignature;
       profileBinding["counter_signature"] = body.counterSignature;
-      profileBinding["kernel_binding_signature"] =
-          body.kernelBindingSignature;
-      profileBinding["normalized_mapper_body"] =
-          body.normalizedMapperBody;
+      profileBinding["kernel_binding_signature"] = body.kernelBindingSignature;
+      profileBinding["normalized_mapper_body"] = body.normalizedMapperBody;
       profileBinding["selected_profile_shape"] = trace.selectedShape;
       profileBinding["selected_cgra_count"] = trace.selectedCount;
       if (hasReplicaEvidence) {
@@ -4493,13 +4528,12 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             {"status", "verified"}};
       }
 
-      if (hasReplicaEvidence ||
-          (useOriginalF45ReplicaScaling &&
-           trace.placement.activeReplicas > 1)) {
-        if (trace.replicas.empty() ||
-            trace.originalOccupiedCells.size() != trace.originalContextIds.size()) {
-          function.emitError()
-              << "original parent trace omits its complete replica cell inventory";
+      if (hasReplicaEvidence || (useOriginalF45ReplicaScaling &&
+                                 trace.placement.activeReplicas > 1)) {
+        if (trace.replicas.empty() || trace.originalOccupiedCells.size() !=
+                                          trace.originalContextIds.size()) {
+          function.emitError() << "original parent trace omits its complete "
+                                  "replica cell inventory";
           return signalPassFailure();
         }
         const OriginalReplicaTrace &firstReplica = trace.replicas.front();
@@ -4524,8 +4558,7 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
             return signalPassFailure();
           }
           llvm::json::Array cells;
-          for (auto [cellIndex, cell] :
-               llvm::enumerate(replica.occupiedCells))
+          for (auto [cellIndex, cell] : llvm::enumerate(replica.occupiedCells))
             cells.push_back(llvm::json::Object{
                 {"row", cell.row},
                 {"col", cell.col},
@@ -4569,9 +4602,10 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         auto decision = materializedDecisions.find(parentName);
         if (decision == materializedDecisions.end())
           continue;
-        auto sourceTask = llvm::find_if(sourceTasks, [&](const TaskMetadata &task) {
-          return task.name == parentName;
-        });
+        auto sourceTask =
+            llvm::find_if(sourceTasks, [&](const TaskMetadata &task) {
+              return task.name == parentName;
+            });
         auto sourceTrace = sourceTraceByName.find(parentName);
         if (sourceTask == sourceTasks.end() ||
             sourceTrace == sourceTraceByName.end()) {
@@ -4701,16 +4735,19 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
               "mapper bodies/profiles, and every original replica placement "
               "were verified; replica durations follow the original F45 "
               "scheduler estimate and are not actual child mapper measurements"
-            : hasReplicaEvidence
+        : hasReplicaEvidence
             ? "the exact canonical parent graph, complete source partition, "
               "all actual child bodies/profiles, and original replica cells "
               "were revalidated in C++"
-            : diagnosticIICeiling == 23
+        : diagnosticIICeiling == 23
             ? "the source-domain resolver revalidated every current task, "
               "including the complete static-internal expansion; sample trips "
-              "remain macro firings and source work counts include expanded extents"
-            : "the source-domain guard revalidated a complete bound certificate "
-              "for every original task and rejected internal multiplicity, changed "
+              "remain macro firings and source work counts include expanded "
+              "extents"
+            : "the source-domain guard revalidated a complete bound "
+              "certificate "
+              "for every original task and rejected internal multiplicity, "
+              "changed "
               "firing extents, active replicas, and replica/tiling lineage";
     result["selected_profile_body_binding_schema"] =
         kOriginalAmoebaProfileBindingSchema.str();
@@ -4728,10 +4765,11 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
         useOriginalF45ReplicaScaling
             ? "original-f45-replica-scaling-of-common-full-parent-compiled-ii-"
               "and-structural-startup-duration"
-            : hasReplicaEvidence
+        : hasReplicaEvidence
             ? "actual-parent-or-replica-profile-compiled-ii-times-actual-trip-"
               "minus-one-plus-original-parent-orientation-catalog-startup"
-            : "profile_info.compiled_ii-times-inferred-trip-count-minus-one-plus-"
+            : "profile_info.compiled_ii-times-inferred-trip-count-minus-one-"
+              "plus-"
               "bound-cost-catalog-startup";
     result["score_source"] =
         "preserved-original-amoeba-decisions-plus-explicit-production-network";
@@ -4774,15 +4812,15 @@ struct RetimingOriginalAmoebaFixedDecisionsPass
                              << llvm::toString(catalogValue.takeError());
         return signalPassFailure();
       }
-      const llvm::json::Object *catalogRoot =
-          catalogValue->getAsObject();
+      const llvm::json::Object *catalogRoot = catalogValue->getAsObject();
       const llvm::json::Object *catalogMetadata =
           catalogRoot ? catalogRoot->getObject("predictor_metadata") : nullptr;
       const llvm::json::Object *diagnosticOverride =
           catalogMetadata ? catalogMetadata->getObject("diagnostic_override")
                           : nullptr;
       if (!diagnosticOverride) {
-        function.emitError() << "validated II23 cost catalog lost its diagnostic proof";
+        function.emitError()
+            << "validated II23 cost catalog lost its diagnostic proof";
         return signalPassFailure();
       }
       result["diagnostic_override"] = llvm::json::Object(*diagnosticOverride);

@@ -1,3 +1,5 @@
+// The 1x1 CGRA placement uses one physical 4x4 mapper tile, matching
+// mapper-arch-4x4.yaml; a 2x2 tile is not a legal fixed shape on this target.
 // Small one-task source used by the native common-parent-profile retimer
 // harness. The harness first binds this source, exports all eight actual
 // mapper shapes, then creates a separate all-unit F45 schedule for replay.
@@ -22,8 +24,8 @@ module {
          cgra_count = 1 : i32, cgra_shape = "1x1",
          amoeba.selected_cgra_count = 1 : i64,
          amoeba.selected_cgra_shape = "1x1",
-         amoeba.selected_mapper_tile_rows = 2 : i64,
-         amoeba.selected_mapper_tile_cols = 2 : i64,
+         amoeba.selected_mapper_tile_rows = 4 : i64,
+         amoeba.selected_mapper_tile_cols = 4 : i64,
          amoeba.selected_trip_count = 1 : i64,
          amoeba.joint_shape_orientation_fixed}
         : (memref<1xi32>, memref<1xi32>) -> memref<1xi32> {

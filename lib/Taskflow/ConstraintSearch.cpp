@@ -69,12 +69,12 @@ ConstraintSearchResult solveConstraintSearch(const ConstraintSearchProblem &p,
   using namespace operations_research;
   using namespace operations_research::sat;
   if (p.taskCount <= 0 || p.tileCount <= 0 || !std::isfinite(o.wallSeconds) ||
-      o.wallSeconds <= 0 || o.workers < 1 || o.maxVariables < 1 ||
-      o.maxConstraints < 1 || o.maxPatterns < 1 || o.maxTasks < 1 ||
-      o.maxTiles < 1 || o.maxInputEdges < 1 || o.maxEdges < 1 ||
-      o.maxMemberships < 1 || o.maxIntersectionWork < 1 ||
-      o.maxPatternBytes < 0 || o.maxPatternInputs < 0 ||
-      o.maxPatternOutputs < 0 ||
+      o.wallSeconds <= 0 || o.workers < 1 || o.workers > 16 ||
+      o.randomSeed < 0 || o.maxVariables < 1 || o.maxConstraints < 1 ||
+      o.maxPatterns < 1 || o.maxTasks < 1 || o.maxTiles < 1 ||
+      o.maxInputEdges < 1 || o.maxEdges < 1 || o.maxMemberships < 1 ||
+      o.maxIntersectionWork < 1 || o.maxPatternBytes < 0 ||
+      o.maxPatternInputs < 0 || o.maxPatternOutputs < 0 ||
       (!p.tileBaseCostNs.empty() &&
        p.tileBaseCostNs.size() != size_t(p.tileCount)))
     return finish(ConstraintSearchStatus::InvalidInput,

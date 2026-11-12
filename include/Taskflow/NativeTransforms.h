@@ -1,9 +1,35 @@
 #ifndef ORBIT_TASKFLOW_NATIVE_TRANSFORMS_H
 #define ORBIT_TASKFLOW_NATIVE_TRANSFORMS_H
 #include "mlir/IR/BuiltinOps.h"
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 namespace orbit::taskflow {
 struct ProgramMappingChoice;
+struct GenericAnalysis;
+// Validate compiler initializer provenance against actual constant-store
+// source. Selection metadata stays outside the function's numeric source
+// fingerprint.
+bool readNativeInitializerTasks(const GenericAnalysis &analysis,
+                                std::vector<size_t> &tasks, std::string &error);
+// Sparse input policy. Unlike GenericTaskImplementation, this does not contain
+// a derived parallel loop. An explicit scalar entry overrides the module
+// policy.
+struct NativeTaskImplementationChoice {
+  size_t task = 0;
+  std::string kind = "scalar";
+  int64_t lanes = 1;
+};
+bool validateNativeImplementation(const std::string &kind, int64_t lanes,
+                                  std::string &error);
+bool readNativeTaskImplementations(
+    mlir::ModuleOp module, size_t taskCount,
+    std::vector<NativeTaskImplementationChoice> &choices, std::string &error);
+bool setNativeTaskImplementations(
+    mlir::ModuleOp module, size_t taskCount,
+    const std::vector<NativeTaskImplementationChoice> &choices,
+    std::string &error);
 bool hasSplittableNativeLoops(mlir::ModuleOp module);
 // Clone/split each eligible task-body outer affine loop into two contiguous
 // sequential ranges. Mathematics and Taskflow task dependencies are unchanged.

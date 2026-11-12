@@ -1,0 +1,26 @@
+{
+  "schema": "orbit.runtime-regression-fixtures.v32",
+  "files": [
+    {
+      "file": "constant-feed.generic.mlir",
+      "producer_artifact": "/tmp/matrix64-preserve-feed-r1/extracted.generic.mlir",
+      "sha256": "8df34db87bfe2202c3e6e8f741cee13ff2d37c5c772722abdc72ea66704e988f"
+    },
+    {
+      "file": "constant-feed.contract.json",
+      "producer_artifact": "/home/shiran/project/orbit-artifact/results/taskflow/full-joint-v32-r1/preparation-r6/gemm64-npu-16x16x64/region-0/program.air.mlir.configuration-0.mlir.runtime-contract.json",
+      "sha256": "11c243d1434727ea284b5d02940282bf386a49a303d51f1a8836c6ac24126fc5"
+    },
+    {
+      "file": "circuit-relu.generic.mlir",
+      "producer_artifact": "/home/shiran/project/orbit-artifact/results/taskflow/full-joint-v32-r1/preparation-r6/gemm96-npu-16x32x48-compile/compiled/region-0/configuration-22/extracted.generic.mlir",
+      "sha256": "ecfcd89b817308d4f0b4c490c96bd2ae82d1d0f55b47229602e81c041af2026e"
+    },
+    {
+      "file": "circuit-relu.contract.json",
+      "producer_artifact": "/home/shiran/project/orbit-artifact/results/taskflow/full-joint-v32-r1/preparation-r6/gemm96-npu-16x32x48/region-0/program.air.mlir.configuration-22.mlir.runtime-contract.json",
+      "sha256": "3f68cda51a97275932f296fba7e26980805ce26f37ad7ff15995710c5f6724c4"
+    }
+  ],
+  "scope": "Actual CPU-compiled AIE and sealed selected-graph contracts; no vendor compiler or hardware required to replay these checks. Core locks and arithmetic remain outside the runtime certificate."
+}

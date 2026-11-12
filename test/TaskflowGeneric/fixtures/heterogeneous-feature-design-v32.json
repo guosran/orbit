@@ -1,0 +1,500 @@
+{
+  "scope": "captured frozen-r3 native static quantities only; no timings or hardware numerical assertions",
+  "feature_sets": {
+    "application": {
+      "reset": [
+        "call",
+        "input_bytes"
+      ],
+      "control": [
+        "call",
+        "configuration_count"
+      ],
+      "copy": [
+        "call",
+        "output_bytes"
+      ]
+    },
+    "cpu": {
+      "body": [
+        "call",
+        "source_operations"
+      ]
+    },
+    "npu": {
+      "sync_to": [
+        "abi_bo_count",
+        "to_device_bytes"
+      ],
+      "submit": [
+        "configuration_count",
+        "configuration_argument_bindings"
+      ],
+      "wait": [
+        "configuration_count",
+        "source_operations"
+      ],
+      "sync_from": [
+        "call",
+        "from_device_bytes"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "train16-cpu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 0,
+          "input_bytes": 1024,
+          "output_bytes": 1024,
+          "regions": 1
+        },
+        "candidate_id": "956c2fdbccb670cf4962f50e7043f23bd848105a733f7b7d5eb69bc516b39292",
+        "parent_graph_id": "1e08b90f473132b7aee9405766ab83ee30b902f70e1baa3319642c4c6af19902",
+        "regions": [
+          {
+            "child_graph_id": "78fb8236fab41cc2df64dd99e562095f0e1066ec0307c8708eddc2857efcc1a2",
+            "device": "cpu",
+            "features": {
+              "abi_bo_count": 3,
+              "abi_bytes": 2048,
+              "call": 1,
+              "configuration_argument_bindings": 3,
+              "configuration_count": 1,
+              "dma_bytes": 0,
+              "dma_transfers": 0,
+              "from_device_bytes": 1024,
+              "hardware_stages": 0,
+              "layout_bytes": 0,
+              "matrix_instances": 0,
+              "phases": 0,
+              "physical_scratch_bytes": 0,
+              "source_memory_accesses": 17152,
+              "source_operations": 16640,
+              "to_device_bytes": 2048
+            },
+            "implementations": [
+              "llvm-ciface-f32"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train16-npu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 1,
+          "input_bytes": 1024,
+          "output_bytes": 1024,
+          "regions": 1
+        },
+        "candidate_id": "29f030cd54f7500f609f6d6accbfec81e87d3b25cdcafb8d5b264512eb23819f",
+        "parent_graph_id": "98545ef6750749c0022bedcdaa50daf7322498ebd86f601b6bc4b1c9c3018feb",
+        "regions": [
+          {
+            "child_graph_id": "96c659e83aecf1ec1760bf327dbecab98321ebd9a15bc9cacf79c0243143f634",
+            "device": "npu",
+            "features": {
+              "abi_bo_count": 4,
+              "abi_bytes": 3072,
+              "call": 1,
+              "configuration_argument_bindings": 4,
+              "configuration_count": 1,
+              "dma_bytes": 4096,
+              "dma_transfers": 5,
+              "from_device_bytes": 1024,
+              "hardware_stages": 2,
+              "layout_bytes": 3072,
+              "matrix_instances": 1,
+              "phases": 3,
+              "physical_scratch_bytes": 2048,
+              "source_memory_accesses": 17152,
+              "source_operations": 16640,
+              "to_device_bytes": 3072
+            },
+            "implementations": [
+              "aie2p-bf16-mmul-f32acc",
+              "scalar"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train32-cpu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 0,
+          "input_bytes": 4096,
+          "output_bytes": 4096,
+          "regions": 1
+        },
+        "candidate_id": "d8b9765bb360b13bb9714c3b37db7dd0412b154274d85939f3e1f327287c725c",
+        "parent_graph_id": "75a69f4c76e1fe18075b110120195698853a26f729d0b828cb580687558ecc3e",
+        "regions": [
+          {
+            "child_graph_id": "5412aee818039c3960ac9a978e449ac6a83c93aeba2e79715c9fa427e664a708",
+            "device": "cpu",
+            "features": {
+              "abi_bo_count": 3,
+              "abi_bytes": 8192,
+              "call": 1,
+              "configuration_argument_bindings": 3,
+              "configuration_count": 1,
+              "dma_bytes": 0,
+              "dma_transfers": 0,
+              "from_device_bytes": 4096,
+              "hardware_stages": 0,
+              "layout_bytes": 0,
+              "matrix_instances": 0,
+              "phases": 0,
+              "physical_scratch_bytes": 0,
+              "source_memory_accesses": 134144,
+              "source_operations": 132096,
+              "to_device_bytes": 8192
+            },
+            "implementations": [
+              "llvm-ciface-f32"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train32-npu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 1,
+          "input_bytes": 4096,
+          "output_bytes": 4096,
+          "regions": 1
+        },
+        "candidate_id": "fd254bddfc101a9382a8c6c04095c2037fc5b330106fc86878bb3cd6ef77c8bc",
+        "parent_graph_id": "38e68e3b53c23044d3ecd848f1a6f7217a978a7db5949f04f80f3a6321a3b7bd",
+        "regions": [
+          {
+            "child_graph_id": "894fbddae040374e24271948a5ca98612b748d5e2a3044bf9564c6f905d4d4f5",
+            "device": "npu",
+            "features": {
+              "abi_bo_count": 4,
+              "abi_bytes": 12288,
+              "call": 1,
+              "configuration_argument_bindings": 4,
+              "configuration_count": 1,
+              "dma_bytes": 16384,
+              "dma_transfers": 5,
+              "from_device_bytes": 4096,
+              "hardware_stages": 2,
+              "layout_bytes": 12288,
+              "matrix_instances": 1,
+              "phases": 3,
+              "physical_scratch_bytes": 8192,
+              "source_memory_accesses": 134144,
+              "source_operations": 132096,
+              "to_device_bytes": 12288
+            },
+            "implementations": [
+              "aie2p-bf16-mmul-f32acc",
+              "scalar"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train64-cpu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 0,
+          "input_bytes": 16384,
+          "output_bytes": 16384,
+          "regions": 1
+        },
+        "candidate_id": "a87584d287365531ac0bcde739e7dbf70cbf3db77e9f91e902024abffb12ced2",
+        "parent_graph_id": "f560e8e81fe85af801e234ab1ab2a11645588a67467221fb7672305553c57cfc",
+        "regions": [
+          {
+            "child_graph_id": "a9eb73d787dc24ef1e625360dd20195e6c92337a1226c6c2832d7293ab57a577",
+            "device": "cpu",
+            "features": {
+              "abi_bo_count": 3,
+              "abi_bytes": 32768,
+              "call": 1,
+              "configuration_argument_bindings": 3,
+              "configuration_count": 1,
+              "dma_bytes": 0,
+              "dma_transfers": 0,
+              "from_device_bytes": 16384,
+              "hardware_stages": 0,
+              "layout_bytes": 0,
+              "matrix_instances": 0,
+              "phases": 0,
+              "physical_scratch_bytes": 0,
+              "source_memory_accesses": 1060864,
+              "source_operations": 1052672,
+              "to_device_bytes": 32768
+            },
+            "implementations": [
+              "llvm-ciface-f32"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train64-npu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 5,
+          "input_bytes": 16384,
+          "output_bytes": 16384,
+          "regions": 1
+        },
+        "candidate_id": "3e06215eb5124c0e2c7748375f04f034b5070b7f28a7c0def6ee3372a902fd38",
+        "parent_graph_id": "1bd5f398b603a1e6ad64dd0976789f7d190918f339f0536baee7065a79b54a59",
+        "regions": [
+          {
+            "child_graph_id": "c52dabb958da2cc8901136e38bbde8f151951d7155390894a435288794135bc9",
+            "device": "npu",
+            "features": {
+              "abi_bo_count": 4,
+              "abi_bytes": 49152,
+              "call": 1,
+              "configuration_argument_bindings": 20,
+              "configuration_count": 5,
+              "dma_bytes": 81920,
+              "dma_transfers": 28,
+              "from_device_bytes": 16384,
+              "hardware_stages": 2,
+              "layout_bytes": 98304,
+              "matrix_instances": 8,
+              "phases": 16,
+              "physical_scratch_bytes": 8192,
+              "source_memory_accesses": 1060864,
+              "source_operations": 1052672,
+              "to_device_bytes": 49152
+            },
+            "implementations": [
+              "aie2p-bf16-mmul-f32acc",
+              "scalar"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train96-cpu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 0,
+          "input_bytes": 36864,
+          "output_bytes": 36864,
+          "regions": 1
+        },
+        "candidate_id": "0c75a01ce1a16a63b328748cc145947e0563b4247d68afe25c7a55edbf7b711a",
+        "parent_graph_id": "de425cd0560e3bd7b3f1a8a7185b0fcff8ccd1bc93d405b01d701c97caa04ffb",
+        "regions": [
+          {
+            "child_graph_id": "cb9f971eb42c79e418502fbb73908a22126a90a2c54b9334631904aceb0281a6",
+            "device": "cpu",
+            "features": {
+              "abi_bo_count": 3,
+              "abi_bytes": 73728,
+              "call": 1,
+              "configuration_argument_bindings": 3,
+              "configuration_count": 1,
+              "dma_bytes": 0,
+              "dma_transfers": 0,
+              "from_device_bytes": 36864,
+              "hardware_stages": 0,
+              "layout_bytes": 0,
+              "matrix_instances": 0,
+              "phases": 0,
+              "physical_scratch_bytes": 0,
+              "source_memory_accesses": 3566592,
+              "source_operations": 3548160,
+              "to_device_bytes": 73728
+            },
+            "implementations": [
+              "llvm-ciface-f32"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "train96-npu",
+      "split": "train",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 12,
+          "input_bytes": 36864,
+          "output_bytes": 36864,
+          "regions": 1
+        },
+        "candidate_id": "c7748ef107a84c4045a326fd93288e0aef02c3f3dfe99230087c4a6852f984ca",
+        "parent_graph_id": "8008c03d5f9e3548b59642b59fdd0acfa6e5849329a4e8879ab3c63b2e7cad42",
+        "regions": [
+          {
+            "child_graph_id": "daa5320260c0d0735b3c21e1da0388472741a8dea4c75ca9742a1498ca7fddcc",
+            "device": "npu",
+            "features": {
+              "abi_bo_count": 4,
+              "abi_bytes": 110592,
+              "call": 1,
+              "configuration_argument_bindings": 48,
+              "configuration_count": 12,
+              "dma_bytes": 221184,
+              "dma_transfers": 81,
+              "from_device_bytes": 36864,
+              "hardware_stages": 2,
+              "layout_bytes": 331776,
+              "matrix_instances": 27,
+              "phases": 45,
+              "physical_scratch_bytes": 8192,
+              "source_memory_accesses": 3566592,
+              "source_operations": 3548160,
+              "to_device_bytes": 110592
+            },
+            "implementations": [
+              "aie2p-bf16-mmul-f32acc",
+              "scalar"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "gemm48-cpu",
+      "split": "holdout",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 0,
+          "input_bytes": 9216,
+          "output_bytes": 9216,
+          "regions": 1
+        },
+        "candidate_id": "2c0f9b5fa27f682a781274a46b42ade6ab694de24c591abd4678cb6011dcdfce",
+        "parent_graph_id": "0ac006533303d1e9491e078d853ba486ea6b8bdf4acba0a700487cbc47b27981",
+        "regions": [
+          {
+            "child_graph_id": "2ffe886a3e5a86a7b0852437904ba6d716b51e295479c18ee5d31b987527487b",
+            "device": "cpu",
+            "features": {
+              "abi_bo_count": 3,
+              "abi_bytes": 18432,
+              "call": 1,
+              "configuration_argument_bindings": 3,
+              "configuration_count": 1,
+              "dma_bytes": 0,
+              "dma_transfers": 0,
+              "from_device_bytes": 9216,
+              "hardware_stages": 0,
+              "layout_bytes": 0,
+              "matrix_instances": 0,
+              "phases": 0,
+              "physical_scratch_bytes": 0,
+              "source_memory_accesses": 449280,
+              "source_operations": 444672,
+              "to_device_bytes": 18432
+            },
+            "implementations": [
+              "llvm-ciface-f32"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    },
+    {
+      "id": "gemm48-tile16-npu-r2",
+      "split": "holdout",
+      "data": {
+        "application": {
+          "call": 1,
+          "configuration_count": 12,
+          "input_bytes": 9216,
+          "output_bytes": 9216,
+          "regions": 1
+        },
+        "candidate_id": "91c1a68fe508070381b5e3d2a1c68b333a1b34ff3d4f214f0f7ee4f90f63a8d4",
+        "parent_graph_id": "b6d54fb169d87e5138c4d8d6276bb722460fe4b3d96476a9e55f07b653cb1d4c",
+        "regions": [
+          {
+            "child_graph_id": "446b9d8574f99e5a7aceb9205b11acab3a1a567e11a4154be93237677cb184c4",
+            "device": "npu",
+            "features": {
+              "abi_bo_count": 4,
+              "abi_bytes": 27648,
+              "call": 1,
+              "configuration_argument_bindings": 48,
+              "configuration_count": 12,
+              "dma_bytes": 55296,
+              "dma_transfers": 81,
+              "from_device_bytes": 9216,
+              "hardware_stages": 2,
+              "layout_bytes": 82944,
+              "matrix_instances": 27,
+              "phases": 45,
+              "physical_scratch_bytes": 2048,
+              "source_memory_accesses": 449280,
+              "source_operations": 444672,
+              "to_device_bytes": 27648
+            },
+            "implementations": [
+              "aie2p-bf16-mmul-f32acc",
+              "scalar"
+            ],
+            "region": 0,
+            "source_family": "9f960fbc704c97abb22388b212195723aa5153007163f23c1d16e00a204f122c"
+          }
+        ],
+        "schema": "orbit.heterogeneous.edge-features.v32"
+      }
+    }
+  ]
+}

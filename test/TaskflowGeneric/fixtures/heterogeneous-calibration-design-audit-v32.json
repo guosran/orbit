@@ -1,0 +1,106 @@
+{
+  "designs": [
+    {
+      "group": "application",
+      "phase": "reset",
+      "features": [
+        "call",
+        "input_bytes"
+      ],
+      "rows": 8,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 3.0853687819736813
+    },
+    {
+      "group": "application",
+      "phase": "control",
+      "features": [
+        "call",
+        "configuration_count"
+      ],
+      "rows": 8,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 3.157573488810921
+    },
+    {
+      "group": "application",
+      "phase": "copy",
+      "features": [
+        "call",
+        "output_bytes"
+      ],
+      "rows": 8,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 3.0853687819736813
+    },
+    {
+      "group": "cpu",
+      "phase": "body",
+      "features": [
+        "call",
+        "source_operations"
+      ],
+      "rows": 4,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 2.8230283549104853
+    },
+    {
+      "group": "npu",
+      "phase": "sync_to",
+      "features": [
+        "abi_bo_count",
+        "to_device_bytes"
+      ],
+      "rows": 4,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 3.0853687819736804
+    },
+    {
+      "group": "npu",
+      "phase": "submit",
+      "features": [
+        "configuration_count",
+        "configuration_argument_bindings"
+      ],
+      "rows": 4,
+      "unique_designs": 3,
+      "rank": 1,
+      "scaled_condition": null
+    },
+    {
+      "group": "npu",
+      "phase": "wait",
+      "features": [
+        "configuration_count",
+        "source_operations"
+      ],
+      "rows": 4,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 14.843662423011729
+    },
+    {
+      "group": "npu",
+      "phase": "sync_from",
+      "features": [
+        "call",
+        "from_device_bytes"
+      ],
+      "rows": 4,
+      "unique_designs": 4,
+      "rank": 2,
+      "scaled_condition": 3.0853687819736804
+    }
+  ],
+  "holdout48_wait_inside_train_convex_hull": false,
+  "holdout48_wait_features": [
+    12.0,
+    444672.0
+  ],
+  "scope": "static quantities only; r3 diagnostic, no timing labels read"
+}

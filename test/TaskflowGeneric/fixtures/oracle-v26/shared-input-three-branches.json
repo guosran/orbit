@@ -1,0 +1,577 @@
+{
+  "generic_air": {
+    "capacity_bytes": 768,
+    "cost_model": {
+      "kind": "event-mechanism",
+      "schema": "orbit.direct-air.cost.v1",
+      "mode": "estimate",
+      "model_id": "v25-cli-contract",
+      "implementations": [
+        "scalar"
+      ],
+      "boundary": "one-invocation",
+      "parameters": {
+        "compute.startup": {
+          "value": 4,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "compute.operation": {
+          "value": 1,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "compute.memory_access": {
+          "value": 0.5,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "configuration.startup": {
+          "value": 1000,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.submit": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.complete": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.visibility": {
+          "value": 10,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "communication.startup": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "communication.bandwidth": {
+          "value": 8,
+          "unit": "bytes/ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "implementations": [
+        {
+          "kind": "scalar",
+          "lanes": 1
+        }
+      ]
+    },
+    "memory_architecture": {
+      "domains": [
+        {
+          "id": "system",
+          "kind": "system",
+          "parent": ""
+        },
+        {
+          "id": "npu",
+          "kind": "device",
+          "parent": "system"
+        },
+        {
+          "id": "tile0",
+          "parent": "npu",
+          "kind": "tile",
+          "coordinates": {
+            "column": 0,
+            "row": 2
+          }
+        },
+        {
+          "id": "tile1",
+          "parent": "npu",
+          "kind": "tile",
+          "coordinates": {
+            "column": 1,
+            "row": 2
+          }
+        }
+      ],
+      "resources": [
+        {
+          "id": "host.worker",
+          "kind": "compute",
+          "device": "host",
+          "capacity": 1,
+          "domain": "system"
+        },
+        {
+          "id": "host-submission",
+          "kind": "submission",
+          "device": "host",
+          "capacity": 1,
+          "domain": "system"
+        },
+        {
+          "id": "npu.compute",
+          "kind": "compute",
+          "device": "npu",
+          "capacity": 1,
+          "domain": "tile0"
+        },
+        {
+          "id": "npu.dma",
+          "kind": "transfer",
+          "device": "npu",
+          "capacity": 1,
+          "domain": "tile0"
+        },
+        {
+          "id": "npu.compute.1",
+          "kind": "compute",
+          "device": "npu",
+          "capacity": 1,
+          "domain": "tile1"
+        },
+        {
+          "id": "npu.dma.1",
+          "kind": "transfer",
+          "device": "npu",
+          "capacity": 1,
+          "domain": "tile1"
+        }
+      ],
+      "memories": [
+        {
+          "id": "system_memory_bo",
+          "kind": "system-bo",
+          "domain": "system",
+          "capacity_bytes": 1048576,
+          "accessible_resources": [
+            "host.worker"
+          ]
+        },
+        {
+          "id": "aie_l1",
+          "kind": "local-sram",
+          "domain": "tile0",
+          "capacity_bytes": 768,
+          "accessible_resources": [
+            "npu.compute"
+          ]
+        },
+        {
+          "id": "aie_l1.1",
+          "kind": "local-sram",
+          "domain": "tile1",
+          "capacity_bytes": 768,
+          "accessible_resources": [
+            "npu.compute.1"
+          ]
+        }
+      ],
+      "links": [
+        {
+          "id": "host_to_l1",
+          "source": "system_memory_bo",
+          "target": "aie_l1",
+          "resource": "npu.dma",
+          "domain": "tile0",
+          "latency_ms": 0.0001,
+          "bandwidth_bytes_per_ms": 8000000,
+          "provenance": {
+            "kind": "assumed",
+            "source": "explicit finite-domain pilot, not hardware timing"
+          }
+        },
+        {
+          "id": "l1_to_host",
+          "source": "aie_l1",
+          "target": "system_memory_bo",
+          "resource": "npu.dma",
+          "domain": "tile0",
+          "latency_ms": 0.0001,
+          "bandwidth_bytes_per_ms": 8000000,
+          "provenance": {
+            "kind": "assumed",
+            "source": "explicit finite-domain pilot, not hardware timing"
+          }
+        },
+        {
+          "id": "host_to_l1.1",
+          "source": "system_memory_bo",
+          "target": "aie_l1.1",
+          "resource": "npu.dma.1",
+          "domain": "tile1",
+          "latency_ms": 0.0001,
+          "bandwidth_bytes_per_ms": 8000000,
+          "provenance": {
+            "kind": "assumed",
+            "source": "explicit finite-domain pilot, not hardware timing"
+          }
+        },
+        {
+          "id": "l1_to_host.1",
+          "source": "aie_l1.1",
+          "target": "system_memory_bo",
+          "resource": "npu.dma.1",
+          "domain": "tile1",
+          "latency_ms": 0.0001,
+          "bandwidth_bytes_per_ms": 8000000,
+          "provenance": {
+            "kind": "assumed",
+            "source": "explicit finite-domain pilot, not hardware timing"
+          }
+        }
+      ]
+    }
+  },
+  "native_auto_candidates": {
+    "mode": "joint",
+    "algorithm": "cp-sat-all"
+  },
+  "program_search": {
+    "seconds": 600,
+    "max_evaluations": 20000,
+    "max_variables": 100000,
+    "max_constraints": 500000,
+    "max_values_per_dimension": 32,
+    "max_routes": 16,
+    "max_priorities": 24,
+    "dimensions": [
+      {
+        "id": "source.fission",
+        "choices": [
+          {
+            "fission": false
+          }
+        ]
+      },
+      {
+        "id": "source.initialization",
+        "choices": [
+          {
+            "distribute": false
+          }
+        ]
+      },
+      {
+        "id": "implementation",
+        "choices": [
+          {
+            "implementation": "scalar",
+            "lanes": 1
+          }
+        ]
+      },
+      {
+        "id": "replica.partition",
+        "choices": [
+          {
+            "partition": 0
+          }
+        ]
+      },
+      {
+        "id": "temporal.priority",
+        "choices": [
+          {
+            "priority": [
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "priority": [
+              2,
+              1,
+              0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tiling.m",
+        "choices": [
+          {
+            "tile_axis": 0,
+            "tile": 2
+          },
+          {
+            "tile_axis": 0,
+            "tile": 4
+          }
+        ]
+      },
+      {
+        "id": "tiling.n",
+        "choices": [
+          {
+            "tile_axis": 1,
+            "tile": 4
+          },
+          {
+            "tile_axis": 1,
+            "tile": 8
+          }
+        ]
+      },
+      {
+        "id": "tiling.k",
+        "choices": [
+          {
+            "tile_axis": 2,
+            "tile": 1
+          }
+        ]
+      },
+      {
+        "id": "task.0.count",
+        "choices": [
+          {
+            "task": 0,
+            "resource_count": 1
+          }
+        ]
+      },
+      {
+        "id": "task.0.shape",
+        "choices": [
+          {
+            "task": 0,
+            "resource_shape": []
+          }
+        ]
+      },
+      {
+        "id": "task.1.count",
+        "choices": [
+          {
+            "task": 1,
+            "resource_count": 1
+          }
+        ]
+      },
+      {
+        "id": "task.1.shape",
+        "choices": [
+          {
+            "task": 1,
+            "resource_shape": []
+          }
+        ]
+      },
+      {
+        "id": "task.2.count",
+        "choices": [
+          {
+            "task": 2,
+            "resource_count": 1
+          }
+        ]
+      },
+      {
+        "id": "task.2.shape",
+        "choices": [
+          {
+            "task": 2,
+            "resource_shape": []
+          }
+        ]
+      },
+      {
+        "id": "fusion.residency.traversal",
+        "choices": [
+          {
+            "mapping": {
+              "residency": "tiled-phase-local",
+              "grouping": "task-shape-stages",
+              "data_organization": "phase-local"
+            }
+          },
+          {
+            "mapping": {
+              "residency": "tiled-phase-local",
+              "grouping": "tile-major",
+              "data_organization": "retain-across-users",
+              "groups": [
+                {
+                  "tasks": [
+                    0,
+                    1
+                  ],
+                  "storages": [
+                    0
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "mapping": {
+              "residency": "tiled-phase-local",
+              "grouping": "tile-major",
+              "data_organization": "retain-across-users",
+              "groups": [
+                {
+                  "tasks": [
+                    1,
+                    2
+                  ],
+                  "storages": [
+                    0
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "task.0.data.0.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.1.data.0.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.2.data.0.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.3.data.1.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.3.data.3.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.3.data.2.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.0.resource",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.0.memory",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.0.placement",
+        "choices": [
+          {
+            "task": 0,
+            "resource": "npu.compute",
+            "memory": "aie_l1"
+          },
+          {
+            "task": 0,
+            "resource": "npu.compute.1",
+            "memory": "aie_l1.1"
+          }
+        ]
+      },
+      {
+        "id": "task.1.resource",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.1.memory",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.1.placement",
+        "choices": [
+          {
+            "task": 1,
+            "resource": "npu.compute",
+            "memory": "aie_l1"
+          },
+          {
+            "task": 1,
+            "resource": "npu.compute.1",
+            "memory": "aie_l1.1"
+          }
+        ]
+      },
+      {
+        "id": "task.2.resource",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.2.memory",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.2.placement",
+        "choices": [
+          {
+            "task": 2,
+            "resource": "npu.compute",
+            "memory": "aie_l1"
+          },
+          {
+            "task": 2,
+            "resource": "npu.compute.1",
+            "memory": "aie_l1.1"
+          }
+        ]
+      }
+    ]
+  }
+}

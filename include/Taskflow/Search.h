@@ -1,51 +1,73 @@
 #ifndef ORBIT_TASKFLOW_SEARCH_H
 #define ORBIT_TASKFLOW_SEARCH_H
-#include "Taskflow/StructuredProgram.h"
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/ProgramSearch.h"
+#include "Taskflow/StructuredProgram.h"
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
 #include <set>
-#include <functional>
 namespace orbit::taskflow {
 struct SearchAction;
+struct ProgramAllHeterogeneousCandidate;
 // Extracted from JointNeighborhoodSearchPass::selectBeam. Both legacy Neura
 // and structured search share scored-only, unique-key, diversity selection.
-template<class State, class Less, class Scored, class Key, class Configuration>
-std::vector<State> selectSearchBeam(std::vector<State> candidates, int64_t width,
-    int64_t diversity, Less less, Scored scored, Key key, Configuration configuration) {
+template <class State, class Less, class Scored, class Key, class Configuration>
+std::vector<State> selectSearchBeam(std::vector<State> candidates,
+                                    int64_t width, int64_t diversity, Less less,
+                                    Scored scored, Key key,
+                                    Configuration configuration) {
   std::stable_sort(candidates.begin(), candidates.end(), less);
   std::vector<size_t> indices;
   std::set<std::string> keys, configurations;
-  const size_t costSlots = size_t(std::max<int64_t>(0, width-diversity));
-  for (size_t i=0; i<candidates.size() && indices.size()<costSlots; ++i) {
-    if (!scored(candidates[i]) || key(candidates[i]).empty() || !keys.insert(key(candidates[i])).second) continue;
-    indices.push_back(i); configurations.insert(configuration(candidates[i]));
+  const size_t costSlots = size_t(std::max<int64_t>(0, width - diversity));
+  for (size_t i = 0; i < candidates.size() && indices.size() < costSlots; ++i) {
+    if (!scored(candidates[i]) || key(candidates[i]).empty() ||
+        !keys.insert(key(candidates[i])).second)
+      continue;
+    indices.push_back(i);
+    configurations.insert(configuration(candidates[i]));
   }
-  for (size_t i=0; i<candidates.size() && indices.size()<size_t(width); ++i) {
-    if (!scored(candidates[i]) || key(candidates[i]).empty() || keys.count(key(candidates[i])) || !configurations.insert(configuration(candidates[i])).second) continue;
-    keys.insert(key(candidates[i])); indices.push_back(i);
+  for (size_t i = 0; i < candidates.size() && indices.size() < size_t(width);
+       ++i) {
+    if (!scored(candidates[i]) || key(candidates[i]).empty() ||
+        keys.count(key(candidates[i])) ||
+        !configurations.insert(configuration(candidates[i])).second)
+      continue;
+    keys.insert(key(candidates[i]));
+    indices.push_back(i);
   }
-  for (size_t i=0; i<candidates.size() && indices.size()<size_t(width); ++i) {
-    if (!scored(candidates[i]) || key(candidates[i]).empty() || !keys.insert(key(candidates[i])).second) continue;
+  for (size_t i = 0; i < candidates.size() && indices.size() < size_t(width);
+       ++i) {
+    if (!scored(candidates[i]) || key(candidates[i]).empty() ||
+        !keys.insert(key(candidates[i])).second)
+      continue;
     indices.push_back(i);
   }
   std::vector<State> selected;
-  for (auto i:indices) selected.push_back(std::move(candidates[i]));
+  for (auto i : indices)
+    selected.push_back(std::move(candidates[i]));
   return selected;
 }
 struct SearchOptions {
   std::string backend, evaluator, outputDir, targetConfigFile, checkpoint;
-  int64_t maxRounds=2, maxCandidates=9, beamWidth=1;
-  bool resume=false;
-  std::string nativeSourceMLIR; // optional actual-body candidates; same search driver
+  int64_t maxRounds = 2, maxCandidates = 9, beamWidth = 1;
+  bool resume = false;
+  std::string
+      nativeSourceMLIR; // optional actual-body candidates; same search driver
   // Backend plugins provide capabilities/evaluation without linking Core to a
   // target implementation. Native candidate/graph/cache handling stays here.
   std::string nativeBackendIdentity;
-  std::function<llvm::json::Value(llvm::StringRef,const llvm::json::Value&,
-      llvm::StringRef,std::string&)> nativeEvaluator;
-  std::function<bool(mlir::ModuleOp,const SearchAction&,std::string&)> nativeApplyAction;
+  std::function<llvm::json::Value(llvm::StringRef, const llvm::json::Value &,
+                                  llvm::StringRef, std::string &)>
+      nativeEvaluator;
+  std::function<bool(mlir::ModuleOp, const SearchAction &, std::string &)>
+      nativeApplyAction;
   std::vector<SearchAction> nativeActions;
+  std::function<ProgramSearchEvaluation(
+      const ProgramAllHeterogeneousCandidate &)>
+      heterogeneousEvaluator;
 };
 struct SearchAction {
   std::string name;
@@ -53,19 +75,24 @@ struct SearchAction {
   std::optional<ProgramMappingChoice> mapping;
   std::string implementation;
   int64_t vectorLanes = 1;
-  int64_t partitionExtent = -1; // -1 unchanged, 0 single command, >0 program fission
+  int64_t partitionExtent =
+      -1; // -1 unchanged, 0 single command, >0 program fission
   std::string backendAction;
   std::vector<int64_t> backendParameters;
 };
 // Target recommendations affect proposals only, never semantic legality.
-struct SearchPreferences { int64_t m=1, n=1, k=1; };
+struct SearchPreferences {
+  int64_t m = 1, n = 1, k = 1;
+};
 // Finite target-aligned neighbors, not legality or a predictive cost model.
 // The search re-analyzes materialized children and uses the public planner.
-std::vector<SearchAction> generateNativeTileActions(const GenericAnalysis &,
-    const std::array<int64_t,3> &current, const GenericTargetCapabilities &,
-    const SearchPreferences &, size_t limit);
-std::vector<SearchAction> generateSearchActions(const Program &, const SearchPreferences & = {});
+std::vector<SearchAction> generateNativeTileActions(
+    const GenericAnalysis &, const std::array<int64_t, 3> &current,
+    const GenericTargetCapabilities &, const SearchPreferences &, size_t limit);
+std::vector<SearchAction> generateSearchActions(const Program &,
+                                                const SearchPreferences & = {});
 std::string canonicalSearchIdentity(const Program &);
-bool runStructuredSearch(const Program &, const SearchOptions &, std::string &error);
-}
+bool runStructuredSearch(const Program &, const SearchOptions &,
+                         std::string &error);
+} // namespace orbit::taskflow
 #endif

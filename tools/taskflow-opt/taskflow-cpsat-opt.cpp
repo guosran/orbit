@@ -4,6 +4,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include <limits>
 #include <stdexcept>
 using namespace orbit::taskflow;
 namespace j = llvm::json;
@@ -63,8 +64,15 @@ int main() {
     ConstraintSearchOptions options;
     if (auto *s = o.getObject("options")) {
       options.wallSeconds = s->getNumber("time_limit_seconds").value_or(1);
-      options.workers = integer(*s, "workers", 1);
-      options.randomSeed = integer(*s, "random_seed", 0);
+      // LLVM JSON retains int64 values; check before narrowing solver controls.
+      const int64_t workers = integer(*s, "workers", 1);
+      const int64_t seed = integer(*s, "random_seed", 0);
+      if (workers < 1 || workers > 16 || seed < 0 ||
+          seed > std::numeric_limits<int>::max())
+        throw std::runtime_error(
+            "workers must be in [1,16] and random_seed in [0,INT_MAX]");
+      options.workers = static_cast<int>(workers);
+      options.randomSeed = static_cast<int>(seed);
       options.maxVariables = integer(*s, "max_variables", 100000);
       options.maxConstraints = integer(*s, "max_constraints", 500000);
       options.maxPatterns = integer(*s, "max_patterns", 20000);

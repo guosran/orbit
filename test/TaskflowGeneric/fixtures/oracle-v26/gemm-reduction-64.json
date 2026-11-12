@@ -1,0 +1,306 @@
+{
+  "generic_air": {
+    "capacity_bytes": 24576,
+    "cost_model": {
+      "kind": "event-mechanism",
+      "schema": "orbit.direct-air.cost.v1",
+      "mode": "estimate",
+      "model_id": "v25-cli-contract",
+      "implementations": [
+        "scalar"
+      ],
+      "boundary": "one-invocation",
+      "parameters": {
+        "compute.startup": {
+          "value": 4,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "compute.operation": {
+          "value": 1,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "compute.memory_access": {
+          "value": 0.5,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "configuration.startup": {
+          "value": 1000,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.submit": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.complete": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "host.visibility": {
+          "value": 10,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "communication.startup": {
+          "value": 100,
+          "unit": "ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        },
+        "communication.bandwidth": {
+          "value": 8,
+          "unit": "bytes/ns",
+          "provenance": {
+            "kind": "assumed",
+            "source": "v25 CLI synthetic contract"
+          }
+        }
+      }
+    }
+  },
+  "native_auto_candidates": {
+    "mode": "joint",
+    "algorithm": "cp-sat-all"
+  },
+  "program_search": {
+    "seconds": 600,
+    "max_evaluations": 20000,
+    "max_variables": 100000,
+    "max_constraints": 500000,
+    "max_values_per_dimension": 16,
+    "max_routes": 2,
+    "max_priorities": 2,
+    "max_full_evaluations": 8,
+    "dimensions": [
+      {
+        "id": "source.fission",
+        "choices": [
+          {
+            "fission": false
+          },
+          {
+            "fission": true
+          }
+        ]
+      },
+      {
+        "id": "source.initialization",
+        "choices": [
+          {
+            "distribute": true
+          }
+        ]
+      },
+      {
+        "id": "tiling.m",
+        "choices": [
+          {
+            "tile_axis": 0,
+            "tile": 2
+          },
+          {
+            "tile_axis": 0,
+            "tile": 4
+          }
+        ]
+      },
+      {
+        "id": "tiling.n",
+        "choices": [
+          {
+            "tile_axis": 1,
+            "tile": 2
+          },
+          {
+            "tile_axis": 1,
+            "tile": 4
+          }
+        ]
+      },
+      {
+        "id": "tiling.k",
+        "choices": [
+          {
+            "tile_axis": 2,
+            "tile": 4
+          },
+          {
+            "tile_axis": 2,
+            "tile": 8
+          }
+        ]
+      },
+      {
+        "id": "implementation",
+        "choices": [
+          {
+            "implementation": "scalar",
+            "lanes": 1
+          }
+        ]
+      },
+      {
+        "id": "fusion.residency.traversal",
+        "choices": [
+          {
+            "mapping": {
+              "data_organization": "phase-local",
+              "grouping": "task-shape-stages",
+              "groups": [],
+              "panel_loop": -1,
+              "residency": "phase-local",
+              "reuse_loop": -1,
+              "storage": -1
+            }
+          }
+        ]
+      },
+      {
+        "id": "replica.partition",
+        "choices": [
+          {
+            "partition": 0
+          }
+        ]
+      },
+      {
+        "id": "copies.retention",
+        "choices": [
+          {
+            "policy": "phase-local"
+          },
+          {
+            "policy": "retain-across-users"
+          }
+        ]
+      },
+      {
+        "id": "data.regions",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "dependencies.implementation_serialization",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "buffering.slots",
+        "choices": [
+          {
+            "reuse_slots": false
+          },
+          {
+            "reuse_slots": true
+          }
+        ]
+      },
+      {
+        "id": "task.0.resource",
+        "choices": [
+          {
+            "resource": "npu.compute",
+            "task": 0
+          }
+        ]
+      },
+      {
+        "id": "task.0.memory",
+        "choices": [
+          {
+            "memory": "aie_l1",
+            "task": 0
+          }
+        ]
+      },
+      {
+        "id": "task.0.count",
+        "choices": [
+          {
+            "resource_count": 1,
+            "task": 0
+          }
+        ]
+      },
+      {
+        "id": "task.0.shape",
+        "choices": [
+          {
+            "resource_shape": [],
+            "task": 0
+          }
+        ]
+      },
+      {
+        "id": "task.0.data.0.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.0.data.1.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.0.data.2.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "task.1.data.2.route",
+        "choices": [
+          null
+        ]
+      },
+      {
+        "id": "temporal.priority",
+        "choices": [
+          {
+            "priority": [
+              0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "layout.dtype",
+        "choices": [
+          null
+        ]
+      }
+    ]
+  }
+}

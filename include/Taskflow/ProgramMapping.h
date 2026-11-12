@@ -1,11 +1,11 @@
 #ifndef ORBIT_TASKFLOW_PROGRAM_MAPPING_H
 #define ORBIT_TASKFLOW_PROGRAM_MAPPING_H
-#include "Taskflow/StaticMapping.h"
 #include "Taskflow/ComputeEstimate.h"
 #include "Taskflow/GenericAnalysis.h"
-#include <optional>
+#include "Taskflow/StaticMapping.h"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 namespace orbit::taskflow {
@@ -36,11 +36,12 @@ struct ProgramExecutionGroup {
   std::vector<size_t> memberEvents;
   std::string spatialOwner;
   // Source/control dependencies and target implementation serialization are
-  // separate decisions. Both constrain execution; only dependencies are semantic.
+  // separate decisions. Both constrain execution; only dependencies are
+  // semantic.
   std::vector<size_t> implementationDependencies;
 };
 struct MappingVersion {
-  size_t region = 0; // interned exact logical cell, arbitrary rank
+  size_t region = 0;     // interned exact logical cell, arbitrary rank
   int64_t producer = -1; // event, -1 is a declared initial input
 };
 struct MappingCopy {
@@ -84,15 +85,26 @@ struct MappingTaskPlacement {
   int64_t resourceCount = 1;
   std::vector<int64_t> resourceShape;
 };
+// Explicit source-copy and ordered link selection for a source storage demand.
+// Applies to every exact cell read by consumerTask at targetMemory. An empty
+// path is an explicit local-copy selection and requires equal endpoints.
+// Output export uses consumerTask == source task count (the boundary consumer).
+struct ProgramTransferChoice {
+  size_t storage = 0, consumerTask = 0;
+  std::string targetMemory, sourceMemory;
+  std::vector<std::string> links;
+};
 struct ProgramDataOrganizationChoice {
   ProgramDataPolicy policy = ProgramDataPolicy::PhaseLocal;
   std::vector<MappingTaskPlacement> placements;
+  std::vector<ProgramTransferChoice> transferChoices;
   std::vector<MappingComputeEstimate> computeEstimates;
   std::optional<double> clockMHz;
-  // Opt-in exact rectangular access partition; default preserves full-storage adapter.
+  // Opt-in exact rectangular access partition; default preserves full-storage
+  // adapter.
   bool partitionExactRegions = false;
-  // Keep source/data dependencies only; scheduling priority is chosen separately.
-  // The default preserves historical whole-task serial plans.
+  // Keep source/data dependencies only; scheduling priority is chosen
+  // separately. The default preserves historical whole-task serial plans.
   bool semanticDependenciesOnly = false;
 };
 // A call boundary is shared by all region inputs. Device stages and data
@@ -104,7 +116,8 @@ struct MappingExecutionRegion {
   int64_t submissionCount = 1;
   // Optional whole-program host-call refinement. The endpoint is accessible
   // to the invocation adapter, not implicitly to a device compute core.
-  std::vector<size_t> sourceTasks, memberEvents, inputCopies, outputCopies, predecessorRegions;
+  std::vector<size_t> sourceTasks, memberEvents, inputCopies, outputCopies,
+      predecessorRegions;
   std::string implementation, endpointMemory;
   // Explicit invocation ABI policy, independent of target/device names.
   // Empty is accepted only as the legacy cpu/npu adapter spelling.
@@ -138,7 +151,7 @@ struct MappingScheduledEvent {
 };
 struct MappingScheduledConfiguration {
   std::vector<size_t> groups;
-  double startMs=0,endMs=0,setupMs=0;
+  double startMs = 0, endMs = 0, setupMs = 0;
 };
 struct MappingGraphSchedule {
   // A conservative serial realization of the dependency/resource partial
@@ -163,7 +176,7 @@ struct ProgramGraph {
   std::vector<MappingTaskInstance> instances;
   MappingGraphSchedule schedule;
   std::string allocationLifetime = "copy-events";
-  std::map<size_t,std::string> inputLocations, outputLocations;
+  std::map<size_t, std::string> inputLocations, outputLocations;
   std::vector<MappingExecutionRegion> executionRegions;
   std::vector<MappingRegionEvent> regionEvents;
   std::vector<ProgramExecutionGroup> executionGroups;
@@ -187,7 +200,7 @@ struct ProgramGraph {
   std::optional<double> clockMHz;
   std::optional<double> estimatedMakespanMs;
   int64_t transferBytes = 0;
-  std::map<std::string,int64_t> peakMemoryBytes;
+  std::map<std::string, int64_t> peakMemoryBytes;
 };
 using ProgramCommunicationPlan = ProgramGraph;
 struct GenericAnalysis;
@@ -198,6 +211,9 @@ bool finalizeProgramGraph(const GenericAnalysis &, ProgramGraph &,
                           const GenericMappingPlan *native, std::string &error);
 // Independent common validation; adapter checkers additionally prove their
 // supported source-region and backend realization correspondence.
+// Recompute only the public schedule witness from existing events, resources
+// and costs. Does not reconstruct source instances, groups or allocations.
+bool refreshProgramGraphSchedule(ProgramGraph &, std::string &error);
 bool checkProgramGraph(const ProgramGraph &, std::string &error);
 bool checkProgramResourceSchedule(const ProgramGraph &, std::string &error);
 bool checkProgramGraphSource(const GenericAnalysis &, const ProgramGraph &,
@@ -210,24 +226,35 @@ struct ProgramBufferOrdering {
 };
 bool programAllocationIsSlot(const ProgramGraph &, size_t allocation);
 bool collectProgramBufferOrdering(const ProgramGraph &,
-    std::vector<ProgramBufferOrdering> &, std::string &error);
+                                  std::vector<ProgramBufferOrdering> &,
+                                  std::string &error);
+// Search materialization over an existing source-bound instance/version graph.
+// Structural transforms/tiling/implementation come from the native generator;
+// placements, copies, multi-hop routes and lifetimes use the common objects.
+bool rebindProgramGraph(const ProgramGraph &, const StaticConfig &,
+                        const ProgramDataOrganizationChoice &, ProgramGraph &,
+                        std::string &error);
 llvm::json::Value serializeProgramGraph(const ProgramGraph &);
 std::string programGraphIdentity(const ProgramGraph &);
 std::string renderProgramGraphDOT(const ProgramGraph &);
 llvm::json::Value summarizeProgramGraphCost(const ProgramGraph &);
 bool parseWholeTaskProgramGraphConfig(const llvm::json::Value &, StaticConfig &,
-    ProgramDataOrganizationChoice &, std::string &error);
+                                      ProgramDataOrganizationChoice &,
+                                      std::string &error);
 bool buildProgramCommunication(const GenericAnalysis &, GenericMappingPlan &,
                                std::string &error);
 bool checkProgramCommunication(const GenericAnalysis &,
                                const GenericMappingPlan &, std::string &error);
 llvm::json::Value serializeProgramCommunication(const GenericMappingPlan &);
-llvm::json::Value serializeProgramCommunication(const ProgramCommunicationPlan &);
+llvm::json::Value
+serializeProgramCommunication(const ProgramCommunicationPlan &);
 bool planProgramDataOrganization(const GenericAnalysis &, const StaticConfig &,
-    const ProgramDataOrganizationChoice &, ProgramCommunicationPlan &,
-    std::string &error);
+                                 const ProgramDataOrganizationChoice &,
+                                 ProgramCommunicationPlan &,
+                                 std::string &error);
 bool checkProgramDataOrganization(const GenericAnalysis &, const StaticConfig &,
-    const ProgramDataOrganizationChoice &, const ProgramCommunicationPlan &,
-    std::string &error);
+                                  const ProgramDataOrganizationChoice &,
+                                  const ProgramCommunicationPlan &,
+                                  std::string &error);
 } // namespace orbit::taskflow
 #endif
