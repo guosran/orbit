@@ -268,6 +268,69 @@ int main(int argc, char **argv) {
             "foreign receipt or invalid price cannot produce an incumbent or "
             "optimum");
   }
+  // Mapping and public copy decisions are independent explicit controls. A
+  // null copy choice inherits the selected native whole-program policy, while
+  // an explicit phase-local choice must not be silently overwritten.
+  for (int policy = 0; policy < 3; ++policy) {
+    auto wholeConfiguration = config;
+    j::Array wholeDimensions;
+    for (const auto &value : *space.getAsObject()->getArray("dimensions")) {
+      const auto &dimension = *value.getAsObject();
+      auto id = dimension.getString("id")->str();
+      j::Value binding = nullptr;
+      if (id == "fusion.residency.traversal")
+        binding = j::Object{
+            {"mapping",
+             j::Object{{"residency", "whole-program"},
+                       {"data_organization", "retain-across-users"}}}};
+      else if (id == "copies.retention" && policy)
+        binding = j::Object{
+            {"policy", policy == 1 ? "retain-across-users" : "phase-local"}};
+      else if (id.rfind("device.task.", 0) == 0)
+        binding = j::Object{{"task", int64_t(std::stoll(id.substr(12)))},
+                            {"device", "npu"}};
+      wholeDimensions.push_back(
+          j::Object{{"id", id}, {"choices", j::Array{std::move(binding)}}});
+    }
+    auto *wholeSearch =
+        wholeConfiguration.getAsObject()->getObject("program_search");
+    (*wholeSearch)["dimensions"] = std::move(wholeDimensions);
+    (*wholeSearch)["max_evaluations"] = 1;
+    options.outputDir =
+        directory.str().str() + "/whole-policy-" + std::to_string(policy);
+    int callbacks = 0;
+    auto wholeEvaluator = [&](const ProgramAllHeterogeneousCandidate &actual) {
+      ++callbacks;
+      bool matches =
+          actual.regions.size() == 1 && actual.regions[0].hasNativePlan;
+      for (const auto &region : actual.regions) {
+        GenericAnalysis child;
+        GenericMappingPlan direct;
+        matches &= analyzeGenericProgram(*region.source, child, error) &&
+                   planGenericMapping(child, j::Object{}, direct, error) &&
+                   direct.choices.residency == "whole-program" &&
+                   region.selectedGraph.dataPolicy ==
+                       ProgramDataPolicy::RetainAcrossUsers &&
+                   programGraphIdentity(direct.communication) ==
+                       programGraphIdentity(region.selectedGraph);
+      }
+      require(matches, "selected whole-program graph equals independently "
+                       "planned native witness");
+      return evaluate(actual);
+    };
+    require(
+        runProgramAllSearch((*input)->getBuffer(), options, wholeConfiguration,
+                            error, wholeEvaluator),
+        "whole-program inheritance search completes without weakening checker");
+    auto row = read(options.outputDir + "/search.json");
+    const auto *result = row.getAsObject();
+    require(policy == 2
+                ? (!callbacks && result->getBoolean("has_best") == false &&
+                   result->getInteger("unknown_feasibility_evaluations") == 1)
+                : (callbacks == 1 && result->getBoolean("has_best") == true),
+            "null and explicit retained policy preserve native graph; explicit "
+            "phase policy stays checked");
+  }
   llvm::outs() << "program all heterogeneous checks: " << checks << "\n";
   return ok ? 0 : 1;
 }

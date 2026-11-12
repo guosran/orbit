@@ -8,13 +8,41 @@ The public target tables previously applied NPU resource/memory/count/shape/rout
 
 The repaired tables include the actual device-property writer and admit every relation for CPU choices. NPU choices retain the original checks. Looking up the property writer also handles custom dimension IDs. The end-to-end `program-all-inactive-bindings.cpp` contract uses real checked source/CPU child graphs, an intentionally excessive NPU resource count, a mismatched shape and an unbound NPU route. Both standard and custom device IDs must preserve the CPU candidate and exclude the active incompatible NPU choice. The test uses an explicitly assumed seven-unit complete-cost oracle; it makes no hardware calibration claim. The custom writer also changes a different task to NPU: a choice that does not write the current task must leave that task's CPU default inactive. The unified ON build passes eight checks, and the existing combined search contract passes 36 checks.
 
+## Selected-native policy inheritance repair (r12)
+
+A null `copies.retention` binding now inherits the data policy of the selected
+canonical native mapping. Previously a selected whole-program/retained mapping
+could retain the old phase-local public default, trigger an unnecessary
+whole-task rebind, and fail the unchanged native execution-group witness check.
+Explicit public policies still override inheritance and must pass the same
+checks; incompatible refinements remain unknown. Native-public frozen replay
+uses the same initialization rule before explicit policy decoding.
+
+The ON/OFF combined contract passes 46/37 checks, including independent native
+graph identity comparison for null and explicit retained choices and rejection
+of the incompatible explicit phase-local choice. Public frozen replay passes
+ten cases, including the complete whole-program graph and timing identity. A
+real MLP2 selected whole-program graph independently re-exports with the same
+parent and child IDs as the earlier direct export; this repairs materialization,
+not the cost coverage or hardware-optimality boundary.
+
+This does **not** add reduction-aware tile-major grouping. First-layer
+matmul/initializer/rounding retention and two such scopes in the MLP still hit
+`instance ordering has unproven cross-tile dependence`. The grouping code also
+has pointwise-only read/write, initializer/retention, writer-count and matching
+instance-domain requirements. Those proofs must be extended together before
+such a binding can be called executable. The probes correctly return UNKNOWN,
+not source-wide mathematical infeasibility; their predicted three/two physical
+configuration counts are not established. Whole-program residency and legal
+existing ungrouped tiled paths remain separate supported realizations.
+
 ## Existing dimensions and their current execution boundary
 
 | Choice family | Generated/materialized today | Boundary that prevents an unrestricted optimum claim |
 |---|---|---|
 | Source fission / initialization | Existing legality-aware source actions, one Boolean each | These are registered transforms, not all possible legal source partitions or transformations. Source-changing choices also need matching cost calibration. |
 | M/N/K tiling | Native phase adapter; current/full, approximately half, and one by default, or explicit positive tile domains | The automatic list is representative rather than all integer tilings. Source-instance limits can return unknown. Whole-task adapter cannot consume native tiles. |
-| Fusion / residency / traversal | `discoverGenericMappingChoices` and `ProgramMappingChoice` | The catalogue proposes local source-derived scopes and extensions of existing groups, not every disjoint grouping. Explicit domains define the proof scope. |
+| Fusion / residency / traversal | `discoverGenericMappingChoices` and `ProgramMappingChoice` | The catalogue proposes local source-derived scopes and extensions of existing groups, not every disjoint grouping. Tile-major scoped retention is pointwise-only; matrix/reduction + initializer/bridge groups need additional proofs and remain unknown. Explicit domains define the proof scope. |
 | Implementation | Module policy plus strict per-original-task native kind/lanes choices; lineage expansion and regional index projection | Typed local overrides are independently checked and realized in graph/AIR. CPU selectors are inactive; generated fills remain scalar. Matrix requires the explicit BF16 source numerical contract and supported tiles. Mixed local assignments need implementation-resolved work calibration; missing coverage remains unknown. |
 | Partition / replicas | Checked source-axis templates | Complete host slicing, assembly and invocation control are unpriced in the noncombined branch; the combined CPU/NPU builder explicitly returns unknown for partition refinement. Partition alone implies no concurrent execution. |
 | Retention / regions / slots | Public copy policies, exact region graph and slot aliases | Native regions/dependencies are derived; a graph-only rebind need not have a physical native witness. Direct AIR uses packed nonoverlapping static slices, not arbitrary lifetime packing. |

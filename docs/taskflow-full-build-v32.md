@@ -118,3 +118,54 @@ byte-hash summaries are in
 and scope are recorded in
 `/tmp/orbit-runtime-compatibility-checkpoint-r1.json`. These parser/CPU results
 do not extend any frozen hardware measurement's provenance to a newer tool.
+
+
+## r12 selected-native retention inheritance increment
+
+A whole-program mapping selected through public search previously left a null
+`copies.retention` binding at the pre-selection phase-local default. That
+mismatch forced an unnecessary whole-task graph rebind, and the unchanged
+native witness checker correctly rejected its replacement execution groups.
+The decoder now inherits the selected canonical native mapping's data policy
+only when no explicit public copy policy was supplied. Explicit phase-local or
+retained policies remain authoritative and checked. Native-public frozen replay
+initializes the same inherited policy before consuming explicit overrides.
+No group checks or graph identities were weakened.
+
+The narrow increment passed `check-taskflow-program-all-heterogeneous` and
+`check-taskflow-public-search` in both independent build trees: combined typed
+contracts 46/37 (ON/OFF), search 29/8, beam 17/17, routing 27/27, public graph
+42/42, mechanism 77/77, public CLI 30/29, identity 8/8 and frozen replay 10/10.
+The new typed cases compare the selected whole-program graph with an
+independently planned native witness, cover null and explicit retained policy,
+and keep an incompatible explicit phase-local request unknown. The replay case
+checks both the complete graph and timing identity. Logs are
+`/tmp/orbit-whole-program-search-build-{on,off}-r3.log`. These are targeted
+incremental tests, not another run of the earlier complete default-all suite.
+
+The exclusively assigned root CLI was rebuilt with
+`ninja -C /tmp/orbit-joint-v23-build -j2 taskflow-opt` and frozen at
+`/tmp/orbit-v32-native-policy-r12/taskflow-opt`, SHA256
+`3616f1ae32734e74df37dfe9fb228b7f0b35a9f864a7455f2e321834839aef1c`.
+Its source/provenance receipt is
+`/tmp/orbit-v32-native-policy-r12/freeze.json`; the final build log is
+`/tmp/orbit-whole-program-search-quickbuild-r12-final.log`. The frozen tool also
+passed all ten public replay cases.
+
+A CPU-only real MLP2 singleton search now exports the selected whole-program
+plan as one physical configuration. Independent direct export of its frozen
+`best.mlir` and the earlier r10 direct export have exactly the same parent ID
+`2bb3958acf05bd1eca4d1a0a24f6b25d78b4cf9ff880fba723e68a4dd7d81207`
+and child ID
+`59b084acaaf4cd9deefdea7ac490174c5954b88ae752bc036e32b3ea94eb6501`.
+Evidence is `/tmp/orbit-mlp-mapping-r12-validation/whole` and the frozen-tool
+recheck `/tmp/orbit-v32-native-policy-r12/whole-mlp-search`. No device was used
+for these checks and no r10 price was imported as a new calibration.
+
+The proposed first-pair and two-pair MLP retention groups remain unsupported:
+the native tile-major adapter requires closed pointwise scopes and rejects
+unproved reduction/cross-tile dependence. Both CPU probes retained UNKNOWN with
+`feasibility_known=false`; no three/two-configuration result was manufactured.
+Evidence is `/tmp/orbit-mlp-mapping-r12-validation/{retain-first,retain-pairs}`.
+New r12 hardware/calibration work and its rectangular-source fallback are
+separate evidence, not a consequence of this parser/search CPU checkpoint.

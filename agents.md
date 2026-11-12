@@ -1976,3 +1976,41 @@ The r9 calibration is not relabeled as r10 calibration. This closes the fixed
 MLP2 numerical/paired-execution validation, not all-dimension joint search,
 full abstraction optimality or arbitrary-depth MLP support. Reports:
 `docs/taskflow-bf16-rne-v32.md`, `docs/taskflow-npu-mlp-r10-v32.md`.
+
+
+### v32 r12 native policy inheritance CPU checkpoint
+
+Public all-search now treats null copies.retention as inheritance from the
+selected canonical native mapping, rather than the pre-selection phase-local
+public default. Explicit policy bindings are still checked and never silently
+overwritten. This fixes whole-program choices that unnecessarily rebound the
+native graph and correctly failed its execution-group witness. Native-public
+replay starts from the same selected native policy. No checker/group guard or
+graph ID was bypassed.
+
+ON/OFF targeted combined tests pass 46/37; public search/replay targets pass,
+including 10 exact frozen graph/timing replay cases. LLVM23 format check passes
+for the modified C++ files; no formatting changes were needed for this final
+documentation checkpoint. Build/test logs:
+`/tmp/orbit-whole-program-search-build-{on,off}-r3.log`.
+The root CLI final rebuild is recorded in
+`/tmp/orbit-whole-program-search-quickbuild-r12-final.log`.
+Frozen tool `/tmp/orbit-v32-native-policy-r12/taskflow-opt` has SHA256
+`3616f1ae32734e74df37dfe9fb228b7f0b35a9f864a7455f2e321834839aef1c`;
+its freeze.json records source hashes and the then-uncommitted narrow fix.
+
+The real MLP2 whole-program singleton exports 1 physical configuration and
+matches the r10 direct-export parent/child graph IDs. Re-export of its frozen
+best.mlir independently matches both IDs; no device was run for these CPU
+checks. Receipts remain in `/tmp/orbit-mlp-mapping-r12-validation/whole` and
+`/tmp/orbit-v32-native-policy-r12/whole-mlp-search`.
+
+Do not claim the proposed grouped-retention holdouts executable: first/pairs
+matmul+bridge groups still return UNKNOWN with feasibility_known=false at the
+pointwise dependence guard. Supporting reductions requires additional scoped
+proofs, not removal of one guard. No 3/2 configuration count is established for
+those probes. Root's r12 rectangular-source campaign uses new frozen evidence;
+its compilation/measurement/model status is separate and is not inferred here.
+The r10 calibration/hardware record is not relabelled as r12 evidence. Relevant
+scope and CPU validation are in docs/taskflow-public-search-scope-v32.md and
+docs/taskflow-full-build-v32.md.

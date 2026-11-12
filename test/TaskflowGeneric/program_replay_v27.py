@@ -31,5 +31,17 @@ def main():
   assert len(domains[index]['choices'])>1
   bad=copy.deepcopy(baseline['assignment']);bad[index]=1
   replay('reject-wrong-'+name,assn=edited('bad-'+name+'-assignment.json',bad),passed=False)
- print(json.dumps(dict(status='passed',cases=9,hardware_executed=False)))
+ # Freeze a whole-program native mapping while leaving public copy retention
+ # null. Replay must inherit the chosen native policy, not the old phase default.
+ whole_cfg=copy.deepcopy(cfg)
+ whole_cfg['program_search']['dimensions']=[dict(id=v['id'],choices=[
+  dict(mapping=dict(residency='whole-program',data_organization='retain-across-users'))
+  if v['id']=='fusion.residency.traversal' else None]) for v in domains]
+ whole_config=edited('whole-config.json',whole_cfg);whole_search=d/'whole-search'
+ q=run([a.tool,source,'--search','--backend=air','--target-config='+str(whole_config),'--search-output='+str(whole_search)]);assert q.returncode==0,q.stderr
+ whole=json.loads((whole_search/'baseline.json').read_text())
+ assert whole['evaluation']['program_graph']['ledger']['data_organization']=='retain-across-users',whole['evaluation']['program_graph']
+ replay('whole-null-retention',source=whole_search/'candidate-0/taskflow.mlir',cfg=whole_config,ev=edited('whole-evaluation.json',whole['evaluation']),assn=edited('whole-assignment.json',whole['assignment']),sp=whole_search/'space.json')
+ assert json.loads((d/'whole-null-retention.json').read_text())['graph_id']==whole['evaluation']['graph_id']
+ print(json.dumps(dict(status='passed',cases=10,hardware_executed=False)))
 if __name__=='__main__':main()

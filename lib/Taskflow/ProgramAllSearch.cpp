@@ -1497,7 +1497,7 @@ bool orbit::taskflow::runProgramAllSearch(
       auto choice = baseChoice;
       std::vector<int64_t> tile(3, 0), order(facts.tasks.size());
       std::iota(order.begin(), order.end(), 0);
-      bool reuse = false;
+      bool reuse = false, explicitCopyPolicy = false;
       int64_t partition = 0;
       std::string impl;
       int64_t lanes = 1;
@@ -1608,11 +1608,13 @@ bool orbit::taskflow::runProgramAllSearch(
         if (auto before = b->getInteger("before_task"))
           if (b->getBoolean("cut").value_or(false))
             deviceChoice.cuts.push_back(*before);
-        if (auto x = b->getString("policy"))
+        if (auto x = b->getString("policy")) {
+          explicitCopyPolicy = true;
           if (!parseProgramDataPolicy(*x, choice.policy, why)) {
             out.message = why;
             return out;
           }
+        }
         if (auto x = b->getBoolean("reuse_slots"))
           reuse = *x;
         if (auto x = b->getBoolean("partition_exact_regions"))
@@ -1771,6 +1773,17 @@ bool orbit::taskflow::runProgramAllSearch(
       order = std::move(expandedOrder);
       ProgramMappingChoice inheritedMapping;
       if (!whole && !readNativeMappingChoice(*module, inheritedMapping, why)) {
+        out.message = why;
+        return out;
+      }
+      // A null public retention binding inherits the selected native mapping,
+      // not the phase-local policy from before the mapping decision. Otherwise
+      // a whole-program selection is needlessly rebuilt by the whole-task
+      // adapter, replacing the native execution-group witness. An explicitly
+      // selected public policy remains authoritative and must still be checked.
+      if (!whole && !explicitCopyPolicy &&
+          !parseProgramDataPolicy(inheritedMapping.dataOrganization,
+                                  choice.policy, why)) {
         out.message = why;
         return out;
       }
@@ -2413,6 +2426,9 @@ bool orbit::taskflow::replayPublicProgramGraph(
     return fail(error, "frozen native witness does not match materialized "
                        "source and target reconstruction");
   ProgramDataOrganizationChoice choice;
+  // Match the search decoder's null-copy inheritance before replaying any
+  // explicit policy override. The source already contains the frozen mapping.
+  choice.policy = native.communication.dataPolicy;
   bool slots = false;
   std::vector<int64_t> order;
   for (auto &p : *expected->getArray("selected_placements")) {
