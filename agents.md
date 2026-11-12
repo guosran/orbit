@@ -1946,3 +1946,33 @@ compatibility reader is being reviewed for a separate compiler revision. Do
 not reuse r9 prices under a different compiler/runtime identity. Raw r9 evidence
 and honest status: docs/taskflow-npu-calibration-r9-v32.md. Complete abstraction
 coverage and MLP hardware/speedup acceptance remain unfinished.
+
+### v32 r10 MLP2 hardware and compatibility checkpoint
+
+Runtime-only generic IR compatibility now structurally removes only the exact
+new-vendor `arith.trunci overflowFlags=#arith.overflow<none>` default before
+pinned registered parsing. Non-default/unknown properties are rejected; other
+operations' flags and metadata survive. Ordinary source parsing and vendor
+files are unchanged. Receipt binds original/normalized text SHA256 plus the
+existing realized-IR SHA. ON/OFF CPU targets and the original real MLP generic
+CLI/AIE verifier passed. Frozen r10 compiler SHA256:
+`0812d28cc6ca271a64e881a76d4f0edc9d0f35fec3b3d5312e308d3484baca03`.
+
+Preparation-r10 completed nine fresh-process runs for fixed MLP2 phase-local
+NPU, whole-program NPU and CPU plans: each process5 warmups+31hot calls,
+324calls total, every original BF16RNE reference check passed. Phase-local
+and whole-program each have one typed NPU region with respectively4 and1
+physical configurations. Median process-hot times are0.798921ms,0.200225ms
+and0.003410ms. The3.990116x ratio uses NPU phase-local as baseline; these
+plans were specified directly, not selected by CP-SAT. CPU remains58.72x
+faster than whole-program NPU. Full-call timing is not pure launch, and the
+contributions of configuration reduction/retention were not separately timed.
+
+Raw measurement-summary/result/manifest evidence remains in
+`/home/shiran/project/orbit-artifact/results/taskflow/full-joint-v32-r1/preparation-r10`.
+Source function bodies are identical; only whole-program module mapping
+metadata differs. Original inputs/RNE reference hashes and tolerance remain.
+The r9 calibration is not relabeled as r10 calibration. This closes the fixed
+MLP2 numerical/paired-execution validation, not all-dimension joint search,
+full abstraction optimality or arbitrary-depth MLP support. Reports:
+`docs/taskflow-bf16-rne-v32.md`, `docs/taskflow-npu-mlp-r10-v32.md`.

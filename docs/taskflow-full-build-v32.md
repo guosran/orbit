@@ -80,3 +80,41 @@ Taskflow source/AIR for that checked gemm16 export, not general device liveness.
 The same-domain SCIP scaling followup is documented separately in
 [the solver scaling note](taskflow-joint-solver-scaling-v32.md). It proves a
 synthetic finite-model optimum and does not supply a hardware speedup claim.
+
+
+## Runtime default-property compatibility increment
+
+The subsequent parser-only compatibility increment completed default-all builds
+in both independent trees. LLVM format 23 check-only validation passed for all
+171 owned Taskflow C++ headers/sources/tests, including the new compatibility
+header and test; no formatting edits were needed. The new unit contract checks
+two exact `arith.trunci` default removals, five negative encodings/promises,
+preservation of unrelated flags and attributes, idempotence, a standard SHA-256
+vector, and acceptance by the registered pinned dialect parser.
+
+The related ON/OFF regression targets all passed: runtime compatibility,
+static runtime (11), fake runtime/lifecycle (19), heterogeneous context/cost
+(56), BF16 RNE and Taskflow core semantics. This increment did not rerun long
+solvers or the entire earlier suite. Commands were `ninja -C BUILD -j2`, then
+`ninja -C BUILD -j2 check-taskflow-runtime-compatibility
+check-taskflow-matrix-runtime-static check-taskflow-bf16-rne
+check-taskflow-heterogeneous-runtime
+check-taskflow-program-all-heterogeneous-cost check-taskflow-core`.
+
+Independent CLI replay used the existing real MLP2 extracted generic IR and
+sealed runtime contract, with fresh outputs for each build. Both tools removed
+exactly two defaults, recorded independently verified input and normalized-byte
+hashes, and emitted the same runtime bytes as the prior checked realization:
+`4bd2c91b46082fa5bc7fd3e679db2879e91993aed4ef61edd9a8dcbb982a4927`.
+A nondefault `nsw` mutation was rejected without writing runtime/proof outputs.
+No vendor compiler or device was invoked, and old raw artifacts were unchanged.
+
+Build and regression logs are
+`/tmp/orbit-runtime-compatibility-{build,regressions}-{on,off}-r1.log`.
+The check-only format manifest is
+`/tmp/orbit-runtime-compatibility-format-all-r1.json`; CLI commands, outputs and
+byte-hash summaries are in
+`/tmp/orbit-runtime-compatibility-validation-r1/{on,off}`. The exact tool hashes
+and scope are recorded in
+`/tmp/orbit-runtime-compatibility-checkpoint-r1.json`. These parser/CPU results
+do not extend any frozen hardware measurement's provenance to a newer tool.

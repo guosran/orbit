@@ -13,6 +13,7 @@
 #include "Taskflow/ProgramMatrixImplementation.h"
 #include "Taskflow/ProgramPartition.h"
 #include "Taskflow/ProgramRegionCompositeCost.h"
+#include "Taskflow/ProgramRuntimeCompatibility.h"
 #include "Taskflow/Search.h"
 #ifdef ORBIT_ENABLE_AIR
 #include "Taskflow/AIRBackend.h"
@@ -302,13 +303,32 @@ int main(int argc, char **argv) {
       return fatal(llvm::toString(contract.takeError()));
     // AIE dialect properties are preserved by generic parsing; installed
     // aie-opt performs the registered dialect verification in the next stage.
+    // Newer vendor Arith prints a default trunci property absent from the
+    // pinned dialect. Normalize only that exact semantic default; preserve
+    // every other operation/property and reject non-default trunci promises.
+    std::string compatibleText;
+    size_t defaultPropertiesRemoved = 0;
+    if (!normalizeProgramRuntimeDefaults(text, compatibleText,
+                                         defaultPropertiesRemoved, error))
+      return fatal(error);
     mlir::ParserConfig parserConfig(&context, /*verifyAfterParse=*/false);
-    auto actual = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
+    auto actual =
+        mlir::parseSourceString<mlir::ModuleOp>(compatibleText, parserConfig);
     mlir::OwningOpRef<mlir::ModuleOp> realized;
     llvm::json::Value proof = nullptr;
     if (!actual || !realizeProgramMatrixRuntime(*contract, *actual, realized,
                                                 proof, error))
       return fatal(error.empty() ? "invalid generic NPU AIE" : error);
+    auto *proofObject = proof.getAsObject();
+    if (!proofObject)
+      return fatal("runtime realization did not return a proof object");
+    (*proofObject)["generic_ir_compatibility"] = llvm::json::Object{
+        {"schema", "orbit.runtime-default-compatibility.v32"},
+        {"input_generic_sha256", programRuntimeTextSHA256(text)},
+        {"normalized_generic_sha256", programRuntimeTextSHA256(compatibleText)},
+        {"trunci_overflow_none_removed", int64_t(defaultPropertiesRemoved)},
+        {"scope", "only exact default trunci overflow property; other flags "
+                  "and operation semantics preserved"}};
     std::error_code ec;
     llvm::raw_fd_ostream out(airOutput, ec);
     if (ec)

@@ -361,3 +361,12 @@ if(ORBIT_ENABLE_AIR)
       --circuit-contract ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/fixtures/matrix-runtime-v32/circuit-relu.contract.json
     DEPENDS taskflow-opt)
 endif()
+
+# Generic IR compatibility is a CPU parser contract, independent of AIR/XRT.
+add_executable(taskflow-runtime-compatibility-test EXCLUDE_FROM_ALL
+  ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program-runtime-compatibility.cpp)
+target_link_libraries(taskflow-runtime-compatibility-test PRIVATE
+  MLIRArithDialect MLIRFuncDialect MLIRParser)
+add_custom_target(check-taskflow-runtime-compatibility
+  COMMAND $<TARGET_FILE:taskflow-runtime-compatibility-test>
+  DEPENDS taskflow-runtime-compatibility-test)
