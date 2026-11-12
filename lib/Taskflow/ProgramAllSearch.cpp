@@ -2361,8 +2361,34 @@ bool orbit::taskflow::runProgramAllSearch(
   r["complete_plan_artifact"] =
       "best.json includes the selected graph and schedule; best.mlir alone "
       "contains only source attributes";
-  r["cost_model_boundary"] = "complete ProgramGraph activity boundary; "
-                             "partition host assembly remains unknown";
+  // The search adapter does not define the provider's runtime boundary. Read
+  // the selected timing receipt: a registered callback or a model schema alone
+  // cannot establish that its complete invocation has been priced.
+  r["cost_model_boundary"] = "unknown: no selected timing boundary receipt";
+  r["cost_model_boundary_scope"] = "selected incumbent receipt";
+  r["cost_model_boundary_priced"] = false;
+  if (solved.hasBest) {
+    const auto *evaluation = solved.bestEvaluation.result.getAsObject();
+    const auto *cost = evaluation;
+    if (heterogeneous && evaluation)
+      cost = evaluation->getObject("cost_evaluation");
+    const auto *timed = cost ? cost->getObject("timing") : nullptr;
+    if (timed) {
+      if (auto boundary = timed->getString("boundary");
+          boundary && !boundary->empty()) {
+        r["cost_model_boundary"] = boundary->str();
+        r["cost_model_boundary_priced"] =
+            solved.bestEvaluation.feasible &&
+            solved.bestEvaluation.feasibilityKnown &&
+            solved.bestEvaluation.costMs.has_value();
+      }
+    } else if (evaluation &&
+               evaluation->getString("status") ==
+                   "uncalibrated-complete-program-host-boundary") {
+      r["cost_model_boundary"] =
+          "unknown: partition host slicing, assembly, and invocation control";
+    }
+  }
   r["scope"] =
       "All supplied public dimensions composed by one branch-and-check master; "
       "source/target capabilities and finite-domain truncation explicit. No "

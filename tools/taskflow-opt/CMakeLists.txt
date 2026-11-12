@@ -210,6 +210,13 @@ if(ORBIT_ENABLE_ORTOOLS)
 else()
   set(ORBIT_PUBLIC_SEARCH_TEST_MODE --solver-off)
 endif()
+set(ORBIT_PUBLIC_SEARCH_BOUNDARY_COMMAND)
+if(ORBIT_ENABLE_AIR)
+  set(ORBIT_PUBLIC_SEARCH_BOUNDARY_COMMAND
+    COMMAND ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_search_boundary_v32.py
+      --tool $<TARGET_FILE:taskflow-opt>)
+endif()
 add_custom_target(check-taskflow-public-search
   COMMAND $<TARGET_FILE:taskflow-program-search-test>
   COMMAND $<TARGET_FILE:taskflow-program-beam-search-test>
@@ -227,9 +234,18 @@ add_custom_target(check-taskflow-public-search
   COMMAND ${Python3_EXECUTABLE}
     ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_replay_v27.py
     --tool $<TARGET_FILE:taskflow-opt> ${ORBIT_PUBLIC_SEARCH_TEST_MODE}
+  ${ORBIT_PUBLIC_SEARCH_BOUNDARY_COMMAND}
   DEPENDS taskflow-opt taskflow-program-search-test taskflow-program-beam-search-test
     taskflow-program-routing-search-test taskflow-program-graph-search-test
     taskflow-program-mechanism-test)
+
+if(ORBIT_ENABLE_AIR)
+  add_custom_target(check-taskflow-public-search-boundary
+    COMMAND ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_search_boundary_v32.py
+      --tool $<TARGET_FILE:taskflow-opt>
+    DEPENDS taskflow-opt)
+endif()
 
 if(ORBIT_ENABLE_AIR)
   add_custom_target(check-taskflow-public-graph-air

@@ -79,3 +79,15 @@ and the tool freeze receipt are recorded in
 `/tmp/orbit-beam-r13-cli-regression-r1/receipt.json`. Together with the independent
 ON/OFF 27-case typed contracts, these verify integration and the exploration
 contract; they do not establish a hardware performance result.
+
+## Metadata correction after the r13 freeze
+
+The r13 frozen CLI's top-level `cost_model_boundary` retained a legacy,
+hard-coded partition-host-assembly warning. The nested typed evaluator receipt
+correctly recorded `prepared-host-to-host: reset, exact serial regions, output
+copy`, including its application control phase. The later source correction
+reads the selected timing receipt and labels that scope explicitly; absent or
+empty receipts remain unknown, and actual partition-template host assembly
+remains unknown. Boundary declaration and whether a checked price is available
+are separate report fields. This metadata-only correction is not present in the
+r13 frozen tool and does not change its original receipts, prices or measurements.
