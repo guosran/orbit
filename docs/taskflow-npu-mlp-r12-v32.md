@@ -65,6 +65,25 @@ review checked all recorded training-input hashes and the model/search hashes
 in `selection-before-validation.json`. Selection was sealed before validation.
 The fitted model is a feature-based phase model, not a complete-plan price table.
 
+## Reproduce the source and numerical inputs
+
+The repository-owned producer requires Python and NumPy, with no compiler or
+board access:
+
+```sh
+python scripts/make-shared-mlp-workload.py --batch 24 --output /tmp/orbit-mlp24-new
+python test/TaskflowGeneric/shared_mlp_workload_v32.py
+```
+
+It emits `source.mlir`, raw BF16 `inputs.npz`, FP32 `reference.npz` and a receipt
+with file/array hashes. The four CPU contract tests use an independent scalar
+FP32/RNE oracle and check source structure, parameters, hashes and overwrite
+protection. An additional comparison against the frozen r12 artifacts verified
+byte-identical source and identical X/W/Y arrays for batches 16, 24 and 32.
+`--width` and `--layers` also generate numerical workloads; they do not certify
+new backend shapes or depths. Formal execution still requires the frozen target
+configuration, compiler/runtime contract and measurement policy described above.
+
 ## Heldout measurements and prediction
 
 Times are hot-call medians in milliseconds. The group target is the median of
