@@ -1,5 +1,6 @@
 #include "Taskflow/ProgramBeamSearch.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <set>
@@ -176,6 +177,112 @@ int main() {
     if (!require(accepted.hasBest && calls == before + 1 &&
                      accepted.status != ConstraintSearchStatus::InvalidInput,
                  "INT_MAX seed accepted with one worker and callback"))
+      return 1;
+  }
+  // Both priced endpoints are separated by checked-feasible unpriced states.
+  // This is a graph-search contract, not an assumed cost for the middle states.
+  options.wallSeconds = 5;
+  auto barrier = binarySpace(4);
+  calls = 0;
+  seen.clear();
+  auto partial = [&](const std::vector<int64_t> &a) {
+    ++calls;
+    seen.insert(a);
+    ProgramSearchEvaluation e;
+    e.feasible = true;
+    const int sum = std::count(a.begin(), a.end(), 1);
+    if (sum == 0 || sum == 4)
+      e.costMs = sum == 0 ? 8. : 2.;
+    return e;
+  };
+  r = searchProgramSpaceBeam(barrier, partial, options, 1, 30);
+  if (!require(r.bestEvaluation.costMs == 2. && calls <= 16 &&
+                   seen.size() == size_t(calls) &&
+                   r.report.getInteger("unknown_expanded").value_or(0) > 0 &&
+                   r.report.getBoolean("finite_domain_optimality_proved") ==
+                       false,
+               "bounded unpriced FIFO crosses a multi-step pricing barrier"))
+    return 1;
+  bool nullObserved = false;
+  for (const auto &entry : *r.report.getArray("evaluation_trace")) {
+    const auto *row = entry.getAsObject();
+    if (!row->getNumber("cost_ms"))
+      nullObserved = true;
+  }
+  if (!require(nullObserved,
+               "unpriced callbacks retain null costs in evidence"))
+    return 1;
+  ProgramBeamExplorationOptions disabled;
+  disabled.unknownSlots = 0;
+  calls = 0;
+  r = searchProgramSpaceBeam(barrier, partial, options, 1, 30, 0, disabled);
+  if (!require(r.bestEvaluation.costMs == 8. && calls == 5,
+               "disabled exploration reproduces the scored-only barrier"))
+    return 1;
+  ProgramBeamExplorationOptions bounded;
+  bounded.maxPendingStates = 1;
+  options.maxEvaluations = 6;
+  calls = 0;
+  r = searchProgramSpaceBeam(barrier, partial, options, 1, 30, 0, bounded);
+  if (!require(calls <= 6 && r.report.getInteger("unknown_pending_peak") == 1 &&
+                   r.report.getInteger("unknown_frontier_dropped").value_or(0) >
+                       0,
+               "frontier memory and evaluator quotas remain bounded"))
+    return 1;
+  options.maxEvaluations = 2048;
+  for (bool unknownFeasibility : {false, true}) {
+    calls = 0;
+    r = searchProgramSpaceBeam(
+        barrier,
+        [&](const std::vector<int64_t> &a) {
+          ++calls;
+          ProgramSearchEvaluation e;
+          const bool baseline = std::count(a.begin(), a.end(), 1) == 0;
+          e.feasible = baseline || unknownFeasibility;
+          e.feasibilityKnown = baseline || !unknownFeasibility;
+          if (baseline)
+            e.costMs = 8.;
+          return e;
+        },
+        options, 1, 30);
+    if (!require(
+            calls == 5 && r.report.getInteger("unknown_enqueued") == 0,
+            "unknown feasibility and infeasible states never enter frontier"))
+      return 1;
+  }
+  auto fairSpace = binarySpace(3);
+  ProgramSearchConstraint fork;
+  fork.dimensions = {0, 1, 2};
+  fork.allowedTuples = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0},
+                        {0, 0, 1}, {0, 1, 1}, {1, 1, 1}};
+  fairSpace.constraints.push_back(std::move(fork));
+  r = searchProgramSpaceBeam(
+      fairSpace,
+      [](const std::vector<int64_t> &a) {
+        ProgramSearchEvaluation e;
+        e.feasible = true;
+        if (!a[2])
+          e.costMs = a[1] ? 1. : (a[0] ? 4. : 8.);
+        return e;
+      },
+      options, 1, 3);
+  const auto *fairHistory = r.report.getArray("beam_selection_history");
+  const auto *selected = (*fairHistory)[2].getAsObject()->getArray("selected");
+  const auto *selectedAssignment =
+      (*selected)[0].getAsObject()->getArray("assignment");
+  if (!require(
+          r.bestEvaluation.costMs == 1. &&
+              (*selectedAssignment)[0].getAsInteger() == 1 &&
+              (*selectedAssignment)[2].getAsInteger() == 0,
+          "width-one FIFO preserves and fairly schedules pending priced work"))
+    return 1;
+  for (auto bad : {ProgramBeamExplorationOptions{-1, 256},
+                   ProgramBeamExplorationOptions{2, 256},
+                   ProgramBeamExplorationOptions{1, -1}}) {
+    calls = 0;
+    r = searchProgramSpaceBeam(barrier, partial, options, 1, 30, 0, bad);
+    if (!require(r.status == ConstraintSearchStatus::InvalidInput && calls == 0,
+                 "invalid exploration bounds rejected before callback"))
       return 1;
   }
   llvm::outs() << "{\"status\":\"passed\",\"checks\":" << checks << "}\n";
