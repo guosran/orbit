@@ -2014,3 +2014,43 @@ its compilation/measurement/model status is separate and is not inferred here.
 The r10 calibration/hardware record is not relabelled as r12 evidence. Relevant
 scope and CPU validation are in docs/taskflow-public-search-scope-v32.md and
 docs/taskflow-full-build-v32.md.
+
+### v32 r12 rectangular MLP calibration and finite native search
+
+Preparation-r12 completed33 fresh-process measurements, each5 warmups+31hot:
+1188calls across7 training and4 heldout designs, all original RNE numeric checks
+passed. Independent saved-output review found max absolute error0 and exact
+exclusive phase sum=wall_ns for every call. Batch16/32 train; batch24 holdout.
+Source/feature/compiled parent and ordered-child identities match. Training input
+hashes pass and contain no batch24 measurements; selected model/search artifacts
+were sealed before opening validation labels. Model SHA256:
+`1605c8c6200cc8df463dcf553d2fad59000c5839f1b2a86dad7cee35a13d6837`.
+Compiler remains frozen3616f1ae32734e74df37dfe9fb228b7f0b35a9f864a7455f2e321834839aef1c.
+
+Heldout batch24 group medians: NPUphase8 2.295797ms, phase24 baseline0.774212ms,
+whole0.195105ms, CPU0.004310ms. Group median prediction error3.649400%, p90
+8.829106%, complete4/4 coverage; individual process-row error targets differ.
+NPUphase24/whole speedup3.968181x; CPU remains45.268x faster than NPUwhole.
+NPU CP searches exactly3 declared native choices, statusOPTIMAL in that frozen
+model domain,458.514ms total/4.526ms CP solve, selectswhole. Beam selects the
+samewhole in334.098ms. This is not CP-exclusive speedup or full abstraction
+optimality. CPU/NPU CP checks48 feasible assignments with42unknown costs,
+selectsCPU in4888.451ms but onlyFEASIBLE; beam checks15 with12unknown costs,
+retainswhole in1657.718ms. Unpriced mixed regions prevent full-domain proof.
+
+Evidence:
+`/home/shiran/project/orbit-artifact/results/taskflow/full-joint-v32-r1/preparation-r12`.
+Report: `docs/taskflow-npu-mlp-r12-v32.md`. Main1188call campaign remains separate
+from additional true-selected-export compilation/device replay; replay is not
+training or heldout data. No old frozen evidence was overwritten.
+
+R12 true-selected-export replay is also complete: the search-selected NPU and
+CPU manifests were independently compiled with exactly matching plan ID,
+parent and ordered-child IDs, then measured alongside the NPU phase24 baseline.
+Nine fresh processes/324 additional calls all pass; saved arrays independently
+match RNE exactly and every phase sum matches wall_ns. Baseline/whole/CPU group
+medians are0.805942/0.195345/0.004250ms, respectively. Replay NPU ratio4.125737x
+is supplementary; do not replace the main campaign3.968181x with the larger
+ratio. Both rounds show about4x against the declared NPU baseline. Total1512
+calls; replay is not fitting/heldout/tuning data. Raw replay summary remains
+`preparation-r12/selected-replay/summary.json` under the evidence root above.
