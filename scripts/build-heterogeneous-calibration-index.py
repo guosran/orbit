@@ -41,6 +41,60 @@ def absolute(p, base):
 def seal(p):
     return {'path': str(p), 'sha256': sha(p)}
 
+def explicit_case_designs(cases, base):
+    """Seal source/typed-witness designs without opening measurement labels.
+
+    Process IDs, paths and shape labels cannot make a shared typed witness an
+    independent holdout design. Repeated processes within one split are legal.
+    """
+    records = {}
+    witness_splits = {}
+    for case in cases:
+        require(type(case['shape']) is int and case['shape'] > 0,
+                'explicit design shape must be a positive integer')
+        design = case.get('design')
+        require(type(design) is dict and
+                set(design) == {'source', 'parent_graph_id', 'region_graph_ids'},
+                'explicit design requires source and complete typed witness')
+        source = design['source']
+        require(type(source) is dict and set(source) == {'path', 'sha256'},
+                'design source requires exact path/sha256')
+        source_path = absolute(source['path'], base)
+        require(sha(source_path) == source['sha256'], 'design source SHA mismatch')
+        feature_path = absolute(case['features'], base)
+        features = read(feature_path)
+        if features.get('schema') == 'orbit.heterogeneous.edge-evaluation.v32':
+            features = features['features']
+        require(features.get('schema') == 'orbit.heterogeneous.edge-features.v32',
+                'explicit design requires native C++ edge features')
+        parent = design['parent_graph_id']
+        children = design['region_graph_ids']
+        require(type(parent) is str and parent and type(children) is list and
+                children and all(type(value) is str and value for value in children),
+                'explicit design requires nonempty ordered graph identities')
+        require(parent == features['parent_graph_id'] and
+                children == [region['child_graph_id'] for region in features['regions']],
+                'explicit design differs from native feature witness')
+        witness = (parent, tuple(children))
+        previous = witness_splits.setdefault(witness, case['split'])
+        require(previous == case['split'],
+                'same typed design appears across train/holdout splits')
+        canonical = {
+            'source_sha256': source['sha256'],
+            'parent_graph_id': parent,
+            'region_graph_ids': children,
+            'shape': case['shape'],
+        }
+        encoded = json.dumps(canonical, sort_keys=True, separators=(',', ':'),
+                             allow_nan=False).encode()
+        records[case['id']] = {
+            'design': canonical,
+            'design_sha256': hashlib.sha256(encoded).hexdigest(),
+            'source': seal(source_path),
+            'native_features': seal(feature_path),
+        }
+    return records
+
 def main():
     a = argparse.ArgumentParser(description=__doc__)
     a.add_argument('phase', choices=['preregister', 'build'])
@@ -54,10 +108,16 @@ def main():
     policy = s.get('feature_sets', POLICY)
     require(cases and len({c['id'] for c in cases}) == len(cases), 'unique explicit case IDs required')
     require({c['split'] for c in cases} == {'train', 'holdout'}, 'explicit train and holdout required')
+    split_policy = s.get('split_policy', 'legacy-shape-split-v32')
+    require(split_policy in ('legacy-shape-split-v32', 'explicit-case-design-v1'),
+            'unknown split policy')
     for c in cases:
         require(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]*', c['id']) is not None, 'case IDs must be safe file names')
-        require(c['shape'] in ([16, 32, 64, 96] if c['split'] == 'train' else [48]), 'shape outside preregistered train/holdout split')
+        if split_policy == 'legacy-shape-split-v32':
+            require(c['shape'] in ([16, 32, 64, 96] if c['split'] == 'train' else [48]), 'shape outside preregistered train/holdout split')
         require(c.get('ranking_group'), 'explicit comparable workload/input ranking_group required')
+    designs = (explicit_case_designs(cases, specpath.parent)
+               if split_policy == 'explicit-case-design-v1' else {})
     # Registration binds the method before labels exist. Process repetition
     # improves uncertainty estimates, but cannot add independent design rows.
     registration = {
@@ -84,6 +144,9 @@ def main():
             'runtime/tool/model contract',
         ],
     }
+    if split_policy == 'explicit-case-design-v1':
+        registration['split_policy'] = split_policy
+        registration['case_designs'] = designs
     if x.phase == 'preregister':
         require(not x.output.exists(), 'new output only')
         write(x.output, registration)
@@ -158,6 +221,8 @@ def main():
         write(featurepath, d)
         entry = {k: c[k] for k in ['id', 'split', 'ranking_group']}
         entry['features'] = seal(featurepath)
+        if designs:
+            entry['design_sha256'] = designs[c['id']]['design_sha256']
         for role in ['identity', 'samples', 'result', 'process']:
             p = (m / (role + '.json')).resolve()
             require(p.exists(), 'missing receipt ' + str(p))
@@ -183,6 +248,9 @@ def main():
         'feature_sets': policy,
         'cases': entries,
     }
+    if designs:
+        index['split_policy'] = split_policy
+        index['case_designs'] = designs
     write(out / 'index.json', index)
     write(out / 'intake.json', {
         'registration': seal(x.registration.resolve()),

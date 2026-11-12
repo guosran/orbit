@@ -1,6 +1,6 @@
 # v32 异构区域成本的校准与独立审查
 
-本轮工具从同一 typed assignment 的真实 C++ 特征和已封存执行 receipt 建立局部 phase 模型。这里提供的是可复核的方法与 CPU 测试；r3 的静态数量用于诊断。新 r4 编译/执行合同及其完整上板、校准和留出验收尚未完成，不能把 r3 timing 混入最终 r4 模型。
+本轮工具从同一 typed assignment 的真实 C++ 特征和已封存执行 receipt 建立局部 phase 模型。这里提供的是可复核的方法与 CPU 测试；r3/r4 的静态诊断和失败记录保留原身份。后续实测分别见 [r9 校准报告](taskflow-npu-calibration-r9-v32.md) 和 [r10 MLP2 报告](taskflow-npu-mlp-r10-v32.md)，不同合同的 timing 与价格不能直接混用。
 
 ## 原生特征与身份
 
@@ -35,6 +35,30 @@ python3 scripts/calibrate-heterogeneous.py fit \
 python3 scripts/calibrate-heterogeneous.py validate \
   --index NEW-index/index.json --model-dir NEW-model --output NEW-validation
 ```
+
+### 同形状的显式执行设计划分
+
+默认不指定 `split_policy` 时，保留原 train16/32/64/96、holdout48 规则。MLP 的相同 shape、不同 tile/retention/grouping 等方案可显式使用 `split_policy: "explicit-case-design-v1"`；每 case 仍指定 `split: "train"` 或 `"holdout"`，且两组均非空，`shape` 必须是任意正整数，不能是 bool 或浮点数。
+
+每 case 增加完整静态设计声明：
+
+```json
+{
+  "design": {
+    "source": {"path": "SOURCE.mlir", "sha256": "ACTUAL_SOURCE_SHA256"},
+    "parent_graph_id": "ACTUAL_PARENT_GRAPH_ID",
+    "region_graph_ids": ["ACTUAL_CHILD_GRAPH_ID_IN_REGION_ORDER"]
+  }
+}
+```
+
+其余 `id`、`ranking_group`、`measurement`、`features`、`mechanism_facts` 与旧格式相同。`source.path` 相对 spec 解析，SHA 必须匹配真实字节；parent 和有序 child IDs 必须匹配 native C++ features，不能用 case 名称或自定义 plan label 替代。source→graph 的算术/实现证明仍由原生 compiler receipt 提供；Python 不新增一份编译器或 source 等价性判定。
+
+预注册只读取 source 与静态 features，不打开 measurement labels；registration 中的 `case_designs` 记录规范化设计、`design_sha256` 和静态文件的 path/SHA。设计 hash 绑定 source SHA、parent/有序 child IDs 和声明 shape，不含 process ID 或测量路径。原 spec 本身也计算 SHA，因此其余声明同样被冻结。
+
+跨 split 出现相同 `(parent_graph_id, ordered region_graph_ids)` 一律拒绝，即使更换 case id、shape 标签、source 路径或仅增加 source 注释。同一 split 内的 fresh-process 重复允许，保持相同设计身份。相同源程序、相同 shape 但不同合法 child graph 的执行方案可以分属 train/holdout；不同文件名本身不能创建独立 holdout。设计独立性和 rank 仍根据真实 witness/feature rows 判断，不能只数 hash 或 process 个数。
+
+build 会再次校验 source/静态 features 与冻结 registration，并把设计 hash 写入每个 index case；编译器、manifest、graph、ABI 和 process 的原精确检查保持。calibrator、固定 phase features 和 accuracy/ranking gate 没有放松，也没有按完整设计 hash 查价格。新的 grouped/retention 方案仍须实际导出、编译、完成数值检查，不能由登记成功推断后端支持。
 
 索引构建验证 identity→compiled→manifest SHA、exact parent/ordered child witness、配置数、配置数×完整 ABI 参数数，以及 measurement-Python process identity。样本文件只计算 SHA，不解析 timing labels。真正数值断言、完整编译/ELF/proof 链及 exclusive phase sum 仍由已有 calibrator 和独立数值审计验收。
 
@@ -78,4 +102,4 @@ python3 test/TaskflowGeneric/heterogeneous_calibration_index_v32.py
 PYTHON_WITH_NUMPY_SCIPY test/TaskflowGeneric/heterogeneous_feature_design_v32.py
 ```
 
-两项独立测试程序均通过：index/config 测试共五例，覆盖 intake 不读取标签、foreign child graph 拒绝、等轴兼容、独立 M/N/K 及无效/冲突参数；design 测试验证 submit rank 缺口、单项 range 不足以证明联合支持、以及特征哈希变动拒绝。测试只依赖仓库内 fixture 和临时生成的 synthetic receipts，不依赖外部 `/tmp` 产物，不执行 NPU。
+两项独立测试程序均通过：index/config 测试现共 **11 例全部通过**，覆盖旧默认与新 explicit 协议的端到端 intake、同 shape 不同 child、同 split process 重复、跨 split 设计 alias 拒绝、source SHA/正整数 shape/缺失设计/未知协议负例，以及既有等轴兼容、独立 M/N/K 与冲突参数。样本可故意为非 JSON 字节，验证登记不读取 labels；原 graph/compiled 精确核验仍保留。另一个 design 测试验证 submit rank 缺口、单项 range 不足以证明联合支持、以及特征哈希变动拒绝。测试只依赖仓库内 fixture 和临时生成的 synthetic receipts，不依赖外部 `/tmp` 产物，不执行 NPU。
