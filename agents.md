@@ -2054,3 +2054,29 @@ is supplementary; do not replace the main campaign3.968181x with the larger
 ratio. Both rounds show about4x against the declared NPU baseline. Total1512
 calls; replay is not fitting/heldout/tuning data. Raw replay summary remains
 `preparation-r12/selected-replay/summary.json` under the evidence root above.
+
+### v32 r13 mixed-price closure and larger MLP evidence
+
+Public beam now has a bounded known-feasible/unknown-price FIFO, within total
+beam width, plus width-one fairness. Unknown remains null; no feasibility or
+optimum is invented. ON/OFF 27 contracts each and 48 CLI cases pass. Old r12
+record replay goes from15 to48evaluations and reaches CP's CPU winner.
+See docs/taskflow-public-beam-exploration-v32.md.
+
+R13 freshly compiles48training+4mixedheldout designs,156fresh processes,
+5616calls, all numerical checks pass. Local keys20 cover all48target placements;
+application control explicitly uses call/regions/configuration_count. Independent
+saved-output and exclusive-phase-sum audits pass. Heldout4/4, medianerror5.1485%.
+CP48allpriced OPTIMAL in declared domain, total4.950677s/solve65.233ms;
+beam43sameCPUplan/cost. This closes42missingprices, not all abstract dimensions.
+Compiler46f288..., contract76197db..., model0f74da... remain frozen. Selected
+replay adds324calls: baseline0.778621/NPU0.202785/CPU0.004250ms. See
+ docs/taskflow-npu-mixed-r13-v32.md and preparation-r13 evidence under the v32root.
+
+Larger fixed-plan comparisons use frozenr12 tool: batch48width16 MLP2 gets
+10.3895x (2.282932 to0.219735ms); batch16width32 MLP2 gets7.3932x
+(1.576507 to0.213236ms). All432calls pass and savedoutputs bitexact. These are
+phase16 NPU versus whole-resident NPU comparisons, not newshape CP proofs or
+CPU speedups. Four-layer phase execution passes diagnosticcalls; whole-program
+layout-helper outlining only has compile/capacity evidence and is not integrated
+or board validated. See docs/taskflow-npu-larger-r13-v32.md.
