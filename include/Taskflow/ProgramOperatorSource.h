@@ -94,11 +94,6 @@ bool materializeProgramOperatorGraph(
     llvm::StringRef hostMemory, ProgramGraph &, std::string &error);
 bool checkProgramOperatorGraph(const ProgramGraph &, std::string &error);
 llvm::json::Value summarizeProgramOperatorGraph(const ProgramGraph &);
-ConstraintSearchResult
-solveProgramOperatorCover(const ProgramOperatorSource &,
-                          const std::vector<ProgramOperatorImplementation> &,
-                          ProgramOperatorSelection &,
-                          const ConstraintSearchOptions &);
 llvm::json::Value
 serializeProgramOperatorSelection(const ProgramOperatorSelection &);
 } // namespace orbit::taskflow

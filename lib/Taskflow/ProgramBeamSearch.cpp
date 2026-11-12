@@ -42,7 +42,8 @@ llvm::json::Array assignmentJSON(const std::vector<int64_t> &assignment) {
 ProgramSearchResult searchProgramSpaceBeam(
     const ProgramSearchSpace &space, const ProgramSearchEvaluator &evaluate,
     const ProgramSearchOptions &options, int64_t beamWidth, int64_t maxRounds,
-    int64_t diversitySlots, const ProgramBeamExplorationOptions &exploration) {
+    int64_t diversitySlots, const ProgramBeamExplorationOptions &exploration,
+    const ProgramBeamTraceOptions &traceOptions) {
   using Clock = std::chrono::steady_clock;
   namespace j = llvm::json;
   const auto start = Clock::now();
@@ -118,6 +119,9 @@ ProgramSearchResult searchProgramSpaceBeam(
     r["callback_deadline_overrun_ms"] = callbackOverrunMs;
     r["compatibility_tuple_cells"] = tupleCells;
     r["dimensions"] = std::move(dimensions);
+    r["evaluation_trace_retained_in_memory"] = traceOptions.retainInMemory;
+    r["evaluation_trace_streamed"] = bool(traceOptions.sink);
+    r["evaluation_trace_rows"] = calls;
     r["evaluation_trace"] = std::move(trace);
     r["beam_selection_history"] = std::move(history);
     if (result.hasBest) {
@@ -147,7 +151,8 @@ ProgramSearchResult searchProgramSpaceBeam(
       options.workers > 16 || options.seed < 0 || maxRounds < -1 ||
       diversitySlots < 0 || diversitySlots > beamWidth ||
       exploration.unknownSlots < 0 || exploration.unknownSlots > beamWidth ||
-      exploration.maxPendingStates < 0)
+      exploration.maxPendingStates < 0 ||
+      (!traceOptions.retainInMemory && !traceOptions.sink))
     return finish(ConstraintSearchStatus::InvalidInput,
                   "Invalid beam options or evaluator");
   if (space.dimensions.size() > static_cast<size_t>(options.maxVariables) ||
@@ -258,7 +263,7 @@ ProgramSearchResult searchProgramSpaceBeam(
       if (!evaluation.costMs)
         ++unknownCosts;
     }
-    trace.push_back(
+    j::Value traceRow =
         j::Object{{"assignment", assignmentJSON(assignment)},
                   {"call", calls},
                   {"feasible", evaluation.feasible},
@@ -267,7 +272,14 @@ ProgramSearchResult searchProgramSpaceBeam(
                                                 : j::Value(nullptr)},
                   {"callback_ms", duration},
                   {"elapsed_ms", milliseconds(start)},
-                  {"message", evaluation.message}});
+                  {"message", evaluation.message}};
+    // Emit before moving the row into the optional in-memory report. Sink
+    // failures propagate to the caller; an incomplete trace is never reported
+    // as a completed search. The sink must not influence the evaluator.
+    if (traceOptions.sink)
+      traceOptions.sink(traceRow);
+    if (traceOptions.retainInMemory)
+      trace.push_back(std::move(traceRow));
     BeamNode node{assignment, std::nullopt, calls,
                   evaluation.feasible && evaluation.feasibilityKnown};
     if (evaluation.feasible && evaluation.feasibilityKnown) {

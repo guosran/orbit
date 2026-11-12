@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <thread>
 using namespace orbit::taskflow;
 
@@ -297,6 +298,76 @@ int main() {
                    converged.report.get("max_rounds")->getAsNull() &&
                    converged.report.getBoolean("budget_exhausted") == false,
                "unlimited beam terminates by checked-neighborhood convergence"))
+    return 1;
+  // Trace persistence must not change candidate order, FIFO exploration or
+  // convergence. Compare the full semantic rows, excluding elapsed timings.
+  auto semanticRow = [](const llvm::json::Value &row) {
+    std::string text;
+    llvm::raw_string_ostream output(text);
+    for (const char *key : {"assignment", "call", "feasible",
+                            "feasibility_known", "cost_ms", "message"})
+      output << *row.getAsObject()->get(key) << "\n";
+    output.flush();
+    return text;
+  };
+  for (bool priced : {true, false}) {
+    const auto &domain = priced ? space : barrier;
+    ProgramSearchEvaluator objective = priced
+                                           ? ProgramSearchEvaluator(evaluator)
+                                           : ProgramSearchEvaluator(partial);
+    auto retained = searchProgramSpaceBeam(domain, objective, unlimited, 4, -1);
+    std::vector<std::string> written;
+    ProgramBeamTraceOptions streamed;
+    streamed.retainInMemory = false;
+    streamed.sink = [&](const llvm::json::Value &row) {
+      written.push_back(semanticRow(row));
+    };
+    auto disk = searchProgramSpaceBeam(domain, objective, unlimited, 4, -1, 0,
+                                       {}, streamed);
+    std::vector<std::string> expected;
+    for (const auto &row : *retained.report.getArray("evaluation_trace"))
+      expected.push_back(semanticRow(row));
+    if (!require(expected == written && disk.status == retained.status &&
+                     disk.bestAssignment == retained.bestAssignment &&
+                     disk.bestEvaluation.costMs ==
+                         retained.bestEvaluation.costMs &&
+                     disk.report.getInteger("rounds") ==
+                         retained.report.getInteger("rounds") &&
+                     disk.report.getInteger("cache_hits") ==
+                         retained.report.getInteger("cache_hits"),
+                 "streaming preserves every priced/unpriced candidate and "
+                 "convergence"))
+      return 1;
+    if (!require(
+            disk.report.getArray("evaluation_trace")->empty() &&
+                disk.report.getBoolean("evaluation_trace_streamed") == true &&
+                disk.report.getBoolean("evaluation_trace_retained_in_memory") ==
+                    false &&
+                disk.report.getInteger("evaluation_trace_rows") ==
+                    int64_t(written.size()),
+            "streamed rows are complete without in-memory JSON duplication"))
+      return 1;
+  }
+  ProgramBeamTraceOptions lost;
+  lost.retainInMemory = false;
+  calls = 0;
+  auto missingSink =
+      searchProgramSpaceBeam(space, evaluator, unlimited, 4, -1, 0, {}, lost);
+  if (!require(missingSink.status == ConstraintSearchStatus::InvalidInput &&
+                   calls == 0,
+               "disabling retained evidence requires an explicit durable sink"))
+    return 1;
+  lost.sink = [](const llvm::json::Value &) {
+    throw std::runtime_error("simulated full trace device");
+  };
+  bool failedSink = false;
+  try {
+    searchProgramSpaceBeam(space, evaluator, unlimited, 4, -1, 0, {}, lost);
+  } catch (const std::runtime_error &) {
+    failedSink = true;
+  }
+  if (!require(failedSink,
+               "trace write failure cannot claim a completed search"))
     return 1;
   unlimited.wallSeconds = std::numeric_limits<double>::quiet_NaN();
   auto invalidUnlimited =

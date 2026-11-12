@@ -10,6 +10,13 @@ struct ProgramBeamExplorationOptions {
   // Queue payload is also bounded by ProgramSearchOptions::maxTupleCells.
   int64_t maxPendingStates = 256;
 };
+// Large searches can write every evaluation to a durable sink without keeping
+// a second JSON copy of every assignment in RAM. This changes evidence
+// storage only: visited assignments, beam ordering and convergence are intact.
+struct ProgramBeamTraceOptions {
+  bool retainInMemory = true;
+  std::function<void(const llvm::json::Value &)> sink;
+};
 // Explicit adapter over the public finite domain and evaluator. Reuses
 // selectSearchBeam, but is not the legacy driver's default action generator.
 // Beam accepts +infinity wallSeconds, maxEvaluations=0 and maxRounds=-1
@@ -21,6 +28,7 @@ searchProgramSpaceBeam(const ProgramSearchSpace &,
                        const ProgramSearchEvaluator &,
                        const ProgramSearchOptions &, int64_t beamWidth,
                        int64_t maxRounds, int64_t diversitySlots = 0,
-                       const ProgramBeamExplorationOptions &exploration = {});
+                       const ProgramBeamExplorationOptions &exploration = {},
+                       const ProgramBeamTraceOptions &traceOptions = {});
 } // namespace orbit::taskflow
 #endif

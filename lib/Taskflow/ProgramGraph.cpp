@@ -1,4 +1,5 @@
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/ProgramOperatorMapping.h"
 #include "Taskflow/ProgramOperatorSource.h"
 #include "Taskflow/ProgramTargetBinding.h"
 #include "llvm/Support/raw_ostream.h"
@@ -299,7 +300,8 @@ llvm::json::Value scheduleJSON(const MappingGraphSchedule &value) {
              "overhead remains unknown unless separately calibrated"
            : "dependency witness only; backend cycle/resource schedule is "
              "separately bound"}};
-  if (value.policy == "constraint-resource-schedule") {
+  if (value.policy == "constraint-resource-schedule" ||
+      value.policy == "external-resource-calendar") {
     Array costs, configurations;
     for (auto cost : value.eventDurationsMs)
       costs.push_back(cost);
@@ -542,6 +544,9 @@ llvm::json::Value graphJSON(const ProgramGraph &graph) {
   }
   if (graph.operatorSource) {
     result["source_kind"] = "source-bound-external-operators";
+    if (graph.operatorMapping)
+      result["external_mapping"] =
+          serializeProgramOperatorMapping(*graph.operatorMapping);
     if (graph.operatorSelection)
       result["external_implementation_selection"] =
           serializeProgramOperatorSelection(*graph.operatorSelection);
@@ -1326,7 +1331,6 @@ bool orbit::taskflow::checkProgramGraph(const ProgramGraph &graph,
         return fail(error, "duplicate or missing copy creation");
       const auto &value = graph.copies[copy];
       const auto &version = graph.versions[value.version];
-      const auto &allocation = graph.allocations[value.allocation];
       const bool pool = programAllocationIsSlot(graph, value.allocation);
       if (pool && overwritten.insert(value.allocation).second) {
         for (size_t old : physicalCopies[value.allocation]) {

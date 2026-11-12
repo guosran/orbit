@@ -1,5 +1,6 @@
 #include "Taskflow/ProgramOperatorSource.h"
 #include "Taskflow/JSONUtils.h"
+#include "Taskflow/ProgramOperatorMapping.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -723,6 +724,8 @@ bool orbit::taskflow::materializeProgramOperatorGraph(
 
 bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
                                                 std::string &error) {
+  if (g.operatorMapping && hasProgramOperatorPackedInputs(*g.operatorMapping))
+    return checkProgramOperatorPackedGraph(g, error);
   if (!g.operatorSource || !g.operatorSelection || g.source.function ||
       !g.source.tasks.empty() || !g.source.storages.empty())
     return fail(error, "missing/mixed first-class operator source");
@@ -843,6 +846,10 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
     if (instance.task != o || instance.domainTask != o ||
         instance.event != owners[o] || instance.phase != owners[o] ||
         instance.kind != "external-source-operator" ||
+        !instance.domain.empty() || instance.lanes != 1 ||
+        instance.parallelLoop != -1 || instance.resourceCount != 1 ||
+        !instance.resourceShape.empty() || placement.resourceCount != 1 ||
+        !placement.resourceShape.empty() ||
         instance.implementation != impl.id || placement.task != o ||
         placement.resource != impl.resource ||
         placement.memory != impl.memory || placement.implementation != impl.id)
@@ -947,6 +954,8 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
         g.copies[c].lastUsers != last)
       return fail(error, "incorrect consumer/last-user copy witness");
   }
+  if (g.operatorMapping)
+    return checkProgramOperatorMapping(g, error);
   if (!g.schedule.events.empty() || !g.schedule.eventDurationsMs.empty() ||
       g.estimatedMakespanMs)
     return fail(error, "unproved source-operator timing allocation");

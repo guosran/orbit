@@ -12,6 +12,7 @@
 namespace orbit::taskflow {
 struct ProgramOperatorSource;
 struct ProgramOperatorSelection;
+struct ProgramOperatorMapping;
 enum class ProgramDataPolicy { PhaseLocal, RetainAcrossUsers };
 llvm::StringRef programDataPolicyName(ProgramDataPolicy);
 bool parseProgramDataPolicy(llvm::StringRef, ProgramDataPolicy &,
@@ -208,6 +209,7 @@ struct ProgramGraph {
   // retain their own typed operator semantics; no fake MLIR handles are made.
   std::shared_ptr<const ProgramOperatorSource> operatorSource;
   std::shared_ptr<const ProgramOperatorSelection> operatorSelection;
+  std::shared_ptr<const ProgramOperatorMapping> operatorMapping;
 };
 using ProgramCommunicationPlan = ProgramGraph;
 struct GenericAnalysis;
