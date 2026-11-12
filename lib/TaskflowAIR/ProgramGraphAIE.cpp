@@ -417,6 +417,9 @@ bool orbit::taskflow::checkProgramGraphAIE(const ProgramGraph &g,
                         {"graph_id", programGraphIdentity(g)}};
     return false;
   };
+  if (g.operatorSource)
+    return reject("external operator source requires its registered runtime "
+                  "implementation");
   if (!expectedAIR || !actualAIE)
     return reject("missing expected AIR or final AIE");
   if (failed(verify(expectedAIR)) || failed(verify(actualAIE)))

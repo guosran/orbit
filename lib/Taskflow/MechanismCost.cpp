@@ -105,6 +105,10 @@ bool orbit::taskflow::collectMechanismFacts(
     const ProgramGraph &graph, const MechanismRuntimeContract &runtime,
     MechanismFacts &facts, std::string &error) {
   facts = {};
+  if (graph.operatorSource)
+    return fail(
+        error,
+        "external operator implementations own their source and cost boundary");
   if (!checkProgramGraph(graph, error))
     return false;
   if (graph.regionEvents.empty() || runtime.identity.empty() ||

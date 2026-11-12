@@ -12,6 +12,9 @@ struct ProgramBeamExplorationOptions {
 };
 // Explicit adapter over the public finite domain and evaluator. Reuses
 // selectSearchBeam, but is not the legacy driver's default action generator.
+// Beam accepts +infinity wallSeconds, maxEvaluations=0 and maxRounds=-1
+// to run until its checked neighborhood converges. These sentinels do not
+// change the finite-domain CP adapter contract.
 // Neighbors change one dimension; coupled fields belong in compound choices.
 ProgramSearchResult
 searchProgramSpaceBeam(const ProgramSearchSpace &,

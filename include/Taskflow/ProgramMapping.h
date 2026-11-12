@@ -5,10 +5,13 @@
 #include "Taskflow/StaticMapping.h"
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 namespace orbit::taskflow {
+struct ProgramOperatorSource;
+struct ProgramOperatorSelection;
 enum class ProgramDataPolicy { PhaseLocal, RetainAcrossUsers };
 llvm::StringRef programDataPolicyName(ProgramDataPolicy);
 bool parseProgramDataPolicy(llvm::StringRef, ProgramDataPolicy &,
@@ -201,6 +204,10 @@ struct ProgramGraph {
   std::optional<double> estimatedMakespanMs;
   int64_t transferBytes = 0;
   std::map<std::string, int64_t> peakMemoryBytes;
+  // Mutually exclusive with native MLIR source. External source contracts
+  // retain their own typed operator semantics; no fake MLIR handles are made.
+  std::shared_ptr<const ProgramOperatorSource> operatorSource;
+  std::shared_ptr<const ProgramOperatorSelection> operatorSelection;
 };
 using ProgramCommunicationPlan = ProgramGraph;
 struct GenericAnalysis;

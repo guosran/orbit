@@ -285,6 +285,25 @@ int main() {
                  "invalid exploration bounds rejected before callback"))
       return 1;
   }
+  ProgramSearchOptions unlimited;
+  unlimited.wallSeconds = std::numeric_limits<double>::infinity();
+  unlimited.maxEvaluations = 0;
+  auto converged =
+      searchProgramSpaceBeam(binarySpace(3), evaluator, unlimited, 4, -1);
+  if (!require(converged.hasBest && converged.bestEvaluation.costMs == 1. &&
+                   converged.report.getInteger("evaluations") == 8 &&
+                   converged.report.get("wall_seconds")->getAsNull() &&
+                   converged.report.get("max_evaluations")->getAsNull() &&
+                   converged.report.get("max_rounds")->getAsNull() &&
+                   converged.report.getBoolean("budget_exhausted") == false,
+               "unlimited beam terminates by checked-neighborhood convergence"))
+    return 1;
+  unlimited.wallSeconds = std::numeric_limits<double>::quiet_NaN();
+  auto invalidUnlimited =
+      searchProgramSpaceBeam(binarySpace(1), evaluator, unlimited, 1, -1);
+  if (!require(invalidUnlimited.status == ConstraintSearchStatus::InvalidInput,
+               "unlimited sentinel does not admit NaN wall budget"))
+    return 1;
   llvm::outs() << "{\"status\":\"passed\",\"checks\":" << checks << "}\n";
   return 0;
 }

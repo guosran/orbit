@@ -136,6 +136,10 @@ bool orbit::taskflow::collectProgramInvocationFeatures(
     const ProgramGraph &g, const ProgramInvocationRuntimeContract &runtime,
     ProgramInvocationFeatures &f, std::string &e) {
   f = {};
+  if (g.operatorSource)
+    return fail(
+        e,
+        "external implementation cover owns its invocation/transport contract");
   if (!checkProgramGraph(g, e))
     return false;
   if (runtime.identity.empty() || runtime.identity == "unbound" ||

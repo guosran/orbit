@@ -198,6 +198,14 @@ add_executable(taskflow-program-search-test EXCLUDE_FROM_ALL ../../test/Taskflow
 target_link_libraries(taskflow-program-search-test PRIVATE ORBITConstraintSearch LLVMSupport)
 add_executable(taskflow-program-beam-search-test EXCLUDE_FROM_ALL ../../test/TaskflowGeneric/program-beam-search.cpp)
 target_link_libraries(taskflow-program-beam-search-test PRIVATE MLIRTaskflowStructured LLVMSupport)
+add_executable(taskflow-program-operator-search EXCLUDE_FROM_ALL
+  ../../experimental/qwen-runtime-search/program-operator-search.cpp)
+target_link_libraries(taskflow-program-operator-search PRIVATE MLIRTaskflowStructured LLVMSupport)
+target_compile_options(taskflow-program-operator-search PRIVATE -fexceptions)
+add_executable(taskflow-program-operator-source-test EXCLUDE_FROM_ALL
+  ../../test/TaskflowGeneric/program-operator-source.cpp)
+target_link_libraries(taskflow-program-operator-source-test PRIVATE MLIRTaskflowStructured LLVMSupport)
+
 add_executable(taskflow-program-routing-search-test EXCLUDE_FROM_ALL ../../test/TaskflowGeneric/program-routing-search.cpp)
 target_link_libraries(taskflow-program-routing-search-test PRIVATE MLIRTaskflowStructured MLIRParser)
 
@@ -220,6 +228,7 @@ endif()
 add_custom_target(check-taskflow-public-search
   COMMAND $<TARGET_FILE:taskflow-program-search-test>
   COMMAND $<TARGET_FILE:taskflow-program-beam-search-test>
+  COMMAND $<TARGET_FILE:taskflow-program-operator-source-test>
   COMMAND $<TARGET_FILE:taskflow-program-routing-search-test>
   COMMAND $<TARGET_FILE:taskflow-program-graph-search-test>
     ${PROJECT_SOURCE_DIR}/test/TaskflowAIR/fixtures/gemm-scale.mlir
@@ -236,6 +245,7 @@ add_custom_target(check-taskflow-public-search
     --tool $<TARGET_FILE:taskflow-opt> ${ORBIT_PUBLIC_SEARCH_TEST_MODE}
   ${ORBIT_PUBLIC_SEARCH_BOUNDARY_COMMAND}
   DEPENDS taskflow-opt taskflow-program-search-test taskflow-program-beam-search-test
+    taskflow-program-operator-source-test
     taskflow-program-routing-search-test taskflow-program-graph-search-test
     taskflow-program-mechanism-test)
 

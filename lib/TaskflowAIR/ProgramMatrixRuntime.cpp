@@ -1261,6 +1261,10 @@ bool orbit::taskflow::checkProgramMatrixRuntime(const ProgramGraph &g,
                                                 ModuleOp module,
                                                 llvm::json::Value &receipt,
                                                 std::string &error) {
+  if (g.operatorSource) {
+    error = "external operator source has no native matrix runtime contract";
+    return false;
+  }
   auto contract = serializeProgramMatrixRuntimeContract(g, abi, error);
   return !contract.getAsNull() &&
          checkProgramMatrixRuntime(contract, module, receipt, error);
@@ -1271,6 +1275,10 @@ bool orbit::taskflow::realizeProgramMatrixRuntime(const ProgramGraph &g,
                                                   OwningOpRef<ModuleOp> &output,
                                                   llvm::json::Value &receipt,
                                                   std::string &error) {
+  if (g.operatorSource) {
+    error = "external operator source has no native matrix runtime contract";
+    return false;
+  }
   auto contract = serializeProgramMatrixRuntimeContract(g, abi, error);
   return !contract.getAsNull() &&
          realizeProgramMatrixRuntime(contract, input, output, receipt, error);

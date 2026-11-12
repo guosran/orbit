@@ -152,6 +152,10 @@ bool orbit::taskflow::buildProgramMechanismCosts(
     std::string &error, bool includeLifecycle, bool includeGroupConfiguration) {
   result = {};
   request = {};
+  if (graph.operatorSource)
+    return fail(
+        error,
+        "external operator implementations own their source and cost boundary");
   if (!checkProgramGraph(graph, error))
     return false;
   if (model.id.empty() || model.boundary.empty() ||

@@ -36,6 +36,9 @@ bool orbit::taskflow::rebindProgramGraph(
     const ProgramGraph &reference, const StaticConfig &target,
     const ProgramDataOrganizationChoice &choice, ProgramGraph &g,
     std::string &error) {
+  if (reference.operatorSource)
+    return fail(error, "external operator source requires its "
+                       "implementation-cover materializer");
   if (!checkProgramGraph(reference, error) ||
       !validateMemoryArchitecture(target, error))
     return false;

@@ -1,4 +1,5 @@
 #include "Taskflow/GenericMapping.h"
+#include "Taskflow/ProgramOperatorSource.h"
 #include "Taskflow/ProgramTargetBinding.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -459,7 +460,9 @@ llvm::json::Value graphJSON(const ProgramGraph &graph) {
     outputs[std::to_string(entry.first)] = entry.second;
   Object result{
       {"schema", "orbit.program-graph.v1"},
-      {"source", serializeGenericAnalysis(graph.source)},
+      {"source", graph.operatorSource
+                     ? serializeProgramOperatorSource(*graph.operatorSource)
+                     : serializeGenericAnalysis(graph.source)},
       {"computation_mlir", body},
       {"logical_data", std::move(logicalData)},
       {"source_dependencies", std::move(sourceDependencies)},
@@ -481,9 +484,13 @@ llvm::json::Value graphJSON(const ProgramGraph &graph) {
       {"source_access_versions",
        "conservative may-overlap source facts; exact finite execution versions "
        "are in the shared ledger"},
-      {"source_binding",
-       "borrowed actual MLIR operations and values; serialized source is a "
-       "view, not an executable graph import"}};
+      {"source_binding", graph.operatorSource
+                             ? "hash-bound external operator/tensor/state "
+                               "contract; registered implementation coverage "
+                               "and ABI are checked, not native MLIR arithmetic"
+                             : "borrowed actual MLIR operations and values; "
+                               "serialized source is a "
+                               "view, not an executable graph import"}};
   if (!graph.targetIdentity.empty())
     result["target_identity"] = graph.targetIdentity;
   Array bindings;
@@ -532,6 +539,12 @@ llvm::json::Value graphJSON(const ProgramGraph &graph) {
                                  {"copies", indices(event.copies)}});
     }
     result["region_events"] = std::move(lifecycle);
+  }
+  if (graph.operatorSource) {
+    result["source_kind"] = "source-bound-external-operators";
+    if (graph.operatorSelection)
+      result["external_implementation_selection"] =
+          serializeProgramOperatorSelection(*graph.operatorSelection);
   }
   return result;
 }
@@ -758,6 +771,9 @@ bool orbit::taskflow::parseWholeTaskProgramGraphConfig(
 bool orbit::taskflow::checkProgramGraphSource(const GenericAnalysis &source,
                                               const ProgramGraph &graph,
                                               std::string &error) {
+  if (graph.operatorSource)
+    return fail(error, "external operator source has no native MLIR body; use "
+                       "its registered implementation cover");
   if (!source.function || !graph.source.function ||
       source.function != graph.source.function ||
       source.bodyFingerprint != graph.bodyFingerprint ||
@@ -929,6 +945,9 @@ bool orbit::taskflow::finalizeProgramGraph(const GenericAnalysis &source,
 
 bool orbit::taskflow::refreshProgramGraphSchedule(ProgramGraph &graph,
                                                   std::string &error) {
+  if (graph.operatorSource)
+    return fail(error, "external implementation timing cannot be redistributed "
+                       "to native source events");
   MappingGraphSchedule refreshed;
   if (!schedule(graph, refreshed, error))
     return false;
@@ -993,6 +1012,8 @@ bool orbit::taskflow::collectProgramBufferOrdering(
 
 bool orbit::taskflow::checkProgramGraph(const ProgramGraph &graph,
                                         std::string &error) {
+  if (graph.operatorSource)
+    return checkProgramOperatorGraph(graph, error);
   const auto &source = graph.source;
   if (!checkProgramGraphSource(source, graph, error))
     return false;
@@ -1802,6 +1823,8 @@ std::string orbit::taskflow::programGraphIdentity(const ProgramGraph &graph) {
 }
 llvm::json::Value
 orbit::taskflow::summarizeProgramGraphCost(const ProgramGraph &graph) {
+  if (graph.operatorSource)
+    return summarizeProgramOperatorGraph(graph);
   int64_t reads = 0, writes = 0, traffic = 0, transfers = 0, submissions = 0;
   bool overflow = false, trafficOverflow = false, submissionOverflow = false;
   for (const auto &task : graph.source.tasks)

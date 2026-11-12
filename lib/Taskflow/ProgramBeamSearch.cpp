@@ -90,7 +90,7 @@ ProgramSearchResult searchProgramSpaceBeam(
         "global assignment deduplication; no complete-plan price catalogue";
     r["compatibility_rejections"] = rejected;
     r["beam_width"] = beamWidth;
-    r["max_rounds"] = maxRounds;
+    r["max_rounds"] = maxRounds < 0 ? j::Value(nullptr) : j::Value(maxRounds);
     r["rounds"] = rounds;
     r["diversity_slots"] = diversitySlots;
     r["unknown_exploration_policy"] =
@@ -106,7 +106,9 @@ ProgramSearchResult searchProgramSpaceBeam(
     r["unknown_cost_ranking_score"] = nullptr;
     r["frontier_fairness"] =
         "retain priced beam; alternate when exploration would occupy all slots";
-    r["max_evaluations"] = options.maxEvaluations;
+    r["max_evaluations"] = options.maxEvaluations == 0
+                               ? j::Value(nullptr)
+                               : j::Value(options.maxEvaluations);
     r["callback_ms"] = callbackMs;
     r["solve_ms"] = 0.;
     r["model_build_ms"] = 0.;
@@ -138,11 +140,11 @@ ProgramSearchResult searchProgramSpaceBeam(
             : 0.;
     return std::move(result);
   };
-  if (!evaluate || !std::isfinite(options.wallSeconds) ||
-      options.wallSeconds <= 0 || options.maxEvaluations <= 0 ||
+  if (!evaluate || std::isnan(options.wallSeconds) ||
+      options.wallSeconds <= 0 || options.maxEvaluations < 0 ||
       options.maxVariables <= 0 || options.maxConstraints <= 0 ||
       options.maxTupleCells <= 0 || beamWidth <= 0 || options.workers <= 0 ||
-      options.workers > 16 || options.seed < 0 || maxRounds < 0 ||
+      options.workers > 16 || options.seed < 0 || maxRounds < -1 ||
       diversitySlots < 0 || diversitySlots > beamWidth ||
       exploration.unknownSlots < 0 || exploration.unknownSlots > beamWidth ||
       exploration.maxPendingStates < 0)
@@ -319,11 +321,11 @@ ProgramSearchResult searchProgramSpaceBeam(
   if (beam.front().cost)
     pricedBeam = beam;
   recordBeam(0, beam);
-  for (int64_t round = 1; round <= maxRounds; ++round) {
+  for (int64_t round = 1; maxRounds < 0 || round <= maxRounds; ++round) {
     if (expired())
       return finish(ConstraintSearchStatus::Unknown,
                     "Shared wall quota exhausted");
-    if (calls >= options.maxEvaluations)
+    if (options.maxEvaluations > 0 && calls >= options.maxEvaluations)
       return finish(outcome(), "Evaluation quota reached");
     std::vector<BeamNode> pool = pricedBeam;
     size_t generated = 0;
@@ -351,7 +353,7 @@ ProgramSearchResult searchProgramSpaceBeam(
             ++rejected;
             continue;
           }
-          if (calls >= options.maxEvaluations)
+          if (options.maxEvaluations > 0 && calls >= options.maxEvaluations)
             return finish(
                 outcome(),
                 "Evaluation quota reached during neighborhood expansion");
