@@ -1121,7 +1121,6 @@ struct OriginalAmoebaCtrlToDataFlowPass
 
 namespace mlir::amoeba::neura::joint_scheduling {
 std::unique_ptr<mlir::Pass> createOriginalAmoebaCtrlToDataFlowPass() {
-  return std::make_unique<
-      OriginalAmoebaCtrlToDataFlowPass>();
+  return std::make_unique<OriginalAmoebaCtrlToDataFlowPass>();
 }
 } // namespace mlir::amoeba::neura::joint_scheduling

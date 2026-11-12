@@ -9,14 +9,14 @@
 // shortlist when score rows were readable; the pass then fails.
 //===----------------------------------------------------------------------===//
 
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/Pass/Pass.h"
 #include "Backend/Neura/GlobalStageRankerPass.h"
 #include "Backend/Neura/Orchestration/JointScheduling/JointSchedulingCandidateOrder.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
@@ -52,10 +52,8 @@ constexpr llvm::StringLiteral kScoreSchema =
     "amoeba-exact-joint-task-scores-v1";
 constexpr llvm::StringLiteral kClosureSchema = "orbit-joint-graph-closure-v1";
 constexpr llvm::StringLiteral kPredictorSource = "ml-ii-startup-predictor";
-constexpr llvm::StringLiteral kProductionTemporalModel =
-    "production-scheduler";
-constexpr llvm::StringLiteral kProductionScheduleSpace =
-    "production-scheduler";
+constexpr llvm::StringLiteral kProductionTemporalModel = "production-scheduler";
+constexpr llvm::StringLiteral kProductionScheduleSpace = "production-scheduler";
 constexpr llvm::StringLiteral kProductionTemporalScope =
     "production-task-scheduler-only";
 constexpr llvm::StringLiteral kProductionStartPolicy =
@@ -261,9 +259,10 @@ static std::optional<std::string> stringField(const json::Object &object,
   return std::nullopt;
 }
 
-static std::optional<std::string>
-stringField(const json::Object &object, StringRef flatKey, StringRef nestedKey,
-            StringRef nestedObject) {
+static std::optional<std::string> stringField(const json::Object &object,
+                                              StringRef flatKey,
+                                              StringRef nestedKey,
+                                              StringRef nestedObject) {
   if (std::optional<std::string> value = stringField(object, flatKey))
     return value;
   const json::Object *nested = object.getObject(nestedObject);
@@ -298,16 +297,15 @@ static bool requireStringAny(const json::Object &object, StringRef flatKey,
   return true;
 }
 
-static std::optional<std::string>
-decimalField(const json::Object &object, StringRef key) {
+static std::optional<std::string> decimalField(const json::Object &object,
+                                               StringRef key) {
   if (std::optional<int64_t> value = object.getInteger(key)) {
     if (*value < 0)
       return std::nullopt;
     return std::to_string(*value);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char value) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char value) {
         return value < '0' || value > '9';
       }))
     return std::nullopt;
@@ -316,9 +314,8 @@ decimalField(const json::Object &object, StringRef key) {
 }
 
 static bool isZero(StringRef decimal) {
-  return decimal.empty() || llvm::all_of(decimal, [](char value) {
-           return value == '0';
-         });
+  return decimal.empty() ||
+         llvm::all_of(decimal, [](char value) { return value == '0'; });
 }
 
 static int compareDecimal(StringRef lhs, StringRef rhs) {
@@ -347,8 +344,7 @@ static std::string addDecimal(StringRef lhs, StringRef rhs) {
   return result.empty() ? "0" : result;
 }
 
-static void putDecimal(json::Object &object, StringRef key,
-                       StringRef decimal) {
+static void putDecimal(json::Object &object, StringRef key, StringRef decimal) {
   uint64_t value = 0;
   if (!decimal.getAsInteger(10, value) &&
       value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
@@ -401,14 +397,14 @@ static bool parseManifest(StringRef path, InputManifest &manifest,
     addError(errors, "input manifest schema is not " + kInputSchema.str());
     valid = false;
   }
-  valid &= requireStringAny(*root, "source_repository", "source",
-                            "repository", manifest.sourceRepository, errors,
-                            "source repository");
+  valid &=
+      requireStringAny(*root, "source_repository", "source", "repository",
+                       manifest.sourceRepository, errors, "source repository");
   valid &= requireStringAny(*root, "source_commit", "source", "commit",
                             manifest.sourceCommit, errors, "source commit");
-  valid &= requireStringAny(*root, "architecture_path", "architecture", "path",
-                            manifest.architecturePath, errors,
-                            "architecture path");
+  valid &=
+      requireStringAny(*root, "architecture_path", "architecture", "path",
+                       manifest.architecturePath, errors, "architecture path");
   // architecture_id is a semantic label supplied by the stage controller. It
   // is optional for compatibility with the source-owned score header, which
   // identifies the architecture by its exact path.
@@ -472,8 +468,8 @@ static bool parseManifest(StringRef path, InputManifest &manifest,
     std::optional<std::string> mapperReplay =
         readPathField(*object, "mapper_replay_path", "prepared_ir_path");
     if (!mapperReplay)
-      mapperReplay = readPathField(*object, "materialized_ir_path",
-                                   "graph_ir_path");
+      mapperReplay =
+          readPathField(*object, "materialized_ir_path", "graph_ir_path");
     if (!mapperReplay || mapperReplay->empty()) {
       addError(errors, "graph variant mapper_replay_path is missing");
       variantValid = false;
@@ -488,7 +484,8 @@ static bool parseManifest(StringRef path, InputManifest &manifest,
     if (std::optional<std::string> stage = stringField(*object, "stage"))
       variant.stage = std::move(*stage);
     const json::Array *rewritePaths = object->getArray("rewrite_paths");
-    if (std::optional<std::string> rewrite = stringField(*object, "rewrite_path"))
+    if (std::optional<std::string> rewrite =
+            stringField(*object, "rewrite_path"))
       appendUnique(variant.rewritePaths, *rewrite);
     else if (std::optional<std::string> rewrite = stringField(*object, "path"))
       appendUnique(variant.rewritePaths, *rewrite);
@@ -577,16 +574,16 @@ static bool parseClosure(StringRef path, const InputManifest &input,
       if (std::optional<StringRef> architecture =
               object->getString("architecture_path")) {
         if (*architecture != input.architecturePath)
-          closureError(info,
-                       "graph closure architecture does not match the manifest");
+          closureError(
+              info, "graph closure architecture does not match the manifest");
       }
       if (std::optional<StringRef> source =
               object->getString("source_repository")) {
         if (*source != input.sourceRepository)
-          closureError(info,
-                       "graph closure source repository does not match");
+          closureError(info, "graph closure source repository does not match");
       }
-      if (std::optional<StringRef> commit = object->getString("source_commit")) {
+      if (std::optional<StringRef> commit =
+              object->getString("source_commit")) {
         if (*commit != input.sourceCommit)
           closureError(info, "graph closure source commit does not match");
       }
@@ -612,7 +609,8 @@ static bool parseClosure(StringRef path, const InputManifest &input,
         if (*status == "proven_illegal") {
           auto reason = object->getString("reason");
           if (!reason || reason->empty())
-            closureError(info, "proven-illegal closure action has no proof reason");
+            closureError(info,
+                         "proven-illegal closure action has no proof reason");
         } else if (*status != "legal" && !allowIncompleteScope) {
           closureError(info, "graph closure contains an unknown action");
         }
@@ -643,8 +641,7 @@ static bool parseClosure(StringRef path, const InputManifest &input,
     }
     ClosureGraph graph;
     graph.path = graphPath->str();
-    graph.structuralText =
-        jsonText(json::Value(json::Object(*structural)));
+    graph.structuralText = jsonText(json::Value(json::Object(*structural)));
     info.structuralKeys.insert(graph.structuralText);
     if (std::optional<StringRef> semantic =
             object->getString("semantic_graph_id"))
@@ -665,7 +662,8 @@ static bool parseClosure(StringRef path, const InputManifest &input,
     if (std::optional<StringRef> factsPath = object->getString("facts_path"))
       graph.factsPath = factsPath->str();
     if (graph.mlirPath.empty() || graph.factsPath.empty())
-      closureError(info, "graph closure graph has no persisted MLIR/facts paths");
+      closureError(info,
+                   "graph closure graph has no persisted MLIR/facts paths");
     else if (!llvm::sys::fs::exists(graph.mlirPath) ||
              !llvm::sys::fs::exists(graph.factsPath))
       closureError(info, "graph closure graph MLIR/facts artifact is missing");
@@ -698,10 +696,10 @@ static bool parseClosure(StringRef path, const InputManifest &input,
   if (footer) {
     std::optional<StringRef> status = footer->getString("status");
     std::optional<bool> complete = footer->getBoolean("complete");
-    std::optional<bool> graphComplete = footer->getBoolean("graph_scope_complete");
-    const bool scopeComplete =
-        status && *status == "complete" && complete && *complete &&
-        graphComplete && *graphComplete;
+    std::optional<bool> graphComplete =
+        footer->getBoolean("graph_scope_complete");
+    const bool scopeComplete = status && *status == "complete" && complete &&
+                               *complete && graphComplete && *graphComplete;
     info.scopeComplete = scopeComplete;
     if (!scopeComplete && !allowIncompleteScope)
       closureError(info, "graph closure is incomplete");
@@ -729,16 +727,17 @@ static bool parseClosure(StringRef path, const InputManifest &input,
       if (!allowIncompleteScope &&
           (*unique < 0 ||
            static_cast<size_t>(*unique) != info.structuralKeys.size()))
-        closureError(info, "graph closure unique structural-key count disagrees");
+        closureError(info,
+                     "graph closure unique structural-key count disagrees");
     } else {
       closureError(info, "graph closure footer has no unique_structural_keys");
     }
-    if (std::optional<int64_t> graphCount =
-            footer->getInteger("graph_count")) {
+    if (std::optional<int64_t> graphCount = footer->getInteger("graph_count")) {
       if (!allowIncompleteScope &&
           (*graphCount < 0 ||
            static_cast<size_t>(*graphCount) != info.structuralKeys.size()))
-        closureError(info, "graph closure graph_count disagrees with graph records");
+        closureError(info,
+                     "graph closure graph_count disagrees with graph records");
     }
   }
   for (const ClosureGraph &graph : info.graphs) {
@@ -766,13 +765,13 @@ static bool isProductionStageOne(StringRef stage) {
 
 static bool isProductionDispatchPolicy(StringRef stage, StringRef policy) {
   return isProductionStageOne(stage) ? policy == "fixed"
-                                    : policy == "critical-path";
+                                     : policy == "critical-path";
 }
 
 static StringRef productionDispatchPolicyScope(StringRef policy) {
-  return policy == "fixed" ? StringRef("canonical-smallest-ready-task")
-                            : StringRef(
-                                  "production-critical-path-dependency-ready");
+  return policy == "fixed"
+             ? StringRef("canonical-smallest-ready-task")
+             : StringRef("production-critical-path-dependency-ready");
 }
 
 // Legacy exact score files predate the namespace/schema fields in their
@@ -799,9 +798,8 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
   if (!commandParsed)
     return false;
   const json::Object *commandObject = commandParsed->getAsObject();
-  const json::Array *argv = commandObject
-                                ? commandObject->getArray("argv")
-                                : nullptr;
+  const json::Array *argv =
+      commandObject ? commandObject->getArray("argv") : nullptr;
   if (!commandObject || !argv || argv->size() < 3 ||
       commandObject->getInteger("exit_code") != std::optional<int64_t>(0))
     return false;
@@ -822,9 +820,8 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
     if (!scoreParsed)
       return false;
     const json::Object *scoreHeader = scoreParsed->getAsObject();
-    if (!scoreHeader ||
-        scoreHeader->getString("record_type") !=
-            std::optional<StringRef>("header"))
+    if (!scoreHeader || scoreHeader->getString("record_type") !=
+                            std::optional<StringRef>("header"))
       return false;
     productionScheduler =
         scoreHeader->getString("temporal_model") ==
@@ -851,8 +848,7 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
     if (index == 1)
       modulePath = text->str();
     if (text->starts_with("--architecture-spec="))
-      architecturePath =
-          text->drop_front(strlen("--architecture-spec=")).str();
+      architecturePath = text->drop_front(strlen("--architecture-spec=")).str();
     if (text->starts_with("--score-exact-joint-task-candidates=")) {
       SmallVector<StringRef> fields;
       text->drop_front(strlen("--score-exact-joint-task-candidates="))
@@ -880,13 +876,15 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
                                                : StringRef("critical-path"))
           : StringRef("all-ready");
   const StringRef expectedScheduleSpace =
-      productionScheduler ? StringRef(kProductionScheduleSpace) : StringRef("exact");
+      productionScheduler ? StringRef(kProductionScheduleSpace)
+                          : StringRef("exact");
   const StringRef expectedTemporalModel =
       productionScheduler ? StringRef(kProductionTemporalModel)
                           : StringRef("dispatch-order");
   if (modulePath.empty() || architecturePath.empty() || !output || !candidate ||
       !cost || normalizedPath(*output) != normalizedPath(scorePath) ||
-      normalizedPath(architecturePath) != normalizedPath(input.architecturePath) ||
+      normalizedPath(architecturePath) !=
+          normalizedPath(input.architecturePath) ||
       option("graph-variant-id") != std::optional<StringRef>(graphVariantId) ||
       option("source-git-repository") !=
           std::optional<StringRef>(input.sourceRepository) ||
@@ -899,7 +897,7 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
       option("temporal-model") !=
           std::optional<StringRef>(expectedTemporalModel) ||
       (!seedOnly && option("max-expanded-nodes") !=
-          std::optional<StringRef>("9223372036854775807")) ||
+                        std::optional<StringRef>("9223372036854775807")) ||
       option("max-milliseconds") != std::optional<StringRef>("0") ||
       option("max-makespan") != std::optional<StringRef>("0"))
     return false;
@@ -931,8 +929,7 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
     using namespace std::chrono;
     const auto startedNanos =
         duration_cast<nanoseconds>(duration<double>(*started));
-    if (status.getLastModificationTime() >
-        llvm::sys::TimePoint<>(startedNanos))
+    if (status.getLastModificationTime() > llvm::sys::TimePoint<>(startedNanos))
       return false;
   }
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> costBuffer =
@@ -963,13 +960,14 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
   if (!namespaceValue || namespaceValue->empty() || !sourceGraph ||
       *sourceGraph != graphVariantId || !architectureSchema ||
       *architectureSchema != "neura-architecture-v1" || !architectureValue ||
-      normalizedPath(*architectureValue) != normalizedPath(input.architecturePath) ||
+      normalizedPath(*architectureValue) !=
+          normalizedPath(input.architecturePath) ||
       !sourceRepository || *sourceRepository != input.sourceRepository ||
       !sourceCommit || *sourceCommit != input.sourceCommit || !predictor ||
       *predictor != kPredictorSource || !provenance ||
-      *provenance != "orbit-cost-provenance-v1" || !model ||
-      model->empty() || !modelSchema || modelSchema->empty() ||
-      !featureContract || featureContract->empty() || !featureExtractor ||
+      *provenance != "orbit-cost-provenance-v1" || !model || model->empty() ||
+      !modelSchema || modelSchema->empty() || !featureContract ||
+      featureContract->empty() || !featureExtractor ||
       featureExtractor->empty())
     return false;
   if (!expectedCostNamespace.empty() &&
@@ -980,8 +978,7 @@ static bool validateLegacyScoreCommand(StringRef scorePath,
 
 static bool hasCompleteScoreRecord(const json::Object &record) {
   return record.getString("schema") == std::optional<StringRef>(kScoreSchema) &&
-         record.getString("record_type") ==
-             std::optional<StringRef>("score") &&
+         record.getString("record_type") == std::optional<StringRef>("score") &&
          record.getBoolean("valid").value_or(false) &&
          record.getString("candidate_id") &&
          !record.getString("candidate_id")->empty() &&
@@ -990,8 +987,9 @@ static bool hasCompleteScoreRecord(const json::Object &record) {
          !record.getArray("task_costs")->empty() &&
          record.getArray("task_schedule") &&
          !record.getArray("task_schedule")->empty() &&
-         record.getString("score_source") == std::optional<StringRef>(
-             "ml-ii-startup-plus-production-explicit-communication") &&
+         record.getString("score_source") ==
+             std::optional<StringRef>(
+                 "ml-ii-startup-plus-production-explicit-communication") &&
          record.getString("task_latency_provenance") ==
              std::optional<StringRef>(
                  "source-owned-ml-ii-startup-trip-count-contract");
@@ -1045,10 +1043,11 @@ static bool readScoreArtifact(StringRef path, ScoreArtifact &artifact) {
          artifact.footer.has_value();
 }
 
-static bool validateBoundScoreArtifact(
-    const EvidenceRow &row, const InputManifest &input,
-    const ClosureInfo &closure, bool seedOnly,
-    StringRef expectedCostNamespace) {
+static bool validateBoundScoreArtifact(const EvidenceRow &row,
+                                       const InputManifest &input,
+                                       const ClosureInfo &closure,
+                                       bool seedOnly,
+                                       StringRef expectedCostNamespace) {
   ScoreArtifact artifact;
   if (!readScoreArtifact(row.scorePath, artifact))
     return false;
@@ -1113,7 +1112,8 @@ static bool validateBoundScoreArtifact(
         header.getString("dispatch_policy") !=
             std::optional<StringRef>(expectedPolicy) ||
         header.getString("dispatch_policy_scope") !=
-            std::optional<StringRef>(productionDispatchPolicyScope(expectedPolicy)))
+            std::optional<StringRef>(
+                productionDispatchPolicyScope(expectedPolicy)))
       return false;
   }
   if (auto sourceGraph = header.getString("source_graph_id"))
@@ -1129,9 +1129,8 @@ static bool validateBoundScoreArtifact(
     if (*architectureSchema != "neura-architecture-v1")
       return false;
   if (auto costNamespace = header.getString("cost_namespace")) {
-    if (costNamespace->empty() ||
-        (!expectedCostNamespace.empty() &&
-         *costNamespace != expectedCostNamespace))
+    if (costNamespace->empty() || (!expectedCostNamespace.empty() &&
+                                   *costNamespace != expectedCostNamespace))
       return false;
     if (header.getString("cost_provenance_schema") !=
         std::optional<StringRef>("orbit-cost-provenance-v1"))
@@ -1165,8 +1164,7 @@ static bool validateBoundScoreArtifact(
         artifact.rows.size() < 5)
       return false;
   } else {
-    if (footer.getString("status") !=
-            std::optional<StringRef>("complete") ||
+    if (footer.getString("status") != std::optional<StringRef>("complete") ||
         footer.getBoolean("incomplete") != std::optional<bool>(false) ||
         footer.getBoolean("top_k_certified") != std::optional<bool>(true) ||
         footer.getBoolean("seed_only").value_or(false) ||
@@ -1175,7 +1173,8 @@ static bool validateBoundScoreArtifact(
     const std::optional<StringRef> certificate =
         footer.getString("ranking_certificate");
     const bool orderDerivedCertificate =
-        certificate == std::optional<StringRef>(
+        certificate ==
+        std::optional<StringRef>(
             "proven-shape-location-dispatch-order-branch-and-bound");
     const bool productionCertificate =
         certificate == std::optional<StringRef>(kProductionCertificate);
@@ -1184,10 +1183,10 @@ static bool validateBoundScoreArtifact(
                            "proven-shape-and-schedule-branch-and-bound") ||
         certificate == std::optional<StringRef>(
                            "exhaustive-shape-plus-bounded-exact-schedule") ||
-        orderDerivedCertificate ||
-        productionCertificate ||
-        certificate == std::optional<StringRef>(
-                           "proven-shape-ranking-at-single-heuristic-placement");
+        orderDerivedCertificate || productionCertificate ||
+        certificate ==
+            std::optional<StringRef>(
+                "proven-shape-ranking-at-single-heuristic-placement");
     if (!completeCertificate ||
         (!orderDerivedCertificate && !productionCertificate &&
          !footer.getBoolean("horizon_proven").value_or(false)))
@@ -1504,10 +1503,10 @@ static bool validateGlobalCutoffEvidence(const ScoreInfo &score,
        footerObject.getString("shape_domain_pruning") !=
            std::optional<StringRef>("dependency-release-tail-cost-only") ||
        footerObject.getString("ranking_certificate") !=
-           std::optional<StringRef>(
-               headerSeedOnly
-                   ? "feasible-seed-only"
-                   : "global-proven-shape-space-under-production-scheduler-top-five")))
+           std::optional<StringRef>(headerSeedOnly
+                                        ? "feasible-seed-only"
+                                        : "global-proven-shape-space-under-"
+                                          "production-scheduler-top-five")))
     return false;
   auto zeroField = [&](StringRef key) {
     if (auto value = footerObject.getInteger(key))
@@ -1549,17 +1548,15 @@ static bool validateGlobalCutoffEvidence(const ScoreInfo &score,
       decimalField(footerObject, "seed_feasible_count").has_value() &&
       compareDecimal(*decimalField(footerObject, "seed_feasible_count"), "5") >=
           0 &&
-      (exact ||
-       (footerObject.getBoolean("complete").has_value() &&
-        !footerObject.getBoolean("complete").value() &&
-        footerObject.getBoolean("stage_certified").has_value() &&
-        !footerObject.getBoolean("stage_certified").value()));
+      (exact || (footerObject.getBoolean("complete").has_value() &&
+                 !footerObject.getBoolean("complete").value() &&
+                 footerObject.getBoolean("stage_certified").has_value() &&
+                 !footerObject.getBoolean("stage_certified").value()));
   if ((exact ? (!exactComplete && !seedFooter)
              : (!globalComplete && !seedFooter)) ||
       headerSeedOnly != seedFooter)
     return false;
-  if (!exact && !seedFooter &&
-      !isZero(*unmeasuredGraphVariantCount))
+  if (!exact && !seedFooter && !isZero(*unmeasuredGraphVariantCount))
     return false;
   if (seedFooter) {
     if (footerObject.getBoolean("seed_only") != std::optional<bool>(true) ||
@@ -1584,21 +1581,21 @@ static bool validateGlobalCutoffEvidence(const ScoreInfo &score,
   if (exact) {
     if (decimalField(footerObject, "scored_count") !=
             std::optional<std::string>(std::to_string(candidates.size())) ||
-        (!seedFooter &&
-         (!zeroField("unsupported_shape_candidates") ||
-          !zeroField("unmeasured_shape_candidates"))))
+        (!seedFooter && (!zeroField("unsupported_shape_candidates") ||
+                         !zeroField("unmeasured_shape_candidates"))))
       return false;
   } else if (decimalField(footerObject, "selected_count") !=
-                 std::optional<std::string>(std::to_string(candidates.size())) ||
+                 std::optional<std::string>(
+                     std::to_string(candidates.size())) ||
              !decimalField(headerObject, "scored_candidate_count") ||
              !decimalField(footerObject, "scored_candidate_count") ||
              *decimalField(headerObject, "scored_candidate_count") !=
                  *decimalField(footerObject, "scored_candidate_count") ||
              (seedFooter
                   ? (!decimalField(footerObject, "candidate_rows_considered") ||
-                     compareDecimal(
-                         *decimalField(footerObject, "candidate_rows_considered"),
-                         std::to_string(candidates.size())) < 0)
+                     compareDecimal(*decimalField(footerObject,
+                                                  "candidate_rows_considered"),
+                                    std::to_string(candidates.size())) < 0)
                   : (!decimalField(footerObject, "candidate_rows_considered") ||
                      *decimalField(footerObject, "candidate_rows_considered") !=
                          std::to_string(candidates.size()) ||
@@ -1609,8 +1606,9 @@ static bool validateGlobalCutoffEvidence(const ScoreInfo &score,
     if (auto footerFunction = footerObject.getString("function"))
       if (*footerFunction != input.function)
         return false;
-    for (StringRef key : {StringRef("stage"), StringRef("source_repository"),
-                          StringRef("source_commit"), StringRef("architecture_path")}) {
+    for (StringRef key :
+         {StringRef("stage"), StringRef("source_repository"),
+          StringRef("source_commit"), StringRef("architecture_path")}) {
       if (auto value = footerObject.getString(key)) {
         if (key == "stage" && *value != input.stage)
           return false;
@@ -1641,10 +1639,9 @@ static bool validateGlobalCutoffEvidence(const ScoreInfo &score,
                 return lhs.cycles < rhs.cycles;
               if (lhs.semanticGraphId != rhs.semanticGraphId)
                 return lhs.semanticGraphId < rhs.semanticGraphId;
-              int candidateOrder =
-                  ::mlir::amoeba::neura::joint_scheduling::
-                      compareProductionCandidateIds(lhs.candidateId,
-                                                    rhs.candidateId);
+              int candidateOrder = ::mlir::amoeba::neura::joint_scheduling::
+                  compareProductionCandidateIds(lhs.candidateId,
+                                                rhs.candidateId);
               if (candidateOrder != 0)
                 return candidateOrder < 0;
               return lhs.graphVariantId < rhs.graphVariantId;
@@ -1784,7 +1781,8 @@ static bool parseScore(StringRef path, const InputManifest &input,
       scoreError(info, "score architecture path does not match the manifest");
     if (sourceGraph) {
       if (*sourceGraph != variant.graphVariantId)
-        scoreError(info, "score source_graph_id does not match the graph variant");
+        scoreError(info,
+                   "score source_graph_id does not match the graph variant");
     } else if (info.seedOnly || headerGlobalCutoffRequested) {
       scoreError(info,
                  "seed/global-cutoff score has no source_graph_id binding");
@@ -1851,9 +1849,11 @@ static bool parseScore(StringRef path, const InputManifest &input,
             header->getBoolean("global_shape_location_temporal_space")) {
       info.globalShapeLocationTemporalSpace = *globalSpace;
       if (info.productionScheduler ? *globalSpace : !*globalSpace)
-        scoreError(info, info.productionScheduler
-                              ? "production scheduler score claims exact shape/location/temporal coverage"
-                              : "score does not cover shape/location/temporal space");
+        scoreError(info,
+                   info.productionScheduler
+                       ? "production scheduler score claims exact "
+                         "shape/location/temporal coverage"
+                       : "score does not cover shape/location/temporal space");
     } else {
       scoreError(info, "score header has no global space marker");
     }
@@ -1873,8 +1873,8 @@ static bool parseScore(StringRef path, const InputManifest &input,
           header->getBoolean("temporal_coverage_limited").value_or(true);
       if (!info.placementCoverageLimited || !info.locationCoverageLimited ||
           !info.temporalCoverageLimited)
-        scoreError(info,
-                   "production scheduler score must mark location and temporal coverage limited");
+        scoreError(info, "production scheduler score must mark location and "
+                         "temporal coverage limited");
     }
     if (std::optional<StringRef> scheduleSpace =
             header->getString("schedule_space")) {
@@ -1886,8 +1886,9 @@ static bool parseScore(StringRef path, const InputManifest &input,
       } else if (*scheduleSpace == "heuristic-placement")
         info.placementCoverageLimited = true;
       else if (*scheduleSpace == "exact" && info.placementCoverageLimited)
-        scoreError(info,
-                   "exact schedule_space cannot claim limited placement coverage");
+        scoreError(
+            info,
+            "exact schedule_space cannot claim limited placement coverage");
       else if (*scheduleSpace == "order-derived" ||
                *scheduleSpace == "order-derived-dispatch")
         info.orderDerivedTemporal = true;
@@ -1903,8 +1904,9 @@ static bool parseScore(StringRef path, const InputManifest &input,
     if (info.productionScheduler &&
         header->getString("shape_domain_pruning") !=
             std::optional<StringRef>("dependency-release-tail-cost-only"))
-      scoreError(info,
-                 "production scheduler score must use the cost-only shape bound");
+      scoreError(
+          info,
+          "production scheduler score must use the cost-only shape bound");
     std::optional<StringRef> temporalScope =
         header->getString("temporal_search_scope");
     std::optional<StringRef> startPolicy = header->getString("start_policy");
@@ -1931,46 +1933,49 @@ static bool parseScore(StringRef path, const InputManifest &input,
     // one of the new temporal fields is present.
     const bool anyTemporalContractField =
         info.orderDerivedTemporal || temporalScope || cycleStarts ||
-        (startPolicy &&
-         *startPolicy == "dependency-and-resource-ready");
+        (startPolicy && *startPolicy == "dependency-and-resource-ready");
     if (info.productionScheduler) {
       info.temporalContractPresent = true;
       if (!temporalScope || !startPolicy || !cycleStarts ||
           *temporalScope != kProductionTemporalScope ||
           *startPolicy != kProductionStartPolicy || *cycleStarts)
-        scoreError(info,
-                   "production scheduler score has an invalid temporal contract");
+        scoreError(
+            info,
+            "production scheduler score has an invalid temporal contract");
       info.dispatchPolicy =
           header->getString("dispatch_policy").value_or(StringRef()).str();
-      info.dispatchPolicyScope =
-          header->getString("dispatch_policy_scope")
-              .value_or(StringRef())
-              .str();
+      info.dispatchPolicyScope = header->getString("dispatch_policy_scope")
+                                     .value_or(StringRef())
+                                     .str();
       info.schedulerBackend =
           header->getString("scheduler_backend").value_or(StringRef()).str();
       if (!isProductionDispatchPolicy(input.stage, info.dispatchPolicy) ||
           info.dispatchPolicyScope !=
               productionDispatchPolicyScope(info.dispatchPolicy).str())
-        scoreError(info,
-                   "production scheduler score has an invalid dispatch policy contract");
+        scoreError(info, "production scheduler score has an invalid dispatch "
+                         "policy contract");
       if (info.schedulerBackend != kProductionSchedulerBackend)
-        scoreError(info,
-                   "production scheduler score has an unknown scheduler backend");
+        scoreError(
+            info,
+            "production scheduler score has an unknown scheduler backend");
     } else if (anyTemporalContractField) {
       if (!temporalScope || !startPolicy || !cycleStarts)
-        scoreError(info,
-                   "temporal score header must provide all order-derived fields");
+        scoreError(
+            info,
+            "temporal score header must provide all order-derived fields");
       else {
         info.temporalContractPresent = true;
         if (*temporalScope != "task-dispatch-order-only")
-          scoreError(info, "score temporal_search_scope is not dispatch-order-only");
-        const bool stageOneGreedy = input.stage == "shape-only" &&
-            info.placementCoverageLimited &&
+          scoreError(info,
+                     "score temporal_search_scope is not dispatch-order-only");
+        const bool stageOneGreedy =
+            input.stage == "shape-only" && info.placementCoverageLimited &&
             header->getString("schedule_space") ==
                 std::optional<StringRef>("heuristic-placement") &&
             *startPolicy == "single-greedy-placement";
         if (*startPolicy != "dependency-and-resource-ready" && !stageOneGreedy)
-          scoreError(info, "score start_policy is not dependency-and-resource-ready");
+          scoreError(info,
+                     "score start_policy is not dependency-and-resource-ready");
         if (*cycleStarts)
           scoreError(info,
                      "order-derived score cannot search integer cycle starts");
@@ -1998,8 +2003,7 @@ static bool parseScore(StringRef path, const InputManifest &input,
         topCertified && !*topCertified &&
         footer->getBoolean("seed_only").value_or(false) &&
         footer->getBoolean("feasible_only").value_or(false) &&
-        footerCertificate ==
-            std::optional<StringRef>("feasible-seed-only");
+        footerCertificate == std::optional<StringRef>("feasible-seed-only");
     info.globalCutoffComplete = globalCutoffComplete;
     const bool orderDerivedCertificate =
         footerCertificate &&
@@ -2009,19 +2013,22 @@ static bool parseScore(StringRef path, const InputManifest &input,
         footerCertificate && *footerCertificate == kProductionCertificate;
     if (globalCutoffComplete) {
       if (!headerGlobalCutoffRequested)
-        scoreError(info,
-                   "global-cutoff score footer lacks the header request marker");
+        scoreError(
+            info, "global-cutoff score footer lacks the header request marker");
       if (!status || (*status != "globally-pruned" && *status != "complete") ||
           !incomplete || *incomplete ||
           !footer->getBoolean("global_cutoff_proven").value_or(false) ||
-          (!footer->getBoolean("global_cutoff_omitted_candidates_strictly_worse")
+          (!footer
+                ->getBoolean("global_cutoff_omitted_candidates_strictly_worse")
                 .value_or(false) &&
-           !footer->getBoolean(
-                "global_cutoff_omitted_candidates_stable_key_dominated")
+           !footer
+                ->getBoolean(
+                    "global_cutoff_omitted_candidates_stable_key_dominated")
                 .value_or(false)) ||
           !footerCertificate ||
           *footerCertificate != "proven-global-incumbent-cycle-cutoff")
-        scoreError(info, "global-cutoff score footer is incomplete or uncertified");
+        scoreError(info,
+                   "global-cutoff score footer is incomplete or uncertified");
       std::optional<int64_t> cutoff =
           footer->getInteger("global_cutoff_cycles");
       if (!cutoff || *cutoff <= 0)
@@ -2035,12 +2042,12 @@ static bool parseScore(StringRef path, const InputManifest &input,
       else
         info.globalCutoffEvidencePath = evidence->str();
       if (footer->getInteger("global_cutoff_evidence_candidate_count")
-                  .value_or(0) < 5)
+              .value_or(0) < 5)
         scoreError(info,
                    "global-cutoff evidence has fewer than five candidates");
       if (footer->getString("global_cutoff_key_policy") !=
-          std::optional<StringRef>(
-              "predicted_whole_program_cycles,semantic_graph_id,candidate_id,graph_variant_id"))
+          std::optional<StringRef>("predicted_whole_program_cycles,semantic_"
+                                   "graph_id,candidate_id,graph_variant_id"))
         scoreError(info, "global-cutoff score has an unstable key policy");
       if (footer->getString("global_cutoff_evidence_function") !=
               std::optional<StringRef>(input.function) ||
@@ -2052,14 +2059,17 @@ static bool parseScore(StringRef path, const InputManifest &input,
               std::optional<StringRef>(input.sourceCommit) ||
           footer->getString("global_cutoff_evidence_architecture_path") !=
               std::optional<StringRef>(input.architecturePath))
-        scoreError(info, "global-cutoff evidence provenance disagrees with manifest");
+        scoreError(info,
+                   "global-cutoff evidence provenance disagrees with manifest");
       if (!llvm::sys::fs::exists(info.globalCutoffEvidencePath))
         scoreError(info, "global-cutoff evidence path does not exist");
     } else if (seedFooter) {
-      if (!seedMode || footer->getInteger("seed_feasible_count").value_or(-1) < 5 ||
+      if (!seedMode ||
+          footer->getInteger("seed_feasible_count").value_or(-1) < 5 ||
           footer->getInteger("seed_feasible_count").value_or(-1) !=
               static_cast<int64_t>(info.candidates.size()))
-        scoreError(info, "seed-only score footer does not cover its feasible rows");
+        scoreError(info,
+                   "seed-only score footer does not cover its feasible rows");
     } else if (!status || *status != "complete" || !incomplete || *incomplete ||
                !topCertified || !*topCertified ||
                (!orderDerivedCertificate && !productionCertificate &&
@@ -2094,8 +2104,9 @@ static bool parseScore(StringRef path, const InputManifest &input,
     if (visited && unmeasured && !info.candidateCount.empty() &&
         addDecimal(addDecimal(*visited, info.boundPrunedShapeCandidates),
                    *unmeasured) != info.candidateCount)
-      scoreError(info,
-                 "score shape coverage does not partition the full factored space");
+      scoreError(
+          info,
+          "score shape coverage does not partition the full factored space");
     std::optional<std::string> validShapes =
         decimalField(*footer, "valid_shape_candidates");
     if (!validShapes ||
@@ -2148,8 +2159,8 @@ static bool parseScore(StringRef path, const InputManifest &input,
               std::optional<StringRef>(info.dispatchPolicy) ||
           footer->getString("dispatch_policy_scope") !=
               std::optional<StringRef>(info.dispatchPolicyScope))
-        scoreError(info,
-                   "production scheduler score footer contract disagrees with its header");
+        scoreError(info, "production scheduler score footer contract disagrees "
+                         "with its header");
     }
     if (footerCertificate) {
       info.rankingCertificate = footerCertificate->str();
@@ -2157,31 +2168,35 @@ static bool parseScore(StringRef path, const InputManifest &input,
           *footerCertificate == "proven-shape-and-schedule-branch-and-bound" ||
           *footerCertificate == "exhaustive-shape-plus-bounded-exact-schedule";
       const bool limitedCertificate =
-          *footerCertificate == "proven-shape-ranking-at-single-heuristic-placement";
+          *footerCertificate ==
+          "proven-shape-ranking-at-single-heuristic-placement";
       if (seedFooter) {
         if (*footerCertificate != "feasible-seed-only")
           scoreError(info, "seed-only score has the wrong certificate");
       } else if (orderDerivedCertificate) {
         info.orderDerivedTemporal = true;
         if (info.placementCoverageLimited || input.stage == "shape-only")
-          scoreError(info,
-                     "order-derived temporal certificate is not valid for this stage");
+          scoreError(
+              info,
+              "order-derived temporal certificate is not valid for this stage");
         if (!info.temporalContractPresent)
-          scoreError(info,
-                     "order-derived score footer requires the temporal header contract");
+          scoreError(info, "order-derived score footer requires the temporal "
+                           "header contract");
       } else if (productionCertificate) {
         if (!info.productionScheduler || !info.temporalContractPresent ||
             !info.placementCoverageLimited ||
             !isZero(info.unmeasuredShapeCandidates))
-          scoreError(info,
-                     "production scheduler certificate lacks complete shape coverage");
+          scoreError(
+              info,
+              "production scheduler certificate lacks complete shape coverage");
       } else if (globalCutoffComplete) {
         if (*footerCertificate != "proven-global-incumbent-cycle-cutoff")
           scoreError(info, "global-cutoff score has the wrong certificate");
       } else if ((info.placementCoverageLimited && !limitedCertificate) ||
                  (!info.placementCoverageLimited && !exactCertificate)) {
-        scoreError(info,
-                   "score ranking certificate does not match placement coverage");
+        scoreError(
+            info,
+            "score ranking certificate does not match placement coverage");
       }
     } else {
       scoreError(info, "score footer has no ranking_certificate");
@@ -2252,14 +2267,16 @@ static bool bindClosureToVariants(const InputManifest &input,
       variantStructural.insert(graph->structuralText);
       if (!graph->semanticGraphId.empty() &&
           graph->semanticGraphId != variant.semanticGraphId)
-        addError(errors, "closure semantic graph identity disagrees with manifest");
+        addError(errors,
+                 "closure semantic graph identity disagrees with manifest");
       if (!graph->graphVariantId.empty() &&
           graph->graphVariantId != variant.graphVariantId)
         addError(errors, "closure graph_variant_id disagrees with manifest");
       auto semanticIt = semanticByStructural.find(graph->structuralText);
       if (semanticIt != semanticByStructural.end() &&
           semanticIt->second != variant.semanticGraphId)
-        addError(errors, "equivalent structural graphs have different semantic IDs");
+        addError(errors,
+                 "equivalent structural graphs have different semantic IDs");
       else
         semanticByStructural[graph->structuralText] = variant.semanticGraphId;
     }
@@ -2276,26 +2293,28 @@ static bool bindClosureToVariants(const InputManifest &input,
       auto structuralIt = structuralBySemantic.find(variant.semanticGraphId);
       if (structuralIt != structuralBySemantic.end() &&
           structuralIt->second != structural)
-        addError(errors, "one semantic graph ID names multiple structural keys");
+        addError(errors,
+                 "one semantic graph ID names multiple structural keys");
       else
         structuralBySemantic[variant.semanticGraphId] = structural;
     }
   }
   for (const ClosureGraph &graph : closure.graphs) {
-    if (!allowUnscoredGraphs && !semanticByStructural.count(graph.structuralText))
+    if (!allowUnscoredGraphs &&
+        !semanticByStructural.count(graph.structuralText))
       addError(errors, "graph closure contains an unscored semantic graph");
   }
   if (semanticIds.empty() || semanticIds.size() != structuralBySemantic.size())
-    addError(errors, "graph closure has no score-bound semantic graph variants");
+    addError(errors,
+             "graph closure has no score-bound semantic graph variants");
   return errors.empty();
 }
 
 static void addRankedCandidate(
-    std::map<std::tuple<std::string, std::string, std::string>, size_t> &indices,
-                               std::vector<RankedCandidate> &ranked,
-                               const VariantSpec &variant,
-                               const ScoreCandidate &score,
-                               const ClosureInfo &closure) {
+    std::map<std::tuple<std::string, std::string, std::string>, size_t>
+        &indices,
+    std::vector<RankedCandidate> &ranked, const VariantSpec &variant,
+    const ScoreCandidate &score, const ClosureInfo &closure) {
   std::tuple<std::string, std::string, std::string> key{
       variant.semanticGraphId, score.candidateId, variant.graphVariantId};
   auto found = indices.find(key);
@@ -2373,8 +2392,8 @@ static void buildRanking(RankResult &result) {
     if (index >= result.scores.size()) {
       result.unmeasuredGraphVariantCount =
           addDecimal(result.unmeasuredGraphVariantCount, "1");
-      addError(result.errors, "score result is missing for graph " +
-                               variant.graphVariantId);
+      addError(result.errors,
+               "score result is missing for graph " + variant.graphVariantId);
       continue;
     }
     const ScoreInfo &score = result.scores[index];
@@ -2402,8 +2421,9 @@ static void buildRanking(RankResult &result) {
                result.schedulerBackend != score.schedulerBackend ||
                result.globalShapeLocationTemporalSpace !=
                    score.globalShapeLocationTemporalSpace) {
-      addError(result.errors,
-               "score temporal scheduling contracts disagree across graph variants");
+      addError(
+          result.errors,
+          "score temporal scheduling contracts disagree across graph variants");
     }
     result.placementCoverageLimited |= score.placementCoverageLimited;
     result.locationCoverageLimited |= score.locationCoverageLimited;
@@ -2413,7 +2433,8 @@ static void buildRanking(RankResult &result) {
       if (result.temporalSearchScope.empty())
         result.temporalSearchScope = score.temporalSearchScope;
       else if (result.temporalSearchScope != score.temporalSearchScope)
-        addError(result.errors, "score temporal scopes disagree across graph variants");
+        addError(result.errors,
+                 "score temporal scopes disagree across graph variants");
     }
     if (!score.startPolicy.empty()) {
       if (result.startPolicy.empty())
@@ -2428,19 +2449,20 @@ static void buildRanking(RankResult &result) {
             score.cycleStartsAreSearchDimensions;
       else if (*result.cycleStartsAreSearchDimensions !=
                *score.cycleStartsAreSearchDimensions)
-        addError(result.errors,
-                 "score cycle-start search markers disagree across graph variants");
+        addError(
+            result.errors,
+            "score cycle-start search markers disagree across graph variants");
     }
     if (!score.candidateCount.empty())
-      result.scoredCandidateCount = addDecimal(
-          result.scoredCandidateCount, score.candidateCount);
+      result.scoredCandidateCount =
+          addDecimal(result.scoredCandidateCount, score.candidateCount);
     if (!score.shapeCandidatesVisited.empty())
       result.visitedShapeCandidateCount = addDecimal(
           result.visitedShapeCandidateCount, score.shapeCandidatesVisited);
     if (!score.boundPrunedShapeCandidates.empty())
-      result.boundPrunedShapeCandidateCount = addDecimal(
-          result.boundPrunedShapeCandidateCount,
-          score.boundPrunedShapeCandidates);
+      result.boundPrunedShapeCandidateCount =
+          addDecimal(result.boundPrunedShapeCandidateCount,
+                     score.boundPrunedShapeCandidates);
     if (!score.unmeasuredShapeCandidates.empty())
       result.unmeasuredCandidateCount = addDecimal(
           result.unmeasuredCandidateCount, score.unmeasuredShapeCandidates);
@@ -2452,7 +2474,8 @@ static void buildRanking(RankResult &result) {
       if (result.costNamespace.empty())
         result.costNamespace = score.costNamespace;
       else if (result.costNamespace != score.costNamespace)
-        addError(result.errors, "score cost namespaces disagree across graph variants");
+        addError(result.errors,
+                 "score cost namespaces disagree across graph variants");
     }
     if (!score.architectureSchema.empty()) {
       if (result.architectureSchema.empty())
@@ -2476,8 +2499,9 @@ static void buildRanking(RankResult &result) {
       representativeCount.emplace(variant.semanticGraphId,
                                   result.scores[index].candidateCount);
     } else if (found->second != result.scores[index].candidateCount) {
-      addError(result.errors,
-               "equivalent semantic graph variants disagree on candidate_count");
+      addError(
+          result.errors,
+          "equivalent semantic graph variants disagree on candidate_count");
     }
   }
   std::string declared = "0";
@@ -2503,11 +2527,12 @@ static void buildRanking(RankResult &result) {
         result.globalShapeLocationTemporalSpace ||
         result.schedulerBackend != kProductionSchedulerBackend ||
         !isProductionDispatchPolicy(result.input.stage,
-                                     result.dispatchPolicy) ||
+                                    result.dispatchPolicy) ||
         result.dispatchPolicyScope !=
             productionDispatchPolicyScope(result.dispatchPolicy))
-      addError(result.errors,
-               "production scheduler global ranking lacks its coverage contract");
+      addError(
+          result.errors,
+          "production scheduler global ranking lacks its coverage contract");
     for (const ScoreInfo &score : result.scores)
       if (!score.productionScheduler || !score.temporalContractPresent)
         addError(result.errors,
@@ -2521,14 +2546,15 @@ static void buildRanking(RankResult &result) {
                "order-derived global ranking lacks its temporal contract");
     for (const ScoreInfo &score : result.scores)
       if (!score.temporalContractPresent)
-        addError(result.errors,
-                 "order-derived global ranking mixes a score without the temporal contract");
+        addError(result.errors, "order-derived global ranking mixes a score "
+                                "without the temporal contract");
   }
   if (!result.seedOnly && !isZero(result.unmeasuredGraphVariantCount))
     addError(result.errors,
              "complete global ranking has unmeasured graph variants");
-  result.complete = !result.seedOnly && result.errors.empty() && allScoresValid &&
-                    result.closure.valid && result.candidates.size() >= 5 &&
+  result.complete = !result.seedOnly && result.errors.empty() &&
+                    allScoresValid && result.closure.valid &&
+                    result.candidates.size() >= 5 &&
                     result.input.variants.size() == result.scores.size();
   (void)declared;
 }
@@ -2539,15 +2565,16 @@ static bool writeOutput(StringRef path, const RankResult &result,
   std::error_code ec;
   llvm::raw_fd_ostream stream(path, ec, llvm::sys::fs::OF_Text);
   if (ec) {
-    error = "cannot write global stage ranking " + path.str() + ": " +
-            ec.message();
+    error =
+        "cannot write global stage ranking " + path.str() + ": " + ec.message();
     return false;
   }
   json::Object header;
   header["schema"] = kOutputSchema.str();
   header["record_type"] = "header";
-  header["status"] = result.seedOnly ? "seed-only"
-                                     : result.complete ? "complete" : "incomplete";
+  header["status"] = result.seedOnly   ? "seed-only"
+                     : result.complete ? "complete"
+                                       : "incomplete";
   header["complete"] = result.complete;
   header["stage_certified"] = result.complete;
   header["seed_only"] = result.seedOnly;
@@ -2600,21 +2627,20 @@ static bool writeOutput(StringRef path, const RankResult &result,
     header["temporal_coverage_limited"] = result.temporalCoverageLimited;
     header["scheduler_backend"] = kProductionSchedulerBackend.str();
     header["orbit_4x4_pruning"] = false;
-    header["shape_domain_pruning"] =
-        "dependency-release-tail-cost-only";
+    header["shape_domain_pruning"] = "dependency-release-tail-cost-only";
     header["dispatch_policy"] = result.dispatchPolicy;
     header["dispatch_policy_scope"] = result.dispatchPolicyScope;
     header["tie_key_policy"] =
-        ::mlir::amoeba::neura::joint_scheduling::
-            kProductionNumericTieKeyPolicy.str();
+        ::mlir::amoeba::neura::joint_scheduling::kProductionNumericTieKeyPolicy
+            .str();
   }
   putDecimal(header, "globally_pruned_graph_variant_count",
              result.globallyPrunedGraphVariantCount);
   header["placement_coverage_policy"] =
       result.productionScheduler
           ? "single-production-scheduler-placement-and-order"
-          : result.placementCoverageLimited ? "single-heuristic-placement"
-                                      : "exact-4x4-location-temporal";
+      : result.placementCoverageLimited ? "single-heuristic-placement"
+                                        : "exact-4x4-location-temporal";
   if (result.productionScheduler || result.orderDerivedTemporal ||
       !result.temporalSearchScope.empty() || !result.startPolicy.empty()) {
     header["temporal_search_scope"] =
@@ -2622,21 +2648,21 @@ static bool writeOutput(StringRef path, const RankResult &result,
             ? (result.productionScheduler ? kProductionTemporalScope.str()
                                           : "task-dispatch-order-only")
             : result.temporalSearchScope;
-    header["start_policy"] = result.startPolicy.empty()
-                                  ? (result.productionScheduler
-                                         ? kProductionStartPolicy.str()
-                                         : "dependency-and-resource-ready")
-                                  : result.startPolicy;
+    header["start_policy"] =
+        result.startPolicy.empty()
+            ? (result.productionScheduler ? kProductionStartPolicy.str()
+                                          : "dependency-and-resource-ready")
+            : result.startPolicy;
     header["cycle_starts_are_search_dimensions"] =
         result.cycleStartsAreSearchDimensions.value_or(false);
   }
   putDecimal(header, "scored_candidate_count", result.scoredCandidateCount);
   putDecimal(header, "shape_candidates_visited",
-              result.visitedShapeCandidateCount);
+             result.visitedShapeCandidateCount);
   putDecimal(header, "bound_pruned_shape_candidates",
-              result.boundPrunedShapeCandidateCount);
+             result.boundPrunedShapeCandidateCount);
   putDecimal(header, "unmeasured_candidate_count",
-              result.unmeasuredCandidateCount);
+             result.unmeasuredCandidateCount);
   stream << jsonLine(std::move(header));
 
   for (size_t rank = 0; rank < selected.size(); ++rank) {
@@ -2689,8 +2715,9 @@ static bool writeOutput(StringRef path, const RankResult &result,
   json::Object footer;
   footer["schema"] = kOutputSchema.str();
   footer["record_type"] = "footer";
-  footer["status"] = result.seedOnly ? "seed-only"
-                                     : result.complete ? "complete" : "incomplete";
+  footer["status"] = result.seedOnly   ? "seed-only"
+                     : result.complete ? "complete"
+                                       : "incomplete";
   footer["complete"] = result.complete;
   footer["incomplete"] = !result.complete;
   footer["stage_certified"] = result.complete;
@@ -2712,8 +2739,8 @@ static bool writeOutput(StringRef path, const RankResult &result,
   footer["placement_coverage_policy"] =
       result.productionScheduler
           ? "single-production-scheduler-placement-and-order"
-          : result.placementCoverageLimited ? "single-heuristic-placement"
-                                      : "exact-4x4-location-temporal";
+      : result.placementCoverageLimited ? "single-heuristic-placement"
+                                        : "exact-4x4-location-temporal";
   if (result.productionScheduler) {
     footer["temporal_model"] = kProductionTemporalModel.str();
     footer["schedule_space"] = kProductionScheduleSpace.str();
@@ -2722,13 +2749,12 @@ static bool writeOutput(StringRef path, const RankResult &result,
     footer["temporal_coverage_limited"] = result.temporalCoverageLimited;
     footer["scheduler_backend"] = kProductionSchedulerBackend.str();
     footer["orbit_4x4_pruning"] = false;
-    footer["shape_domain_pruning"] =
-        "dependency-release-tail-cost-only";
+    footer["shape_domain_pruning"] = "dependency-release-tail-cost-only";
     footer["dispatch_policy"] = result.dispatchPolicy;
     footer["dispatch_policy_scope"] = result.dispatchPolicyScope;
     footer["tie_key_policy"] =
-        ::mlir::amoeba::neura::joint_scheduling::
-            kProductionNumericTieKeyPolicy.str();
+        ::mlir::amoeba::neura::joint_scheduling::kProductionNumericTieKeyPolicy
+            .str();
   }
   if (result.productionScheduler || result.orderDerivedTemporal ||
       !result.temporalSearchScope.empty() || !result.startPolicy.empty()) {
@@ -2737,11 +2763,11 @@ static bool writeOutput(StringRef path, const RankResult &result,
             ? (result.productionScheduler ? kProductionTemporalScope.str()
                                           : "task-dispatch-order-only")
             : result.temporalSearchScope;
-    footer["start_policy"] = result.startPolicy.empty()
-                                  ? (result.productionScheduler
-                                         ? kProductionStartPolicy.str()
-                                         : "dependency-and-resource-ready")
-                                  : result.startPolicy;
+    footer["start_policy"] =
+        result.startPolicy.empty()
+            ? (result.productionScheduler ? kProductionStartPolicy.str()
+                                          : "dependency-and-resource-ready")
+            : result.startPolicy;
     footer["cycle_starts_are_search_dimensions"] =
         result.cycleStartsAreSearchDimensions.value_or(false);
   }
@@ -2772,15 +2798,16 @@ static bool writeOutput(StringRef path, const RankResult &result,
                                 ? result.candidates.size() - selected.size()
                                 : 0));
   footer["ranking_certificate"] =
-      result.seedOnly
-          ? "feasible-seed-only"
-          : result.complete
-          ? (result.productionScheduler
-                 ? "global-proven-shape-space-under-production-scheduler-top-five"
-                 : result.placementCoverageLimited
-                 ? "global-proven-shape-ranking-at-single-heuristic-placement-top-five"
-                 : result.orderDerivedTemporal
-                       ? "global-proven-shape-location-dispatch-order-branch-and-bound-top-five"
+      result.seedOnly ? "feasible-seed-only"
+      : result.complete
+          ? (result.productionScheduler ? "global-proven-shape-space-under-"
+                                          "production-scheduler-top-five"
+             : result.placementCoverageLimited
+                 ? "global-proven-shape-ranking-at-single-heuristic-placement-"
+                   "top-five"
+             : result.orderDerivedTemporal
+                 ? "global-proven-shape-location-dispatch-order-branch-and-"
+                   "bound-top-five"
                  : "global-proven-shape-and-schedule-branch-and-bound-top-five")
           : "best-found-diagnostic-only";
   footer["ranking_objective"] = "predicted_whole_program_cycles";
@@ -2819,14 +2846,14 @@ public:
     return "select-global-stage-top-five";
   }
   StringRef getDescription() const override {
-    return "Select one certified global predicted top five across graph variants";
+    return "Select one certified global predicted top five across graph "
+           "variants";
   }
 
   Option<std::string> manifestFile{*this, "manifest", llvm::cl::init("")};
   Option<std::string> outputFile{*this, "output", llvm::cl::init("")};
   Option<bool> incumbentOnly{*this, "incumbent-only", llvm::cl::init(false)};
-  Option<int64_t> diagnosticLimit{*this, "max-diagnostics",
-                                  llvm::cl::init(5)};
+  Option<int64_t> diagnosticLimit{*this, "max-diagnostics", llvm::cl::init(5)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -2838,14 +2865,13 @@ public:
     }
 
     RankResult result;
-    result.diagnosticLimit =
-        static_cast<unsigned>(diagnosticLimit.getValue());
+    result.diagnosticLimit = static_cast<unsigned>(diagnosticLimit.getValue());
     // Output is interpreted by the driver, while alias checks use one
     // normalized spelling before any output is opened.
     const std::string normalizedOutputPath =
         normalizedPath(outputFile.getValue());
-    bool manifestValid = parseManifest(manifestFile.getValue(), result.input,
-                                       result.errors);
+    bool manifestValid =
+        parseManifest(manifestFile.getValue(), result.input, result.errors);
     if (manifestValid) {
       result.closure.valid = false;
       parseClosure(result.input.closurePath, result.input, result.closure,
@@ -2858,8 +2884,7 @@ public:
         parseScore(variant.scorePath, result.input, variant, result.closure,
                    score, incumbentOnly.getValue());
         if (score.globalCutoffComplete &&
-            !validateGlobalCutoffEvidence(score, result.input,
-                                          result.closure))
+            !validateGlobalCutoffEvidence(score, result.input, result.closure))
           scoreError(
               score,
               "global-cutoff evidence is not a matching complete C++ top-five");
@@ -2911,8 +2936,7 @@ public:
     }
     std::string outputError;
     const size_t selectedCount = selected.size();
-    if (!writeOutput(outputFile.getValue(), result, selected,
-                     outputError)) {
+    if (!writeOutput(outputFile.getValue(), result, selected, outputError)) {
       module.emitError() << outputError;
       return signalPassFailure();
     }
@@ -2932,7 +2956,6 @@ public:
 
 } // namespace
 
-std::unique_ptr<Pass>
-mlir::amoeba::neura::createGlobalStageRankerPass() {
+std::unique_ptr<Pass> mlir::amoeba::neura::createGlobalStageRankerPass() {
   return std::make_unique<GlobalStageRankerPass>();
 }

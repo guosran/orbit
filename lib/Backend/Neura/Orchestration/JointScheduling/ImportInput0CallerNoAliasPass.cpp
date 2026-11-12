@@ -13,8 +13,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Backend/Neura/NeuraBackendPasses.h"
 #include "AnalyticalTaskCandidateCommon.h"
+#include "Backend/Neura/NeuraBackendPasses.h"
 
 #include "NeuraDialect/NeuraDialect.h"
 #include "TaskflowDialect/TaskflowDialect.h"
@@ -60,8 +60,7 @@ constexpr StringLiteral kProvenAttr = "amoeba.input0_caller_noalias_proven";
 constexpr StringLiteral kEvidencePathAttr =
     "amoeba.input0_caller_evidence_path";
 constexpr StringLiteral kCallerAttr = "amoeba.input0_caller_function";
-constexpr StringLiteral kStaticBoundAttr =
-    "amoeba.input0_caller_static_bound";
+constexpr StringLiteral kStaticBoundAttr = "amoeba.input0_caller_static_bound";
 constexpr StringLiteral kPreparedInputPathAttr =
     "amoeba.input0_caller_prepared_input_path";
 constexpr StringLiteral kProofModeAttr =
@@ -108,15 +107,14 @@ static FailureOr<std::string> readExactText(StringRef path,
                                             std::string &reason) {
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
-    reason = (llvm::Twine("could not read evidence path '") + path + "'")
-                 .str();
+    reason = (llvm::Twine("could not read evidence path '") + path + "'").str();
     return failure();
   }
   return buffer.get()->getBuffer().str();
 }
 
 static OwningOpRef<ModuleOp> parseExactModule(StringRef text, StringRef path,
-                                               MLIRContext *context) {
+                                              MLIRContext *context) {
   return parseSourceString<ModuleOp>(text, ParserConfig(context), path);
 }
 
@@ -180,8 +178,8 @@ static std::optional<int64_t> constantInteger(Value value) {
 }
 
 static FailureOr<Value> traceAllocationRoot(Value value, func::FuncOp caller,
-                                             ArrayRef<int64_t> expectedShape,
-                                             std::string &reason) {
+                                            ArrayRef<int64_t> expectedShape,
+                                            std::string &reason) {
   SmallPtrSet<Operation *, 16> visited;
   while (true) {
     Operation *definition = value.getDefiningOp();
@@ -244,7 +242,8 @@ static FailureOr<Value> traceAllocationRoot(Value value, func::FuncOp caller,
     if (auto cast = dyn_cast<memref::CastOp>(definition)) {
       auto sourceType = dyn_cast<MemRefType>(cast.getSource().getType());
       auto resultType = dyn_cast<MemRefType>(cast.getResult().getType());
-      if (!sourceType || !resultType || sourceType.getRank() != resultType.getRank() ||
+      if (!sourceType || !resultType ||
+          sourceType.getRank() != resultType.getRank() ||
           !isIdentityMemRef(sourceType) || !isIdentityMemRef(resultType)) {
         reason = "memref.cast is not a ranked identity-layout cast";
         return failure();
@@ -271,11 +270,13 @@ static FailureOr<Value> traceAllocationRoot(Value value, func::FuncOp caller,
         reason = "memref.subview rank metadata is incomplete";
         return failure();
       }
-      for (auto [index, sourceExtent] : llvm::enumerate(sourceType.getShape())) {
+      for (auto [index, sourceExtent] :
+           llvm::enumerate(sourceType.getShape())) {
         if (offsets[index] != 0 || strides[index] != 1 ||
             sizes[index] != sourceExtent ||
             resultType.getDimSize(index) != sourceExtent) {
-          reason = "memref.subview is partial or has dynamic offset/size/stride";
+          reason =
+              "memref.subview is partial or has dynamic offset/size/stride";
           return failure();
         }
       }
@@ -307,7 +308,8 @@ static FailureOr<Shape> argumentShape(func::FuncOp target, unsigned argument,
     }
     shape = explicitShapes[memrefOrdinal];
   } else {
-    Attribute attribute = target.getArgAttr(argument, kLogicalTransferShapeAttr);
+    Attribute attribute =
+        target.getArgAttr(argument, kLogicalTransferShapeAttr);
     auto dense = dyn_cast_or_null<DenseI64ArrayAttr>(attribute);
     if (!dense) {
       reason = "dynamic target memref lacks a source-owned logical shape "
@@ -349,9 +351,11 @@ static FailureOr<Shape> argumentShape(func::FuncOp target, unsigned argument,
 // the prepared graph body when importing a harness, but its symbol and
 // function type must match.  A caller file with the right name or a numeric
 // shape fixture therefore cannot authorize a different caller or target.
-static LogicalResult validateCallerEvidence(
-    StringRef path, ModuleOp module, func::FuncOp target, func::FuncOp caller,
-    ArrayRef<func::CallOp> calls, std::string &reason) {
+static LogicalResult validateCallerEvidence(StringRef path, ModuleOp module,
+                                            func::FuncOp target,
+                                            func::FuncOp caller,
+                                            ArrayRef<func::CallOp> calls,
+                                            std::string &reason) {
   OwningOpRef<ModuleOp> evidence =
       parseSourceFile<ModuleOp>(path, ParserConfig(module.getContext()));
   if (!evidence) {
@@ -404,7 +408,8 @@ static LogicalResult validateCallerEvidence(
                "has a different operand count";
       return failure();
     }
-    for (auto [operandIndex, operand] : llvm::enumerate(evidenceCall.getOperands()))
+    for (auto [operandIndex, operand] :
+         llvm::enumerate(evidenceCall.getOperands()))
       if (operand.getType() !=
           calls[index]->getOperand(operandIndex).getType()) {
         reason = "caller-evidence target call operand types differ from the "
@@ -488,11 +493,10 @@ static LogicalResult proveCallerAllocations(
           rootType.getMemorySpace() != operandType.getMemorySpace() ||
           rootType.getRank() !=
               static_cast<int64_t>(expectedShapes[ordinal].size())) {
-        reason =
-            (llvm::Twine("caller allocation shape/type disagrees with the "
-                         "source logical shape for argument ") +
-             llvm::Twine(argument))
-                .str();
+        reason = (llvm::Twine("caller allocation shape/type disagrees with the "
+                              "source logical shape for argument ") +
+                  llvm::Twine(argument))
+                     .str();
         return failure();
       }
       for (Value priorRoot : roots) {
@@ -532,18 +536,14 @@ static LogicalResult rejectPreparedTargetUses(ModuleOp module,
   return success();
 }
 
-static LogicalResult writeEvidence(StringRef path, StringRef callerEvidence,
-                                   StringRef targetName, StringRef callerName,
-                                   StringRef callerText,
-                                   StringRef targetSignature,
-                                   int64_t staticBound,
-                                   ArrayRef<Shape> shapes,
-                                   ArrayRef<CallProof> proofs,
-                                   bool preparedExternal,
-                                   StringRef preparedInput,
-                                   StringRef preparedFunctionText,
-                                   StringRef callerEvidenceFileText,
-                                   StringRef preparedInputFileText) {
+static LogicalResult
+writeEvidence(StringRef path, StringRef callerEvidence, StringRef targetName,
+              StringRef callerName, StringRef callerText,
+              StringRef targetSignature, int64_t staticBound,
+              ArrayRef<Shape> shapes, ArrayRef<CallProof> proofs,
+              bool preparedExternal, StringRef preparedInput,
+              StringRef preparedFunctionText, StringRef callerEvidenceFileText,
+              StringRef preparedInputFileText) {
 
   llvm::json::Array shapeArray;
   for (const Shape &shape : shapes)
@@ -568,11 +568,10 @@ static LogicalResult writeEvidence(StringRef path, StringRef callerEvidence,
   }
 
   llvm::json::Object record;
-  record["schema"] = preparedExternal
-                          ? "amoeba.input0-caller-noalias-proof-v2"
-                          : "amoeba.input0-caller-noalias-proof-v1";
-  record["proof_mode"] = preparedExternal ? "prepared-external-caller"
-                                           : "in-module-caller";
+  record["schema"] = preparedExternal ? "amoeba.input0-caller-noalias-proof-v2"
+                                      : "amoeba.input0-caller-noalias-proof-v1";
+  record["proof_mode"] =
+      preparedExternal ? "prepared-external-caller" : "in-module-caller";
   record["caller_evidence_path"] = callerEvidence.str();
   record["caller_function"] = callerName.str();
   record["target_function"] = targetName.str();
@@ -591,16 +590,18 @@ static LogicalResult writeEvidence(StringRef path, StringRef callerEvidence,
   }
   std::string error;
   bool written = mlir::amoeba::neura::joint_scheduling::writeAtomically(
-      path, [&](llvm::raw_ostream &output) {
-        output << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(record)));
+      path,
+      [&](llvm::raw_ostream &output) {
+        output << llvm::formatv("{0:2}\n",
+                                llvm::json::Value(std::move(record)));
         return true;
-      }, error);
+      },
+      error);
   return success(written);
 }
 
 struct ImportInput0CallerNoAliasPass
-    : PassWrapper<ImportInput0CallerNoAliasPass,
-                  OperationPass<ModuleOp>> {
+    : PassWrapper<ImportInput0CallerNoAliasPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ImportInput0CallerNoAliasPass)
 
   ImportInput0CallerNoAliasPass() = default;
@@ -611,18 +612,19 @@ struct ImportInput0CallerNoAliasPass
     return "import-input0-caller-noalias";
   }
   StringRef getDescription() const override {
-    return "Import noalias only from a verified input-0 caller allocation graph";
+    return "Import noalias only from a verified input-0 caller allocation "
+           "graph";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    func::FuncDialect, LLVM::LLVMDialect,
-                    memref::MemRefDialect, scf::SCFDialect,
-                    neura::NeuraDialect, taskflow::TaskflowDialect>();
+    registry
+        .insert<affine::AffineDialect, arith::ArithDialect, func::FuncDialect,
+                LLVM::LLVMDialect, memref::MemRefDialect, scf::SCFDialect,
+                neura::NeuraDialect, taskflow::TaskflowDialect>();
   }
 
-  Option<std::string> targetFunction{
-      *this, "target", llvm::cl::desc("Target func.func symbol"),
-      llvm::cl::init("")};
+  Option<std::string> targetFunction{*this, "target",
+                                     llvm::cl::desc("Target func.func symbol"),
+                                     llvm::cl::init("")};
   Option<std::string> callerFunction{
       *this, "caller", llvm::cl::desc("Closed-world input-0 caller symbol"),
       llvm::cl::init("main")};
@@ -634,9 +636,9 @@ struct ImportInput0CallerNoAliasPass
       *this, "logical-shapes",
       llvm::cl::desc("Semicolon-separated x-separated memref shapes"),
       llvm::cl::init("")};
-  Option<std::string> evidenceOutput{
-      *this, "evidence-output", llvm::cl::desc("Proof JSON output path"),
-      llvm::cl::init("")};
+  Option<std::string> evidenceOutput{*this, "evidence-output",
+                                     llvm::cl::desc("Proof JSON output path"),
+                                     llvm::cl::init("")};
   Option<int64_t> staticBound{
       *this, "static-bound",
       llvm::cl::desc("Source-proven scalar loop bound supplied by caller"),
@@ -647,7 +649,8 @@ struct ImportInput0CallerNoAliasPass
       llvm::cl::init(false)};
   Option<bool> preparedExternalCaller{
       *this, "prepared-external-caller",
-      llvm::cl::desc("Prove a prepared target from an external lower-generated caller"),
+      llvm::cl::desc(
+          "Prove a prepared target from an external lower-generated caller"),
       llvm::cl::init(false)};
   Option<std::string> preparedInput{
       *this, "prepared-input",
@@ -733,18 +736,19 @@ struct ImportInput0CallerNoAliasPass
         continue;
       }
       if (!isa<IntegerType, IndexType>(type) || scalarArgument) {
-        fail("target must have exactly one integer/index static-bound argument");
+        fail(
+            "target must have exactly one integer/index static-bound argument");
         return;
       }
       scalarArgument = index;
     }
     if (!scalarArgument || memrefArguments.empty()) {
-      fail("target must have one scalar bound and at least one memref argument");
+      fail(
+          "target must have one scalar bound and at least one memref argument");
       return;
     }
     std::string staticBoundName =
-        (llvm::Twine("amoeba.static_bound.arg.") +
-         llvm::Twine(*scalarArgument))
+        (llvm::Twine("amoeba.static_bound.arg.") + llvm::Twine(*scalarArgument))
             .str();
     if (auto existingBound =
             target->getAttrOfType<IntegerAttr>(staticBoundName)) {
@@ -754,7 +758,8 @@ struct ImportInput0CallerNoAliasPass
         return;
       }
     }
-    if (!shapeContract.empty() && shapeContract.size() != memrefArguments.size()) {
+    if (!shapeContract.empty() &&
+        shapeContract.size() != memrefArguments.size()) {
       fail("logical-shapes count does not match target memref argument count");
       return;
     }
@@ -763,8 +768,8 @@ struct ImportInput0CallerNoAliasPass
     expectedShapes.reserve(memrefArguments.size());
     for (auto [ordinal, argument] : llvm::enumerate(memrefArguments)) {
       std::string reason;
-      FailureOr<Shape> shape = argumentShape(
-          target, argument, shapeContract, ordinal, reason);
+      FailureOr<Shape> shape =
+          argumentShape(target, argument, shapeContract, ordinal, reason);
       if (failed(shape)) {
         fail(llvm::Twine("argument ") + llvm::Twine(argument) + ": " + reason);
         return;
@@ -797,9 +802,9 @@ struct ImportInput0CallerNoAliasPass
         fail(proofReason);
         return;
       }
-      if (failed(proveCallerAllocations(
-              module, target, caller, memrefArguments, *scalarArgument,
-              staticBound, expectedShapes, proofs, proofReason))) {
+      if (failed(proveCallerAllocations(module, target, caller, memrefArguments,
+                                        *scalarArgument, staticBound,
+                                        expectedShapes, proofs, proofReason))) {
         fail(proofReason);
         return;
       }
@@ -809,8 +814,7 @@ struct ImportInput0CallerNoAliasPass
       // separate lower-generated module supplies only its closed-world ABI
       // invocation proof; this preserves the Taskflow/Neura body for the
       // later replica/tiling passes.
-      auto existingBound =
-          target->getAttrOfType<IntegerAttr>(staticBoundName);
+      auto existingBound = target->getAttrOfType<IntegerAttr>(staticBoundName);
       if (!existingBound) {
         fail("prepared target must carry its source-owned static_bound "
              "contract");
@@ -828,9 +832,8 @@ struct ImportInput0CallerNoAliasPass
         return;
       }
       preparedInputFileText = std::move(*preparedText);
-      preparedInputModule =
-          parseExactModule(preparedInputFileText, preparedInput,
-                           module.getContext());
+      preparedInputModule = parseExactModule(
+          preparedInputFileText, preparedInput, module.getContext());
       if (!preparedInputModule) {
         fail("prepared-input is not a parseable MLIR module");
         return;
@@ -857,9 +860,8 @@ struct ImportInput0CallerNoAliasPass
         return;
       }
       callerEvidenceFileText = std::move(*evidenceText);
-      evidenceModule =
-          parseExactModule(callerEvidenceFileText, callerEvidence,
-                           module.getContext());
+      evidenceModule = parseExactModule(callerEvidenceFileText, callerEvidence,
+                                        module.getContext());
       if (!evidenceModule) {
         fail("caller-evidence is not a parseable MLIR module");
         return;
@@ -885,9 +887,8 @@ struct ImportInput0CallerNoAliasPass
         fail("caller-evidence target and caller must be distinct functions");
         return;
       }
-      auto evidenceUses =
-          SymbolTable::getSymbolUses(evidenceTarget.getOperation(),
-                                     *evidenceModule);
+      auto evidenceUses = SymbolTable::getSymbolUses(
+          evidenceTarget.getOperation(), *evidenceModule);
       if (!evidenceUses) {
         fail("caller-evidence contains unknown symbol uses for the target");
         return;
@@ -917,8 +918,7 @@ struct ImportInput0CallerNoAliasPass
         return;
       }
       for (auto [ordinal, argument] : llvm::enumerate(memrefArguments)) {
-        if (!evidenceTarget.getArgAttr(argument,
-                                      kLogicalTransferShapeAttr)) {
+        if (!evidenceTarget.getArgAttr(argument, kLogicalTransferShapeAttr)) {
           fail("caller-evidence target lacks a source-owned logical shape "
                "contract");
           return;
@@ -931,10 +931,10 @@ struct ImportInput0CallerNoAliasPass
           return;
         }
       }
-      if (failed(proveCallerAllocations(
-              *evidenceModule, evidenceTarget, evidenceCaller, memrefArguments,
-              *scalarArgument, staticBound, expectedShapes, proofs,
-              proofReason))) {
+      if (failed(proveCallerAllocations(*evidenceModule, evidenceTarget,
+                                        evidenceCaller, memrefArguments,
+                                        *scalarArgument, staticBound,
+                                        expectedShapes, proofs, proofReason))) {
         fail(proofReason);
         return;
       }
@@ -942,12 +942,12 @@ struct ImportInput0CallerNoAliasPass
     }
 
     if (!evidenceOutput.empty() &&
-        failed(writeEvidence(
-            evidenceOutput, callerEvidence, target.getSymName(),
-            callerFunction, callerText, printType(target.getFunctionType()),
-            staticBound, expectedShapes, proofs, preparedExternalCaller,
-            preparedInput, preparedFunctionText, callerEvidenceFileText,
-            preparedInputFileText))) {
+        failed(writeEvidence(evidenceOutput, callerEvidence,
+                             target.getSymName(), callerFunction, callerText,
+                             printType(target.getFunctionType()), staticBound,
+                             expectedShapes, proofs, preparedExternalCaller,
+                             preparedInput, preparedFunctionText,
+                             callerEvidenceFileText, preparedInputFileText))) {
       fail("could not write evidence output");
       return;
     }
@@ -977,15 +977,14 @@ struct ImportInput0CallerNoAliasPass
     target->setAttr(kStaticBoundAttr,
                     IntegerAttr::get(IntegerType::get(module.getContext(), 64),
                                      staticBound));
-    target->setAttr(kProofModeAttr,
-                    StringAttr::get(module.getContext(),
-                                    preparedExternalCaller
-                                        ? "prepared-external-caller"
-                                        : "in-module-caller"));
+    target->setAttr(
+        kProofModeAttr,
+        StringAttr::get(module.getContext(), preparedExternalCaller
+                                                 ? "prepared-external-caller"
+                                                 : "in-module-caller"));
     if (preparedExternalCaller)
-      target->setAttr(
-          kPreparedInputPathAttr,
-          StringAttr::get(module.getContext(), preparedInput));
+      target->setAttr(kPreparedInputPathAttr,
+                      StringAttr::get(module.getContext(), preparedInput));
   }
 };
 

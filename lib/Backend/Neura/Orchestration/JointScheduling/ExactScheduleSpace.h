@@ -81,8 +81,8 @@ struct ExactScheduleResult {
   uint64_t optimisticEndsMemoCapacitySkips = 0;
 };
 
-// Every emitted path records its dispatch order and fits the grid at every time point.
-// A complete result covers event-normalized fixed-shape schedules only.
+// Every emitted path records its dispatch order and fits the grid at every time
+// point. A complete result covers event-normalized fixed-shape schedules only.
 // Communication delays, SRAM byte capacity and the shape/graph search are
 // separate gates. Returning false means malformed input or counter overflow.
 bool enumerateExactScheduleSpace(

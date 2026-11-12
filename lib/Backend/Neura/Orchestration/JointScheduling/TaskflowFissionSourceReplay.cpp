@@ -1,8 +1,8 @@
 #include "TaskflowFissionSourceReplay.h"
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
-#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
+#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -13,8 +13,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
-#include "llvm/Support/JSON.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <limits>
@@ -30,7 +30,8 @@ llvm::StringRef taskflowFissionCanonicalLoweringPipeline() {
   return "builtin.module(convert-taskflow-to-neura,cse,lower-affine,"
          "convert-scf-to-cf,convert-cf-to-llvm{index-bitwidth=0},"
          "assign-accelerator,lower-memref-to-neura,lower-arith-to-neura,"
-         "lower-builtin-to-neura,lower-llvm-to-neura,promote-input-arg-to-const,"
+         "lower-builtin-to-neura,lower-llvm-to-neura,promote-input-arg-to-"
+         "const,"
          "fold-constant,canonicalize-return,canonicalize-live-in,"
          "leverage-predicated-value,transform-ctrl-to-data-flow,fold-constant,"
          "insert-data-mov,bind-source-iteration-domain)";
@@ -41,7 +42,8 @@ static llvm::StringRef taskflowFissionCanonicalLoweringPasses() {
   // Passing the anchored CLI form would nest another builtin.module manager
   // and leave a source module without nested modules completely untouched.
   return taskflowFissionCanonicalLoweringPipeline()
-      .drop_front(llvm::StringRef("builtin.module(").size()).drop_back();
+      .drop_front(llvm::StringRef("builtin.module(").size())
+      .drop_back();
 }
 
 std::string printTaskflowFissionModuleWitness(ModuleOp module) {
@@ -57,13 +59,15 @@ void registerTaskflowFissionCanonicalLoweringDependencies(
   OpPassManager manager(ModuleOp::getOperationName());
   if (failed(parsePassPipeline(taskflowFissionCanonicalLoweringPasses(),
                                manager, llvm::errs())))
-    llvm::report_fatal_error("source-owned fission lowering pipeline is unavailable");
+    llvm::report_fatal_error(
+        "source-owned fission lowering pipeline is unavailable");
   manager.getDependentDialects(registry);
   mlir::amoeba::neura::createFissionTaskPass()->getDependentDialects(registry);
 }
 
-LogicalResult lowerPreparedTaskflowFissionSource(
-    ModuleOp source, OwningOpRef<ModuleOp> &lowered, std::string &error) {
+LogicalResult lowerPreparedTaskflowFissionSource(ModuleOp source,
+                                                 OwningOpRef<ModuleOp> &lowered,
+                                                 std::string &error) {
   lowered = nullptr;
   if (!source || failed(verify(source))) {
     error = "fission lowering requires a verified prepared source module";
@@ -100,10 +104,12 @@ LogicalResult lowerPreparedTaskflowFissionSource(
   return success();
 }
 
-LogicalResult verifyTaskflowFissionCanonicalLowering(
-    ModuleOp source, ModuleOp canonicalNeura, std::string &error) {
+LogicalResult verifyTaskflowFissionCanonicalLowering(ModuleOp source,
+                                                     ModuleOp canonicalNeura,
+                                                     std::string &error) {
   OwningOpRef<ModuleOp> expected;
-  if (!canonicalNeura || failed(lowerPreparedTaskflowFissionSource(source, expected, error)))
+  if (!canonicalNeura ||
+      failed(lowerPreparedTaskflowFissionSource(source, expected, error)))
     return failure();
   std::string expectedText = printTaskflowFissionModuleWitness(*expected);
   std::string canonicalText = printTaskflowFissionModuleWitness(canonicalNeura);
@@ -112,8 +118,10 @@ LogicalResult verifyTaskflowFissionCanonicalLowering(
     while (offset < expectedText.size() && offset < canonicalText.size() &&
            expectedText[offset] == canonicalText[offset])
       ++offset;
-    error = "prepared fission source does not reproduce the exact canonical Neura module; first mismatch at byte " +
-            std::to_string(offset) + "; expected: " + expectedText.substr(offset, 160) +
+    error = "prepared fission source does not reproduce the exact canonical "
+            "Neura module; first mismatch at byte " +
+            std::to_string(offset) +
+            "; expected: " + expectedText.substr(offset, 160) +
             "; actual: " + canonicalText.substr(offset, 160);
     return failure();
   }
@@ -124,13 +132,20 @@ LogicalResult verifyTaskflowFissionCanonicalLowering(
 
 namespace {
 struct VerifyTaskflowFissionSourceReplayPass
-    : PassWrapper<VerifyTaskflowFissionSourceReplayPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyTaskflowFissionSourceReplayPass)
+    : PassWrapper<VerifyTaskflowFissionSourceReplayPass,
+                  OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      VerifyTaskflowFissionSourceReplayPass)
   VerifyTaskflowFissionSourceReplayPass() = default;
-  VerifyTaskflowFissionSourceReplayPass(const VerifyTaskflowFissionSourceReplayPass &other)
+  VerifyTaskflowFissionSourceReplayPass(
+      const VerifyTaskflowFissionSourceReplayPass &other)
       : PassWrapper(other) {}
-  StringRef getArgument() const override { return "verify-taskflow-fission-source-replay"; }
-  StringRef getDescription() const override { return "Verify exact source-owned DFG fission replay"; }
+  StringRef getArgument() const override {
+    return "verify-taskflow-fission-source-replay";
+  }
+  StringRef getDescription() const override {
+    return "Verify exact source-owned DFG fission replay";
+  }
   void getDependentDialects(DialectRegistry &registry) const override {
     mlir::amoeba::neura::joint_scheduling::
         registerTaskflowFissionCanonicalLoweringDependencies(registry);
@@ -138,7 +153,8 @@ struct VerifyTaskflowFissionSourceReplayPass
   Option<std::string> parentFile{*this, "parent-module", llvm::cl::init("")};
   Option<std::string> actionFile{*this, "actions", llvm::cl::init("")};
   Option<std::string> output{*this, "output", llvm::cl::init("")};
-  Option<std::string> enumerateFunction{*this, "enumerate-function", llvm::cl::init("")};
+  Option<std::string> enumerateFunction{*this, "enumerate-function",
+                                        llvm::cl::init("")};
   Option<int64_t> maxFissionActionsPerTask{
       *this, "max-fission-actions-per-task", llvm::cl::init(64)};
 
@@ -150,7 +166,8 @@ struct VerifyTaskflowFissionSourceReplayPass
     if (!enumerateFunction.empty()) {
       if (!parentFile.empty() || !actionFile.empty() || output.empty() ||
           maxFissionActionsPerTask <= 0)
-        return fail("source fission census requires output and a positive cap, without replay inputs");
+        return fail("source fission census requires output and a positive cap, "
+                    "without replay inputs");
       auto function = getOperation().lookupSymbol<mlir::func::FuncOp>(
           enumerateFunction.getValue());
       if (!function || function.isDeclaration())
@@ -162,7 +179,8 @@ struct VerifyTaskflowFissionSourceReplayPass
           return;
         std::string diagnostic;
         auto cuts = mlir::amoeba::neura::enumerateTaskflowFissionPartitions(
-            task, static_cast<uint64_t>(maxFissionActionsPerTask.getValue()), diagnostic);
+            task, static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
+            diagnostic);
         if (failed(cuts)) {
           fatalError = task.getTaskName().str() + ":" + diagnostic;
           return;
@@ -182,24 +200,34 @@ struct VerifyTaskflowFissionSourceReplayPass
             {"left_nodes", std::move(partitions)}});
       });
       if (!fatalError.empty())
-        return fail("fission census overflow; no partial manifest published:" + fatalError);
+        return fail("fission census overflow; no partial manifest published:" +
+                    fatalError);
       using namespace mlir::amoeba::neura::joint_scheduling;
       llvm::json::Object record{
           {"schema", "orbit-taskflow-fission-source-cut-census-v1"},
-          {"status", "complete"}, {"function", enumerateFunction.getValue()},
+          {"status", "complete"},
+          {"function", enumerateFunction.getValue()},
           {"max_fission_actions_per_task", maxFissionActionsPerTask.getValue()},
-          {"source_module_witness_bytes", printTaskflowFissionModuleWitness(getOperation())},
-          {"tasks", std::move(tasks)}, {"mapper_invoked", false}};
+          {"source_module_witness_bytes",
+           printTaskflowFissionModuleWitness(getOperation())},
+          {"tasks", std::move(tasks)},
+          {"mapper_invoked", false}};
       std::string error;
-      if (!writeAtomically(output.getValue(), [&](llvm::raw_ostream &stream) {
-            stream << llvm::json::Value(std::move(record)) << '\n'; return true;
-          }, error))
+      if (!writeAtomically(
+              output.getValue(),
+              [&](llvm::raw_ostream &stream) {
+                stream << llvm::json::Value(std::move(record)) << '\n';
+                return true;
+              },
+              error))
         return fail(error);
       return;
     }
     if (parentFile.empty() || actionFile.empty())
-      return fail("source fission verification requires parent-module and actions");
-    auto parent = parseSourceFile<ModuleOp>(parentFile.getValue(), &getContext());
+      return fail(
+          "source fission verification requires parent-module and actions");
+    auto parent =
+        parseSourceFile<ModuleOp>(parentFile.getValue(), &getContext());
     auto bytes = llvm::MemoryBuffer::getFile(actionFile.getValue());
     if (!parent || !bytes)
       return fail("cannot read immutable parent or typed fission actions");
@@ -211,17 +239,18 @@ struct VerifyTaskflowFissionSourceReplayPass
     auto *root = document->getAsObject();
     auto *rows = root ? root->getArray("actions") : nullptr;
     auto schema = root ? root->getString("schema") : std::optional<StringRef>();
-    if (!root || root->size() != 2 ||
-        !schema || *schema != "orbit-taskflow-fission-actions-v1" || !rows)
+    if (!root || root->size() != 2 || !schema ||
+        *schema != "orbit-taskflow-fission-actions-v1" || !rows)
       return fail("unsupported typed source fission action schema");
     llvm::SmallVector<mlir::amoeba::neura::TaskflowFissionAction> actions;
     for (const auto &value : *rows) {
       auto *row = value.getAsObject();
-      auto function = row ? row->getString("function") : std::optional<StringRef>();
+      auto function =
+          row ? row->getString("function") : std::optional<StringRef>();
       auto task = row ? row->getString("task") : std::optional<StringRef>();
       auto *cut = row ? row->getArray("left_nodes") : nullptr;
-      if (!row || row->size() != 3 || !function || function->empty() ||
-          !task || task->empty() || !cut || cut->empty())
+      if (!row || row->size() != 3 || !function || function->empty() || !task ||
+          task->empty() || !cut || cut->empty())
         return fail("malformed typed source fission action");
       mlir::amoeba::neura::TaskflowFissionAction action;
       action.function = function->str();
@@ -229,7 +258,8 @@ struct VerifyTaskflowFissionSourceReplayPass
       for (const auto &node : *cut) {
         auto index = node.getAsInteger();
         if (!index || *index < 0 ||
-            static_cast<uint64_t>(*index) > std::numeric_limits<unsigned>::max())
+            static_cast<uint64_t>(*index) >
+                std::numeric_limits<unsigned>::max())
           return fail("fission cut has an invalid source node ordinal");
         action.leftNodes.push_back(static_cast<unsigned>(*index));
       }
@@ -241,23 +271,34 @@ struct VerifyTaskflowFissionSourceReplayPass
       return fail(error);
     if (!output.empty()) {
       using namespace mlir::amoeba::neura::joint_scheduling;
-      llvm::json::Object record{{"schema", "orbit-taskflow-fission-source-replay-v1"},
-          {"status", "pass"}, {"source_replay_verified", true},
-          {"parent_module", parentFile.getValue()}, {"actions_file", actionFile.getValue()},
+      llvm::json::Object record{
+          {"schema", "orbit-taskflow-fission-source-replay-v1"},
+          {"status", "pass"},
+          {"source_replay_verified", true},
+          {"parent_module", parentFile.getValue()},
+          {"actions_file", actionFile.getValue()},
           {"action_count", static_cast<int64_t>(actions.size())},
           {"comparison", "exact-generic-MLIR-without-debug-locations"},
-          {"counter_domains", "retained-per-source-operation; not-disjoint-firing-partitions"},
-          {"parent_module_witness_bytes", printTaskflowFissionModuleWitness(*parent)},
-          {"candidate_module_witness_bytes", printTaskflowFissionModuleWitness(getOperation())}};
-      if (!writeAtomically(output.getValue(), [&](llvm::raw_ostream &stream) {
-            stream << llvm::json::Value(std::move(record)) << '\n'; return true;
-          }, error))
+          {"counter_domains",
+           "retained-per-source-operation; not-disjoint-firing-partitions"},
+          {"parent_module_witness_bytes",
+           printTaskflowFissionModuleWitness(*parent)},
+          {"candidate_module_witness_bytes",
+           printTaskflowFissionModuleWitness(getOperation())}};
+      if (!writeAtomically(
+              output.getValue(),
+              [&](llvm::raw_ostream &stream) {
+                stream << llvm::json::Value(std::move(record)) << '\n';
+                return true;
+              },
+              error))
         return fail(error);
     }
   }
 };
 } // namespace
 
-std::unique_ptr<Pass> mlir::amoeba::neura::createVerifyTaskflowFissionSourceReplayPass() {
+std::unique_ptr<Pass>
+mlir::amoeba::neura::createVerifyTaskflowFissionSourceReplayPass() {
   return std::make_unique<VerifyTaskflowFissionSourceReplayPass>();
 }

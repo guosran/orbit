@@ -18,13 +18,14 @@ bool setNativeAIRTileSizes(mlir::ModuleOp module, int64_t m, int64_t n,
 // Materialize a whole-program mapping choice; legality is checked against
 // source accesses and target capabilities by the shared planner.
 // Read syntactically canonical public policy and target realization without
-// mutating source. Legality/capacity remain the shared planner's responsibility.
+// mutating source. Legality/capacity remain the shared planner's
+// responsibility.
 bool readNativeMappingChoice(mlir::ModuleOp, ProgramMappingChoice &,
                              std::string &error);
 // Canonicalize legacy and public spellings before candidate identity/caching.
 bool normalizeNativeMappingChoice(mlir::ModuleOp, std::string &error);
-bool setNativeMappingChoice(mlir::ModuleOp module,
-                            const ProgramMappingChoice &, std::string &error);
+bool setNativeMappingChoice(mlir::ModuleOp module, const ProgramMappingChoice &,
+                            std::string &error);
 bool setNativeImplementation(mlir::ModuleOp module, const std::string &kind,
                              int64_t lanes, std::string &error);
 } // namespace orbit::taskflow

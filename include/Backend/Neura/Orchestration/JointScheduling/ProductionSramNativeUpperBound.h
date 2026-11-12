@@ -14,10 +14,10 @@
 #ifndef AMOEBA_PRODUCTION_SRAM_NATIVE_UPPER_BOUND_H
 #define AMOEBA_PRODUCTION_SRAM_NATIVE_UPPER_BOUND_H
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -114,8 +114,9 @@ struct NativeSramUpperBoundResult {
 /// only coordinate validation parameters; they do not imply an SRAM byte
 /// capacity.  The result is fail-closed and remains pending when any required
 /// storage proof is missing.
-NativeSramUpperBoundResult exportNativeSramUpperBound(
-    func::FuncOp function, int64_t gridRows = 4, int64_t gridColumns = 4);
+NativeSramUpperBoundResult exportNativeSramUpperBound(func::FuncOp function,
+                                                      int64_t gridRows = 4,
+                                                      int64_t gridColumns = 4);
 
 /// Annotate a module with the exporter result.  Registration belongs to the
 /// owning backend; this private factory is provided so integration can add a

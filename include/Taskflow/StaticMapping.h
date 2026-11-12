@@ -35,7 +35,7 @@ struct StaticProvenance {
 struct StaticResourceDomain {
   std::string id, parent, kind;
   // Target-defined physical axes. Generic code validates types/references only.
-  std::map<std::string,int64_t> coordinates;
+  std::map<std::string, int64_t> coordinates;
 };
 struct StaticResource {
   std::string id, kind, device;
@@ -43,7 +43,7 @@ struct StaticResource {
   std::string domain;
   // Minimum reservation implications per unit; concurrent activities contend
   // through the referenced shared resource, independently of identifier names.
-  std::map<std::string,int64_t> sharedResources;
+  std::map<std::string, int64_t> sharedResources;
 };
 struct StaticMemory {
   std::string id;
@@ -52,7 +52,8 @@ struct StaticMemory {
   std::string domain, kind;
   // When present, this is the precise allow-list; device access is legacy.
   std::vector<std::string> accessibleResources;
-  // Allocation byte quantum; default1 is payload accounting, not physical bank alignment.
+  // Allocation byte quantum; default1 is payload accounting, not physical bank
+  // alignment.
   int64_t alignmentBytes = 1;
   // False means physical byte capacity is not modeled by this target. The
   // internal INT64_MAX ceiling is arithmetic accounting, never physical SRAM.
@@ -182,7 +183,8 @@ struct StaticMappingResult {
   bool exhaustiveAssignments = false, regionExactCover = false;
   uint64_t possibleAssignments = 0, evaluatedAssignments = 0, budget = 0;
 };
-// These functions validate topology/capacity without requiring calibrated costs.
+// These functions validate topology/capacity without requiring calibrated
+// costs.
 bool validateMemoryArchitecture(const StaticConfig &, std::string &error);
 bool memoryAccessible(const StaticConfig &, llvm::StringRef memory,
                       llvm::StringRef computeResource);

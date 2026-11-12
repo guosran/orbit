@@ -57,9 +57,10 @@ inline constexpr llvm::StringLiteral kPerCgra2x2DiagnosticOutputRule =
 // diagnostic contract permits only an exact ctrl_mem_items: 20 -> 23 text
 // substitution; ordinary inference requires byte-for-byte architecture
 // identity.
-bool validatePerCgra2x2RuntimeContract(
-    double runtimeIICeiling, llvm::StringRef trainingArchitectureText,
-    llvm::StringRef runtimeArchitectureText, std::string &error);
+bool validatePerCgra2x2RuntimeContract(double runtimeIICeiling,
+                                       llvm::StringRef trainingArchitectureText,
+                                       llvm::StringRef runtimeArchitectureText,
+                                       std::string &error);
 
 // Produces and validates the shared diagnostic metadata contract.  The
 // validator accepts the complete predictor_metadata object and binds its
@@ -137,8 +138,8 @@ public:
   bool isLoaded() const { return loaded; }
   bool featureNamesMatch(llvm::ArrayRef<std::string> names) const;
 
-  MLCostCacheResources makeCacheResources(
-      llvm::StringRef architectureText) const;
+  MLCostCacheResources
+  makeCacheResources(llvm::StringRef architectureText) const;
 
 private:
   struct Checkpoint {
@@ -186,9 +187,8 @@ public:
             llvm::StringRef runtimeArchitectureText, double runtimeIICeiling,
             std::string &error);
 
-  bool predict(llvm::ArrayRef<double> features, double recMii,
-               double resMii, double lowerBound,
-               DirectMapperIIPrediction &prediction,
+  bool predict(llvm::ArrayRef<double> features, double recMii, double resMii,
+               double lowerBound, DirectMapperIIPrediction &prediction,
                std::string &error) const;
 
   bool featureNamesMatch(llvm::ArrayRef<std::string> names) const;
@@ -261,8 +261,7 @@ public:
   bool write(llvm::StringRef path, llvm::StringRef modelSchema,
              llvm::StringRef featureContractId,
              llvm::StringRef architectureContract,
-             const MLCostCacheResources &resources,
-             std::string &error) const;
+             const MLCostCacheResources &resources, std::string &error) const;
 
   uint64_t getHitCount() const { return hitCount; }
   uint64_t getMissCount() const { return missCount; }

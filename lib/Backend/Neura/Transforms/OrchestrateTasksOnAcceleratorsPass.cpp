@@ -16,16 +16,15 @@ namespace {
 std::unique_ptr<Orchestration>
 createOrchestrationStrategy(StringRef strategy_name, int grid_rows,
                             int grid_cols, SchedulingMode mode,
-                            bool communication_aware,
-                            bool fixed_dispatch) {
+                            bool communication_aware, bool fixed_dispatch) {
   return llvm::StringSwitch<std::unique_ptr<Orchestration>>(strategy_name)
       .Case("routing-critical-path",
             std::make_unique<RoutingCriticalPathOrchestration>(grid_rows,
                                                                grid_cols, mode))
-      .Case("analytical-based-task-orchestration",
-            std::make_unique<AnalyticalBasedTaskOrchestration>(
-                grid_rows, grid_cols, mode, communication_aware,
-                fixed_dispatch))
+      .Case(
+          "analytical-based-task-orchestration",
+          std::make_unique<AnalyticalBasedTaskOrchestration>(
+              grid_rows, grid_cols, mode, communication_aware, fixed_dispatch))
       .Default(nullptr);
 }
 
@@ -74,15 +73,24 @@ struct OrchestrateTasksOnAcceleratorsPass
                      "'critical-path'."),
       llvm::cl::init("critical-path")};
 
-  Option<std::string> exactReplayTiming{*this, "exact-replay-timing", llvm::cl::init("strict")};
+  Option<std::string> exactReplayTiming{*this, "exact-replay-timing",
+                                        llvm::cl::init("strict")};
 
   void runOnOperation() override {
     if (exactReplayTiming != "strict" && exactReplayTiming != "mapped") {
-      getOperation().emitError("exact replay timing must be strict or mapped"); return signalPassFailure();
+      getOperation().emitError("exact replay timing must be strict or mapped");
+      return signalPassFailure();
     }
-    if (getOperation()->hasAttr("joint_scheduling_exact_dispatch_order") && exactReplayTiming == "mapped") {
-      getOperation().walk([](TaskflowTaskOp task) { task->setAttr("amoeba.exact_replay_mapped_timing", UnitAttr::get(task.getContext())); });
-      getOperation()->setAttr("joint_scheduling_exact_replay_timing", StringAttr::get(getOperation().getContext(), "mapped-duration-preserve-location-dispatch-idle"));
+    if (getOperation()->hasAttr("joint_scheduling_exact_dispatch_order") &&
+        exactReplayTiming == "mapped") {
+      getOperation().walk([](TaskflowTaskOp task) {
+        task->setAttr("amoeba.exact_replay_mapped_timing",
+                      UnitAttr::get(task.getContext()));
+      });
+      getOperation()->setAttr(
+          "joint_scheduling_exact_replay_timing",
+          StringAttr::get(getOperation().getContext(),
+                          "mapped-duration-preserve-location-dispatch-idle"));
     }
 
     if (dispatchPolicy.getValue() != "fixed" &&

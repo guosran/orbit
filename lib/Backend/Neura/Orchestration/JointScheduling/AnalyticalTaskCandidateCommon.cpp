@@ -8,8 +8,8 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/SymbolTable.h"
 
@@ -80,23 +80,21 @@ inferStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
     if (!activeStaticValues.insert(value).second)
       return failure();
 
-    auto clearActive = llvm::make_scope_exit(
-        [&] { activeStaticValues.erase(value); });
+    auto clearActive =
+        llvm::make_scope_exit([&] { activeStaticValues.erase(value); });
     auto integer_attr = [](IntegerAttr integer) -> FailureOr<int64_t> {
       const llvm::APInt &value = integer.getValue();
       if (!value.isSignedIntN(64))
         return failure();
       return value.getSExtValue();
     };
-    auto checked_add = [](int64_t lhs,
-                          int64_t rhs) -> FailureOr<int64_t> {
+    auto checked_add = [](int64_t lhs, int64_t rhs) -> FailureOr<int64_t> {
       if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
           (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
         return failure();
       return lhs + rhs;
     };
-    auto checked_sub = [](int64_t lhs,
-                          int64_t rhs) -> FailureOr<int64_t> {
+    auto checked_sub = [](int64_t lhs, int64_t rhs) -> FailureOr<int64_t> {
       if ((rhs < 0 && lhs > std::numeric_limits<int64_t>::max() + rhs) ||
           (rhs > 0 && lhs < std::numeric_limits<int64_t>::min() + rhs))
         return failure();
@@ -139,8 +137,8 @@ inferStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
         FailureOr<int64_t> constant = constant_index(operand);
         if (failed(constant))
           return failure();
-        operandConstants.push_back(IntegerAttr::get(
-            IndexType::get(value.getContext()), *constant));
+        operandConstants.push_back(
+            IntegerAttr::get(IndexType::get(value.getContext()), *constant));
       }
       SmallVector<Attribute> folded;
       if (failed(apply.getAffineMap().constantFold(operandConstants, folded)) ||
@@ -240,8 +238,8 @@ inferStaticTaskTripCount(TaskflowTaskOp task, std::string &error) {
 }
 
 static bool validateTaskflowCounterAxisChain(TaskflowTaskOp task,
-                                              unsigned expectedAxes,
-                                              std::string &error) {
+                                             unsigned expectedAxes,
+                                             std::string &error) {
   SmallVector<TaskflowCounterOp> counters;
   SmallVector<TaskflowCounterOp> roots;
   llvm::DenseMap<Value, SmallVector<TaskflowCounterOp>> children;
@@ -314,9 +312,10 @@ static bool hasRetainedSequentialLoop(TaskflowTaskOp task) {
   return found;
 }
 
-static bool validateExplicitMapperFiringCount(
-    TaskflowTaskOp task, int64_t expected, std::string &error,
-    bool validateReplicaShardTripCount = true) {
+static bool
+validateExplicitMapperFiringCount(TaskflowTaskOp task, int64_t expected,
+                                  std::string &error,
+                                  bool validateReplicaShardTripCount = true) {
   auto validateAttribute = [&](StringRef attribute) {
     if (!task->hasAttr(attribute))
       return true;
@@ -344,8 +343,8 @@ static FailureOr<TaskIterationDomainMetadata>
 resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
                                bool sourcePartitionCandidate) {
   TaskIterationDomainMetadata result;
-  auto sourceAttr = task->getAttrOfType<DictionaryAttr>(
-      kSourceIterationDomainAttr);
+  auto sourceAttr =
+      task->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
   if (task->hasAttr(kSourceIterationDomainAttr) && !sourceAttr) {
     error = "task " + task.getTaskName().str() +
             " has a malformed source-owned iteration-domain attribute";
@@ -380,16 +379,19 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
       result.sourceIterationWorkCount = currentCount;
       return result;
     }
-    // Compatibility for uncertified historical inputs and small mapper fixtures.
-    // These counts are diagnostic; certified searches reject such inputs at
-    // their canonical boundary. Never substitute one for an unknown axis.
+    // Compatibility for uncertified historical inputs and small mapper
+    // fixtures. These counts are diagnostic; certified searches reject such
+    // inputs at their canonical boundary. Never substitute one for an unknown
+    // axis.
     if (hasRetainedSequentialLoop(task)) {
       error = "task " + task.getTaskName().str() +
               " has retained sequential control without source-domain coverage";
       return failure();
     }
-    FailureOr<std::optional<int64_t>> inferred = inferStaticTaskTripCount(task, error);
-    if (failed(inferred)) return failure();
+    FailureOr<std::optional<int64_t>> inferred =
+        inferStaticTaskTripCount(task, error);
+    if (failed(inferred))
+      return failure();
     std::optional<int64_t> known = *inferred;
     if (!known) {
       if (auto explicitCount = task->getAttrOfType<IntegerAttr>("trip_count"))
@@ -399,8 +401,9 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
     }
     if (!known || *known <= 0 ||
         !validateExplicitMapperFiringCount(task, *known, error)) {
-      if (error.empty()) error = "task " + task.getTaskName().str() +
-          " has no known mapper-firing count or source-domain proof";
+      if (error.empty())
+        error = "task " + task.getTaskName().str() +
+                " has no known mapper-firing count or source-domain proof";
       return failure();
     }
     result.complete = false;
@@ -433,8 +436,8 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
     if (!axis.representedByTaskflow)
       result.expandedInternalExtents.push_back(axis.extent);
 
-  unsigned representedAxes = llvm::count_if(
-      parsed->axes, [](const SourceIterationAxis &axis) {
+  unsigned representedAxes =
+      llvm::count_if(parsed->axes, [](const SourceIterationAxis &axis) {
         return axis.representedByTaskflow;
       });
   if (!validateTaskflowCounterAxisChain(task, representedAxes, error))
@@ -464,11 +467,10 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
   const bool changedMapperDomain =
       result.taskflowTripCount != parsed->representedMultiplicity;
   if (changedMapperDomain && !sourcePartitionCandidate) {
-    auto partitionProof = task->getAttrOfType<StringAttr>(
-        kSourceIterationPartitionProofAttr);
-    if (!partitionProof ||
-        partitionProof.getValue() !=
-            sourceIterationDomainCanonicalWitness(*parsed)) {
+    auto partitionProof =
+        task->getAttrOfType<StringAttr>(kSourceIterationPartitionProofAttr);
+    if (!partitionProof || partitionProof.getValue() !=
+                               sourceIterationDomainCanonicalWitness(*parsed)) {
       error = "task " + task.getTaskName().str() +
               " has current Taskflow extent " +
               std::to_string(result.taskflowTripCount) +
@@ -482,11 +484,10 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
     result.status = "source-partition-proof-candidate";
   }
   if (!changedMapperDomain && !sourcePartitionCandidate) {
-    auto partitionProof = task->getAttrOfType<StringAttr>(
-        kSourceIterationPartitionProofAttr);
-    if (partitionProof &&
-        partitionProof.getValue() !=
-            sourceIterationDomainCanonicalWitness(*parsed)) {
+    auto partitionProof =
+        task->getAttrOfType<StringAttr>(kSourceIterationPartitionProofAttr);
+    if (partitionProof && partitionProof.getValue() !=
+                              sourceIterationDomainCanonicalWitness(*parsed)) {
       error = "task " + task.getTaskName().str() +
               " has a stale source iteration partition proof";
       return failure();
@@ -494,8 +495,7 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
     if (partitionProof)
       result.status = "certified-source-partition";
   }
-  if (!checkedMultiply(result.taskflowTripCount,
-                       result.internalMultiplicity,
+  if (!checkedMultiply(result.taskflowTripCount, result.internalMultiplicity,
                        result.sourceIterationWorkCount)) {
     error = "task " + task.getTaskName().str() +
             " source iteration work count exceeds int64";
@@ -510,10 +510,10 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
             " source-domain certificate still needs trusted control binding";
     return failure();
   }
-  auto binding = task->getAttrOfType<StringAttr>(
-      kSourceIterationControlBindingAttr);
-  auto sourceBinding = task->getAttrOfType<StringAttr>(
-      kSourceIterationSourceControlBindingAttr);
+  auto binding =
+      task->getAttrOfType<StringAttr>(kSourceIterationControlBindingAttr);
+  auto sourceBinding =
+      task->getAttrOfType<StringAttr>(kSourceIterationSourceControlBindingAttr);
   if (!binding || binding.getValue().empty() || !sourceBinding ||
       sourceBinding.getValue().empty()) {
     error = "task " + task.getTaskName().str() +
@@ -527,12 +527,13 @@ resolveTaskIterationDomainImpl(TaskflowTaskOp task, std::string &error,
       size_t mismatch = 0;
       StringRef stored = binding.getValue();
       while (mismatch < stored.size() && mismatch < expectedBinding.size() &&
-             stored[mismatch] == expectedBinding[mismatch]) ++mismatch;
+             stored[mismatch] == expectedBinding[mismatch])
+        ++mismatch;
       error = "task " + task.getTaskName().str() +
               " source-domain control binding is stale or forged at byte " +
-              std::to_string(mismatch) + "; stored=" +
-              stored.substr(mismatch, 180).str() + "; current=" +
-              expectedBinding.substr(mismatch, 180);
+              std::to_string(mismatch) +
+              "; stored=" + stored.substr(mismatch, 180).str() +
+              "; current=" + expectedBinding.substr(mismatch, 180);
       return failure();
     }
     if (!task->hasAttr(kSourceIterationPartitionProofAttr) &&
@@ -616,15 +617,15 @@ collectAnalyticalTaskMetadataImpl(func::FuncOp func, std::string &error,
 
 FailureOr<SmallVector<TaskMetadata>>
 collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error) {
-  return collectAnalyticalTaskMetadataImpl(
-      func, error, /*sourcePartitionCandidate=*/false);
+  return collectAnalyticalTaskMetadataImpl(func, error,
+                                           /*sourcePartitionCandidate=*/false);
 }
 
 FailureOr<SmallVector<TaskMetadata>>
 collectAnalyticalTaskMetadataForSourcePartitionProof(func::FuncOp func,
                                                      std::string &error) {
-  return collectAnalyticalTaskMetadataImpl(
-      func, error, /*sourcePartitionCandidate=*/true);
+  return collectAnalyticalTaskMetadataImpl(func, error,
+                                           /*sourcePartitionCandidate=*/true);
 }
 
 std::string makeSequentialCandidateId(uint64_t index) {
@@ -665,8 +666,8 @@ bool writeAtomically(StringRef output,
     // caller records an incomplete result and removes the temporary file.
     os.close();
     if (os.has_error()) {
-      error = "failed while writing " + output.str() + ": " +
-              os.error().message();
+      error =
+          "failed while writing " + output.str() + ": " + os.error().message();
       ok = false;
       os.clear_error();
     }

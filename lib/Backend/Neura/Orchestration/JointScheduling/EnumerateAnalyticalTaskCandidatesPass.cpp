@@ -58,7 +58,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       llvm::cl::init(1000000)};
   Option<bool> factoredOutput{
       *this, "factored-output",
-      llvm::cl::desc("Writes one exact factored space descriptor instead of candidate rows."),
+      llvm::cl::desc("Writes one exact factored space descriptor instead of "
+                     "candidate rows."),
       llvm::cl::init(false)};
   Option<int64_t> maxCgrasPerTask{
       *this, "max-cgras-per-task",
@@ -67,13 +68,12 @@ struct EnumerateAnalyticalTaskCandidatesPass
       llvm::cl::init(0)};
   Option<std::string> searchPolicy{
       *this, "search-policy",
-      llvm::cl::desc(
-          "Shape policy: complete-cartesian only; changed-task pruning was removed."),
+      llvm::cl::desc("Shape policy: complete-cartesian only; changed-task "
+                     "pruning was removed."),
       llvm::cl::init("")};
   Option<std::string> shapePruningPolicyOption{
       *this, "shape-pruning-policy",
-      llvm::cl::desc(
-          "Alias for search-policy for the shape-pruning contract."),
+      llvm::cl::desc("Alias for search-policy for the shape-pruning contract."),
       llvm::cl::init("")};
   Option<int64_t> maxChangedTasks{
       *this, "max-changed-tasks",
@@ -86,7 +86,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       llvm::cl::init("")};
   Option<std::string> graphVariantSha256{
       *this, "graph-variant-sha256",
-      llvm::cl::desc("Legacy file fingerprint; rejected by the no-SHA contract."),
+      llvm::cl::desc(
+          "Legacy file fingerprint; rejected by the no-SHA contract."),
       llvm::cl::init("")};
 
   void runOnOperation() override {
@@ -109,8 +110,9 @@ struct EnumerateAnalyticalTaskCandidatesPass
       func->removeAttr("amoeba.graph_variant_id");
       func->removeAttr("amoeba.graph_variant_sha256");
       if (!graphVariantId.getValue().empty())
-        func->setAttr("amoeba.graph_variant_id",
-                      StringAttr::get(func.getContext(), graphVariantId.getValue()));
+        func->setAttr(
+            "amoeba.graph_variant_id",
+            StringAttr::get(func.getContext(), graphVariantId.getValue()));
     };
     if (outputFile.getValue().empty() || maxCandidates.getValue() <= 0 ||
         maxCgrasPerTask.getValue() < 0) {
@@ -217,7 +219,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
       };
       const std::string function = func.getSymName().str();
       bool wroteFactored = writeAtomically(
-          outputFile.getValue(), [&](llvm::raw_ostream &os) {
+          outputFile.getValue(),
+          [&](llvm::raw_ostream &os) {
             llvm::json::Object header;
             header["record_type"] = "space";
             header["schema"] = kFactoredSpaceSchema.str();
@@ -273,14 +276,17 @@ struct EnumerateAnalyticalTaskCandidatesPass
       }
       publishSemanticGraphLabel();
       llvm::errs() << "[JointScheduling] wrote exact factored task-shape "
-                      "space (" << spaceCounts.declared
+                      "space ("
+                   << spaceCounts.declared
                    << " candidates) without candidate rows; direct ranking is "
-                      "required before ablation" << "\n";
+                      "required before ablation"
+                   << "\n";
       return;
     }
     if (exceedsRowBudget) {
       func.emitError() << "complete task-shape Cartesian product exceeds "
-                          "max-candidates=" << maxCandidates.getValue()
+                          "max-candidates="
+                       << maxCandidates.getValue()
                        << "; refusing to publish a partial candidate manifest; "
                           "use --factored-output for an exact space descriptor";
       return signalPassFailure();
@@ -360,7 +366,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
                              StringRef decimal) {
             uint64_t value = 0;
             if (!decimal.getAsInteger(10, value) &&
-                value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                value <=
+                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
               object[key] = static_cast<int64_t>(value);
             else
               object[key] = decimal.str();
@@ -417,7 +424,8 @@ struct EnumerateAnalyticalTaskCandidatesPass
                                    StringRef decimal) {
             uint64_t value = 0;
             if (!decimal.getAsInteger(10, value) &&
-                value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                value <=
+                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
               object[key] = static_cast<int64_t>(value);
             else
               object[key] = decimal.str();

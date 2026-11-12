@@ -24,21 +24,21 @@
 #include "AnalyticalMLPInference.h"
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
-#include "MapperCounterBounds.h"
-#include "MapperCostAnalysis.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
-#include "NeighborhoodReplaySelection.h"
 #include "Conversion/NeuraConversionPasses.h"
+#include "MapperCostAnalysis.h"
+#include "MapperCounterBounds.h"
+#include "NeighborhoodReplaySelection.h"
 #include "NeuraDialect/NeuraPasses.h"
 
+#include "NeuraDialect/Mapping/mapping_util.h"
+#include "NeuraDialect/NeuraOps.h"
+#include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "NeuraDialect/Mapping/mapping_util.h"
-#include "NeuraDialect/NeuraOps.h"
-#include "TaskflowDialect/TaskflowOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -133,8 +133,14 @@ struct FeatureQuery {
 // loader validates this list against the JSON protocol before any query is
 // evaluated.
 constexpr std::array<std::pair<int64_t, int64_t>, 8> kFormalMax4Shapes = {{
-    {4, 4}, {4, 8}, {8, 4}, {4, 12},
-    {12, 4}, {4, 16}, {8, 8}, {16, 4},
+    {4, 4},
+    {4, 8},
+    {8, 4},
+    {4, 12},
+    {12, 4},
+    {4, 16},
+    {8, 8},
+    {16, 4},
 }};
 
 struct CurrentTaskBody {
@@ -197,8 +203,7 @@ static bool decimalField(const json::Object &object, llvm::StringRef key,
     return true;
   }
   std::optional<llvm::StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char character) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char character) {
         return character < '0' || character > '9';
       })) {
     error = "candidate count is not a positive decimal";
@@ -238,7 +243,8 @@ static bool readCandidateCount(llvm::StringRef path, llvm::StringRef function,
       error = "candidate space record is not an object";
       return false;
     }
-    std::optional<llvm::StringRef> recordType = object->getString("record_type");
+    std::optional<llvm::StringRef> recordType =
+        object->getString("record_type");
     if (recordType && *recordType != "header" && *recordType != "space" &&
         *recordType != "footer")
       continue;
@@ -260,9 +266,10 @@ static bool readCandidateCount(llvm::StringRef path, llvm::StringRef function,
         return false;
       }
     }
-    llvm::StringRef countKey = object->get("candidate_count")
-                                   ? llvm::StringRef("candidate_count")
-                                   : llvm::StringRef("declared_candidate_count");
+    llvm::StringRef countKey =
+        object->get("candidate_count")
+            ? llvm::StringRef("candidate_count")
+            : llvm::StringRef("declared_candidate_count");
     if (!decimalField(*object, countKey, candidateCount, error))
       return false;
     found = true;
@@ -332,8 +339,8 @@ static bool getString(const json::Object &object, llvm::StringRef key,
                       std::string &value, std::string &error) {
   std::optional<llvm::StringRef> raw = object.getString(key);
   if (!raw || raw->empty()) {
-    error = "feature query is missing non-empty string field \"" + key.str() +
-            "\"";
+    error =
+        "feature query is missing non-empty string field \"" + key.str() + "\"";
     return false;
   }
   value = raw->str();
@@ -355,8 +362,8 @@ static bool getNumber(const json::Object &object, llvm::StringRef key,
                       double &value, std::string &error) {
   std::optional<double> raw = object.getNumber(key);
   if (!raw || !std::isfinite(*raw)) {
-    error = "feature query is missing finite number field \"" + key.str() +
-            "\"";
+    error =
+        "feature query is missing finite number field \"" + key.str() + "\"";
     return false;
   }
   value = *raw;
@@ -382,8 +389,8 @@ static bool rejectTransferDigestKeys(const json::Value &value,
       std::string lower;
       lower.reserve(key.size());
       for (char character : key)
-        lower.push_back(static_cast<char>(std::tolower(
-            static_cast<unsigned char>(character))));
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
       if (lower == "hash" || lower == "sha256" ||
           llvm::StringRef(lower).ends_with("_hash") ||
           llvm::StringRef(lower).ends_with("_sha256")) {
@@ -413,8 +420,8 @@ static bool readArchitectureTransferEvidence(
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
-    error = "cannot read architecture transfer catalogue " + path.str() +
-            ": " + buffer.getError().message();
+    error = "cannot read architecture transfer catalogue " + path.str() + ": " +
+            buffer.getError().message();
     return false;
   }
   llvm::Expected<json::Value> parsed = json::parse((*buffer)->getBuffer());
@@ -426,7 +433,8 @@ static bool readArchitectureTransferEvidence(
   if (!rejectTransferDigestKeys(*parsed, error))
     return false;
   json::Object *root = parsed->getAsObject();
-  json::Object *metadata = root ? root->getObject("predictor_metadata") : nullptr;
+  json::Object *metadata =
+      root ? root->getObject("predictor_metadata") : nullptr;
   json::Object *transfer =
       metadata ? metadata->getObject("architecture_transfer") : nullptr;
   if (!transfer) {
@@ -435,13 +443,14 @@ static bool readArchitectureTransferEvidence(
     return false;
   }
   if (!requireString(*transfer, "schema", "orbit-architecture-transfer-v1",
-                    error) ||
+                     error) ||
       !requireString(*transfer, "mode",
                      "explicit-structural-equivalence-task-ii", error) ||
       !requireString(*transfer, "actual_architecture_path", architecturePath,
                      error))
     return false;
-  std::optional<bool> productionReady = transfer->getBoolean("production_ready");
+  std::optional<bool> productionReady =
+      transfer->getBoolean("production_ready");
   if (!productionReady || *productionReady) {
     error = "architecture transfer evidence must remain exploratory "
             "(production_ready=false)";
@@ -454,8 +463,8 @@ static bool readArchitectureTransferEvidence(
     return false;
   }
   const json::Object *checks = transfer->getObject("structural_checks");
-  if (!checks || !requireString(*checks, "directed_link_graph", "matched",
-                                error) ||
+  if (!checks ||
+      !requireString(*checks, "directed_link_graph", "matched", error) ||
       !requireString(*checks, "mapper_visible_resources", "matched", error) ||
       !requireString(*checks, "per_cgra_tile", "matched-4x4", error) ||
       !requireString(*checks, "physical_grid", "matched-4x4", error))
@@ -562,8 +571,8 @@ static json::Array graphNodeTypes(ArrayRef<int> nodeTypes) {
   return result;
 }
 
-static json::Array graphNodeFeatures(
-    ArrayRef<orbit::mapper_features::NodeFeature> nodeFeatures) {
+static json::Array
+graphNodeFeatures(ArrayRef<orbit::mapper_features::NodeFeature> nodeFeatures) {
   json::Array result;
   for (const auto &row : nodeFeatures) {
     json::Array values;
@@ -595,9 +604,10 @@ static bool startupCyclesFromGraph(const RouteExpandedGraph &graph,
   return deriveStartupCyclesFromCppFeatureOutput(object, startup, error);
 }
 
-static bool collectCurrentTaskBodies(
-    func::FuncOp function, OwningOpRef<ModuleOp> &mapperInput,
-    std::vector<CurrentTaskBody> &bodies, std::string &error) {
+static bool collectCurrentTaskBodies(func::FuncOp function,
+                                     OwningOpRef<ModuleOp> &mapperInput,
+                                     std::vector<CurrentTaskBody> &bodies,
+                                     std::string &error) {
   bodies.clear();
   mapperInput = ModuleOp::create(function.getLoc());
 
@@ -613,9 +623,8 @@ static bool collectCurrentTaskBodies(
     if (collectionFailed)
       return WalkResult::interrupt();
     SmallVector<::mlir::neura::KernelOp> kernels;
-    task.walk([&](::mlir::neura::KernelOp kernel) {
-      kernels.push_back(kernel);
-    });
+    task.walk(
+        [&](::mlir::neura::KernelOp kernel) { kernels.push_back(kernel); });
     if (kernels.size() != 1) {
       error = "current task " + task.getTaskName().str() +
               " must contain exactly one mapper-visible neura.kernel";
@@ -740,7 +749,8 @@ static bool collectCurrentTaskBodies(
     if (!residualDialect.empty()) {
       error = "current task " + item.task +
               " raw kernel could not be lowered to mapper-visible Neura IR; "
-              "unsupported residual operation " + residualDialect;
+              "unsupported residual operation " +
+              residualDialect;
       return false;
     }
 
@@ -762,7 +772,8 @@ static bool collectCurrentTaskBodies(
             mapperText, current.graph, error, /*requireExpanded=*/true)) {
       error = "current task " + current.task +
               " mapper-visible body is not a valid route-expanded DFG after "
-              "the C++ frontend: " + error;
+              "the C++ frontend: " +
+              error;
       return false;
     }
     if (!canonicalBodyFromGraph(current.graph, current.bodyStructuralText,
@@ -802,8 +813,7 @@ static bool readFeatureQueries(
     return false;
   }
   std::optional<llvm::StringRef> schema = root->getString("schema");
-  bool cppFeatureOutput =
-      schema && *schema == "cgra-ii-cpp-feature-output-v1";
+  bool cppFeatureOutput = schema && *schema == "cgra-ii-cpp-feature-output-v1";
   if (!schema || (!cppFeatureOutput && *schema != kFeatureQuerySchema)) {
     error = "feature query schema is not a supported C++ contract";
     return false;
@@ -901,13 +911,12 @@ static bool readFeatureQueries(
         if (!getNumber(*startupByTask, query.task, query.startupCycles, error))
           return false;
       } else {
-        if (!deriveStartupCyclesFromCppFeatureOutput(*object,
-                                                      query.startupCycles,
-                                                      error))
+        if (!deriveStartupCyclesFromCppFeatureOutput(
+                *object, query.startupCycles, error))
           return false;
       }
-      if (!canonicalBodyFromCppFeatureOutput(*object,
-                                              query.bodyStructuralText, error))
+      if (!canonicalBodyFromCppFeatureOutput(*object, query.bodyStructuralText,
+                                             error))
         return false;
     } else if (!getNumber(*object, "startup_cycles", query.startupCycles,
                           error)) {
@@ -953,8 +962,8 @@ static bool generateCurrentFeatureQueries(
       double resMII = 0.0;
       double lowerBound = 0.0;
       if (!computeMapperAnalyticalFacts(body.mapperFunction.getBody(), rows,
-                                         columns, recMII, resMII, lowerBound,
-                                         error)) {
+                                        columns, recMII, resMII, lowerBound,
+                                        error)) {
         error = "current task " + body.task + " shape rect-" +
                 std::to_string(rows) + "x" + std::to_string(columns) +
                 " has invalid analytical facts: " + error;
@@ -1026,14 +1035,16 @@ static bool sameFeatureNumber(double lhs, double rhs) {
   return std::abs(lhs - rhs) <= 1.0e-12 * scale;
 }
 
-static bool verifyFeatureQueriesBoundToCurrentBodies(
-    ArrayRef<FeatureQuery> generated, ArrayRef<FeatureQuery> supplied,
-    std::string &error) {
+static bool
+verifyFeatureQueriesBoundToCurrentBodies(ArrayRef<FeatureQuery> generated,
+                                         ArrayRef<FeatureQuery> supplied,
+                                         std::string &error) {
   using QueryKey = std::tuple<std::string, int64_t, int64_t>;
   std::map<QueryKey, const FeatureQuery *> expected;
   for (const FeatureQuery &query : generated)
     expected.emplace(QueryKey{query.task, query.rows, query.cols}, &query);
-  if (expected.size() != generated.size() || supplied.size() != generated.size()) {
+  if (expected.size() != generated.size() ||
+      supplied.size() != generated.size()) {
     error = "supplied feature queries do not cover exactly the current task "
             "and formal mapper-shape space";
     return false;
@@ -1048,8 +1059,8 @@ static bool verifyFeatureQueriesBoundToCurrentBodies(
     const FeatureQuery &current = *found->second;
     if (actual.bodyStructuralText != current.bodyStructuralText) {
       error = "supplied feature query body does not match the current "
-              "mapper-visible task body for task=" + actual.task +
-              " shape=rect-" + std::to_string(actual.rows) + "x" +
+              "mapper-visible task body for task=" +
+              actual.task + " shape=rect-" + std::to_string(actual.rows) + "x" +
               std::to_string(actual.cols);
       return false;
     }
@@ -1059,18 +1070,17 @@ static bool verifyFeatureQueriesBoundToCurrentBodies(
         !sameFeatureNumber(actual.startupCycles, current.startupCycles) ||
         actual.features.size() != current.features.size()) {
       error = "supplied feature query facts do not match the current "
-              "mapper-visible task body for task=" + actual.task +
-              " shape=rect-" + std::to_string(actual.rows) + "x" +
+              "mapper-visible task body for task=" +
+              actual.task + " shape=rect-" + std::to_string(actual.rows) + "x" +
               std::to_string(actual.cols);
       return false;
     }
     for (size_t index = 0; index < actual.features.size(); ++index) {
-      if (!sameFeatureNumber(actual.features[index],
-                             current.features[index])) {
+      if (!sameFeatureNumber(actual.features[index], current.features[index])) {
         error = "supplied feature query vector does not match the current "
-                "mapper-visible task body for task=" + actual.task +
-                " shape=rect-" + std::to_string(actual.rows) + "x" +
-                std::to_string(actual.cols);
+                "mapper-visible task body for task=" +
+                actual.task + " shape=rect-" + std::to_string(actual.rows) +
+                "x" + std::to_string(actual.cols);
         return false;
       }
     }
@@ -1205,9 +1215,9 @@ static bool writeCatalogue(
       metadata["diagnostic_only"] = true;
       metadata["formal"] = false;
       json::Object diagnosticOverride;
-      if (!makePerCgra2x2DiagnosticOverrideMetadata(
-              trainingArchitectureText, runtimeArchitectureText,
-              diagnosticOverride, error))
+      if (!makePerCgra2x2DiagnosticOverrideMetadata(trainingArchitectureText,
+                                                    runtimeArchitectureText,
+                                                    diagnosticOverride, error))
         return false;
       metadata["diagnostic_override"] = std::move(diagnosticOverride);
     }
@@ -1217,12 +1227,12 @@ static bool writeCatalogue(
       json::Object{{"objective", "predicted_scheduler_makespan"},
                    {"mapper_success_probability", "not_predicted"},
                    {"uses_mapper_success_probability", false}};
-  metadata["ml_cache"] = json::Object{
-      {"identity", "canonical-body-text-and-mapper-shape"},
-      {"entries", static_cast<int64_t>(cache.size())},
-      {"hits", static_cast<int64_t>(cache.getHitCount())},
-      {"misses", static_cast<int64_t>(cache.getMissCount())},
-      {"trip_count_in_identity", false}};
+  metadata["ml_cache"] =
+      json::Object{{"identity", "canonical-body-text-and-mapper-shape"},
+                   {"entries", static_cast<int64_t>(cache.size())},
+                   {"hits", static_cast<int64_t>(cache.getHitCount())},
+                   {"misses", static_cast<int64_t>(cache.getMissCount())},
+                   {"trip_count_in_identity", false}};
   if (allowUnsupportedAboveModelCeiling ||
       runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
     metadata["unsupported_prediction_policy"] =
@@ -1254,8 +1264,7 @@ static bool writeCatalogue(
           {"analytical_lower_bound", query.lowerBound},
           {"model_interval_max_ii", kFormalMax4ModelCeilingII}};
       if (runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
-        unsupportedEntry["training_ceiling_ii"] =
-            kPerCgra2x2TrainingIICeiling;
+        unsupportedEntry["training_ceiling_ii"] = kPerCgra2x2TrainingIICeiling;
         unsupportedEntry["runtime_ceiling_ii"] = runtimeIICeiling;
         unsupportedEntry["extrapolation_status"] =
             "outside-diagnostic-runtime-domain";
@@ -1293,18 +1302,17 @@ static bool writeCatalogue(
       entry["direct_ensemble_members"] = std::move(members);
       entry["candidate_only"] = true;
       if (runtimeIICeiling == kPerCgra2x2DiagnosticIICeiling) {
-        const bool extrapolated = query.lowerBound >
-                                      kPerCgra2x2TrainingIICeiling ||
-                                  llvm::any_of(
-                                      directPredictions[index].memberPredictions,
-                                      [](double value) {
-                                        return value >
-                                               kPerCgra2x2TrainingIICeiling;
-                                      });
+        const bool extrapolated =
+            query.lowerBound > kPerCgra2x2TrainingIICeiling ||
+            llvm::any_of(directPredictions[index].memberPredictions,
+                         [](double value) {
+                           return value > kPerCgra2x2TrainingIICeiling;
+                         });
         entry["training_ceiling_ii"] = kPerCgra2x2TrainingIICeiling;
         entry["runtime_ceiling_ii"] = runtimeIICeiling;
-        entry["extrapolation_status"] =
-            extrapolated ? "out-of-training-ceiling" : "within-training-ceiling";
+        entry["extrapolation_status"] = extrapolated
+                                            ? "out-of-training-ceiling"
+                                            : "within-training-ceiling";
       }
     }
     entries.push_back(std::move(entry));
@@ -1345,12 +1353,12 @@ struct PredictAnalyticalTaskCostCatalogPass
   Option<std::string> spaceFile{
       *this, "space-file", llvm::cl::desc("Exhaustive candidate-space header"),
       llvm::cl::init("")};
-  Option<std::string> ensembleFile{
-      *this, "ensemble-file", llvm::cl::desc("Formal JSON ensemble"),
-      llvm::cl::init("")};
+  Option<std::string> ensembleFile{*this, "ensemble-file",
+                                   llvm::cl::desc("Formal JSON ensemble"),
+                                   llvm::cl::init("")};
   Option<std::string> checkpointDirectory{
-      *this, "checkpoint-dir", llvm::cl::desc("Formal JSON checkpoint directory"),
-      llvm::cl::init("")};
+      *this, "checkpoint-dir",
+      llvm::cl::desc("Formal JSON checkpoint directory"), llvm::cl::init("")};
   Option<std::string> architectureContract{
       *this, "architecture-contract",
       llvm::cl::desc("Neura architecture and shape contract"),
@@ -1358,18 +1366,19 @@ struct PredictAnalyticalTaskCostCatalogPass
   Option<std::string> architecturePath{
       *this, "architecture-path", llvm::cl::desc("Target architecture path"),
       llvm::cl::init("")};
-  Option<std::string> sourceRepository{
-      *this, "source-git-repository", llvm::cl::desc("Source repository"),
-      llvm::cl::init("")};
-  Option<std::string> sourceCommit{
-      *this, "source-git-commit", llvm::cl::desc("Source Git commit"),
-      llvm::cl::init("")};
-  Option<std::string> graphVariantId{
-      *this, "graph-variant-id", llvm::cl::desc("Graph variant identity"),
-      llvm::cl::init("")};
+  Option<std::string> sourceRepository{*this, "source-git-repository",
+                                       llvm::cl::desc("Source repository"),
+                                       llvm::cl::init("")};
+  Option<std::string> sourceCommit{*this, "source-git-commit",
+                                   llvm::cl::desc("Source Git commit"),
+                                   llvm::cl::init("")};
+  Option<std::string> graphVariantId{*this, "graph-variant-id",
+                                     llvm::cl::desc("Graph variant identity"),
+                                     llvm::cl::init("")};
   Option<std::string> architectureTransferCatalog{
       *this, "architecture-transfer-catalog",
-      llvm::cl::desc("Optional validated rebound catalogue with architecture transfer evidence"),
+      llvm::cl::desc("Optional validated rebound catalogue with architecture "
+                     "transfer evidence"),
       llvm::cl::init("")};
   Option<std::string> modelNamespace{
       *this, "model-namespace", llvm::cl::desc("Output catalogue namespace"),
@@ -1377,9 +1386,9 @@ struct PredictAnalyticalTaskCostCatalogPass
   Option<std::string> cacheFile{
       *this, "cache", llvm::cl::desc("Persistent structural ML cache"),
       llvm::cl::init("")};
-  Option<std::string> outputFile{
-      *this, "output", llvm::cl::desc("Output task-shape catalogue"),
-      llvm::cl::init("")};
+  Option<std::string> outputFile{*this, "output",
+                                 llvm::cl::desc("Output task-shape catalogue"),
+                                 llvm::cl::init("")};
   Option<bool> allowUnsupportedAboveModelCeiling{
       *this, "allow-unsupported-above-model-ceiling",
       llvm::cl::desc("Record C++-proved mapper lower bounds above the model "
@@ -1429,8 +1438,8 @@ struct PredictAnalyticalTaskCostCatalogPass
            "graph-variant-id, and output");
       return;
     }
-    if (!llvm::StringRef(architectureContract).starts_with(
-            kCacheArchitecturePrefix)) {
+    if (!llvm::StringRef(architectureContract)
+             .starts_with(kCacheArchitecturePrefix)) {
       fail("architecture-contract must use the neura-architecture-v1: prefix");
       return;
     }
@@ -1542,16 +1551,17 @@ struct PredictAnalyticalTaskCostCatalogPass
       return;
     }
     std::vector<FeatureQuery> generatedQueries;
-    if (!generateCurrentFeatureQueries(currentBodies, featureNames,
-                                       directModelMode, generatedQueries, error,
-                                       allowUnsupportedAboveModelCeiling,
-                                       runtimeIICeiling)) {
+    if (!generateCurrentFeatureQueries(
+            currentBodies, featureNames, directModelMode, generatedQueries,
+            error, allowUnsupportedAboveModelCeiling, runtimeIICeiling)) {
       fail(error);
       return;
     }
-    if (llvm::any_of(generatedQueries, [](const FeatureQuery &query) {
-          return query.modelDomainUnsupported;
-        }) && (!featureFile.empty() || !featureOutputFile.empty())) {
+    if (llvm::any_of(generatedQueries,
+                     [](const FeatureQuery &query) {
+                       return query.modelDomainUnsupported;
+                     }) &&
+        (!featureFile.empty() || !featureOutputFile.empty())) {
       fail("feature-file and feature-output do not support explicit "
            "unsupported model-domain queries");
       return;
@@ -1603,10 +1613,11 @@ struct PredictAnalyticalTaskCostCatalogPass
         return;
       }
     }
-    llvm::sort(queries, [&](const FeatureQuery &left, const FeatureQuery &right) {
-      return std::tie(taskOrder[left.task], left.rows, left.cols) <
-             std::tie(taskOrder[right.task], right.rows, right.cols);
-    });
+    llvm::sort(queries,
+               [&](const FeatureQuery &left, const FeatureQuery &right) {
+                 return std::tie(taskOrder[left.task], left.rows, left.cols) <
+                        std::tie(taskOrder[right.task], right.rows, right.cols);
+               });
 
     // Keep this lock alive from cache load through all lookups, predictions,
     // and the atomic cache write.  A shared cache is used by independent
@@ -1618,16 +1629,15 @@ struct PredictAnalyticalTaskCostCatalogPass
       return;
     }
     PersistentMLCostCache cache;
-    const double cacheRuntimeIICeiling =
-        directModelMode ? directModel.getRuntimeIICeiling()
-                        : kFormalMax4ModelCeilingII;
+    const double cacheRuntimeIICeiling = directModelMode
+                                             ? directModel.getRuntimeIICeiling()
+                                             : kFormalMax4ModelCeilingII;
     const llvm::StringRef cacheTrainingArchitectureText =
         directModelMode ? directModel.getTrainingArchitectureText()
                         : llvm::StringRef();
     if (!cache.load(cacheFile, modelSchema, featureContractId,
-                    architectureContract, cacheResources,
-                    cacheRuntimeIICeiling, cacheTrainingArchitectureText,
-                    error)) {
+                    architectureContract, cacheResources, cacheRuntimeIICeiling,
+                    cacheTrainingArchitectureText, error)) {
       fail(error);
       return;
     }
@@ -1773,7 +1783,8 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
     return false;
   }
   json::Object *root = parsed->getAsObject();
-  json::Object *metadata = root ? root->getObject("predictor_metadata") : nullptr;
+  json::Object *metadata =
+      root ? root->getObject("predictor_metadata") : nullptr;
   json::Array *entries = root ? root->getArray("entries") : nullptr;
   if (!root || !metadata || !entries)
     return fail("model-domain catalogue lacks root metadata or entries");
@@ -1788,14 +1799,15 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
     std::string currentArchitectureText;
     if (!directModel || !architecturePath ||
         !readTextFile(*architecturePath, currentArchitectureText, error) ||
-        !validatePerCgra2x2DiagnosticMetadata(
-            *metadata, currentArchitectureText, error))
+        !validatePerCgra2x2DiagnosticMetadata(*metadata,
+                                              currentArchitectureText, error))
       return fail(error.empty()
                       ? "diagnostic override metadata is missing or invalid"
                       : error);
     runtimeIICeiling = kPerCgra2x2DiagnosticIICeiling;
   } else if (metadata->get("diagnostic_only") || metadata->get("formal")) {
-    return fail("diagnostic catalogue is missing its diagnostic_override proof");
+    return fail(
+        "diagnostic catalogue is missing its diagnostic_override proof");
   }
   ArrayRef<std::pair<int64_t, int64_t>> shapes =
       directModel ? ArrayRef<std::pair<int64_t, int64_t>>(kPerCgra2x2Shapes)
@@ -1804,13 +1816,12 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
   auto policy = metadata->getString("unsupported_prediction_policy");
   auto ceiling = metadata->getNumber("model_interval_max_ii");
   const llvm::StringRef expectedUnsupportedPolicy =
-      diagnosticOverride ? llvm::StringRef(kDiagnosticUnsupportedPolicy)
-                         : llvm::StringRef(
-                               "analytical-lower-bound-exceeds-model-ceiling-v1");
+      diagnosticOverride
+          ? llvm::StringRef(kDiagnosticUnsupportedPolicy)
+          : llvm::StringRef("analytical-lower-bound-exceeds-model-ceiling-v1");
   if (!witness || *witness != neighborhoodReplaySourceText(module) || !policy ||
-      *policy != expectedUnsupportedPolicy ||
-      !ceiling || !std::isfinite(*ceiling) ||
-      *ceiling != kFormalMax4ModelCeilingII)
+      *policy != expectedUnsupportedPolicy || !ceiling ||
+      !std::isfinite(*ceiling) || *ceiling != kFormalMax4ModelCeilingII)
     return fail("model-domain catalogue source binding or interval policy "
                 "does not match the exact current module");
   if (directModel &&
@@ -1869,9 +1880,10 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
       if (!computeMapperAnalyticalFacts(body.mapperFunction.getBody(), rows,
                                         cols, recMII, resMII, lowerBound,
                                         error)) {
-        error = "source lower-bound recomputation failed for task=" +
-                body.task + " shape=rect-" + std::to_string(rows) + "x" +
-                std::to_string(cols) + ": " + error;
+        error =
+            "source lower-bound recomputation failed for task=" + body.task +
+            " shape=rect-" + std::to_string(rows) + "x" + std::to_string(cols) +
+            ": " + error;
         return false;
       }
       expectedBounds.emplace(QueryKey{body.task, rows, cols}, lowerBound);
@@ -1910,8 +1922,7 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
           directModel ? entry->getArray("direct_ensemble_members") : nullptr;
       if (!predictedII || !startup || !std::isfinite(*predictedII) ||
           !std::isfinite(*startup) || *predictedII < expected->second ||
-          *predictedII > runtimeIICeiling + 1.0e-6 ||
-          *startup <= 0.0 ||
+          *predictedII > runtimeIICeiling + 1.0e-6 || *startup <= 0.0 ||
           (directModel &&
            (!members || members->size() != 4 || entry->get("baseline_ii") ||
             entry->get("large_operation_ii") || entry->get("ranking_ii") ||
@@ -1966,9 +1977,9 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
               *rowTrainingCeiling != kPerCgra2x2TrainingIICeiling ||
               !rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
               !extrapolationStatus ||
-              *extrapolationStatus !=
-                  (extrapolated ? "out-of-training-ceiling"
-                                : "within-training-ceiling"))
+              *extrapolationStatus != (extrapolated
+                                           ? "out-of-training-ceiling"
+                                           : "within-training-ceiling"))
             return fail("diagnostic prediction row omits its exact training "
                         "and runtime interval status");
         } else if (entry->get("training_ceiling_ii") ||
@@ -1985,21 +1996,18 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
     auto rowCeiling = entry->getNumber("model_interval_max_ii");
     auto rowRuntimeCeiling = entry->getNumber("runtime_ceiling_ii");
     auto rowTrainingCeiling = entry->getNumber("training_ceiling_ii");
-    auto unsupportedReason = diagnosticOverride
-                                 ? llvm::StringRef(
-                                       kDiagnosticUnsupportedReason)
-                                 : llvm::StringRef(
-                                       kModelDomainUnsupportedReason);
+    auto unsupportedReason =
+        diagnosticOverride ? llvm::StringRef(kDiagnosticUnsupportedReason)
+                           : llvm::StringRef(kModelDomainUnsupportedReason);
     if (*supportStatus != "unsupported" || !status ||
         *status != kModelDomainUnsupportedStatus || !reason ||
         *reason != unsupportedReason || !rowCeiling ||
         !std::isfinite(*rowCeiling) ||
         *rowCeiling != kFormalMax4ModelCeilingII ||
-        expected->second <= runtimeIICeiling ||
-        entry->get("predicted_ii") || entry->get("startup_cycles") ||
-        entry->get("predicted_ii_std") || entry->get("ii_mean_source") ||
-        entry->get("direct_ensemble_members") || entry->get("model_status") ||
-        entry->get("production_ready") ||
+        expected->second <= runtimeIICeiling || entry->get("predicted_ii") ||
+        entry->get("startup_cycles") || entry->get("predicted_ii_std") ||
+        entry->get("ii_mean_source") || entry->get("direct_ensemble_members") ||
+        entry->get("model_status") || entry->get("production_ready") ||
         entry->get("mapper_success_probability") ||
         (diagnosticOverride &&
          (!rowTrainingCeiling ||
@@ -2007,9 +2015,8 @@ bool verifyCurrentModelDomainCostCatalog(ModuleOp module,
           !rowRuntimeCeiling || *rowRuntimeCeiling != runtimeIICeiling ||
           entry->getString("extrapolation_status") !=
               "outside-diagnostic-runtime-domain")) ||
-        (!diagnosticOverride &&
-         (rowTrainingCeiling || rowRuntimeCeiling ||
-          entry->get("extrapolation_status"))))
+        (!diagnosticOverride && (rowTrainingCeiling || rowRuntimeCeiling ||
+                                 entry->get("extrapolation_status"))))
       return fail("unsupported model-domain row is not justified by the "
                   "current source lower bound");
   }

@@ -367,9 +367,8 @@ static TaskflowTaskOp convertLoopToTask(
   for (Value result : cloned_loop->getResults()) {
     value_yield_operands.push_back(result);
   }
-  task_builder.create<TaskflowYieldOp>(loc, yield_for_done_reads,
-                                       yield_for_done_writes,
-                                       value_yield_operands);
+  task_builder.create<TaskflowYieldOp>(
+      loc, yield_for_done_reads, yield_for_done_writes, value_yield_operands);
 
   //-------------------------------------------------------------------
   // Step 9 : Updates value mapping with task outputs for subsequent tasks

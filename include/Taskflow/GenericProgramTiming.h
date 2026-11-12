@@ -7,7 +7,8 @@ namespace orbit::taskflow {
 // event evaluator. No new graph, parameters, or planner are introduced. A full
 // invocation cost owns its complete coverage once; internal durations remain
 // unknown until a separately identifiable implementation model is supplied.
-bool evaluateGenericProgramTiming(const GenericAnalysis &, const GenericMappingPlan &,
-                                 llvm::json::Value &, std::string &error);
-}
+bool evaluateGenericProgramTiming(const GenericAnalysis &,
+                                  const GenericMappingPlan &,
+                                  llvm::json::Value &, std::string &error);
+} // namespace orbit::taskflow
 #endif

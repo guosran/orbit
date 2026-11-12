@@ -12,8 +12,8 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
-#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
+#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "TaskflowDialect/TaskflowOps.h"
 
@@ -24,8 +24,8 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 
@@ -36,8 +36,8 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <string>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -75,8 +75,7 @@ static bool isSupportedPartitionFactor(int64_t factor,
 }
 
 static std::string factorLimitWord(unsigned maxPartitionFactor) {
-  return maxPartitionFactor == kDefaultMaxPartitionFactor ? "four" :
-                                                              "eight";
+  return maxPartitionFactor == kDefaultMaxPartitionFactor ? "four" : "eight";
 }
 
 static std::string factorLimitReason(StringRef prefix,
@@ -97,7 +96,8 @@ static bool isLegalArea4Shape(int64_t rows, int64_t cols) {
 static std::string lower(StringRef value) {
   std::string result = value.str();
   for (char &character : result)
-    character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    character =
+        static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
   return result;
 }
 
@@ -210,27 +210,25 @@ static TaskflowTaskOp findTask(ModuleOp module, StringRef functionName,
   return result;
 }
 
-static SmallVector<std::string> taskNames(ModuleOp module,
-                                           StringRef functionName,
-                                           bool sorted = true) {
+static SmallVector<std::string>
+taskNames(ModuleOp module, StringRef functionName, bool sorted = true) {
   SmallVector<std::string> result;
   std::string error;
   FailureOr<func::FuncOp> function =
       selectTaskFunction(module, functionName, error);
   if (failed(function))
     return result;
-  function->walk([&](TaskflowTaskOp task) {
-    result.push_back(task.getTaskName().str());
-  });
+  function->walk(
+      [&](TaskflowTaskOp task) { result.push_back(task.getTaskName().str()); });
   if (sorted)
     llvm::sort(result);
   return result;
 }
 
 static SmallVector<int64_t> replicaOutputAxes(ModuleOp module,
-                                             StringRef functionName,
-                                             StringRef taskName,
-                                             int64_t factor = 1) {
+                                              StringRef functionName,
+                                              StringRef taskName,
+                                              int64_t factor = 1) {
   SmallVector<int64_t> axes{0, 1};
   TaskflowTaskOp task = findTask(module, functionName, taskName);
   if (!task)
@@ -251,8 +249,7 @@ static SmallVector<int64_t> replicaOutputAxes(ModuleOp module,
 static void addUniqueShape(SmallVectorImpl<ShapeKey> &shapes, int64_t rows,
                            int64_t cols) {
   ShapeKey candidate{rows, cols};
-  if (isLegalArea4Shape(rows, cols) &&
-      !llvm::is_contained(shapes, candidate))
+  if (isLegalArea4Shape(rows, cols) && !llvm::is_contained(shapes, candidate))
     shapes.push_back(candidate);
 }
 
@@ -268,7 +265,7 @@ static void addUniqueAction(std::vector<NeighborhoodAction> &actions,
 }
 
 static NeighborhoodPrimitive tilePrimitive(StringRef task, int64_t axis,
-                                            int64_t factor) {
+                                           int64_t factor) {
   NeighborhoodPrimitive primitive;
   primitive.kind = "tile";
   primitive.firstTask = task.str();
@@ -279,7 +276,7 @@ static NeighborhoodPrimitive tilePrimitive(StringRef task, int64_t axis,
 }
 
 static NeighborhoodPrimitive kTilePrimitive(StringRef task, StringRef mode,
-                                             int64_t factor) {
+                                            int64_t factor) {
   NeighborhoodPrimitive primitive;
   primitive.kind = "k-tile";
   primitive.firstTask = task.str();
@@ -290,7 +287,7 @@ static NeighborhoodPrimitive kTilePrimitive(StringRef task, StringRef mode,
 }
 
 static NeighborhoodPrimitive replicaPrimitive(StringRef task, int64_t axis,
-                                               int64_t factor) {
+                                              int64_t factor) {
   NeighborhoodPrimitive primitive;
   primitive.kind = "replica";
   primitive.firstTask = task.str();
@@ -300,7 +297,7 @@ static NeighborhoodPrimitive replicaPrimitive(StringRef task, int64_t axis,
 }
 
 static NeighborhoodPrimitive fusionPrimitive(StringRef first, StringRef second,
-                                              StringRef mode) {
+                                             StringRef mode) {
   NeighborhoodPrimitive primitive;
   primitive.kind = mode == "sibling" ? "sibling-fusion" : "fusion";
   primitive.firstTask = first.str();
@@ -417,9 +414,10 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
       return false;
     }
     pass = mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
-    options = "task-name=\"" + primitive.firstTask + "\" tile-axis=" +
-              std::to_string(primitive.axis) + " tile-factor=" +
-              std::to_string(primitive.factor) + " fusion-mode=none";
+    options = "task-name=\"" + primitive.firstTask +
+              "\" tile-axis=" + std::to_string(primitive.axis) +
+              " tile-factor=" + std::to_string(primitive.factor) +
+              " fusion-mode=none";
   } else if (kind == "k-tile" || kind == "k_tiling" || kind == "ktile") {
     if (!isSupportedPartitionFactor(primitive.factor, maxPartitionFactor)) {
       reason = "unsupported_k_tiling_factor";
@@ -435,12 +433,11 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
     }
     pass = mlir::amoeba::neura::createMaterializeNeuraKReductionPass();
     options = "function=\"" + functionName.str() + "\" task-name=\"" +
-              primitive.firstTask + "\" k-mode=" + mode + " k-factor=" +
-              std::to_string(primitive.factor);
+              primitive.firstTask + "\" k-mode=" + mode +
+              " k-factor=" + std::to_string(primitive.factor);
   } else if (kind == "replica" || kind == "replication") {
-    SmallVector<int64_t> axes =
-        replicaOutputAxes(module, functionName, primitive.firstTask,
-                          primitive.factor);
+    SmallVector<int64_t> axes = replicaOutputAxes(
+        module, functionName, primitive.firstTask, primitive.factor);
     if (!llvm::is_contained(axes, primitive.axis) ||
         !isSupportedPartitionFactor(primitive.factor, maxPartitionFactor)) {
       reason = "unsupported_replica_factor_or_axis";
@@ -448,9 +445,9 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
     }
     pass = mlir::amoeba::neura::createMaterializeJointTaskReplicasPass();
     options = "function=\"" + functionName.str() + "\" task=\"" +
-              primitive.firstTask + "\" replicas=" +
-              std::to_string(primitive.factor) + " axis=" +
-              std::to_string(primitive.axis);
+              primitive.firstTask +
+              "\" replicas=" + std::to_string(primitive.factor) +
+              " axis=" + std::to_string(primitive.axis);
   } else if (kind == "fusion" || kind == "producer-consumer" ||
              kind == "producer_consumer" || kind == "sibling-fusion" ||
              kind == "sibling") {
@@ -492,16 +489,15 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
   LogicalResult runResult = failure();
   LogicalResult verifyResult = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(
-                                            diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     runResult = manager.run(module);
     if (succeeded(runResult))
       verifyResult = verify(module.getOperation());
@@ -521,7 +517,8 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
 
 static bool copyModuleBody(ModuleOp destination, ModuleOp source,
                            std::string &reason) {
-  if (!destination || !source || destination.getOperation() == source.getOperation()) {
+  if (!destination || !source ||
+      destination.getOperation() == source.getOperation()) {
     reason = "invalid_module_reset_target";
     return false;
   }
@@ -544,9 +541,10 @@ static bool isShapePrimitive(StringRef kind) {
   return value == "shape" || value == "shape-choice" || value == "shape_choice";
 }
 
-static bool actionHasDuplicateLineageFactor(
-    ArrayRef<NeighborhoodPrimitive> primitives, unsigned maxPartitionFactor,
-    std::string &reason) {
+static bool
+actionHasDuplicateLineageFactor(ArrayRef<NeighborhoodPrimitive> primitives,
+                                unsigned maxPartitionFactor,
+                                std::string &reason) {
   // A local composite may contain two edits to the same original dimension.
   // Reject only a provable product above the selected original-domain bound;
   // all other unsupported cases are left to the source materializer and
@@ -571,15 +569,14 @@ static bool actionHasDuplicateLineageFactor(
     }
     if (primitive.factor == 1)
       continue;
-    if (primitive.factor != 2 && primitive.factor != 4 &&
-        primitive.factor != 8)
-      continue; // The source-owned materializer supplies the kind-specific guard.
+    if (primitive.factor != 2 && primitive.factor != 4 && primitive.factor != 8)
+      continue; // The source-owned materializer supplies the kind-specific
+                // guard.
     auto key = std::make_pair(primitive.firstTask, family);
     int64_t &product = products[key];
     if (product == 0)
       product = 1;
-    if (product > static_cast<int64_t>(maxPartitionFactor) /
-                    primitive.factor) {
+    if (product > static_cast<int64_t>(maxPartitionFactor) / primitive.factor) {
       reason = factorLimitReason("cumulative_original_domain_factor_exceeds",
                                  maxPartitionFactor);
       return false;
@@ -620,8 +617,8 @@ struct RootLineage {
 using PartitionLineage = SmallVector<RootLineage, 2>;
 
 static std::optional<int64_t> staticIndex(Value value, TaskflowTaskOp task,
-                                         neura::KernelOp kernel = nullptr,
-                                         unsigned depth = 0) {
+                                          neura::KernelOp kernel = nullptr,
+                                          unsigned depth = 0) {
   if (!value || depth > 32)
     return std::nullopt;
   if (auto constant = value.getDefiningOp<arith::ConstantOp>())
@@ -671,9 +668,10 @@ static std::optional<int64_t> staticIndex(Value value, TaskflowTaskOp task,
   return std::nullopt;
 }
 
-static std::optional<int64_t> staticKernelBound(
-    neura::CounterOp counter, StringRef name, Value operand,
-    TaskflowTaskOp task, neura::KernelOp kernel) {
+static std::optional<int64_t> staticKernelBound(neura::CounterOp counter,
+                                                StringRef name, Value operand,
+                                                TaskflowTaskOp task,
+                                                neura::KernelOp kernel) {
   std::optional<int64_t> fromOperand;
   if (operand) {
     fromOperand = staticIndex(operand, task, kernel);
@@ -688,7 +686,8 @@ static std::optional<int64_t> staticKernelBound(
       StringRef spelling = text.getValue();
       unsigned input = 0;
       if (!spelling.consume_front("%input") || spelling.empty() ||
-          spelling.getAsInteger(10, input) || input >= kernel.getInputs().size())
+          spelling.getAsInteger(10, input) ||
+          input >= kernel.getInputs().size())
         return std::nullopt;
       fromAttribute = staticIndex(kernel.getInputs()[input], task, kernel);
       if (!fromAttribute)
@@ -747,8 +746,8 @@ static bool collectTypedDomains(TaskflowTaskOp task, CounterDomains &domains,
       reason = "lineage_proof_unknown";
       return false;
     }
-    for (Operation *operation : {counter.getOperation(),
-                                 kernelCounters[index].getOperation()}) {
+    for (Operation *operation :
+         {counter.getOperation(), kernelCounters[index].getOperation()}) {
       if (auto id = operation->getAttrOfType<IntegerAttr>("counter_id"))
         if (id.getInt() != static_cast<int64_t>(index)) {
           reason = "lineage_proof_unknown";
@@ -756,12 +755,12 @@ static bool collectTypedDomains(TaskflowTaskOp task, CounterDomains &domains,
         }
     }
     neura::CounterOp hardware = kernelCounters[index];
-    auto hardwareLow = staticKernelBound(hardware, "lower_bound_value",
-                                        hardware.getLowerBound(), task, kernel);
-    auto hardwareHigh = staticKernelBound(hardware, "upper_bound_value",
-                                         hardware.getUpperBound(), task, kernel);
+    auto hardwareLow = staticKernelBound(
+        hardware, "lower_bound_value", hardware.getLowerBound(), task, kernel);
+    auto hardwareHigh = staticKernelBound(
+        hardware, "upper_bound_value", hardware.getUpperBound(), task, kernel);
     auto hardwareStep = staticKernelBound(hardware, "step_value",
-                                         hardware.getStep(), task, kernel);
+                                          hardware.getStep(), task, kernel);
     if (!hardwareLow || !hardwareHigh || !hardwareStep ||
         *hardwareLow != *low || *hardwareHigh != *high ||
         *hardwareStep != *step) {
@@ -774,10 +773,9 @@ static bool collectTypedDomains(TaskflowTaskOp task, CounterDomains &domains,
 }
 
 static bool checkedMultiply(int64_t &value, int64_t factor,
-                            unsigned maxPartitionFactor,
-                            StringRef boundReason, std::string &reason) {
-  if (!isSupportedPartitionFactor(factor, maxPartitionFactor) ||
-      value < 1 ||
+                            unsigned maxPartitionFactor, StringRef boundReason,
+                            std::string &reason) {
+  if (!isSupportedPartitionFactor(factor, maxPartitionFactor) || value < 1 ||
       value > static_cast<int64_t>(maxPartitionFactor) / factor) {
     reason = boundReason.str();
     return false;
@@ -792,9 +790,8 @@ static bool partitionMatches(const PartitionStep &step,
                              unsigned maxPartitionFactor) {
   if ((step.family != "tiling" && step.family != "replica") ||
       !isSupportedPartitionFactor(step.factor, maxPartitionFactor) ||
-      step.factor == 1 || step.part < 0 ||
-      step.part >= step.factor || step.axis < 0 ||
-      static_cast<size_t>(step.axis) >= step.before.size() ||
+      step.factor == 1 || step.part < 0 || step.part >= step.factor ||
+      step.axis < 0 || static_cast<size_t>(step.axis) >= step.before.size() ||
       step.after.size() != step.before.size())
     return false;
   for (auto [axis, source] : llvm::enumerate(step.before)) {
@@ -812,8 +809,8 @@ static bool partitionMatches(const PartitionStep &step,
     int64_t remainder = extent % step.factor;
     // Both products are bounded by extent; the resulting range is bounded by
     // the already authenticated positive int64 source interval.
-    int64_t low = source.lower + quotient * step.part +
-                  std::min(step.part, remainder);
+    int64_t low =
+        source.lower + quotient * step.part + std::min(step.part, remainder);
     int64_t high = low + quotient + (step.part < remainder ? 1 : 0);
     if (!(step.after[axis] == CounterDomain{low, high, 1}))
       return false;
@@ -822,7 +819,7 @@ static bool partitionMatches(const PartitionStep &step,
 }
 
 static DenseI64ArrayAttr encodeDomains(MLIRContext *context,
-                                      ArrayRef<CounterDomain> domains) {
+                                       ArrayRef<CounterDomain> domains) {
   SmallVector<int64_t> values;
   for (const CounterDomain &domain : domains)
     values.append({domain.lower, domain.upper, domain.step});
@@ -917,10 +914,9 @@ static bool decodeLineage(Attribute attribute, PartitionLineage &lineage,
 }
 
 static bool authenticateLineage(ModuleOp canonical, StringRef functionName,
-                                 TaskflowTaskOp task,
-                                 PartitionLineage &lineage,
-                                 std::string &reason,
-                                 unsigned maxPartitionFactor) {
+                                TaskflowTaskOp task, PartitionLineage &lineage,
+                                std::string &reason,
+                                unsigned maxPartitionFactor) {
   CounterDomains actual;
   if (!collectTypedDomains(task, actual, reason))
     return false;
@@ -962,7 +958,8 @@ static bool authenticateLineage(ModuleOp canonical, StringRef functionName,
     int64_t tiling = 1;
     int64_t replica = 1;
     for (const PartitionStep &step : root.steps) {
-      if (step.before != current || !partitionMatches(step, maxPartitionFactor)) {
+      if (step.before != current ||
+          !partitionMatches(step, maxPartitionFactor)) {
         reason = "lineage_proof_unknown";
         return false;
       }
@@ -970,10 +967,12 @@ static bool authenticateLineage(ModuleOp canonical, StringRef functionName,
       if (!checkedMultiply(
               product, step.factor, maxPartitionFactor,
               step.family == "tiling"
-                  ? factorLimitReason("cumulative_original_tiling_factor_exceeds",
-                                      maxPartitionFactor)
-                  : factorLimitReason("cumulative_original_replica_factor_exceeds",
-                                      maxPartitionFactor),
+                  ? factorLimitReason(
+                        "cumulative_original_tiling_factor_exceeds",
+                        maxPartitionFactor)
+                  : factorLimitReason(
+                        "cumulative_original_replica_factor_exceeds",
+                        maxPartitionFactor),
               reason))
         return false;
       current = step.after;
@@ -1003,10 +1002,12 @@ static bool isFusion(StringRef kind) {
          value == "sibling";
 }
 
-static bool checkCumulativeLineageFactor(
-    ModuleOp module, ModuleOp canonical, StringRef functionName,
-    const NeighborhoodPrimitive &primitive, PartitionLineage &lineage,
-    std::string &reason, unsigned maxPartitionFactor) {
+static bool checkCumulativeLineageFactor(ModuleOp module, ModuleOp canonical,
+                                         StringRef functionName,
+                                         const NeighborhoodPrimitive &primitive,
+                                         PartitionLineage &lineage,
+                                         std::string &reason,
+                                         unsigned maxPartitionFactor) {
   std::string family = partitionFamily(primitive.kind);
   if (family.empty())
     return true;
@@ -1032,8 +1033,9 @@ static bool checkCumulativeLineageFactor(
             family == "tiling"
                 ? factorLimitReason("cumulative_original_tiling_factor_exceeds",
                                     maxPartitionFactor)
-                : factorLimitReason("cumulative_original_replica_factor_exceeds",
-                                    maxPartitionFactor),
+                : factorLimitReason(
+                      "cumulative_original_replica_factor_exceeds",
+                      maxPartitionFactor),
             reason))
       return false;
   }
@@ -1044,10 +1046,10 @@ static bool replicaLineageCounterAxis(TaskflowTaskOp task,
                                       int64_t requestedAxis,
                                       int64_t &counterAxis,
                                       std::string &reason) {
-  auto declaredCounterAxis = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.shard_axis");
-  auto declaredOutputAxis = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.output_shard_axis");
+  auto declaredCounterAxis =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
+  auto declaredOutputAxis =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.output_shard_axis");
   if (!declaredCounterAxis || declaredCounterAxis.getInt() < 0 ||
       (task->hasAttr("amoeba.replica.output_shard_axis") &&
        !declaredOutputAxis)) {
@@ -1087,8 +1089,7 @@ static bool replicaLineageCounterAxis(TaskflowTaskOp task,
   }
 
   if (declaredOutputAxis) {
-    if (mappedCounter !=
-        static_cast<unsigned>(declaredCounterAxis.getInt())) {
+    if (mappedCounter != static_cast<unsigned>(declaredCounterAxis.getInt())) {
       reason = "lineage_proof_unknown";
       return false;
     }
@@ -1113,11 +1114,12 @@ static bool replicaLineageCounterAxis(TaskflowTaskOp task,
   return true;
 }
 
-static bool recordPartitionLineage(
-    ModuleOp module, StringRef functionName,
-    const NeighborhoodPrimitive &primitive, ArrayRef<RootLineage> sourceLineage,
-    ArrayRef<std::string> oldNames, std::string &reason,
-    unsigned maxPartitionFactor) {
+static bool recordPartitionLineage(ModuleOp module, StringRef functionName,
+                                   const NeighborhoodPrimitive &primitive,
+                                   ArrayRef<RootLineage> sourceLineage,
+                                   ArrayRef<std::string> oldNames,
+                                   std::string &reason,
+                                   unsigned maxPartitionFactor) {
   std::string family = partitionFamily(primitive.kind);
   if (family.empty())
     return true;
@@ -1131,8 +1133,8 @@ static bool recordPartitionLineage(
                               ? sourceLineage.front().original
                               : sourceLineage.front().steps.back().after;
   for (const RootLineage &root : sourceLineage) {
-    CounterDomains rootCurrent = root.steps.empty() ? root.original
-                                                  : root.steps.back().after;
+    CounterDomains rootCurrent =
+        root.steps.empty() ? root.original : root.steps.back().after;
     if (rootCurrent != before) {
       reason = "lineage_proof_unknown";
       return false;
@@ -1147,19 +1149,19 @@ static bool recordPartitionLineage(
     StringRef kind = primitive.kind;
     bool kTile = kind == "k-tile" || kind == "k_tiling" || kind == "ktile";
     StringRef parentAttribute = family == "replica"
-                                   ? "amoeba.replica.parent_task"
-                                   : "amoeba.neura.tiling.parent_task";
+                                    ? "amoeba.replica.parent_task"
+                                    : "amoeba.neura.tiling.parent_task";
     auto parent = task->getAttrOfType<StringAttr>(parentAttribute);
     if (!kTile && (!parent || parent.getValue() != primitive.firstTask))
       continue;
     StringRef partAttribute = family == "replica"
-                                 ? "amoeba.replica.id"
-                                 : (kTile ? "amoeba.semantic.k_block_index"
-                                          : "amoeba.neura.tiling.part_index");
+                                  ? "amoeba.replica.id"
+                                  : (kTile ? "amoeba.semantic.k_block_index"
+                                           : "amoeba.neura.tiling.part_index");
     StringRef factorAttribute = family == "replica"
-                                   ? "amoeba.replica.count"
-                                   : (kTile ? "amoeba.semantic.k_block_count"
-                                            : "amoeba.neura.tiling.factor");
+                                    ? "amoeba.replica.count"
+                                    : (kTile ? "amoeba.semantic.k_block_count"
+                                             : "amoeba.neura.tiling.factor");
     auto part = task->getAttrOfType<IntegerAttr>(partAttribute);
     auto factor = task->getAttrOfType<IntegerAttr>(factorAttribute);
     if (!part || !factor || factor.getInt() != primitive.factor)
@@ -1179,8 +1181,8 @@ static bool recordPartitionLineage(
         return false;
       }
     }
-    PartitionStep step{family, lineageAxis, primitive.factor,
-                       part.getInt(), before, after};
+    PartitionStep step{family,        lineageAxis, primitive.factor,
+                       part.getInt(), before,      after};
     if (!partitionMatches(step, maxPartitionFactor) ||
         !seenParts.insert(step.part).second) {
       reason = "lineage_proof_unknown";
@@ -1203,23 +1205,27 @@ static bool recordPartitionLineage(
       }
     }
     if (family == "tiling") {
-      auto matchesRange = [&](StringRef attribute, const CounterDomain &domain) {
+      auto matchesRange = [&](StringRef attribute,
+                              const CounterDomain &domain) {
         auto range = task->getAttrOfType<DenseI64ArrayAttr>(attribute);
         return range && range.size() == 2 &&
                range.asArrayRef()[0] == domain.lower &&
                range.asArrayRef()[1] == domain.upper;
       };
-      if ((kTile && !matchesRange("amoeba.semantic.K_range", after[step.axis])) ||
-          (!kTile &&
-           (!matchesRange("amoeba.neura.tiling.original_range", before[step.axis]) ||
-            !matchesRange("amoeba.neura.tiling.derived_range", after[step.axis])))) {
+      if ((kTile &&
+           !matchesRange("amoeba.semantic.K_range", after[step.axis])) ||
+          (!kTile && (!matchesRange("amoeba.neura.tiling.original_range",
+                                    before[step.axis]) ||
+                      !matchesRange("amoeba.neura.tiling.derived_range",
+                                    after[step.axis])))) {
         reason = "lineage_proof_unknown";
         return false;
       }
     }
     if (family == "replica") {
       auto low = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
-      auto high = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
+      auto high =
+          task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
       if (!low || !high || low.getInt() != after[lineageAxis].lower ||
           high.getInt() != after[lineageAxis].upper) {
         reason = "lineage_proof_unknown";
@@ -1239,13 +1245,14 @@ static bool recordPartitionLineage(
 }
 
 static bool recordFusionLineage(ModuleOp module, ModuleOp canonical,
-                                 StringRef functionName,
-                                 const NeighborhoodPrimitive &primitive,
-                                 ArrayRef<RootLineage> merged,
-                                 std::string &reason,
-                                 unsigned maxPartitionFactor) {
-  TaskflowTaskOp fused = findTask(module, functionName,
-      fusedTaskName(primitive.firstTask, primitive.secondTask));
+                                StringRef functionName,
+                                const NeighborhoodPrimitive &primitive,
+                                ArrayRef<RootLineage> merged,
+                                std::string &reason,
+                                unsigned maxPartitionFactor) {
+  TaskflowTaskOp fused =
+      findTask(module, functionName,
+               fusedTaskName(primitive.firstTask, primitive.secondTask));
   if (!fused)
     return true; // Unsupported fusion naming cannot grant a factor proof.
   fused->removeAttr(kPartitionLineage);
@@ -1270,8 +1277,8 @@ static bool recordFusionLineage(ModuleOp module, ModuleOp canonical,
   fused->setAttr(kPartitionLineage, encodeLineage(module.getContext(), unique));
   PartitionLineage authenticated;
   std::string ignored;
-  if (!authenticateLineage(canonical, functionName, fused, authenticated, ignored,
-                           maxPartitionFactor))
+  if (!authenticateLineage(canonical, functionName, fused, authenticated,
+                           ignored, maxPartitionFactor))
     fused->removeAttr(kPartitionLineage);
   return true;
 }
@@ -1298,10 +1305,13 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
   std::map<int64_t, TaskflowTaskOp> producers, consumers;
   for (const std::string &name : taskNames(module, functionName)) {
     TaskflowTaskOp task = findTask(module, functionName, name);
-    auto parent = task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
-    auto part = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
+    auto parent =
+        task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
+    auto part =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
     auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
-    auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto factor =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
     if (!parent || !part || !axis || !factor ||
         axis.getInt() != producerEdit.axis ||
         factor.getInt() != producerEdit.factor)
@@ -1336,8 +1346,8 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
     unsigned matches = 0;
     for (auto [index, input] : llvm::enumerate(c->second.getWillReads())) {
       auto join = input.getDefiningOp<TaskflowJoinOp>();
-      if (!join ||
-          !llvm::is_contained(join.getTileStates(), p->second.getDoneWrites()[0]))
+      if (!join || !llvm::is_contained(join.getTileStates(),
+                                       p->second.getDoneWrites()[0]))
         continue;
       if ((producerJoin && producerJoin != join) ||
           join.getAxis() != static_cast<uint64_t>(producerEdit.axis) ||
@@ -1358,8 +1368,7 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
       return false;
     }
   }
-  if (!producerJoin ||
-      producerJoin.getJoined().getUses().empty()) {
+  if (!producerJoin || producerJoin.getJoined().getUses().empty()) {
     reason = "co_tiling_dependency_proof_unknown";
     return false;
   }
@@ -1387,7 +1396,8 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
     auto replacement = llvm::find_if(replacements, [&](const auto &entry) {
       return entry.first == consumer;
     });
-    consumer.getWillReadsMutable().slice(replacement->second, 1)
+    consumer.getWillReadsMutable()
+        .slice(replacement->second, 1)
         .assign(producers.at(part).getDoneWrites()[0]);
   }
   producerJoin.erase();
@@ -1397,15 +1407,17 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
   std::string error;
   auto function = selectTaskFunction(module, functionName, error);
   TaskEdgeGraphOptions options;
-  auto graph = succeeded(function) ? buildTaskEdgeGraph(*function, options, error)
-                                   : FailureOr<TaskEdgeGraph>(failure());
+  auto graph = succeeded(function)
+                   ? buildTaskEdgeGraph(*function, options, error)
+                   : FailureOr<TaskEdgeGraph>(failure());
   if (failed(graph)) {
     reason = "co_tiling_dependency_proof_unknown";
     diagnostic = error;
     return false;
   }
   for (const auto &[part, consumer] : consumers) {
-    auto old = consumer->getAttrOfType<ArrayAttr>("amoeba.semantic.incoming_edges");
+    auto old =
+        consumer->getAttrOfType<ArrayAttr>("amoeba.semantic.incoming_edges");
     if (!old)
       continue;
     std::map<std::string, std::string> roles;
@@ -1436,9 +1448,10 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
         reason = "co_tiling_semantic_annotation_unknown";
         return false;
       }
-      rebuilt.push_back(StringAttr::get(module.getContext(),
-          producer + "|" + role->second + "|" +
-          stringifyTaskEdgeScope(edge.scope).str() + "|" + kind));
+      rebuilt.push_back(StringAttr::get(
+          module.getContext(), producer + "|" + role->second + "|" +
+                                   stringifyTaskEdgeScope(edge.scope).str() +
+                                   "|" + kind));
     }
     consumer->setAttr("amoeba.semantic.incoming_edges",
                       ArrayAttr::get(module.getContext(), rebuilt));
@@ -1457,7 +1470,7 @@ static bool repairCoTiledDependency(ModuleOp module, StringRef functionName,
         action.primitives[2].mode);
     std::string proofReason, proofDiagnostic;
     if (!runMaterializer(*proof, functionName, fusion, proofReason,
-                           proofDiagnostic, maxPartitionFactor)) {
+                         proofDiagnostic, maxPartitionFactor)) {
       reason = "co_tiling_dependency_existing_fusion_proof_rejected";
       diagnostic = proofDiagnostic;
       return false;
@@ -1473,8 +1486,7 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
     ModuleOp module, StringRef functionName, ArrayRef<NeighborhoodShape> shapes,
     StringRef stage, unsigned round, unsigned maxPartitionFactor,
     ModuleOp preparedTaskflowSource, uint64_t maxFissionActionsPerTask,
-    std::string *enumerationError,
-    std::vector<std::string> *fissionDiagnostics,
+    std::string *enumerationError, std::vector<std::string> *fissionDiagnostics,
     ArrayRef<NeighborhoodAction> precomputedFissionActions) {
   std::vector<NeighborhoodAction> actions;
   if (enumerationError)
@@ -1537,15 +1549,16 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
   for (const std::string &name : names) {
     const NeighborhoodShape *current = findShape(shapes, name);
     for (const ShapeKey &choice : shapeChoices) {
-      if (current && current->rows == choice.rows && current->cols == choice.cols)
+      if (current && current->rows == choice.rows &&
+          current->cols == choice.cols)
         continue;
       NeighborhoodAction action;
       action.family = "shape";
       action.shapeTask = name;
       action.shapeRows = choice.rows;
       action.shapeCols = choice.cols;
-      action.label = (Twine("shape:") + name + ":" +
-                      Twine(choice.rows) + "x" + Twine(choice.cols))
+      action.label = (Twine("shape:") + name + ":" + Twine(choice.rows) + "x" +
+                      Twine(choice.cols))
                          .str();
       addUniqueAction(actions, std::move(action));
     }
@@ -1569,8 +1582,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
           NeighborhoodAction action;
           action.family = "replica";
           action.primitives.push_back(replicaPrimitive(name, axis, factor));
-          action.label = (Twine("replica:") + name + ":axis=" +
-                          Twine(axis) + ":factor=" + Twine(factor))
+          action.label = (Twine("replica:") + name + ":axis=" + Twine(axis) +
+                          ":factor=" + Twine(factor))
                              .str();
           addUniqueAction(actions, std::move(action));
         }
@@ -1596,9 +1609,9 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
                              .str();
           addUniqueAction(actions, std::move(action));
         }
-        for (StringRef mode : {StringRef("sequential"),
-                               StringRef("parallel-linear"),
-                               StringRef("parallel-tree")}) {
+        for (StringRef mode :
+             {StringRef("sequential"), StringRef("parallel-linear"),
+              StringRef("parallel-tree")}) {
           NeighborhoodAction action;
           action.family = "k-tiling";
           action.primitives.push_back(kTilePrimitive(name, mode, factor));
@@ -1619,18 +1632,20 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
         coTile.primitives.push_back(tilePrimitive(edge.producer, axis, 2));
         coTile.primitives.push_back(tilePrimitive(edge.consumer, axis, 2));
         coTile.label = (Twine("co-tile:") + edge.producer + ":" +
-                        edge.consumer + ":axis=" + Twine(axis)).str();
+                        edge.consumer + ":axis=" + Twine(axis))
+                           .str();
         addUniqueAction(actions, std::move(coTile));
       }
-      for (StringRef mode : {StringRef("sequential"),
-                             StringRef("parallel-linear"),
-                             StringRef("parallel-tree")}) {
+      for (StringRef mode :
+           {StringRef("sequential"), StringRef("parallel-linear"),
+            StringRef("parallel-tree")}) {
         NeighborhoodAction coTile;
         coTile.family = "producer-consumer-co-k-tiling";
         coTile.primitives.push_back(kTilePrimitive(edge.producer, mode, 2));
         coTile.primitives.push_back(kTilePrimitive(edge.consumer, mode, 2));
         coTile.label = (Twine("co-k-tile:") + edge.producer + ":" +
-                        edge.consumer + ":mode=" + mode).str();
+                        edge.consumer + ":mode=" + mode)
+                           .str();
         addUniqueAction(actions, std::move(coTile));
       }
     }
@@ -1651,9 +1666,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
         NeighborhoodAction action;
         action.family = "fusion";
         action.primitives.push_back(fusionPrimitive(producer, consumer, mode));
-        action.label = (Twine("fuse:") + producer + ":" + consumer + ":" +
-                        mode)
-                           .str();
+        action.label =
+            (Twine("fuse:") + producer + ":" + consumer + ":" + mode).str();
         addUniqueAction(actions, std::move(action));
       }
 
@@ -1664,8 +1678,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
       fuseTile.primitives.push_back(
           fusionPrimitive(producer, consumer, "producer-consumer-forwarded"));
       fuseTile.primitives.push_back(tilePrimitive(fused, 0, 2));
-      fuseTile.label = (Twine("fuse-then-tile:") + producer + ":" + consumer)
-                           .str();
+      fuseTile.label =
+          (Twine("fuse-then-tile:") + producer + ":" + consumer).str();
       addUniqueAction(actions, std::move(fuseTile));
 
       // Complete local path in the opposite order.  Both tasks are tiled and
@@ -1680,8 +1694,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
       tileFuse.primitives.push_back(tilePrimitive(consumer, 0, 2));
       tileFuse.primitives.push_back(fusionPrimitive(
           producerShard, consumerShard, "producer-consumer-forwarded"));
-      tileFuse.label = (Twine("tile-then-fuse:") + producer + ":" + consumer)
-                           .str();
+      tileFuse.label =
+          (Twine("tile-then-fuse:") + producer + ":" + consumer).str();
       addUniqueAction(actions, std::move(tileFuse));
 
       NeighborhoodAction coTile;
@@ -1698,8 +1712,7 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
       fusionShape.shapeTask = fused;
       fusionShape.shapeRows = 1;
       fusionShape.shapeCols = 2;
-      fusionShape.label =
-          (Twine("fuse-plus-shape:") + fused + ":1x2").str();
+      fusionShape.label = (Twine("fuse-plus-shape:") + fused + ":1x2").str();
       addUniqueAction(actions, std::move(fusionShape));
     }
 
@@ -1711,8 +1724,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
         sibling.family = "sibling-fusion";
         sibling.primitives.push_back(
             fusionPrimitive(names[i], names[j], "sibling"));
-        sibling.label = (Twine("sibling-fuse:") + names[i] + ":" + names[j])
-                            .str();
+        sibling.label =
+            (Twine("sibling-fuse:") + names[i] + ":" + names[j]).str();
         addUniqueAction(actions, std::move(sibling));
       }
     }
@@ -1721,8 +1734,8 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
   if (stageId >= 6) {
     if (!preparedTaskflowSource) {
       if (enumerationError)
-        *enumerationError =
-            "full-joint-fission requires the authenticated prepared Taskflow source";
+        *enumerationError = "full-joint-fission requires the authenticated "
+                            "prepared Taskflow source";
       return {};
     }
     if (maxFissionActionsPerTask == 0) {
@@ -1735,8 +1748,7 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
                                   selectError))) {
       if (enumerationError)
         *enumerationError =
-            "prepared Taskflow source function is unavailable: " +
-            selectError;
+            "prepared Taskflow source function is unavailable: " + selectError;
       return {};
     }
     for (const NeighborhoodAction &action : precomputedFissionActions)
@@ -1746,16 +1758,16 @@ mlir::amoeba::neura::joint_scheduling::enumerateNeighborhoodActions(
   return actions;
 }
 
-FailureOr<std::vector<NeighborhoodAction>>
-mlir::amoeba::neura::joint_scheduling::
-enumerateTaskflowFissionNeighborhoodActions(
-    ModuleOp preparedTaskflowSource, StringRef functionName,
-    uint64_t maxFissionActionsPerTask,
-    std::vector<std::string> &diagnostics, std::string &error) {
+FailureOr<std::vector<NeighborhoodAction>> mlir::amoeba::neura::
+    joint_scheduling::enumerateTaskflowFissionNeighborhoodActions(
+        ModuleOp preparedTaskflowSource, StringRef functionName,
+        uint64_t maxFissionActionsPerTask,
+        std::vector<std::string> &diagnostics, std::string &error) {
   diagnostics.clear();
   error.clear();
   if (!preparedTaskflowSource || maxFissionActionsPerTask == 0) {
-    error = "fission enumeration requires prepared source and a positive cut cap";
+    error =
+        "fission enumeration requires prepared source and a positive cut cap";
     return failure();
   }
   FailureOr<func::FuncOp> sourceFunction =
@@ -1771,17 +1783,17 @@ enumerateTaskflowFissionNeighborhoodActions(
         mlir::amoeba::neura::enumerateTaskflowFissionPartitions(
             task, maxFissionActionsPerTask, diagnostic);
     if (failed(partitions)) {
-      error = "fission_enumeration_limit_exceeded:" +
-              task.getTaskName().str() + ":" + diagnostic;
+      error = "fission_enumeration_limit_exceeded:" + task.getTaskName().str() +
+              ":" + diagnostic;
       return;
     }
     if (partitions->empty()) {
-      diagnostics.push_back(task.getTaskName().str() + ":unsupported:" +
-                            diagnostic);
+      diagnostics.push_back(task.getTaskName().str() +
+                            ":unsupported:" + diagnostic);
       return;
     }
-    diagnostics.push_back(task.getTaskName().str() + ":supported:" +
-                          std::to_string(partitions->size()));
+    diagnostics.push_back(task.getTaskName().str() +
+                          ":supported:" + std::to_string(partitions->size()));
     if (!diagnostic.empty())
       diagnostics.push_back(task.getTaskName().str() + ":" + diagnostic);
     for (const SmallVector<unsigned> &leftNodes : *partitions) {
@@ -1814,8 +1826,7 @@ enumerateTaskflowFissionNeighborhoodActions(
 bool mlir::amoeba::neura::joint_scheduling::applyNeighborhoodAction(
     ModuleOp cloned, ModuleOp canonical, StringRef functionName,
     const NeighborhoodAction &action, std::vector<NeighborhoodShape> &shapes,
-    std::string &reason, std::string &diagnostic,
-    unsigned maxPartitionFactor) {
+    std::string &reason, std::string &diagnostic, unsigned maxPartitionFactor) {
   reason.clear();
   diagnostic.clear();
   if (!isSupportedMaxPartitionFactor(maxPartitionFactor)) {
@@ -1848,8 +1859,8 @@ bool mlir::amoeba::neura::joint_scheduling::applyNeighborhoodAction(
 
   // Work on a private operation clone.  A failed or unsupported action can
   // never leave half of a rewrite in the caller's predecessor.
-  OwningOpRef<ModuleOp> trial = action.canonicalReset ? canonical.clone()
-                                                       : cloned.clone();
+  OwningOpRef<ModuleOp> trial =
+      action.canonicalReset ? canonical.clone() : cloned.clone();
   if (!trial) {
     reason = "candidate_clone_failed";
     return false;
@@ -1887,12 +1898,14 @@ bool mlir::amoeba::neura::joint_scheduling::applyNeighborhoodAction(
     if (isFusion(primitive.kind)) {
       PartitionLineage first, second;
       std::string firstReason, secondReason;
-      if (authenticateLineage(canonical, functionName,
-                              findTask(*trial, functionName, primitive.firstTask),
-                              first, firstReason, maxPartitionFactor) &&
-          authenticateLineage(canonical, functionName,
-                              findTask(*trial, functionName, primitive.secondTask),
-                              second, secondReason, maxPartitionFactor)) {
+      if (authenticateLineage(
+              canonical, functionName,
+              findTask(*trial, functionName, primitive.firstTask), first,
+              firstReason, maxPartitionFactor) &&
+          authenticateLineage(
+              canonical, functionName,
+              findTask(*trial, functionName, primitive.secondTask), second,
+              secondReason, maxPartitionFactor)) {
         fusionLineage.append(first.begin(), first.end());
         fusionLineage.append(second.begin(), second.end());
       }
@@ -1912,14 +1925,14 @@ bool mlir::amoeba::neura::joint_scheduling::applyNeighborhoodAction(
                          maxPartitionFactor))
       return false;
     if (!recordPartitionLineage(*trial, functionName, primitive, sourceLineage,
-                                 namesBefore, reason, maxPartitionFactor)) {
+                                namesBefore, reason, maxPartitionFactor)) {
       diagnostic = "materialized_partition_lineage_authentication:" +
                    primitive.firstTask;
       return false;
     }
     if (isFusion(primitive.kind) &&
         !recordFusionLineage(*trial, canonical, functionName, primitive,
-                              fusionLineage, reason, maxPartitionFactor))
+                             fusionLineage, reason, maxPartitionFactor))
       return false;
     std::vector<NeighborhoodShape> refreshed;
     synchronizeShapes(*trial, functionName, nextShapes, refreshed);

@@ -7,7 +7,8 @@
 namespace orbit::taskflow {
 // Runtime evidence, not an inferred allocation/page size. Logical tensor bytes
 // occupy [storageOffset, storageOffset + tensorBytes) in the observed BO. The
-// initial adapter requires a distinct physical BO per storage (no suballocation).
+// initial adapter requires a distinct physical BO per storage (no
+// suballocation).
 struct SyncRuntimeBOBinding {
   size_t storage = 0;
   std::string physicalId;
@@ -38,12 +39,14 @@ struct SyncBoundaryTrace {
   std::vector<SyncBoundaryObservation> observations;
   std::vector<SyncBoundaryQuery> queries;
 };
-// Projects a successful serial execution of the checked source/runtime contract.
-// This is NOT a claim that these observations were measured on a device. Wait
-// success is an explicit scenario assumption. Unobserved BO padding stays unknown.
+// Projects a successful serial execution of the checked source/runtime
+// contract. This is NOT a claim that these observations were measured on a
+// device. Wait success is an explicit scenario assumption. Unobserved BO
+// padding stays unknown.
 bool collectSyncBoundaryQueries(const ProgramGraph &, const MechanismFacts &,
-    const std::vector<SyncRuntimeBOBinding> &, const SyncQueryContext &,
-    SyncBoundaryTrace &, std::string &error);
+                                const std::vector<SyncRuntimeBOBinding> &,
+                                const SyncQueryContext &, SyncBoundaryTrace &,
+                                std::string &error);
 llvm::json::Value serializeSyncBoundaryTrace(const SyncBoundaryTrace &);
 } // namespace orbit::taskflow
 #endif

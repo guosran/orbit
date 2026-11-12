@@ -19,13 +19,11 @@ namespace mlir::amoeba::neura::joint_scheduling {
 
 inline constexpr llvm::StringLiteral kCommonAmoebaParentProfileProvenance =
     "source-owned-common-parent-profile-only-mapped-duration-v1";
-inline constexpr llvm::StringLiteral
-    kCommonAmoebaParentProfileBindingSchema =
-        "orbit-original-f45-common-parent-profile-binding-v1";
-inline constexpr llvm::StringLiteral
-    kCommonAmoebaParentProfileDurationFormula =
-        "ceil(structural_startup_cycles + compiled_ii * "
-        "(sample_trip_count - 1))";
+inline constexpr llvm::StringLiteral kCommonAmoebaParentProfileBindingSchema =
+    "orbit-original-f45-common-parent-profile-binding-v1";
+inline constexpr llvm::StringLiteral kCommonAmoebaParentProfileDurationFormula =
+    "ceil(structural_startup_cycles + compiled_ii * "
+    "(sample_trip_count - 1))";
 
 struct CommonAmoebaMapperShapeProfile {
   std::string shape;

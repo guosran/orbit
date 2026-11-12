@@ -6,13 +6,13 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/YAMLParser.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
@@ -63,8 +63,8 @@ bool loadContextMemItems(int &context_mem_items, std::string &error) {
             "per_cgra_defaults.context_mem_items";
     return false;
   }
-  auto *root = llvm::dyn_cast_or_null<llvm::yaml::MappingNode>(
-      document->getRoot());
+  auto *root =
+      llvm::dyn_cast_or_null<llvm::yaml::MappingNode>(document->getRoot());
   if (!root) {
     error = "architecture YAML root is not a mapping";
     return false;
@@ -73,8 +73,8 @@ bool loadContextMemItems(int &context_mem_items, std::string &error) {
   bool foundPerCgraDefaults = false;
   bool foundContextCapacity = false;
   for (auto &entry : *root) {
-    auto *keyNode = llvm::dyn_cast_or_null<llvm::yaml::ScalarNode>(
-        entry.getKey());
+    auto *keyNode =
+        llvm::dyn_cast_or_null<llvm::yaml::ScalarNode>(entry.getKey());
     if (!keyNode)
       continue;
     llvm::SmallString<64> keyStorage;
@@ -85,23 +85,22 @@ bool loadContextMemItems(int &context_mem_items, std::string &error) {
       return false;
     }
     foundPerCgraDefaults = true;
-    auto *perCgraDefaults = llvm::dyn_cast_or_null<llvm::yaml::MappingNode>(
-        entry.getValue());
+    auto *perCgraDefaults =
+        llvm::dyn_cast_or_null<llvm::yaml::MappingNode>(entry.getValue());
     if (!perCgraDefaults) {
       error = "per_cgra_defaults must be a mapping";
       return false;
     }
     for (auto &perCgraEntry : *perCgraDefaults) {
-      auto *perCgraKey = llvm::dyn_cast_or_null<llvm::yaml::ScalarNode>(
-          perCgraEntry.getKey());
+      auto *perCgraKey =
+          llvm::dyn_cast_or_null<llvm::yaml::ScalarNode>(perCgraEntry.getKey());
       if (!perCgraKey)
         continue;
       llvm::SmallString<64> perCgraKeyStorage;
       if (perCgraKey->getValue(perCgraKeyStorage) != "context_mem_items")
         continue;
       if (foundContextCapacity) {
-        error =
-            "per_cgra_defaults contains duplicate context_mem_items fields";
+        error = "per_cgra_defaults contains duplicate context_mem_items fields";
         return false;
       }
       foundContextCapacity = true;
@@ -382,16 +381,17 @@ public:
     // Phase 3: Build explicit task dependency edges. Keep scalar/value SSA
     // dependencies visible through value_inputs, and also scan all operands to
     // catch taskflow dependency_read_in/dependency_write_in token edges.
-    if (!communication_model || !communication_model->hasAuthoritativeDependencies())
-    for (auto &consumer_node : task_nodes) {
-      for (Value value_input : consumer_node->op.getValueInputs()) {
-        addProducerDependency(value_input, consumer_node.get());
-      }
+    if (!communication_model ||
+        !communication_model->hasAuthoritativeDependencies())
+      for (auto &consumer_node : task_nodes) {
+        for (Value value_input : consumer_node->op.getValueInputs()) {
+          addProducerDependency(value_input, consumer_node.get());
+        }
 
-      for (Value operand : consumer_node->op->getOperands()) {
-        addProducerDependency(operand, consumer_node.get());
+        for (Value operand : consumer_node->op->getOperands()) {
+          addProducerDependency(operand, consumer_node.get());
+        }
       }
-    }
 
     if (communication_model) {
       for (auto &consumer_node : task_nodes) {
@@ -578,7 +578,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
     return false;
   }
 
-  if (auto order = func->getAttrOfType<ArrayAttr>("joint_scheduling_exact_dispatch_order")) {
+  if (auto order = func->getAttrOfType<ArrayAttr>(
+          "joint_scheduling_exact_dispatch_order")) {
     SmallVector<TaskNode *> exactOrder;
     llvm::DenseSet<TaskNode *> placed;
     for (Attribute value : order) {
@@ -587,15 +588,18 @@ bool TaskScheduler::schedule(func::FuncOp func,
         return name && node->op.getTaskName() == name.getValue();
       });
       if (found == graph.task_nodes.end() || placed.contains(found->get()) ||
-          !llvm::all_of((*found)->ssa_operands, [&](TaskNode *p) { return placed.contains(p); })) {
-        func.emitError("exact replay dispatch must cover each task once in dependency order");
+          !llvm::all_of((*found)->ssa_operands,
+                        [&](TaskNode *p) { return placed.contains(p); })) {
+        func.emitError("exact replay dispatch must cover each task once in "
+                       "dependency order");
         return false;
       }
       exactOrder.push_back(found->get());
       placed.insert(found->get());
     }
     if (exactOrder.size() != sorted_tasks.size()) {
-      func.emitError("exact replay dispatch coverage differs"); return false;
+      func.emitError("exact replay dispatch coverage differs");
+      return false;
     }
     sorted_tasks = std::move(exactOrder);
   }
@@ -618,8 +622,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
   constexpr int kDefaultFixedPointIterations = 10;
   int max_fixed_point_iterations = kDefaultFixedPointIterations;
   if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
-    if (auto configured = func->getAttrOfType<IntegerAttr>(
-            kFixedPointIterationLimitAttr)) {
+    if (auto configured =
+            func->getAttrOfType<IntegerAttr>(kFixedPointIterationLimitAttr)) {
       int64_t value = configured.getInt();
       if (value <= 0 || value > std::numeric_limits<int>::max()) {
         func.emitError() << kFixedPointIterationLimitAttr
@@ -654,9 +658,9 @@ bool TaskScheduler::schedule(func::FuncOp func,
     state.srams.reserve(graph.memory_nodes.size());
     for (const auto &mem_node : graph.memory_nodes) {
       if (mem_node->assigned_sram_pos) {
-        state.srams.emplace_back(std::make_pair(
-            mem_node->assigned_sram_pos->row,
-            mem_node->assigned_sram_pos->col));
+        state.srams.emplace_back(
+            std::make_pair(mem_node->assigned_sram_pos->row,
+                           mem_node->assigned_sram_pos->col));
       } else {
         state.srams.emplace_back(std::nullopt);
       }
@@ -676,9 +680,9 @@ bool TaskScheduler::schedule(func::FuncOp func,
       for (size_t pos_id = 0; pos_id < left.size(); ++pos_id) {
         const CgraPosition &a = left[pos_id];
         const CgraPosition &b = right[pos_id];
-        if (a.row != b.row || a.col != b.col ||
-            a.start_time != b.start_time || a.duration != b.duration ||
-            a.context_id != b.context_id || a.replica_id != b.replica_id)
+        if (a.row != b.row || a.col != b.col || a.start_time != b.start_time ||
+            a.duration != b.duration || a.context_id != b.context_id ||
+            a.replica_id != b.replica_id)
           return false;
       }
     }
@@ -729,11 +733,10 @@ bool TaskScheduler::schedule(func::FuncOp func,
       }
       for (const CgraPosition &pos : task_node->placement) {
         if (!posInBounds(pos) || pos.start_time < 0 || pos.duration <= 0 ||
-            pos.start_time > std::numeric_limits<int64_t>::max() -
-                                 pos.duration)
+            pos.start_time > std::numeric_limits<int64_t>::max() - pos.duration)
           return false;
-        auto &cell = intervals[static_cast<size_t>(pos.row * grid_cols_ +
-                                                    pos.col)];
+        auto &cell =
+            intervals[static_cast<size_t>(pos.row * grid_cols_ + pos.col)];
         const int64_t end = pos.start_time + pos.duration;
         for (auto [other_start, other_end] : cell) {
           if (pos.start_time < other_end && other_start < end)
@@ -788,8 +791,7 @@ bool TaskScheduler::schedule(func::FuncOp func,
         const CgraPosition &first_source = producer->placement.front();
         if (first_source.start_time < 0 || first_source.duration <= 0 ||
             first_source.start_time >
-                std::numeric_limits<int64_t>::max() -
-                    first_source.duration) {
+                std::numeric_limits<int64_t>::max() - first_source.duration) {
           communication_model_->finishTrial(false);
           communication_error_ =
               "final communication replay predecessor finish overflows";
@@ -845,8 +847,8 @@ bool TaskScheduler::schedule(func::FuncOp func,
 
       const CgraPosition &task_start = task_node->placement.front();
       if (ready_time > task_start.start_time) {
-        communication_error_ =
-            "final placement starts before dependency/communication ready cycle";
+        communication_error_ = "final placement starts before "
+                               "dependency/communication ready cycle";
         return false;
       }
     }
@@ -890,134 +892,134 @@ bool TaskScheduler::schedule(func::FuncOp func,
           // communication-aware candidate scoring and reservation behavior.
           placement = findBestPlacement(task_node, cgra_count, graph);
         } else {
-        if (task_node->op->hasAttr("amoeba.exact_schedule")) {
-          task_node->op.emitError()
-              << "aggregate replica scheduling cannot consume an exact "
-                 "single-region placement";
-          return false;
-        }
+          if (task_node->op->hasAttr("amoeba.exact_schedule")) {
+            task_node->op.emitError()
+                << "aggregate replica scheduling cannot consume an exact "
+                   "single-region placement";
+            return false;
+          }
 
-        // One source task remains one graph node and one communication edge.
-        // Place each selected per-replica shape independently, with all
-        // replicas sharing the same interval. Temporary occupancy reserves
-        // already chosen regions while the next region is searched.
-        SmallVector<int64_t> candidateStarts{
-            mode_ == SchedulingMode::SpatialTemporal
-                ? computeEarliestStartTime(task_node)
-                : 0};
-        if (mode_ == SchedulingMode::SpatialTemporal) {
-          for (const auto &row : cgra_occupancy_)
-            for (const auto &cell : row)
-              for (auto [unusedStart, occupiedEnd] : cell)
-                if (occupiedEnd >= candidateStarts.front())
-                  candidateStarts.push_back(occupiedEnd);
-          llvm::sort(candidateStarts);
-          candidateStarts.erase(
-              std::unique(candidateStarts.begin(), candidateStarts.end()),
-              candidateStarts.end());
-        }
+          // One source task remains one graph node and one communication edge.
+          // Place each selected per-replica shape independently, with all
+          // replicas sharing the same interval. Temporary occupancy reserves
+          // already chosen regions while the next region is searched.
+          SmallVector<int64_t> candidateStarts{
+              mode_ == SchedulingMode::SpatialTemporal
+                  ? computeEarliestStartTime(task_node)
+                  : 0};
+          if (mode_ == SchedulingMode::SpatialTemporal) {
+            for (const auto &row : cgra_occupancy_)
+              for (const auto &cell : row)
+                for (auto [unusedStart, occupiedEnd] : cell)
+                  if (occupiedEnd >= candidateStarts.front())
+                    candidateStarts.push_back(occupiedEnd);
+            llvm::sort(candidateStarts);
+            candidateStarts.erase(
+                std::unique(candidateStarts.begin(), candidateStarts.end()),
+                candidateStarts.end());
+          }
 
-        std::vector<std::vector<size_t>> occupancySizes(grid_rows_);
-        for (int row = 0; row < grid_rows_; ++row) {
-          occupancySizes[row].reserve(grid_cols_);
-          for (int col = 0; col < grid_cols_; ++col)
-            occupancySizes[row].push_back(cgra_occupancy_[row][col].size());
-        }
-        auto restoreOccupancy = [&]() {
-          for (int row = 0; row < grid_rows_; ++row)
+          std::vector<std::vector<size_t>> occupancySizes(grid_rows_);
+          for (int row = 0; row < grid_rows_; ++row) {
+            occupancySizes[row].reserve(grid_cols_);
             for (int col = 0; col < grid_cols_; ++col)
-              cgra_occupancy_[row][col].resize(occupancySizes[row][col]);
-        };
-
-        bool placedAggregate = false;
-        for (size_t timeIndex = 0; timeIndex < candidateStarts.size();
-             ++timeIndex) {
-          const int64_t start = candidateStarts[timeIndex];
-          if (start < computeEarliestStartTime(task_node))
-            continue;
-          if (start > std::numeric_limits<int64_t>::max() -
-                          task_node->getDuration())
-            continue;
-
-          TaskPlacement aggregate;
-          bool allReplicasPlaced = true;
-          for (int64_t replica = 0; replica < replicaCount; ++replica) {
-            int64_t nextCommunicationReady =
-                std::numeric_limits<int64_t>::max();
-            TaskPlacement region = findBestPlacement(
-                task_node, cgra_count, graph, start,
-                /*defer_aggregate_communication=*/true,
-                &nextCommunicationReady);
-            if (region.cgra_positions.empty()) {
-              if (nextCommunicationReady > start &&
-                  nextCommunicationReady !=
-                      std::numeric_limits<int64_t>::max())
-                candidateStarts.push_back(nextCommunicationReady);
-              allReplicasPlaced = false;
-              break;
-            }
-            for (CgraPosition position : region.cgra_positions) {
-              position.replica_id = static_cast<int>(replica);
-              aggregate.cgra_positions.push_back(position);
-              markOccupied(position.row, position.col, position.start_time,
-                           position.duration);
-            }
+              occupancySizes[row].push_back(cgra_occupancy_[row][col].size());
           }
+          auto restoreOccupancy = [&]() {
+            for (int row = 0; row < grid_rows_; ++row)
+              for (int col = 0; col < grid_cols_; ++col)
+                cgra_occupancy_[row][col].resize(occupancySizes[row][col]);
+          };
 
-          if (!allReplicasPlaced) {
-            // The current group's temporary reservations can themselves be
-            // the next resource-release event. Preserve those candidate
-            // starts before restoring the baseline occupancy so every replica
-            // is retried together at that later cycle.
-            if (mode_ == SchedulingMode::SpatialTemporal) {
-              for (const auto &row : cgra_occupancy_)
-                for (const auto &cell : row)
-                  for (auto [unusedStart, occupiedEnd] : cell)
-                    if (occupiedEnd > start)
-                      candidateStarts.push_back(occupiedEnd);
+          bool placedAggregate = false;
+          for (size_t timeIndex = 0; timeIndex < candidateStarts.size();
+               ++timeIndex) {
+            const int64_t start = candidateStarts[timeIndex];
+            if (start < computeEarliestStartTime(task_node))
+              continue;
+            if (start >
+                std::numeric_limits<int64_t>::max() - task_node->getDuration())
+              continue;
+
+            TaskPlacement aggregate;
+            bool allReplicasPlaced = true;
+            for (int64_t replica = 0; replica < replicaCount; ++replica) {
+              int64_t nextCommunicationReady =
+                  std::numeric_limits<int64_t>::max();
+              TaskPlacement region =
+                  findBestPlacement(task_node, cgra_count, graph, start,
+                                    /*defer_aggregate_communication=*/true,
+                                    &nextCommunicationReady);
+              if (region.cgra_positions.empty()) {
+                if (nextCommunicationReady > start &&
+                    nextCommunicationReady !=
+                        std::numeric_limits<int64_t>::max())
+                  candidateStarts.push_back(nextCommunicationReady);
+                allReplicasPlaced = false;
+                break;
+              }
+              for (CgraPosition position : region.cgra_positions) {
+                position.replica_id = static_cast<int>(replica);
+                aggregate.cgra_positions.push_back(position);
+                markOccupied(position.row, position.col, position.start_time,
+                             position.duration);
+              }
             }
-            restoreOccupancy();
-            llvm::sort(candidateStarts);
-            candidateStarts.erase(
-                std::unique(candidateStarts.begin(), candidateStarts.end()),
-                candidateStarts.end());
-            continue;
-          }
 
-          int64_t communicationReadyCycle = 0;
-          if (!communicationReady(task_node, aggregate, false,
-                                  communicationReadyCycle)) {
+            if (!allReplicasPlaced) {
+              // The current group's temporary reservations can themselves be
+              // the next resource-release event. Preserve those candidate
+              // starts before restoring the baseline occupancy so every replica
+              // is retried together at that later cycle.
+              if (mode_ == SchedulingMode::SpatialTemporal) {
+                for (const auto &row : cgra_occupancy_)
+                  for (const auto &cell : row)
+                    for (auto [unusedStart, occupiedEnd] : cell)
+                      if (occupiedEnd > start)
+                        candidateStarts.push_back(occupiedEnd);
+              }
+              restoreOccupancy();
+              llvm::sort(candidateStarts);
+              candidateStarts.erase(
+                  std::unique(candidateStarts.begin(), candidateStarts.end()),
+                  candidateStarts.end());
+              continue;
+            }
+
+            int64_t communicationReadyCycle = 0;
+            if (!communicationReady(task_node, aggregate, false,
+                                    communicationReadyCycle)) {
+              restoreOccupancy();
+              task_node->op.emitError() << communication_error_;
+              return false;
+            }
+            if (communicationReadyCycle > start) {
+              restoreOccupancy();
+              candidateStarts.push_back(communicationReadyCycle);
+              llvm::sort(candidateStarts);
+              candidateStarts.erase(
+                  std::unique(candidateStarts.begin(), candidateStarts.end()),
+                  candidateStarts.end());
+              continue;
+            }
+            if (!communicationReady(task_node, aggregate, true,
+                                    communicationReadyCycle)) {
+              restoreOccupancy();
+              task_node->op.emitError() << communication_error_;
+              return false;
+            }
+
             restoreOccupancy();
-            task_node->op.emitError() << communication_error_;
+            placement = std::move(aggregate);
+            placedAggregate = true;
+            break;
+          }
+          if (!placedAggregate) {
+            task_node->op.emitError()
+                << "cannot place all aggregate active replicas as disjoint "
+                   "fixed-orientation regions with one common start";
             return false;
           }
-          if (communicationReadyCycle > start) {
-            restoreOccupancy();
-            candidateStarts.push_back(communicationReadyCycle);
-            llvm::sort(candidateStarts);
-            candidateStarts.erase(
-                std::unique(candidateStarts.begin(), candidateStarts.end()),
-                candidateStarts.end());
-            continue;
-          }
-          if (!communicationReady(task_node, aggregate, true,
-                                  communicationReadyCycle)) {
-            restoreOccupancy();
-            task_node->op.emitError() << communication_error_;
-            return false;
-          }
-
-          restoreOccupancy();
-          placement = std::move(aggregate);
-          placedAggregate = true;
-          break;
-        }
-        if (!placedAggregate) {
-          task_node->op.emitError()
-              << "cannot place all aggregate active replicas as disjoint "
-                 "fixed-orientation regions with one common start";
-          return false;
-        }
         }
       } else {
         placement = findBestPlacement(task_node, cgra_count, graph);
@@ -1059,21 +1061,20 @@ bool TaskScheduler::schedule(func::FuncOp func,
     bool placement_stable =
         !fixed_point_history.empty() &&
         same_fixed_point_state(current_state, fixed_point_history.back());
-    if (!sram_moved &&
-        (fixed_point_history.empty() || placement_stable)) {
+    if (!sram_moved && (fixed_point_history.empty() || placement_stable)) {
       converged = true;
       break;
     }
 
-    auto repeated_state = std::find_if(
-        fixed_point_history.begin(), fixed_point_history.end(),
-        [&](const FixedPointState &previous) {
-          return same_fixed_point_state(current_state, previous);
-        });
+    auto repeated_state =
+        std::find_if(fixed_point_history.begin(), fixed_point_history.end(),
+                     [&](const FixedPointState &previous) {
+                       return same_fixed_point_state(current_state, previous);
+                     });
     if (repeated_state != fixed_point_history.end()) {
       cycle_resolved = true;
-      cycle_length = static_cast<int>(
-          fixed_point_history.end() - repeated_state);
+      cycle_length =
+          static_cast<int>(fixed_point_history.end() - repeated_state);
       // The current state is the repeated state and has just been assigned
       // from the current placement.  Recheck both independent legality
       // conditions before allowing it to leave the scheduler.
@@ -1151,8 +1152,7 @@ bool TaskScheduler::schedule(func::FuncOp func,
                          return a.first < b.first;
                        });
       if (context_mem_items_ > 0 &&
-          tasks_at_cell.size() >
-              static_cast<size_t>(context_mem_items_)) {
+          tasks_at_cell.size() > static_cast<size_t>(context_mem_items_)) {
         func.emitError()
             << "task placement exceeds per_cgra_defaults.context_mem_items="
             << context_mem_items_ << " at CGRA (" << r << ", " << c << ")";
@@ -1213,9 +1213,9 @@ bool TaskScheduler::schedule(func::FuncOp func,
           NamedAttribute(StringAttr::get(func.getContext(), "context_id"),
                          builder.getI32IntegerAttr(pos.context_id)));
       if (task_node->op->hasAttr("amoeba.aggregate_active_replicas"))
-        coord_attrs.push_back(NamedAttribute(
-            StringAttr::get(func.getContext(), "replica_id"),
-            builder.getI32IntegerAttr(pos.replica_id)));
+        coord_attrs.push_back(
+            NamedAttribute(StringAttr::get(func.getContext(), "replica_id"),
+                           builder.getI32IntegerAttr(pos.replica_id)));
       coord_attrs.push_back(
           NamedAttribute(StringAttr::get(func.getContext(), "row"),
                          builder.getI32IntegerAttr(pos.row)));
@@ -1310,27 +1310,26 @@ bool TaskScheduler::schedule(func::FuncOp func,
     for (const TaskScheduleEntry &entry : schedule_entries_) {
       auto task = cast<TaskflowTaskOp>(entry.task);
       SmallVector<NamedAttribute> record;
-      record.push_back(builder.getNamedAttr(
-          "cgra_positions", [&]() {
-            SmallVector<Attribute> cells;
-            cells.reserve(entry.positions.size());
-            const bool hasReplicaIds =
-                entry.replicaIds.size() == entry.positions.size() &&
-                task->hasAttr("amoeba.aggregate_active_replicas");
-            for (auto [index, coordinate] : llvm::enumerate(entry.positions)) {
-              auto [row, col] = coordinate;
-              SmallVector<NamedAttribute> fields{
-                  builder.getNamedAttr("col", builder.getI32IntegerAttr(col))};
-              if (hasReplicaIds)
-                fields.push_back(builder.getNamedAttr(
-                    "replica_id",
-                    builder.getI32IntegerAttr(entry.replicaIds[index])));
-              fields.push_back(
-                  builder.getNamedAttr("row", builder.getI32IntegerAttr(row)));
-              cells.push_back(builder.getDictionaryAttr(fields));
-            }
-            return builder.getArrayAttr(cells);
-          }()));
+      record.push_back(builder.getNamedAttr("cgra_positions", [&]() {
+        SmallVector<Attribute> cells;
+        cells.reserve(entry.positions.size());
+        const bool hasReplicaIds =
+            entry.replicaIds.size() == entry.positions.size() &&
+            task->hasAttr("amoeba.aggregate_active_replicas");
+        for (auto [index, coordinate] : llvm::enumerate(entry.positions)) {
+          auto [row, col] = coordinate;
+          SmallVector<NamedAttribute> fields{
+              builder.getNamedAttr("col", builder.getI32IntegerAttr(col))};
+          if (hasReplicaIds)
+            fields.push_back(builder.getNamedAttr(
+                "replica_id",
+                builder.getI32IntegerAttr(entry.replicaIds[index])));
+          fields.push_back(
+              builder.getNamedAttr("row", builder.getI32IntegerAttr(row)));
+          cells.push_back(builder.getDictionaryAttr(fields));
+        }
+        return builder.getArrayAttr(cells);
+      }()));
       record.push_back(builder.getNamedAttr(
           "end_cycle", builder.getI64IntegerAttr(entry.endCycle)));
       record.push_back(builder.getNamedAttr(
@@ -1524,13 +1523,10 @@ bool TaskScheduler::assignAllSrams(TaskMemoryGraph &graph) {
 // In SpatialTemporal mode the task is tested at its dependency-ready time and
 // every resource-release event. A new placement can become feasible only at
 // one of those times, so this is both exact and independent of cycle counts.
-TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
-                                               int cgra_count,
-                                               TaskMemoryGraph &graph,
-                                               int64_t required_start,
-                                               bool defer_aggregate_communication,
-                                               int64_t *next_communication_ready,
-                                               bool use_ready_task_lookahead) {
+TaskPlacement TaskScheduler::findBestPlacement(
+    TaskNode *task_node, int cgra_count, TaskMemoryGraph &graph,
+    int64_t required_start, bool defer_aggregate_communication,
+    int64_t *next_communication_ready, bool use_ready_task_lookahead) {
   SmallVector<CgraShape> shapes_to_try;
   auto shape_attr = task_node->op->getAttrOfType<StringAttr>("cgra_shape");
   if (shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
@@ -1560,30 +1556,37 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
   int64_t t_start = (mode_ == SchedulingMode::SpatialTemporal)
                         ? computeEarliestStartTime(task_node)
                         : 0;
-  auto exact = task_node->op->getAttrOfType<DictionaryAttr>("amoeba.exact_schedule");
-  bool mappedTiming = exact && task_node->op->hasAttr("amoeba.exact_replay_mapped_timing");
-  auto idleAttr = exact ? exact.getAs<IntegerAttr>("idle_cycles") : IntegerAttr();
+  auto exact =
+      task_node->op->getAttrOfType<DictionaryAttr>("amoeba.exact_schedule");
+  bool mappedTiming =
+      exact && task_node->op->hasAttr("amoeba.exact_replay_mapped_timing");
+  auto idleAttr =
+      exact ? exact.getAs<IntegerAttr>("idle_cycles") : IntegerAttr();
   int64_t idle = idleAttr ? idleAttr.getInt() : 0;
   if (exact && !mappedTiming) {
     auto start = exact.getAs<IntegerAttr>("start_cycle");
     if (!start || start.getInt() < t_start) {
-      communication_error_ = "mapped duration makes the selected exact start dependency-infeasible";
+      communication_error_ = "mapped duration makes the selected exact start "
+                             "dependency-infeasible";
       return TaskPlacement{};
     }
     t_start = start.getInt();
   }
   if (mappedTiming) {
-    if (idle < 0 || t_start > std::numeric_limits<int64_t>::max() - idle) return TaskPlacement{};
+    if (idle < 0 || t_start > std::numeric_limits<int64_t>::max() - idle)
+      return TaskPlacement{};
     t_start += idle;
   }
-  SmallVector<int64_t> candidate_times{
-      required_start >= 0 ? required_start : t_start};
+  SmallVector<int64_t> candidate_times{required_start >= 0 ? required_start
+                                                           : t_start};
   if (required_start < 0 && (!exact || mappedTiming) &&
       mode_ == SchedulingMode::SpatialTemporal) {
     for (const auto &row : cgra_occupancy_)
       for (const auto &cell : row)
         for (auto [unusedStart, occupiedEnd] : cell)
-          if (occupiedEnd >= t_start && occupiedEnd <= std::numeric_limits<int64_t>::max() - (mappedTiming ? idle : 0))
+          if (occupiedEnd >= t_start &&
+              occupiedEnd <= std::numeric_limits<int64_t>::max() -
+                                 (mappedTiming ? idle : 0))
             candidate_times.push_back(occupiedEnd + (mappedTiming ? idle : 0));
     llvm::sort(candidate_times);
     candidate_times.erase(
@@ -1606,50 +1609,67 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
       if (defer_aggregate_communication)
         return this->communicationReady(task_node, candidate,
                                         /*commit=*/false, ready_time);
-      return this->communicationReady(task_node, candidate, commit,
-                                      ready_time);
+      return this->communicationReady(task_node, candidate, commit, ready_time);
     };
 
     if (exact) {
-      auto row = exact.getAs<IntegerAttr>("row"), col = exact.getAs<IntegerAttr>("col");
-      auto rows = exact.getAs<IntegerAttr>("rows"), cols = exact.getAs<IntegerAttr>("cols");
+      auto row = exact.getAs<IntegerAttr>("row"),
+           col = exact.getAs<IntegerAttr>("col");
+      auto rows = exact.getAs<IntegerAttr>("rows"),
+           cols = exact.getAs<IntegerAttr>("cols");
       if (!row || !col || !rows || !cols || shapes_to_try.size() != 1 ||
-          rows.getInt() != shapes_to_try[0].rows || cols.getInt() != shapes_to_try[0].cols) {
-        communication_error_ = "selected exact rectangle differs from the mapper rectangle";
+          rows.getInt() != shapes_to_try[0].rows ||
+          cols.getInt() != shapes_to_try[0].cols) {
+        communication_error_ =
+            "selected exact rectangle differs from the mapper rectangle";
         return TaskPlacement{};
       }
       TaskPlacement candidate;
       bool fits = true;
       for (int64_t r = row.getInt(); r < row.getInt() + rows.getInt(); ++r)
         for (int64_t c = col.getInt(); c < col.getInt() + cols.getInt(); ++c) {
-          if (r < 0 || c < 0 || r >= grid_rows_ || c >= grid_cols_ || isOccupied(r, c, t, task_duration)) {
-            if (mappedTiming && r >= 0 && c >= 0 && r < grid_rows_ && c < grid_cols_) { fits = false; continue; }
-            communication_error_ = "mapped duration or rectangle violates exact replay cell occupancy";
+          if (r < 0 || c < 0 || r >= grid_rows_ || c >= grid_cols_ ||
+              isOccupied(r, c, t, task_duration)) {
+            if (mappedTiming && r >= 0 && c >= 0 && r < grid_rows_ &&
+                c < grid_cols_) {
+              fits = false;
+              continue;
+            }
+            communication_error_ = "mapped duration or rectangle violates "
+                                   "exact replay cell occupancy";
             return TaskPlacement{};
           }
-          candidate.cgra_positions.push_back({static_cast<int>(r), static_cast<int>(c), t, task_duration, 0});
+          candidate.cgra_positions.push_back(
+              {static_cast<int>(r), static_cast<int>(c), t, task_duration, 0});
         }
-      if (!fits) continue;
+      if (!fits)
+        continue;
       int64_t ready = 0;
-      if (!communicationReady(candidate, false, ready)) return TaskPlacement{};
+      if (!communicationReady(candidate, false, ready))
+        return TaskPlacement{};
       if (mappedTiming && ready > t - idle) {
-        if (ready > std::numeric_limits<int64_t>::max() - idle) return TaskPlacement{};
+        if (ready > std::numeric_limits<int64_t>::max() - idle)
+          return TaskPlacement{};
         if (required_start >= 0) {
           if (next_communication_ready)
-            *next_communication_ready = std::min(*next_communication_ready,
-                                                 ready + idle);
+            *next_communication_ready =
+                std::min(*next_communication_ready, ready + idle);
           return TaskPlacement{};
         }
         candidate_times.push_back(ready + idle);
         llvm::sort(candidate_times);
-        candidate_times.erase(std::unique(candidate_times.begin(), candidate_times.end()), candidate_times.end());
+        candidate_times.erase(
+            std::unique(candidate_times.begin(), candidate_times.end()),
+            candidate_times.end());
         continue;
       }
       if (ready > t) {
-        communication_error_ = "mapped communication makes selected exact start infeasible";
+        communication_error_ =
+            "mapped communication makes selected exact start infeasible";
         return TaskPlacement{};
       }
-      if (!communicationReady(candidate, true, ready)) return TaskPlacement{};
+      if (!communicationReady(candidate, true, ready))
+        return TaskPlacement{};
       return candidate;
     }
 
@@ -1704,7 +1724,8 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
           int64_t ready_horizon = t + task_duration;
           if (use_ready_task_lookahead && required_start < 0 &&
               mode_ == SchedulingMode::SpatialTemporal &&
-              shape_selection_policy_ == ShapeSelectionPolicy::FixedOrientation) {
+              shape_selection_policy_ ==
+                  ShapeSelectionPolicy::FixedOrientation) {
             for (const CgraPosition &pos : candidate.cgra_positions)
               markOccupied(pos.row, pos.col, pos.start_time, pos.duration);
             for (const auto &node : graph.task_nodes) {
@@ -1729,8 +1750,8 @@ TaskPlacement TaskScheduler::findBestPlacement(TaskNode *task_node,
                 break;
               }
               const CgraPosition &first = trial.cgra_positions.front();
-              ready_horizon = std::max(ready_horizon,
-                                      first.start_time + first.duration);
+              ready_horizon =
+                  std::max(ready_horizon, first.start_time + first.duration);
             }
             for (const CgraPosition &pos : candidate.cgra_positions)
               cgra_occupancy_[pos.row][pos.col].pop_back();
@@ -1960,5 +1981,7 @@ int TaskScheduler::computeScore(TaskNode *task_node,
 } // namespace mlir
 
 namespace mlir::taskflow {
-bool getProductionContextSlots(int &slots,std::string &error) {return loadContextMemItems(slots,error);}
+bool getProductionContextSlots(int &slots, std::string &error) {
+  return loadContextMemItems(slots, error);
 }
+} // namespace mlir::taskflow

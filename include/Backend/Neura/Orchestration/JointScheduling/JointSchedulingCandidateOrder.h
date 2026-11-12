@@ -73,8 +73,8 @@ parseProductionCandidateId(llvm::StringRef candidateId) {
 // Returns a strict weak ordering result: negative if lhs precedes rhs, zero
 // if they are identical, and positive if rhs precedes lhs.  When both IDs are
 // canonical production IDs, shape and schedule ordinals are compared as
-// arbitrary-precision decimals.  Legacy IDs form a separate ordering category and retain their
-// existing lexical order within that category.
+// arbitrary-precision decimals.  Legacy IDs form a separate ordering category
+// and retain their existing lexical order within that category.
 inline int compareProductionCandidateIds(llvm::StringRef lhs,
                                          llvm::StringRef rhs) {
   const auto left = parseProductionCandidateId(lhs);
@@ -89,12 +89,12 @@ inline int compareProductionCandidateIds(llvm::StringRef lhs,
     return lhs < rhs ? -1 : 1;
   }
 
-  int shapeOrder = compareNormalizedProductionDecimal(left->shape,
-                                                       right->shape);
+  int shapeOrder =
+      compareNormalizedProductionDecimal(left->shape, right->shape);
   if (shapeOrder != 0)
     return shapeOrder;
-  int scheduleOrder = compareNormalizedProductionDecimal(left->schedule,
-                                                          right->schedule);
+  int scheduleOrder =
+      compareNormalizedProductionDecimal(left->schedule, right->schedule);
   if (scheduleOrder != 0)
     return scheduleOrder;
 

@@ -8,12 +8,12 @@
 
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
-#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskGraphRewriteLegality.h"
-#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraTypes.h"
 
@@ -24,13 +24,13 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "llvm/ADT/DenseSet.h"
-#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <array>
@@ -95,8 +95,8 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
       auto constant = compileTimeIndex(operand, task, kernel);
       if (!constant)
         return std::nullopt;
-      constants.push_back(IntegerAttr::get(IndexType::get(value.getContext()),
-                                           *constant));
+      constants.push_back(
+          IntegerAttr::get(IndexType::get(value.getContext()), *constant));
     }
     SmallVector<Attribute> folded;
     if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
@@ -116,8 +116,8 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
       return compileTimeIndex(kernel.getInputs()[index], task);
     }
     if (argument.getOwner() == &task.getBody().front()) {
-      unsigned firstValueInput = task.getWillReads().size() +
-                                 task.getWillWrites().size();
+      unsigned firstValueInput =
+          task.getWillReads().size() + task.getWillWrites().size();
       if (argument.getArgNumber() < firstValueInput)
         return std::nullopt;
       unsigned index = argument.getArgNumber() - firstValueInput;
@@ -125,8 +125,8 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
         return std::nullopt;
       return compileTimeIndex(task.getValueInputs()[index], task);
     }
-    if (auto function = dyn_cast_or_null<func::FuncOp>(
-            argument.getOwner()->getParentOp()))
+    if (auto function =
+            dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp()))
       return mlir::amoeba::neura::joint_scheduling::detail::
           input0StaticIndexBound(function, argument);
   }
@@ -144,8 +144,7 @@ compileTimeCounterBound(neura::CounterOp counter, StringRef attributeName,
   if (auto integer = counter->getAttrOfType<IntegerAttr>(attributeName))
     return integer.getInt();
 
-  if (auto input = parseKernelInputReference(
-          counter->getAttr(attributeName))) {
+  if (auto input = parseKernelInputReference(counter->getAttr(attributeName))) {
     if (!kernel || *input >= kernel.getInputs().size())
       return std::nullopt;
     return compileTimeIndex(kernel.getInputs()[*input], task, kernel);
@@ -161,8 +160,7 @@ compileTimeCounterBound(neura::CounterOp counter, StringRef attributeName,
 // particular, a valid folded attr must never mask an unresolved or conflicting
 // actual operand.  Keep this helper separate so Radar's legacy validator does
 // not silently change while the LU/replica proof remains fail-closed.
-static std::optional<int64_t>
-compileTimeCounterBoundWithAgreement(
+static std::optional<int64_t> compileTimeCounterBoundWithAgreement(
     neura::CounterOp counter, StringRef attributeName, Value operand,
     TaskflowTaskOp task, neura::KernelOp kernel = neura::KernelOp()) {
   std::optional<int64_t> operandValue;
@@ -179,8 +177,8 @@ compileTimeCounterBoundWithAgreement(
     } else if (auto input = parseKernelInputReference(attribute)) {
       if (!kernel || *input >= kernel.getInputs().size())
         return std::nullopt;
-      attributeValue = compileTimeIndex(kernel.getInputs()[*input], task,
-                                        kernel);
+      attributeValue =
+          compileTimeIndex(kernel.getInputs()[*input], task, kernel);
       if (!attributeValue)
         return std::nullopt;
     } else {
@@ -241,9 +239,10 @@ static LogicalResult captureActiveTransferRewriteFacts(
     }
     StaticActiveTransferShapeProof proof =
         analyzeStaticActiveTransferShape(function, argument);
-    if (llvm::any_of(proof.accesses, [](const ActiveTransferAccessRecord &access) {
-          return !access.proven;
-        })) {
+    if (llvm::any_of(proof.accesses,
+                     [](const ActiveTransferAccessRecord &access) {
+                       return !access.proven;
+                     })) {
       function.emitError()
           << "cannot enter source replica rewrite with an unproved memory "
              "access on argument "
@@ -274,9 +273,10 @@ static LogicalResult refreshActiveTransferProofsAfterSourceRewrite(
     }
     StaticActiveTransferShapeProof proof =
         analyzeStaticActiveTransferShape(function, fact.argument);
-    if (llvm::any_of(proof.accesses, [](const ActiveTransferAccessRecord &access) {
-          return !access.proven;
-        })) {
+    if (llvm::any_of(proof.accesses,
+                     [](const ActiveTransferAccessRecord &access) {
+                       return !access.proven;
+                     })) {
       function.emitError()
           << "trusted source rewrite left an unproved memory access on "
              "argument "
@@ -356,9 +356,9 @@ static bool isOriginalAmoebaFixedDecisionTask(func::FuncOp function,
 }
 
 static bool isOriginalAmoebaFixedDecisionMode(TaskflowTaskOp task) {
-  auto mode = task ? task->getAttrOfType<BoolAttr>(
-                         kOriginalAmoebaDecisionModeAttr)
-                   : BoolAttr();
+  auto mode =
+      task ? task->getAttrOfType<BoolAttr>(kOriginalAmoebaDecisionModeAttr)
+           : BoolAttr();
   return mode && mode.getValue();
 }
 
@@ -383,15 +383,15 @@ static std::optional<StringRef> stringField(DictionaryAttr dictionary,
   return value.getValue();
 }
 
-static std::optional<std::pair<int64_t, int64_t>> parseCgraShape(
-    StringRef shape) {
+static std::optional<std::pair<int64_t, int64_t>>
+parseCgraShape(StringRef shape) {
   auto parts = shape.split('x');
   int64_t rows = 0;
   int64_t cols = 0;
-  if (parts.first.empty() || parts.second.empty() || parts.second.contains('x') ||
-      parts.first.getAsInteger(10, rows) ||
-      parts.second.getAsInteger(10, cols) || rows < 1 || cols < 1 ||
-      rows > 4 || cols > 4 || rows * cols > 4)
+  if (parts.first.empty() || parts.second.empty() ||
+      parts.second.contains('x') || parts.first.getAsInteger(10, rows) ||
+      parts.second.getAsInteger(10, cols) || rows < 1 || cols < 1 || rows > 4 ||
+      cols > 4 || rows * cols > 4)
     return std::nullopt;
   return std::make_pair(rows, cols);
 }
@@ -417,13 +417,14 @@ static LogicalResult readOriginalAmoebaReplicaDecision(
   if (!active || !info || !infoActive || !infoTask || !shapes || !placements ||
       *infoActive != active.getInt() || *infoTask != task.getTaskName() ||
       active.getInt() < 2 || active.getInt() > 4 ||
-      shapes.size() != static_cast<size_t>(active.getInt()) || placements.empty())
+      shapes.size() != static_cast<size_t>(active.getInt()) ||
+      placements.empty())
     return fail("trace does not bind a valid 2-4 replica inventory");
 
   auto composed = task->getAttrOfType<StringAttr>("composed_cgra_shape");
   auto composedCount = task->getAttrOfType<IntegerAttr>("composed_cgra_count");
-  auto parsedComposed = composed ? parseCgraShape(composed.getValue())
-                                 : std::nullopt;
+  auto parsedComposed =
+      composed ? parseCgraShape(composed.getValue()) : std::nullopt;
   if (!composed || !composedCount || !parsedComposed ||
       composedCount.getInt() != parsedComposed->first * parsedComposed->second)
     return fail("selected composed shape/count is invalid");
@@ -448,7 +449,8 @@ static LogicalResult readOriginalAmoebaReplicaDecision(
         ((*rows != parsedComposed->first || *cols != parsedComposed->second) &&
          (*rows != parsedComposed->second || *cols != parsedComposed->first)) ||
         *row < 0 || *col < 0 || *row + *rows > 4 || *col + *cols > 4)
-      return fail("replica shape disagrees with the selected area or placement");
+      return fail(
+          "replica shape disagrees with the selected area or placement");
     byId[*id] = shape;
   }
   for (Attribute attribute : placements) {
@@ -509,16 +511,17 @@ static bool hasVerifiedReadCompletionFanIn(TaskflowTaskOp task,
   Value state = task.getDoneReads().front();
   if (!llvm::hasSingleElement(state.getUses()))
     return false;
-  auto join = dyn_cast<TaskflowReadCompletionJoinOp>(
-      state.use_begin()->getOwner());
+  auto join =
+      dyn_cast<TaskflowReadCompletionJoinOp>(state.use_begin()->getOwner());
   return join && join.getWriteCompletion() == outputJoin.getJoined() &&
          llvm::is_contained(join.getTileStates(), state) &&
          succeeded(verify(join.getOperation()));
 }
 
-static LogicalResult appendTypedCompletionJoinIncomingEdges(
-    TaskflowTaskOp consumer, Value input,
-    SmallVectorImpl<Attribute> &incoming, OpBuilder &builder) {
+static LogicalResult
+appendTypedCompletionJoinIncomingEdges(TaskflowTaskOp consumer, Value input,
+                                       SmallVectorImpl<Attribute> &incoming,
+                                       OpBuilder &builder) {
   auto reject = [&](const Twine &reason) {
     consumer.emitError(reason);
     return failure();
@@ -553,8 +556,9 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
 
   std::string graphError;
   FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
-      function, TaskEdgeGraphOptions{/*require_payload=*/false,
-                                     /*read_control_predecessors=*/true},
+      function,
+      TaskEdgeGraphOptions{/*require_payload=*/false,
+                           /*read_control_predecessors=*/true},
       graphError);
   if (failed(graph))
     return reject("cannot prove completion join incoming edges: " +
@@ -623,11 +627,12 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
       const unsigned resultIndex =
           static_cast<unsigned>(result - task.getDoneWrites().begin());
       if (task.getWillWrites().size() != task.getDoneWrites().size() ||
-          task.getWillWrites().size() != task.getOriginalWriteMemrefs().size() ||
+          task.getWillWrites().size() !=
+              task.getOriginalWriteMemrefs().size() ||
           resultIndex >= task.getWillWrites().size())
         return reject("completion join state has an incomplete output ABI");
-      FailureOr<Value> taskOutputRoot =
-          resolveTaskflowMemoryRoot(task.getOriginalWriteMemrefs()[resultIndex]);
+      FailureOr<Value> taskOutputRoot = resolveTaskflowMemoryRoot(
+          task.getOriginalWriteMemrefs()[resultIndex]);
       FailureOr<Value> joinOutputRoot = resolveTaskflowMemoryRoot(rootBase);
       if (stripMemrefCasts(task.getWillWrites()[resultIndex]) != rootBase ||
           failed(taskOutputRoot) || failed(joinOutputRoot) ||
@@ -637,17 +642,18 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
           !visitedLeaves.insert(task.getOperation()).second)
         return reject("completion join state is not a unique output task");
       if (replicaJoin) {
-        auto parent = task->getAttrOfType<StringAttr>(
-            "amoeba.replica.parent_task");
+        auto parent =
+            task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
         auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
         auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
-        auto axis = task->getAttrOfType<IntegerAttr>(
-            "amoeba.replica.shard_axis");
+        auto axis =
+            task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
         auto outputAxis = task->getAttrOfType<IntegerAttr>(
             "amoeba.replica.output_shard_axis");
         if (!parent || !id || !count || !axis || parent.getValue().empty() ||
             id.getInt() < 0 ||
-            id.getInt() >= static_cast<int64_t>(current.getTileStates().size()) ||
+            id.getInt() >=
+                static_cast<int64_t>(current.getTileStates().size()) ||
             (outputAxis ? outputAxis.getInt() : axis.getInt()) !=
                 static_cast<int64_t>(current.getAxis()) ||
             !replicaIds.insert(id.getInt()).second ||
@@ -656,8 +662,10 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
         if (replicaCount < 0)
           replicaCount = count.getInt();
         if (count.getInt() != replicaCount ||
-            replicaCount != static_cast<int64_t>(current.getTileStates().size()))
-          return reject("completion join replica metadata disagrees with states");
+            replicaCount !=
+                static_cast<int64_t>(current.getTileStates().size()))
+          return reject(
+              "completion join replica metadata disagrees with states");
         if (parentName.empty())
           parentName = parent.getValue().str();
         if (parent.getValue() != parentName)
@@ -666,9 +674,11 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
       leaves.push_back({task, resultIndex});
     }
     if (replicaJoin &&
-        (replicaCount < 2 || replicaIds.size() != current.getTileStates().size() ||
+        (replicaCount < 2 ||
+         replicaIds.size() != current.getTileStates().size() ||
          directReplicaTasks.size() != current.getTileStates().size()))
-      return reject("completion join does not contain its complete replica set");
+      return reject(
+          "completion join does not contain its complete replica set");
     return success();
   };
 
@@ -676,8 +686,8 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
       leaves.empty())
     return failure();
 
-  const bool expectsWrite = llvm::any_of(
-      consumer.getWillWrites(), [&](Value value) {
+  const bool expectsWrite =
+      llvm::any_of(consumer.getWillWrites(), [&](Value value) {
         return stripMemrefCasts(value) == joinValue;
       });
   for (Leaf &leaf : leaves) {
@@ -714,7 +724,8 @@ static LogicalResult appendTypedCompletionJoinIncomingEdges(
       return edge->kind == TaskEdgeKind::Waw;
     });
     if (!hasRaw || (expectsWrite != hasWaw))
-      return reject("completion join leaf lacks the required typed RAW/WAW edge");
+      return reject(
+          "completion join leaf lacks the required typed RAW/WAW edge");
     for (const TaskEdge *edge : incomingEdges) {
       std::string encoded =
           (leaf.task.getTaskName() + "|producer_consumer|tensor_wide").str();
@@ -762,9 +773,10 @@ static bool isReadOnlyTaskInput(Value value, func::FuncOp function) {
 // reduction.  The proof is intentionally narrow: static M/N counters, one
 // static unit-step K reduction, read-only inputs, and one direct output store.
 // This keeps arbitrary task bodies out of the execution-shard transform.
-static FailureOr<TaskflowTaskOp>
-validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
-                     int64_t axis, int64_t replicas) {
+static FailureOr<TaskflowTaskOp> validateGemmProducer(func::FuncOp function,
+                                                      TaskflowTaskOp source,
+                                                      int64_t axis,
+                                                      int64_t replicas) {
   if (!source || source.getWillReads().size() != 3 ||
       source.getWillWrites().size() != 1 ||
       source.getOriginalReadMemrefs().size() != 3 ||
@@ -775,8 +787,8 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
 
   Value output = source.getWillWrites().front();
   auto outputType = dyn_cast<MemRefType>(output.getType());
-  if (!outputType || !outputType.hasStaticShape() || outputType.getRank() != 2 ||
-      axis < 0 || axis >= outputType.getRank() ||
+  if (!outputType || !outputType.hasStaticShape() ||
+      outputType.getRank() != 2 || axis < 0 || axis >= outputType.getRank() ||
       !isSupportedReplicaCount(replicas) || replicas < 2 ||
       !hasBalancedShards(outputType.getShape()[axis], replicas))
     return rejectGemm(source,
@@ -791,7 +803,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
     if (source.getOriginalReadMemrefs()[index] != input ||
         !isReadOnlyTaskInput(input, function))
       return rejectGemm(source, "GEMM producer inputs must be noalias function "
-                              "arguments with matching original memrefs");
+                                "arguments with matching original memrefs");
 
   // The producer result must feed exactly one task.  Channels, returns, and
   // multiple consumers are deliberately rejected because the transform only
@@ -803,7 +815,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
     auto candidate = dyn_cast<TaskflowTaskOp>(use.getOwner());
     if (!candidate || !llvm::is_contained(candidate.getWillReads(), produced))
       return rejectGemm(source, "GEMM producer must have one direct task "
-                              "consumer and no aliases");
+                                "consumer and no aliases");
     if (consumer && consumer != candidate)
       return rejectGemm(source, "GEMM producer has multiple downstream tasks");
     consumer = candidate;
@@ -818,12 +830,12 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
   if (consumerInputs != 1 ||
       llvm::count(consumer.getOriginalReadMemrefs(), output) != 1)
     return rejectGemm(source, "GEMM producer consumer edge must be unique");
-  auto consumerLowers = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionLowersAttr);
-  auto consumerUppers = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionUppersAttr);
-  auto consumerReasons = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionReasonsAttr);
+  auto consumerLowers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionLowersAttr);
+  auto consumerUppers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionUppersAttr);
+  auto consumerReasons =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionReasonsAttr);
   if ((consumerLowers || consumerUppers || consumerReasons) &&
       (!consumerLowers || !consumerUppers || !consumerReasons ||
        consumerLowers.size() != consumer.getWillReads().size() ||
@@ -861,7 +873,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
     if (!isa<arith::ConstantOp, arith::ConstantIndexOp, TaskflowYieldOp>(
             &operation))
       return rejectGemm(source, "GEMM producer body contains an unsupported "
-                              "top-level operation");
+                                "top-level operation");
   }
   if (counters.size() != 2 || hyperblockCount != 1)
     return rejectGemm(source, "GEMM producer needs exactly two outer counters "
@@ -875,7 +887,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
             std::optional<int64_t>(outputType.getShape()[index]) ||
         constantIndex(counter.getStep()) != std::optional<int64_t>(1))
       return rejectGemm(source, "GEMM producer outer bounds must be static "
-                              "unit-step M/N counters");
+                                "unit-step M/N counters");
   }
   if (hyperblock.getIndices().size() != counters.size() ||
       !hyperblock.getBody().hasOneBlock())
@@ -884,7 +896,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
   for (auto [index, value] : llvm::enumerate(hyperblock.getIndices()))
     if (value != counters[index].getCounterIndex())
       return rejectGemm(source, "GEMM producer hyperblock indices must be the "
-                              "outer counters");
+                                "outer counters");
 
   Block &kernel = hyperblock.getBody().front();
   if (kernel.getNumArguments() != 2)
@@ -900,10 +912,9 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
     } else if (auto candidate = dyn_cast<scf::ForOp>(&operation)) {
       reduction = candidate;
       ++reductions;
-    } else if (!isa<memref::LoadOp>(&operation) &&
-               !isPureArith(&operation)) {
+    } else if (!isa<memref::LoadOp>(&operation) && !isPureArith(&operation)) {
       return rejectGemm(source, "GEMM producer kernel has an unsupported "
-                              "side effect");
+                                "side effect");
     }
   }
   if (stores != 1 || reductions != 1)
@@ -918,7 +929,7 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
   for (auto [index, value] : llvm::enumerate(store.getIndices()))
     if (value != kernel.getArgument(index))
       return rejectGemm(source, "GEMM producer store must be indexed directly "
-                              "by M/N counters");
+                                "by M/N counters");
 
   if (reduction.getInitArgs().size() != 1 || reduction.getNumResults() != 1 ||
       !reduction.getBody() ||
@@ -934,7 +945,8 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
                               "and one accumulator argument");
   auto yield = dyn_cast<scf::YieldOp>(reductionBody.getTerminator());
   if (!yield || yield.getNumOperands() != 1)
-    return rejectGemm(source, "GEMM producer K loop must yield one accumulator");
+    return rejectGemm(source,
+                      "GEMM producer K loop must yield one accumulator");
   auto add = yield.getOperand(0).getDefiningOp<arith::AddIOp>();
   if (!add || (add.getOperand(0) != reductionBody.getArgument(1) &&
                add.getOperand(1) != reductionBody.getArgument(1)))
@@ -978,15 +990,12 @@ validateGemmProducer(func::FuncOp function, TaskflowTaskOp source,
   return consumer;
 }
 
-static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
-                                                       Value joined,
-                                                       StringRef parent,
-                                                       OpBuilder &builder,
-                                                       int64_t replicas,
-                                                       bool preserveOtherProducerEdges = false) {
+static LogicalResult makeConsumerTensorWideForReplicas(
+    TaskflowTaskOp consumer, Value joined, StringRef parent, OpBuilder &builder,
+    int64_t replicas, bool preserveOtherProducerEdges = false) {
   SmallVector<Attribute> incoming;
-  if (auto previous = consumer->getAttrOfType<ArrayAttr>(
-          kSemanticIncomingEdgesAttr))
+  if (auto previous =
+          consumer->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr))
     for (Attribute entry : previous) {
       auto text = dyn_cast<StringAttr>(entry);
       if (!text) {
@@ -1000,12 +1009,12 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
   while (auto cast = joinedBase.getDefiningOp<memref::CastOp>())
     joinedBase = cast.getSource();
   if (auto completionJoin = joinedBase.getDefiningOp<TaskflowJoinOp>();
-      completionJoin && completionJoin->hasAttr(
-                             "amoeba.semantic.completion_only") &&
+      completionJoin &&
+      completionJoin->hasAttr("amoeba.semantic.completion_only") &&
       (completionJoin->hasAttr("amoeba.replica.completion_only") ||
        completionJoin->hasAttr("amoeba.neura.joint_rewrite"))) {
     if (failed(appendTypedCompletionJoinIncomingEdges(consumer, joined,
-                                                       incoming, builder)))
+                                                      incoming, builder)))
       return failure();
   } else {
     for (int64_t replicaId = 0; replicaId < replicas; ++replicaId)
@@ -1018,8 +1027,9 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
     std::string graphError;
     auto function = consumer->getParentOfType<func::FuncOp>();
     FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
-        function, TaskEdgeGraphOptions{/*require_payload=*/false,
-                                       /*read_control_predecessors=*/true},
+        function,
+        TaskEdgeGraphOptions{/*require_payload=*/false,
+                             /*read_control_predecessors=*/true},
         graphError);
     if (failed(graph)) {
       consumer.emitError("cannot prove preserved replica consumer edges: " +
@@ -1050,16 +1060,18 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
         if (!previousJoin->hasAttr("amoeba.semantic.completion_only") ||
             (!previousJoin->hasAttr("amoeba.replica.completion_only") &&
              !previousJoin->hasAttr("amoeba.neura.joint_rewrite"))) {
-          consumer.emitError("replica consumer has an unproved non-replica join");
+          consumer.emitError(
+              "replica consumer has an unproved non-replica join");
           return failure();
         }
-        if (failed(appendTypedCompletionJoinIncomingEdges(
-                consumer, input, incoming, builder)))
+        if (failed(appendTypedCompletionJoinIncomingEdges(consumer, input,
+                                                          incoming, builder)))
           return failure();
       } else if (!isa<BlockArgument>(input) &&
                  !input.getDefiningOp<memref::AllocOp>() &&
                  !input.getDefiningOp<memref::AllocaOp>()) {
-        consumer.emitError("replica consumer has an unclassified input producer");
+        consumer.emitError(
+            "replica consumer has an unclassified input producer");
         return failure();
       }
     }
@@ -1082,28 +1094,27 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
       completeIncoming.push_back(builder.getStringAttr(
           (producer.getTaskName() + "|producer_consumer|" +
            stringifyTaskEdgeScope(edge.scope) + "|" +
-           stringifyTaskEdgeKind(edge.kind)).str()));
+           stringifyTaskEdgeKind(edge.kind))
+              .str()));
     }
     incoming = std::move(completeIncoming);
   }
-  consumer->setAttr(kSemanticIncomingEdgesAttr,
-                    builder.getArrayAttr(incoming));
-  auto lowers = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionLowersAttr);
-  auto uppers = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionUppersAttr);
-  auto reasons = consumer->getAttrOfType<ArrayAttr>(
-      kTilingInputRegionReasonsAttr);
+  consumer->setAttr(kSemanticIncomingEdgesAttr, builder.getArrayAttr(incoming));
+  auto lowers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionLowersAttr);
+  auto uppers =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionUppersAttr);
+  auto reasons =
+      consumer->getAttrOfType<ArrayAttr>(kTilingInputRegionReasonsAttr);
   if (!lowers && !uppers && !reasons)
     return success();
   if (!lowers || !uppers || !reasons ||
       lowers.size() != consumer.getWillReads().size() ||
-      uppers.size() != lowers.size() || reasons.size() != lowers.size())
-    {
-      consumer.emitError("replica consumer has incomplete input-region "
-                         "metadata");
-      return failure();
-    }
+      uppers.size() != lowers.size() || reasons.size() != lowers.size()) {
+    consumer.emitError("replica consumer has incomplete input-region "
+                       "metadata");
+    return failure();
+  }
   SmallVector<Attribute> newLowers(lowers.begin(), lowers.end());
   SmallVector<Attribute> newUppers(uppers.begin(), uppers.end());
   SmallVector<Attribute> newReasons(reasons.begin(), reasons.end());
@@ -1122,11 +1133,10 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
     newUppers[index] = builder.getUnitAttr();
     newReasons[index] = builder.getStringAttr("replica_completion");
   }
-  if (!foundJoinedInput)
-    {
-      consumer.emitError("replica consumer does not use the completion join");
-      return failure();
-    }
+  if (!foundJoinedInput) {
+    consumer.emitError("replica consumer does not use the completion join");
+    return failure();
+  }
   consumer->setAttr(kTilingInputRegionLowersAttr,
                     builder.getArrayAttr(newLowers));
   consumer->setAttr(kTilingInputRegionUppersAttr,
@@ -1139,15 +1149,17 @@ static LogicalResult makeConsumerTensorWideForReplicas(TaskflowTaskOp consumer,
 // A source done-read may feed downstream writers. Replacing it with a typed
 // read-completion join must retain one WAR edge from every replica to each
 // writer, with annotations checked against the derived TaskEdgeGraph.
-static LogicalResult makeReadCompletionConsumerEdges(
-    TaskflowTaskOp consumer, Value joined, StringRef parent,
-    OpBuilder &builder) {
+static LogicalResult makeReadCompletionConsumerEdges(TaskflowTaskOp consumer,
+                                                     Value joined,
+                                                     StringRef parent,
+                                                     OpBuilder &builder) {
   auto reject = [&](const Twine &reason) {
     consumer.emitError(reason);
     return failure();
   };
   auto join = joined.getDefiningOp<TaskflowReadCompletionJoinOp>();
-  if (!join || join.getJoined() != joined || failed(verify(join.getOperation())))
+  if (!join || join.getJoined() != joined ||
+      failed(verify(join.getOperation())))
     return reject("replica writer has an unverified read-completion join");
   auto joinedWrite = llvm::find(consumer.getWillWrites(), joined);
   if (joinedWrite == consumer.getWillWrites().end() ||
@@ -1160,16 +1172,17 @@ static LogicalResult makeReadCompletionConsumerEdges(
     return reject("read-completion join and writer are in different functions");
   std::string graphError;
   FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
-      function, TaskEdgeGraphOptions{/*require_payload=*/false,
-                                     /*read_control_predecessors=*/true},
+      function,
+      TaskEdgeGraphOptions{/*require_payload=*/false,
+                           /*read_control_predecessors=*/true},
       graphError);
   if (failed(graph))
     return reject("cannot prove read-completion WAR edges: " +
                   Twine(graphError));
 
   SmallVector<Attribute> incoming;
-  if (auto previous = consumer->getAttrOfType<ArrayAttr>(
-          kSemanticIncomingEdgesAttr)) {
+  if (auto previous =
+          consumer->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr)) {
     for (Attribute entry : previous) {
       auto text = dyn_cast<StringAttr>(entry);
       if (!text)
@@ -1183,11 +1196,13 @@ static LogicalResult makeReadCompletionConsumerEdges(
   for (Value state : join.getTileStates()) {
     auto producer = state.getDefiningOp<TaskflowTaskOp>();
     if (!producer)
-      return reject("read-completion join contains an unclassified replica leaf");
+      return reject(
+          "read-completion join contains an unclassified replica leaf");
     auto result = llvm::find(producer.getDoneReads(), state);
     if (result == producer.getDoneReads().end() ||
         !leaves.insert(producer.getOperation()).second)
-      return reject("read-completion join contains a duplicate or non-read result");
+      return reject(
+          "read-completion join contains a duplicate or non-read result");
     unsigned resultIndex =
         static_cast<unsigned>(result - producer.getDoneReads().begin());
     SmallVector<const TaskEdge *, 2> matchingEdges;
@@ -1195,20 +1210,19 @@ static LogicalResult makeReadCompletionConsumerEdges(
       if (edge.origin == TaskEdgeOrigin::Taskflow &&
           edge.producer == producer && edge.consumer == consumer &&
           edge.producer_segment == TaskResultSegment::DoneReads &&
-          edge.producer_index == resultIndex && edge.kind == TaskEdgeKind::War &&
+          edge.producer_index == resultIndex &&
+          edge.kind == TaskEdgeKind::War &&
           edge.consumer_segment == TaskOperandSegment::WillWrites &&
           edge.consumer_index == writeIndex &&
           edge.scope == TaskEdgeScope::TensorWide)
         matchingEdges.push_back(&edge);
     if (matchingEdges.size() != 1)
-      return reject("read-completion leaf lacks one typed tensor-wide WAR edge");
+      return reject(
+          "read-completion leaf lacks one typed tensor-wide WAR edge");
     incoming.push_back(builder.getStringAttr(
-        (producer.getTaskName() +
-         "|producer_consumer|tensor_wide|war")
-            .str()));
+        (producer.getTaskName() + "|producer_consumer|tensor_wide|war").str()));
   }
-  consumer->setAttr(kSemanticIncomingEdgesAttr,
-                    builder.getArrayAttr(incoming));
+  consumer->setAttr(kSemanticIncomingEdgesAttr, builder.getArrayAttr(incoming));
   return success();
 }
 
@@ -1216,7 +1230,6 @@ static LogicalResult rejectLlama(TaskflowTaskOp source, StringRef reason) {
   source.emitError() << reason;
   return failure();
 }
-
 
 static LogicalResult rejectRadar(TaskflowTaskOp source, StringRef reason) {
   source.emitError() << reason;
@@ -1244,7 +1257,7 @@ static bool isRadarNoAliasArgument(Value value, func::FuncOp function) {
 
 static FailureOr<TaskflowTaskOp>
 validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
-                      int64_t axis, int64_t replicas) {
+                            int64_t axis, int64_t replicas) {
   if (axis != 0 || source.getTaskName() != "Task_0")
     return rejectRadar(source, "Radar replica requires Task_0 and chirp axis");
   if (!isSupportedReplicaCount(replicas) || replicas < 2 ||
@@ -1261,8 +1274,7 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
       incoming && !incoming.empty())
     return rejectRadar(source,
                        "Radar Task_0 must not have an incoming semantic edge");
-  if (source.getWillReads().size() != 1 ||
-      source.getWillWrites().size() != 1 ||
+  if (source.getWillReads().size() != 1 || source.getWillWrites().size() != 1 ||
       source.getOriginalReadMemrefs().size() != 1 ||
       source.getOriginalWriteMemrefs().size() != 1 ||
       source.getDoneWrites().size() != 1 || !source.getDoneReads().empty() ||
@@ -1276,8 +1288,7 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
   auto inputType = dyn_cast<MemRefType>(input.getType());
   auto outputType = dyn_cast<MemRefType>(output.getType());
   if (!inputType || inputType.getRank() != 2 ||
-      inputType.getElementType() !=
-          IntegerType::get(source.getContext(), 32) ||
+      inputType.getElementType() != IntegerType::get(source.getContext(), 32) ||
       inputType.isDynamicDim(1) || inputType.getShape()[1] != 256 ||
       !outputType || outputType.getRank() != 1 ||
       outputType.getElementType() !=
@@ -1323,8 +1334,7 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
     auto candidate = dyn_cast<TaskflowTaskOp>(use.getOwner());
     if (!candidate || candidate.getTaskName() != "Task_2" ||
         !llvm::is_contained(candidate.getWillReads(), produced))
-      return rejectRadar(source,
-                         "Radar Task_0 result must feed only Task_2");
+      return rejectRadar(source, "Radar Task_0 result must feed only Task_2");
     consumer = candidate;
     ++directUses;
   }
@@ -1373,11 +1383,10 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
     if (constantIndex(counter.getLowerBound()) != lower ||
         constantIndex(counter.getStep()) != 1 ||
         (upper && compileTimeIndex(counter.getUpperBound(), source) != upper))
-      return rejectRadar(
-          source,
-          (Twine("Radar Task_0 ") + name +
-           " counter is not a compile-time unit-step domain")
-              .str());
+      return rejectRadar(source,
+                         (Twine("Radar Task_0 ") + name +
+                          " counter is not a compile-time unit-step domain")
+                             .str());
     return success();
   };
   if (failed(checkTaskCounter(counters[0], 0, 32, "chirp")) ||
@@ -1400,8 +1409,7 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
   const unsigned firstWrite = source.getWillReads().size();
   const unsigned firstValue =
       source.getWillReads().size() + source.getWillWrites().size();
-  if (kernel.getInputs().size() != 5 ||
-      kernel.getIterArgsInit().size() != 1 ||
+  if (kernel.getInputs().size() != 5 || kernel.getIterArgsInit().size() != 1 ||
       kernel.getInputs()[0] != body.getArgument(0) ||
       kernel.getInputs()[1] != body.getArgument(firstValue + 2) ||
       kernel.getInputs()[2] != body.getArgument(firstValue) ||
@@ -1416,7 +1424,8 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
     return rejectRadar(
         source, "Radar Task_0 Neura kernel has an invalid accumulator ABI");
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   if (neuraCounters.size() != 2)
     return rejectRadar(source,
                        "Radar Task_0 Neura kernel requires chirp and range "
@@ -1435,9 +1444,8 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
         compileTimeIndex(counter.getLowerBound(), source, kernel) != 0 ||
         compileTimeIndex(counter.getUpperBound(), source, kernel) != upper ||
         compileTimeIndex(counter.getStep(), source, kernel) != 1)
-      return rejectRadar(source,
-                         "Radar Task_0 Neura counters are not 0..32/64 "
-                         "compile-time unit-step domains");
+      return rejectRadar(source, "Radar Task_0 Neura counters are not 0..32/64 "
+                                 "compile-time unit-step domains");
   }
   Value kernelInput = kernelBody.getArgument(0);
   Value kernelOutput = kernelBody.getArgument(3);
@@ -1478,12 +1486,10 @@ validateRadarLegacyProducer(func::FuncOp function, TaskflowTaskOp source,
   return consumer;
 }
 
-
-
-
 static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
-                                              TaskflowTaskOp source,
-                                              int64_t axis, int64_t replicas) {
+                                                    TaskflowTaskOp source,
+                                                    int64_t axis,
+                                                    int64_t replicas) {
   FailureOr<TaskflowTaskOp> validated =
       validateRadarLegacyProducer(function, source, axis, replicas);
   if (failed(validated))
@@ -1504,7 +1510,8 @@ static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
     replica->setAttr("amoeba.replica.parent_task",
                      builder.getStringAttr(sourceName));
     replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(replicaId));
-    replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+    replica->setAttr("amoeba.replica.count",
+                     builder.getI64IntegerAttr(replicas));
     replica->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
     replica->setAttr("amoeba.replica.shard_lower",
                      builder.getI64IntegerAttr(lower));
@@ -1549,8 +1556,9 @@ static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
     clonedCounters[0].setCounterDynamismAttr(
         builder.getStringAttr("constant_bound"));
     SmallVector<neura::CounterOp> clonedNeuraCounters;
-    clonedKernel.walk(
-        [&](neura::CounterOp counter) { clonedNeuraCounters.push_back(counter); });
+    clonedKernel.walk([&](neura::CounterOp counter) {
+      clonedNeuraCounters.push_back(counter);
+    });
     for (neura::CounterOp counter : clonedNeuraCounters) {
       auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
       if (!id || id.getInt() != 0)
@@ -1567,8 +1575,7 @@ static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
                        builder.getStringAttr("constant_bound"));
     }
     int64_t shardTripCount = (upper - lower) * rangeBins;
-    replica->setAttr("trip_count",
-                     builder.getI64IntegerAttr(shardTripCount));
+    replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
     if (replica->getAttrOfType<IntegerAttr>("amoeba.selected_trip_count"))
       replica->setAttr("amoeba.selected_trip_count",
                        builder.getI64IntegerAttr(shardTripCount));
@@ -1591,7 +1598,8 @@ static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
   function->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
   function->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(chirps * rangeBins));
@@ -1599,8 +1607,6 @@ static LogicalResult materializeRadarLegacyProducer(func::FuncOp function,
                     builder.getI64IntegerAttr((chirps / replicas) * rangeBins));
   return success();
 }
-
-
 
 // The prepared input keeps caller-owned memrefs dynamically shaped while its
 // source-owned preparation records the exact transfer shape on the function
@@ -1626,16 +1632,16 @@ static bool radarShapeMatches(Value value, MemRefType type,
   return contract && llvm::equal(*contract, expected);
 }
 
-// Radar's Task_0/Task_1 producers are deliberately narrow producer proofs. Their outer domain is
-// the 32 independent chirps and its inner domain is the statically bound
-// input row (64 for the canonical input). The output is one scalar per chirp,
-// so splitting the outer domain creates disjoint output regions while
-// preserving the complete reduction body in each clone.
+// Radar's Task_0/Task_1 producers are deliberately narrow producer proofs.
+// Their outer domain is the 32 independent chirps and its inner domain is the
+// statically bound input row (64 for the canonical input). The output is one
+// scalar per chirp, so splitting the outer domain creates disjoint output
+// regions while preserving the complete reduction body in each clone.
 static FailureOr<TaskflowTaskOp>
 validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
-                      int64_t axis, int64_t replicas) {
-  if (axis != 0 || (source.getTaskName() != "Task_0" &&
-                    source.getTaskName() != "Task_1"))
+                                int64_t axis, int64_t replicas) {
+  if (axis != 0 ||
+      (source.getTaskName() != "Task_0" && source.getTaskName() != "Task_1"))
     return rejectRadar(source,
                        "Radar replica requires Task_0/Task_1 and chirp axis");
   if (!isSupportedReplicaCount(replicas) || replicas < 2 ||
@@ -1650,10 +1656,9 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   if (auto incoming =
           source->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr);
       incoming && !incoming.empty())
-    return rejectRadar(source,
-                       "Radar producer must not have an incoming semantic edge");
-  if (source.getWillReads().size() != 1 ||
-      source.getWillWrites().size() != 1 ||
+    return rejectRadar(
+        source, "Radar producer must not have an incoming semantic edge");
+  if (source.getWillReads().size() != 1 || source.getWillWrites().size() != 1 ||
       source.getOriginalReadMemrefs().size() != 1 ||
       source.getOriginalWriteMemrefs().size() != 1 ||
       source.getDoneWrites().size() != 1 || !source.getDoneReads().empty() ||
@@ -1667,8 +1672,7 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   auto inputType = dyn_cast<MemRefType>(input.getType());
   auto outputType = dyn_cast<MemRefType>(output.getType());
   if (!inputType || inputType.getRank() != 2 ||
-      inputType.getElementType() !=
-          IntegerType::get(source.getContext(), 32) ||
+      inputType.getElementType() != IntegerType::get(source.getContext(), 32) ||
       inputType.isDynamicDim(1) || inputType.getShape()[1] != 256 ||
       !outputType || outputType.getRank() != 1 ||
       outputType.getElementType() !=
@@ -1702,8 +1706,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
     auto task = dyn_cast<TaskflowTaskOp>(use.getOwner());
     if (!task || !llvm::is_contained(task.getWillReads(), input) ||
         llvm::is_contained(task.getWillWrites(), input))
-      return rejectRadar(source,
-                         "Radar producer input has an alias or possible writer");
+      return rejectRadar(
+          source, "Radar producer input has an alias or possible writer");
   }
 
   Value produced = source.getDoneWrites().front();
@@ -1713,8 +1717,7 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
     auto candidate = dyn_cast<TaskflowTaskOp>(use.getOwner());
     if (!candidate || candidate.getTaskName() != "Task_2" ||
         !llvm::is_contained(candidate.getWillReads(), produced))
-      return rejectRadar(source,
-                         "Radar producer result must feed only Task_2");
+      return rejectRadar(source, "Radar producer result must feed only Task_2");
     consumer = candidate;
     ++directUses;
   }
@@ -1750,8 +1753,7 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
       return rejectRadar(source,
                          "Radar Task_0 body contains an unsupported op");
   }
-  if ((counters.size() != 1 && counters.size() != 2) || kernels != 1 ||
-      !kernel)
+  if ((counters.size() != 1 && counters.size() != 2) || kernels != 1 || !kernel)
     return rejectRadar(source,
                        "Radar producer requires one or two counters and one "
                        "Neura kernel");
@@ -1760,18 +1762,17 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
                        "Radar producer chirp counter must be a root counter");
   if (counters.size() == 2 &&
       counters[1].getParentIndex() != counters[0].getCounterIndex())
-    return rejectRadar(
-        source, "Radar producer counters must form a chirp/range chain");
+    return rejectRadar(source,
+                       "Radar producer counters must form a chirp/range chain");
   auto checkTaskCounter = [&](TaskflowCounterOp counter, int64_t lower,
                               std::optional<int64_t> upper, StringRef name) {
     if (constantIndex(counter.getLowerBound()) != lower ||
         constantIndex(counter.getStep()) != 1 ||
         (upper && compileTimeIndex(counter.getUpperBound(), source) != upper))
-      return rejectRadar(
-          source,
-          (Twine("Radar Task_0 ") + name +
-           " counter is not a compile-time unit-step domain")
-              .str());
+      return rejectRadar(source,
+                         (Twine("Radar Task_0 ") + name +
+                          " counter is not a compile-time unit-step domain")
+                             .str());
     return success();
   };
   if (failed(checkTaskCounter(counters[0], 0, 32, "chirp")) ||
@@ -1806,21 +1807,21 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
       kernel.getInputs()[3] != body.getArgument(firstValue + 2) ||
       kernel.getInputs()[4] != body.getArgument(firstWrite))
     return rejectRadar(
-        source,
-        "Radar producer Neura kernel inputs are not the canonical "
-        "input/range/accumulator/divisor/output ABI");
+        source, "Radar producer Neura kernel inputs are not the canonical "
+                "input/range/accumulator/divisor/output ABI");
   Block &kernelBody = kernel.getBody().front();
   if (kernelBody.getNumArguments() != kernel.getInputs().size())
     return rejectRadar(
         source, "Radar producer Neura kernel has an invalid accumulator ABI");
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   if (neuraCounters.size() != 1)
     return rejectRadar(source,
                        "Radar producer Neura kernel requires exactly one "
                        "chirp counter and an explicit range recurrence");
-  auto counterId = neuraCounters.front()->getAttrOfType<IntegerAttr>(
-      "counter_id");
+  auto counterId =
+      neuraCounters.front()->getAttrOfType<IntegerAttr>("counter_id");
   if (!counterId || counterId.getInt() != 0 ||
       compileTimeCounterBound(neuraCounters.front(), "lower_bound_value",
                               neuraCounters.front().getLowerBound(), source,
@@ -1844,21 +1845,20 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   kernel.walk([&](neura::LoadIndexedOp candidate) {
     load = candidate;
     ++loads;
-    auto inputIndex = parseKernelInputReference(candidate->getAttr("lhs_value"));
-    badMemory |=
-        (!inputIndex || *inputIndex != 0) ||
-        (candidate.getBase() && candidate.getBase() != kernelInput) ||
-        candidate.getIndices().size() != 2;
+    auto inputIndex =
+        parseKernelInputReference(candidate->getAttr("lhs_value"));
+    badMemory |= (!inputIndex || *inputIndex != 0) ||
+                 (candidate.getBase() && candidate.getBase() != kernelInput) ||
+                 candidate.getIndices().size() != 2;
   });
   kernel.walk([&](neura::StoreIndexedOp candidate) {
     store = candidate;
     ++stores;
     auto outputIndex =
         parseKernelInputReference(candidate->getAttr("rhs_value"));
-    badMemory |=
-        (!outputIndex || *outputIndex != 4) ||
-        (candidate.getBase() && candidate.getBase() != kernelOutput) ||
-        candidate.getIndices().size() != 1;
+    badMemory |= (!outputIndex || *outputIndex != 4) ||
+                 (candidate.getBase() && candidate.getBase() != kernelOutput) ||
+                 candidate.getIndices().size() != 1;
   });
   kernel.walk([&](Operation *operation) {
     if (operation == kernel.getOperation())
@@ -1867,10 +1867,10 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
     if (name == "neura.counter" || name == "neura.reserve" ||
         name == "neura.phi" || name == "neura.ctrl_mov" ||
         name == "neura.grant_predicate" || name == "neura.constant" ||
-        name == "neura.cast" || name == "neura.icmp" ||
-        name == "neura.not" || name == "neura.add" ||
-        name == "neura.div" || name == "neura.load_indexed" ||
-        name == "neura.store_indexed" || name == "neura.yield")
+        name == "neura.cast" || name == "neura.icmp" || name == "neura.not" ||
+        name == "neura.add" || name == "neura.div" ||
+        name == "neura.load_indexed" || name == "neura.store_indexed" ||
+        name == "neura.yield")
       return;
     badMemory = true;
   });
@@ -1898,8 +1898,7 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   auto isReserve = [&](Value value) { return isNamed(value, "neura.reserve"); };
   auto isFoldedKernelInput = [](Value value, unsigned index) {
     Operation *definition = value ? value.getDefiningOp() : nullptr;
-    if (!definition || definition->getName().getStringRef() !=
-                           "neura.constant")
+    if (!definition || definition->getName().getStringRef() != "neura.constant")
       return false;
     return parseKernelInputReference(definition->getAttr("value")) ==
            std::optional<unsigned>(index);
@@ -1960,9 +1959,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   if (!rangePhiOp || rangePhiOp->getName().getStringRef() != "neura.phi" ||
       rangePhiOp->getNumOperands() != 2 ||
       !isReserve(rangePhiOp->getOperand(0)))
-    return rejectRadar(source,
-                       "Radar producer range index lacks a reserve/phi "
-                       "initialization");
+    return rejectRadar(source, "Radar producer range index lacks a reserve/phi "
+                               "initialization");
   auto initialCast = rangePhiOp->getOperand(1).getDefiningOp();
   auto initialConstant = initialCast && initialCast->getNumOperands() == 1
                              ? initialCast->getOperand(0).getDefiningOp()
@@ -1973,7 +1971,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   if (!initialCast || initialCast->getName().getStringRef() != "neura.cast" ||
       initialCast->getAttrOfType<StringAttr>("cast_type") == nullptr ||
       initialCast->getAttrOfType<StringAttr>("cast_type").getValue() !=
-          "index_to_int" || !initialConstant ||
+          "index_to_int" ||
+      !initialConstant ||
       initialConstant->getName().getStringRef() != "neura.constant" || !zero ||
       zero.getInt() != 0)
     return rejectRadar(source,
@@ -1990,8 +1989,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
     return rejectRadar(source,
                        "Radar producer range predicate is not input1-bounded");
   auto storePredicate = storeOuter->getOperand(1).getDefiningOp();
-  if (!storePredicate || storePredicate->getName().getStringRef() !=
-                             "neura.not" ||
+  if (!storePredicate ||
+      storePredicate->getName().getStringRef() != "neura.not" ||
       storePredicate->getNumOperands() != 1 ||
       storePredicate->getOperand(0) != predicate)
     return rejectRadar(source,
@@ -2036,7 +2035,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
   Value rangeReserve = rangePhiOp->getOperand(0);
   Value accumulatorReserve = accumulatorPhi.getDefiningOp()->getOperand(0);
   unsigned feedbackCount = 0;
-  bool outerFeedback = false, rangeFeedback = false, accumulatorFeedback = false;
+  bool outerFeedback = false, rangeFeedback = false,
+       accumulatorFeedback = false;
   for (Operation &operation : kernelBody) {
     if (operation.getName().getStringRef() != "neura.ctrl_mov")
       continue;
@@ -2053,8 +2053,8 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
       continue;
     }
     Operation *cast = from.getDefiningOp();
-    auto castType = cast ? cast->getAttrOfType<StringAttr>("cast_type")
-                         : StringAttr();
+    auto castType =
+        cast ? cast->getAttrOfType<StringAttr>("cast_type") : StringAttr();
     if (to == rangeReserve && cast &&
         cast->getName().getStringRef() == "neura.cast" &&
         cast->getNumOperands() == 1 && castType &&
@@ -2063,18 +2063,17 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
       rangeFeedback = true;
       continue;
     }
-    return rejectRadar(source,
-                       "Radar producer feedback crosses its proved local state");
+    return rejectRadar(
+        source, "Radar producer feedback crosses its proved local state");
   }
   if (feedbackCount != 3 || !outerFeedback || !rangeFeedback ||
       !accumulatorFeedback)
-    return rejectRadar(source,
-                       "Radar producer feedback does not cover each local state");
+    return rejectRadar(
+        source, "Radar producer feedback does not cover each local state");
   Operation *divide = store.getValue().getDefiningOp();
-  Operation *finalAccumulator =
-      divide && divide->getNumOperands() == 1
-          ? divide->getOperand(0).getDefiningOp()
-          : nullptr;
+  Operation *finalAccumulator = divide && divide->getNumOperands() == 1
+                                    ? divide->getOperand(0).getDefiningOp()
+                                    : nullptr;
   if (!divide || divide->getName().getStringRef() != "neura.div" ||
       parseKernelInputReference(divide->getAttr("rhs_value")) !=
           std::optional<unsigned>(3) ||
@@ -2083,15 +2082,15 @@ validateRadarNormalizedProducer(func::FuncOp function, TaskflowTaskOp source,
       finalAccumulator->getNumOperands() != 2 ||
       finalAccumulator->getOperand(0) != accumulatorPhi ||
       finalAccumulator->getOperand(1) != storeOuter->getOperand(1))
-    return rejectRadar(source,
-                       "Radar producer store is not the completed row accumulator");
+    return rejectRadar(
+        source, "Radar producer store is not the completed row accumulator");
   return consumer;
 }
 
-
 static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
-                                              TaskflowTaskOp source,
-                                              int64_t axis, int64_t replicas) {
+                                                        TaskflowTaskOp source,
+                                                        int64_t axis,
+                                                        int64_t replicas) {
   FailureOr<TaskflowTaskOp> validated =
       validateRadarNormalizedProducer(function, source, axis, replicas);
   if (failed(validated))
@@ -2112,7 +2111,8 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
     replica->setAttr("amoeba.replica.parent_task",
                      builder.getStringAttr(sourceName));
     replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(replicaId));
-    replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+    replica->setAttr("amoeba.replica.count",
+                     builder.getI64IntegerAttr(replicas));
     replica->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
     replica->setAttr("amoeba.replica.shard_lower",
                      builder.getI64IntegerAttr(lower));
@@ -2161,8 +2161,9 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
     clonedCounters[0].setCounterDynamismAttr(
         builder.getStringAttr("constant_bound"));
     SmallVector<neura::CounterOp> clonedNeuraCounters;
-    clonedKernel.walk(
-        [&](neura::CounterOp counter) { clonedNeuraCounters.push_back(counter); });
+    clonedKernel.walk([&](neura::CounterOp counter) {
+      clonedNeuraCounters.push_back(counter);
+    });
     for (neura::CounterOp counter : clonedNeuraCounters) {
       auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
       if (!id || id.getInt() != 0)
@@ -2192,8 +2193,7 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
     // materialization and shard it consistently.
     if (source->hasAttr("trip_count")) {
       int64_t shardTripCount = (upper - lower) * rangeBins;
-      replica->setAttr("trip_count",
-                       builder.getI64IntegerAttr(shardTripCount));
+      replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
       if (replica->getAttrOfType<IntegerAttr>("amoeba.selected_trip_count"))
         replica->setAttr("amoeba.selected_trip_count",
                          builder.getI64IntegerAttr(shardTripCount));
@@ -2207,16 +2207,17 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
   auto outputType = cast<MemRefType>(source.getWillWrites().front().getType());
   SmallVector<int64_t> outputShape;
   if (outputType.hasStaticShape())
-    outputShape.append(outputType.getShape().begin(), outputType.getShape().end());
+    outputShape.append(outputType.getShape().begin(),
+                       outputType.getShape().end());
   else
     outputShape = {chirps};
-  auto staticOutputType = MemRefType::get(
-      outputShape, outputType.getElementType(), outputType.getLayout(),
-      outputType.getMemorySpace());
+  auto staticOutputType =
+      MemRefType::get(outputShape, outputType.getElementType(),
+                      outputType.getLayout(), outputType.getMemorySpace());
   Value outputStorage = source.getWillWrites().front();
   if (outputStorage.getType() != staticOutputType) {
     if (!memref::CastOp::areCastCompatible({outputStorage.getType()},
-                                            {staticOutputType}))
+                                           {staticOutputType}))
       return rejectRadar(source,
                          "Radar producer output has no compatible static "
                          "completion view");
@@ -2231,7 +2232,7 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
       continue;
     }
     if (!memref::CastOp::areCastCompatible({state.getType()},
-                                            {staticOutputType}))
+                                           {staticOutputType}))
       return rejectRadar(source,
                          "Radar producer replica state has no compatible "
                          "static completion view");
@@ -2250,20 +2251,19 @@ static LogicalResult materializeRadarNormalizedProducer(func::FuncOp function,
     replacement = builder.create<memref::CastOp>(
         source.getLoc(), source.getDoneWrites().front().getType(), replacement);
   source.getDoneWrites().front().replaceAllUsesWith(replacement);
-  if (failed(makeConsumerTensorWideForReplicas(consumer, replacement,
-                                               sourceName, builder, replicas,
-                                               true)))
+  if (failed(makeConsumerTensorWideForReplicas(
+          consumer, replacement, sourceName, builder, replicas, true)))
     return failure();
   source.erase();
   function->setAttr("amoeba.replica.materialized_task",
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
   function->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
-  const int64_t canonicalTripCount = sourceHasExplicitTripCount
-                                         ? chirps * rangeBins
-                                         : chirps;
+  const int64_t canonicalTripCount =
+      sourceHasExplicitTripCount ? chirps * rangeBins : chirps;
   function->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(canonicalTripCount));
   function->setAttr("amoeba.replica.shard_trip_count",
@@ -2291,7 +2291,8 @@ static bool hasRadarLegacyAbi(TaskflowTaskOp source) {
       kernel.getIterArgsInit().size() != 1)
     return false;
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   return neuraCounters.size() == 2;
 }
 
@@ -2315,7 +2316,8 @@ static bool hasRadarNormalizedAbi(TaskflowTaskOp source) {
       !kernel || !kernel.getIterArgsInit().empty())
     return false;
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   return neuraCounters.size() == 1;
 }
 
@@ -2350,9 +2352,8 @@ validateLlamaSourceProducer(func::FuncOp function, TaskflowTaskOp source,
                        "divide the 320-row M domain");
   if (auto dlp = source->getAttrOfType<BoolAttr>("dlp_replicable");
       dlp && !dlp.getValue())
-    return rejectLlama(source,
-                       "source LLaMA replica rejected explicit "
-                       "dlp_replicable=false");
+    return rejectLlama(source, "source LLaMA replica rejected explicit "
+                               "dlp_replicable=false");
   auto incoming = source->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr);
   if (!incoming || !incoming.empty())
     return rejectLlama(source,
@@ -2551,7 +2552,8 @@ validateLlamaSourceProducer(func::FuncOp function, TaskflowTaskOp source,
 
 static LogicalResult materializeLlamaSourceProducer(func::FuncOp function,
                                                     TaskflowTaskOp source,
-                                                    int64_t axis, int64_t replicas) {
+                                                    int64_t axis,
+                                                    int64_t replicas) {
   FailureOr<TaskflowTaskOp> validated =
       validateLlamaSourceProducer(function, source, axis, replicas);
   if (failed(validated))
@@ -2573,7 +2575,8 @@ static LogicalResult materializeLlamaSourceProducer(func::FuncOp function,
     replica->setAttr("amoeba.replica.parent_task",
                      builder.getStringAttr(sourceName));
     replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(replicaId));
-    replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+    replica->setAttr("amoeba.replica.count",
+                     builder.getI64IntegerAttr(replicas));
     replica->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
     replica->setAttr("amoeba.replica.shard_lower",
                      builder.getI64IntegerAttr(lower));
@@ -2582,8 +2585,7 @@ static LogicalResult materializeLlamaSourceProducer(func::FuncOp function,
     replica->setAttr("amoeba.semantic.M_range",
                      builder.getDenseI64ArrayAttr({lower, upper}));
     const int64_t shardTripCount = (upper - lower) * hidden * reduction;
-    replica->setAttr("trip_count",
-                     builder.getI64IntegerAttr(shardTripCount));
+    replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
     replica->setAttr("amoeba.selected_trip_count",
                      builder.getI64IntegerAttr(shardTripCount));
     replica->removeAttr(kSemanticIncomingEdgesAttr);
@@ -2618,22 +2620,22 @@ static LogicalResult materializeLlamaSourceProducer(func::FuncOp function,
   join->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
   join->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
   source.getDoneWrites().front().replaceAllUsesWith(join.getJoined());
-  if (failed(makeConsumerTensorWideForReplicas(consumer, join.getJoined(),
-                                               sourceName, builder, replicas,
-                                               true)))
+  if (failed(makeConsumerTensorWideForReplicas(
+          consumer, join.getJoined(), sourceName, builder, replicas, true)))
     return failure();
   source.erase();
   function->setAttr("amoeba.replica.materialized_task",
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
   function->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(0));
   function->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(seqLen * hidden * reduction));
-  function->setAttr("amoeba.replica.shard_trip_count",
-                    builder.getI64IntegerAttr((seqLen / replicas) * hidden *
-                                               reduction));
+  function->setAttr(
+      "amoeba.replica.shard_trip_count",
+      builder.getI64IntegerAttr((seqLen / replicas) * hidden * reduction));
   return success();
 }
 
@@ -2684,7 +2686,6 @@ static bool isPrivateLlamaProducerRead(Value input, Value original,
       return false;
   return true;
 }
-
 
 // A replicated canonical producer publishes one completion-only join for its
 // original private output.  The join is a storage-preserving barrier: it
@@ -2737,28 +2738,28 @@ static bool isLlamaCompletionJoinRead(Value input, Value original,
   int64_t replicaCount = -1;
   for (Value state : join.getTileStates()) {
     auto replica = state.getDefiningOp<TaskflowTaskOp>();
-    auto parent = replica
-                      ? replica->getAttrOfType<StringAttr>(
-                            "amoeba.replica.parent_task")
-                      : StringAttr();
-    auto id = replica ? replica->getAttrOfType<IntegerAttr>(
-                            "amoeba.replica.id")
+    auto parent =
+        replica
+            ? replica->getAttrOfType<StringAttr>("amoeba.replica.parent_task")
+            : StringAttr();
+    auto id = replica ? replica->getAttrOfType<IntegerAttr>("amoeba.replica.id")
                       : IntegerAttr();
-    auto count = replica ? replica->getAttrOfType<IntegerAttr>(
-                              "amoeba.replica.count")
-                         : IntegerAttr();
-    auto axis = replica ? replica->getAttrOfType<IntegerAttr>(
-                             "amoeba.replica.shard_axis")
-                        : IntegerAttr();
+    auto count =
+        replica ? replica->getAttrOfType<IntegerAttr>("amoeba.replica.count")
+                : IntegerAttr();
+    auto axis =
+        replica
+            ? replica->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis")
+            : IntegerAttr();
     if (!replica || !llvm::is_contained(replica.getDoneWrites(), state) ||
         replica.getWillWrites().size() != 1 ||
         replica.getWillWrites().front() != original ||
         replica.getOriginalWriteMemrefs().size() != 1 ||
         replica.getOriginalWriteMemrefs().front() != original ||
         !replica.getDoneReads().empty() || !replica.getValueOutputs().empty() ||
-        llvm::is_contained(replica.getWillReads(), original) || !parent || !id ||
-        !count || !axis || parent.getValue().empty() || id.getInt() < 0 ||
-        id.getInt() >= static_cast<int64_t>(stateCount) ||
+        llvm::is_contained(replica.getWillReads(), original) || !parent ||
+        !id || !count || !axis || parent.getValue().empty() ||
+        id.getInt() < 0 || id.getInt() >= static_cast<int64_t>(stateCount) ||
         axis.getInt() != static_cast<int64_t>(join.getAxis()) ||
         !replicaIds.insert(id.getInt()).second)
       return false;
@@ -2816,9 +2817,9 @@ static bool isLlamaCompletionJoinRead(Value input, Value original,
 // that fanout only when it is the complete, source-owned replica set and all
 // of those consumers are covered by one verified completion join.  This
 // keeps a second writer, an alias, or an incomplete replica set fail-closed.
-static bool collectLlamaProducerConsumers(
-    TaskflowTaskOp source, Value output,
-    SmallVectorImpl<TaskflowTaskOp> &consumers) {
+static bool
+collectLlamaProducerConsumers(TaskflowTaskOp source, Value output,
+                              SmallVectorImpl<TaskflowTaskOp> &consumers) {
   if (source.getDoneWrites().size() != 1)
     return false;
   Value produced = source.getDoneWrites().front();
@@ -2855,12 +2856,13 @@ static bool collectLlamaProducerConsumers(
   Value consumerBase;
   llvm::SmallDenseSet<Value, 8> consumerStates;
   for (TaskflowTaskOp consumer : consumers) {
-    auto parent = consumer->getAttrOfType<StringAttr>(
-        "amoeba.replica.parent_task");
+    auto parent =
+        consumer->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
     auto id = consumer->getAttrOfType<IntegerAttr>("amoeba.replica.id");
     auto count = consumer->getAttrOfType<IntegerAttr>("amoeba.replica.count");
     if (!parent || !id || !count || parent.getValue() != "Task_3" ||
-        id.getInt() < 0 || id.getInt() >= static_cast<int64_t>(consumers.size()) ||
+        id.getInt() < 0 ||
+        id.getInt() >= static_cast<int64_t>(consumers.size()) ||
         !replicaIds.insert(id.getInt()).second ||
         consumer.getDoneWrites().size() != 1 ||
         consumer.getWillWrites().size() != 1 ||
@@ -2914,8 +2916,7 @@ static bool collectLlamaProducerConsumers(
   // The consumer output root must not be written or aliased by an operation
   // outside the complete replica set and its completion join.
   for (Operation *owner : consumerBase.getUsers()) {
-    if (owner == completionJoin.getOperation() ||
-        isa<memref::DeallocOp>(owner))
+    if (owner == completionJoin.getOperation() || isa<memref::DeallocOp>(owner))
       continue;
     auto task = dyn_cast<TaskflowTaskOp>(owner);
     if (task && llvm::is_contained(consumers, task) &&
@@ -2936,15 +2937,14 @@ static bool collectLlamaProducerConsumers(
   }
   for (OpOperand &use : completionJoin.getJoined().getUses()) {
     auto downstream = dyn_cast<TaskflowTaskOp>(use.getOwner());
-    if (!downstream || !llvm::is_contained(downstream.getWillReads(),
-                                           completionJoin.getJoined()) ||
+    if (!downstream ||
+        !llvm::is_contained(downstream.getWillReads(),
+                            completionJoin.getJoined()) ||
         llvm::is_contained(downstream.getWillWrites(), consumerBase))
       return false;
   }
   return true;
 }
-
-
 
 // Converted Neura DFGs may carry a memory base through data-movement and
 // predicate operations, or fold it into lhs_value/rhs_value as %inputN. Walk
@@ -2979,8 +2979,8 @@ static std::optional<unsigned> traceKernelInput(Value value,
   return traceKernelInput(value, kernel, visited);
 }
 
-static std::optional<unsigned>
-getFoldedKernelInput(Operation *operation, StringRef attributeName) {
+static std::optional<unsigned> getFoldedKernelInput(Operation *operation,
+                                                    StringRef attributeName) {
   return parseKernelInputReference(operation->getAttr(attributeName));
 }
 
@@ -3000,9 +3000,8 @@ static bool isLlamaInternalDFGOp(Operation *operation) {
   return name == "neura.constant" || name == "neura.counter" ||
          name == "neura.grant_once" || name == "neura.reserve" ||
          name == "neura.phi_start" || name == "neura.phi" ||
-         name == "neura.icmp" ||
-         name == "neura.grant_predicate" || name == "neura.mul" ||
-         name == "neura.not" || name == "neura.add" ||
+         name == "neura.icmp" || name == "neura.grant_predicate" ||
+         name == "neura.mul" || name == "neura.not" || name == "neura.add" ||
          name == "neura.ctrl_mov" || name == "neura.extract_predicate" ||
          name == "neura.return_value";
 }
@@ -3012,8 +3011,7 @@ static bool isLlamaInternalDFGOp(Operation *operation) {
 // well-typed, attribute-free form emitted by the canonical kernel conversion.
 // Requiring the definition and use to stay in the kernel's single body block
 // keeps this special case from forwarding values across region/control edges.
-static bool isLlamaIdentityDataMove(Operation *operation,
-                                    Block &kernelBody) {
+static bool isLlamaIdentityDataMove(Operation *operation, Block &kernelBody) {
   if (!isa<neura::DataMovOp>(operation) ||
       operation->getBlock() != &kernelBody ||
       operation->getNumOperands() != 1 || operation->getNumResults() != 1 ||
@@ -3059,9 +3057,10 @@ static bool isReplicaOutputCoordinate(Value value, neura::CounterOp counter,
   return false;
 }
 
-static FailureOr<TaskflowTaskOp>
-validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
-                      int64_t axis, int64_t replicas) {
+static FailureOr<TaskflowTaskOp> validateLlamaProducer(func::FuncOp function,
+                                                       TaskflowTaskOp source,
+                                                       int64_t axis,
+                                                       int64_t replicas) {
   if (axis < 0 || axis > 1)
     return rejectLlama(source,
                        "canonical LLaMA replica supports only the M or N axis");
@@ -3072,24 +3071,21 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   // each complete Neura DFG, while only the independent M domain is split.
   // Therefore an absent generic dlp_replicable tag is expected here. If a
   // caller supplied an explicit negative tag, preserve fail-closed behavior.
-  if (auto dlp = source->getAttrOfType<BoolAttr>("dlp_replicable"); dlp &&
-      !dlp.getValue())
-    return rejectLlama(source,
-                       "LLaMA Task_0 replica rejected explicit "
-                       "dlp_replicable=false");
+  if (auto dlp = source->getAttrOfType<BoolAttr>("dlp_replicable");
+      dlp && !dlp.getValue())
+    return rejectLlama(source, "LLaMA Task_0 replica rejected explicit "
+                               "dlp_replicable=false");
   auto partitionable =
       source->getAttrOfType<DenseI32ArrayAttr>("dlp_partitionable_counter_ids");
-  if (partitionable &&
-      (partitionable.asArrayRef().size() != 2 ||
-       partitionable.asArrayRef()[0] != 0 ||
-       partitionable.asArrayRef()[1] != 1))
+  if (partitionable && (partitionable.asArrayRef().size() != 2 ||
+                        partitionable.asArrayRef()[0] != 0 ||
+                        partitionable.asArrayRef()[1] != 1))
     return rejectLlama(
         source,
         "LLaMA Task_0 has an invalid partitionable counter declaration; "
         "expected M/N counters [0, 1]");
 
-  if (source.getWillReads().size() != 2 ||
-      source.getWillWrites().size() != 1 ||
+  if (source.getWillReads().size() != 2 || source.getWillWrites().size() != 1 ||
       source.getOriginalReadMemrefs().size() != 2 ||
       source.getOriginalWriteMemrefs().size() != 1 ||
       source.getDoneReads().size() != 0 || source.getValueOutputs().size() != 0)
@@ -3097,10 +3093,9 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
                        "LLaMA Task_0 replica requires two reads, one write, "
                        "and no read or value outputs");
   if (source.getWillReads()[0] == source.getWillReads()[1] ||
-      source.getOriginalReadMemrefs()[0] ==
-          source.getOriginalReadMemrefs()[1])
-    return rejectLlama(source,
-                       "canonical LLaMA inputs must be distinct storage values");
+      source.getOriginalReadMemrefs()[0] == source.getOriginalReadMemrefs()[1])
+    return rejectLlama(
+        source, "canonical LLaMA inputs must be distinct storage values");
   for (auto [index, input] : llvm::enumerate(source.getWillReads()))
     if (!((source.getOriginalReadMemrefs()[index] == input &&
            isLlamaReadArgument(input, function)) ||
@@ -3119,9 +3114,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   if (body.getNumArguments() !=
       readCount + writeCount + source.getValueInputs().size())
     return rejectLlama(
-        source,
-        "LLaMA Task_0 body arguments do not match its Taskflow operand "
-        "segments");
+        source, "LLaMA Task_0 body arguments do not match its Taskflow operand "
+                "segments");
   Value taskRead0 = body.getArgument(0);
   Value taskRead1 = body.getArgument(1);
   Value taskOutput = body.getArgument(readCount);
@@ -3140,25 +3134,23 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   if (seqValueIndex == std::numeric_limits<unsigned>::max() ||
       zeroValueIndex == std::numeric_limits<unsigned>::max())
     return rejectLlama(
-        source,
-        "LLaMA Task_0 requires one index bound and one i32 initial "
-        "accumulator value input");
+        source, "LLaMA Task_0 requires one index bound and one i32 initial "
+                "accumulator value input");
   Value taskSeq = body.getArgument(readCount + writeCount + seqValueIndex);
   Value taskZero = body.getArgument(readCount + writeCount + zeroValueIndex);
   if (compileTimeIndex(source.getValueInputs()[zeroValueIndex], source) != 0)
-    return rejectLlama(source,
-                       "LLaMA Task_0 initial accumulator must be zero");
+    return rejectLlama(source, "LLaMA Task_0 initial accumulator must be zero");
 
   Value output = source.getWillWrites().front();
   auto outputType = dyn_cast<MemRefType>(output.getType());
   auto allocation = output.getDefiningOp<memref::AllocaOp>();
-  const int64_t logicalN =
-      outputType && outputType.hasStaticShape() && outputType.getRank() == 2 &&
-              outputType.getShape()[1] == 512
-          ? 320
-          : 256;
-  if (!outputType || !outputType.hasStaticShape() || outputType.getRank() != 2 ||
-      outputType.getShape()[0] != 512 ||
+  const int64_t logicalN = outputType && outputType.hasStaticShape() &&
+                                   outputType.getRank() == 2 &&
+                                   outputType.getShape()[1] == 512
+                               ? 320
+                               : 256;
+  if (!outputType || !outputType.hasStaticShape() ||
+      outputType.getRank() != 2 || outputType.getShape()[0] != 512 ||
       (outputType.getShape()[1] != 256 && outputType.getShape()[1] != 512) ||
       !allocation || source.getOriginalWriteMemrefs().front() != output ||
       llvm::is_contained(source.getOriginalReadMemrefs(), output) ||
@@ -3172,8 +3164,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
       !hasBalancedShards(shardExtent, replicas))
     return rejectLlama(source,
                        (Twine("canonical LLaMA replica factor must be 2, 4, "
-                              "or 8 and divide the ") + shardName +
-                        " domain")
+                              "or 8 and divide the ") +
+                        shardName + " domain")
                            .str());
   SmallVector<TaskflowTaskOp> consumers;
   if (!collectLlamaProducerConsumers(source, output, consumers))
@@ -3202,8 +3194,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   // completion-only replacement below.
   TaskflowTaskOp consumer = consumers.front();
   for (TaskflowTaskOp candidate : consumers)
-    if (auto incoming = candidate->getAttrOfType<ArrayAttr>(
-            kSemanticIncomingEdgesAttr))
+    if (auto incoming =
+            candidate->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr))
       for (Attribute edge : incoming)
         if (auto text = dyn_cast<StringAttr>(edge);
             text && text.getValue().contains("tile_local"))
@@ -3216,7 +3208,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
       auto task = dyn_cast<TaskflowTaskOp>(owner);
       if (!task || !llvm::is_contained(consumers, task))
         return rejectLlama(
-            source, "replica output has an additional storage alias or consumer");
+            source,
+            "replica output has an additional storage alias or consumer");
     }
 
   SmallVector<TaskflowCounterOp> counters;
@@ -3250,15 +3243,14 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
                        "LLaMA Task_0 counters must form an M/N/K parent chain");
   auto checkTaskCounter = [&](TaskflowCounterOp counter, int64_t upper,
                               StringRef name) -> LogicalResult {
-    if (constantIndex(counter.getLowerBound()) !=
-            std::optional<int64_t>(0) ||
+    if (constantIndex(counter.getLowerBound()) != std::optional<int64_t>(0) ||
         compileTimeIndex(counter.getUpperBound(), source) !=
             std::optional<int64_t>(upper) ||
         constantIndex(counter.getStep()) != std::optional<int64_t>(1))
       return rejectLlama(source, (Twine("LLaMA Task_0 ") + name +
                                   " counter is not a compile-time 0..bound "
                                   "unit-step domain")
-                                 .str());
+                                     .str());
     return success();
   };
   if (failed(checkTaskCounter(counters[0], 320, "M")) ||
@@ -3272,7 +3264,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
         "non-dead execution dependency");
 
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   if (neuraCounters.size() != 3)
     return rejectLlama(source,
                        "LLaMA Task_0 Neura kernel must contain complete M/N/K "
@@ -3294,11 +3287,11 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
                          "LLaMA Task_0 Neura counter IDs must be 0,1,2");
     int64_t expected = index == 0 ? 320 : (index == 1 ? logicalN : 256);
     if (compileTimeCounterBound(counter, "lower_bound_value",
-                                counter.getLowerBound(), source, kernel) !=
-            std::optional<int64_t>(0) ||
+                                counter.getLowerBound(), source,
+                                kernel) != std::optional<int64_t>(0) ||
         compileTimeCounterBound(counter, "upper_bound_value",
-                                counter.getUpperBound(), source, kernel) !=
-            std::optional<int64_t>(expected) ||
+                                counter.getUpperBound(), source,
+                                kernel) != std::optional<int64_t>(expected) ||
         compileTimeCounterBound(counter, "step_value", counter.getStep(),
                                 source, kernel) != std::optional<int64_t>(1))
       return rejectLlama(
@@ -3307,41 +3300,38 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   }
 
   SmallVector<Value> kernelRoles{taskOutput, taskRead0, taskRead1, taskSeq};
-  SmallVector<unsigned> roleInputIndices(
-      kernelRoles.size(), std::numeric_limits<unsigned>::max());
+  SmallVector<unsigned> roleInputIndices(kernelRoles.size(),
+                                         std::numeric_limits<unsigned>::max());
   for (auto [index, input] : llvm::enumerate(kernel.getInputs())) {
     auto role = llvm::find(kernelRoles, input);
     if (role != kernelRoles.end()) {
       unsigned roleIndex = role - kernelRoles.begin();
-      if (roleInputIndices[roleIndex] !=
-          std::numeric_limits<unsigned>::max())
+      if (roleInputIndices[roleIndex] != std::numeric_limits<unsigned>::max())
         return rejectLlama(source,
                            "LLaMA Task_0 Neura kernel repeats a Taskflow "
                            "operand");
       roleInputIndices[roleIndex] = index;
       continue;
     }
-    if (input != taskZero ||
-        llvm::count(kernel.getInputs(), taskZero) != 1)
+    if (input != taskZero || llvm::count(kernel.getInputs(), taskZero) != 1)
       return rejectLlama(
           source,
           "LLaMA Task_0 Neura kernel has an unexpected input outside its "
           "Taskflow operand roles");
   }
-  if (llvm::any_of(roleInputIndices, [](unsigned index) {
-        return index == std::numeric_limits<unsigned>::max();
-      }) ||
+  if (llvm::any_of(roleInputIndices,
+                   [](unsigned index) {
+                     return index == std::numeric_limits<unsigned>::max();
+                   }) ||
       kernel.getIterArgsInit().size() != 1 ||
       kernel.getIterArgsInit().front() != taskZero)
     return rejectLlama(
-        source,
-        "LLaMA Task_0 Neura kernel inputs must identify output, read0, "
-        "read1, seq, and the zero iter-arg initializer");
+        source, "LLaMA Task_0 Neura kernel inputs must identify output, read0, "
+                "read1, seq, and the zero iter-arg initializer");
   unsigned zeroInputCount = llvm::count(kernel.getInputs(), taskZero);
   if (zeroInputCount > 1 ||
       (zeroInputCount == 1 && kernel.getInputs().front() != taskZero) ||
-      (kernel.getInputs().size() != kernelRoles.size() &&
-       zeroInputCount != 1))
+      (kernel.getInputs().size() != kernelRoles.size() && zeroInputCount != 1))
     return rejectLlama(source,
                        "LLaMA Task_0 Neura kernel input ABI has an invalid "
                        "leading zero role");
@@ -3430,8 +3420,8 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   kernel.walk([&](Operation *operation) {
     if (operation == kernel.getOperation() ||
         isa<memref::LoadOp, memref::StoreOp, neura::LoadIndexedOp,
-            neura::StoreIndexedOp, scf::IfOp, scf::YieldOp,
-            neura::YieldOp>(operation) ||
+            neura::StoreIndexedOp, scf::IfOp, scf::YieldOp, neura::YieldOp>(
+            operation) ||
         isLlamaInternalDFGOp(operation))
       return;
     if (isa<neura::DataMovOp>(operation)) {
@@ -3445,13 +3435,13 @@ validateLlamaProducer(func::FuncOp function, TaskflowTaskOp source,
   });
   if (stores == 0 || !loadedRead0 || !loadedRead1 || unsafeMemory)
     return rejectLlama(
-        source,
-        (Twine("LLaMA ") + source.getTaskName() +
-         " Neura DFG must store only the private output and load both "
-         "read-only inputs")
-            .str());
+        source, (Twine("LLaMA ") + source.getTaskName() +
+                 " Neura DFG must store only the private output and load both "
+                 "read-only inputs")
+                    .str());
   if (unsafeOutputCoordinates)
-    return rejectLlama(source,
+    return rejectLlama(
+        source,
         "replica output stores do not preserve independent M/N cell ownership");
 
   return consumer;
@@ -3467,7 +3457,8 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
   SmallVector<TaskflowTaskOp> consumers;
   Value sourceOutput = source.getWillWrites().front();
   if (!collectLlamaProducerConsumers(source, sourceOutput, consumers))
-    return rejectLlama(source, "LLaMA producer consumers changed after validation");
+    return rejectLlama(source,
+                       "LLaMA producer consumers changed after validation");
   auto output = cast<MemRefType>(source.getWillWrites().front().getType());
   constexpr int64_t seqLen = 320;
   constexpr int64_t reduction = 256;
@@ -3488,7 +3479,8 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
     replica->setAttr("amoeba.replica.parent_task",
                      builder.getStringAttr(sourceName));
     replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(replicaId));
-    replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+    replica->setAttr("amoeba.replica.count",
+                     builder.getI64IntegerAttr(replicas));
     replica->setAttr("amoeba.replica.shard_axis",
                      builder.getI64IntegerAttr(axis));
     replica->setAttr("amoeba.replica.shard_lower",
@@ -3529,10 +3521,10 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
 
     TaskflowCounterOp selectedCounter = clonedCounters[axis];
     OpBuilder counterBuilder(selectedCounter);
-    Value lowerValue = counterBuilder.create<arith::ConstantIndexOp>(
-        source.getLoc(), lower);
-    Value upperValue = counterBuilder.create<arith::ConstantIndexOp>(
-        source.getLoc(), upper);
+    Value lowerValue =
+        counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(), lower);
+    Value upperValue =
+        counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(), upper);
     selectedCounter.getLowerBoundMutable().assign(lowerValue);
     selectedCounter.getUpperBoundMutable().assign(upperValue);
     selectedCounter.setCounterDynamismAttr(
@@ -3545,10 +3537,10 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
     // weakening the runtime domain.
     if (axis == 1) {
       OpBuilder mBoundBuilder(clonedCounters[0]);
-      Value fullMLower = mBoundBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), 0);
-      Value fullMUpper = mBoundBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), seqLen);
+      Value fullMLower =
+          mBoundBuilder.create<arith::ConstantIndexOp>(source.getLoc(), 0);
+      Value fullMUpper =
+          mBoundBuilder.create<arith::ConstantIndexOp>(source.getLoc(), seqLen);
       clonedCounters[0].getLowerBoundMutable().assign(fullMLower);
       clonedCounters[0].getUpperBoundMutable().assign(fullMUpper);
       clonedCounters[0].setCounterDynamismAttr(
@@ -3559,10 +3551,10 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
       // validation has already proved this value is exactly logicalN, so
       // replace only the cloned scaffold operand with that constant.
       OpBuilder nBoundBuilder(clonedCounters[1]);
-      Value fullNLower = nBoundBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), 0);
-      Value fullNUpper = nBoundBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), hidden);
+      Value fullNLower =
+          nBoundBuilder.create<arith::ConstantIndexOp>(source.getLoc(), 0);
+      Value fullNUpper =
+          nBoundBuilder.create<arith::ConstantIndexOp>(source.getLoc(), hidden);
       clonedCounters[1].getLowerBoundMutable().assign(fullNLower);
       clonedCounters[1].getUpperBoundMutable().assign(fullNUpper);
       clonedCounters[1].setCounterDynamismAttr(
@@ -3570,22 +3562,22 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
     }
 
     SmallVector<neura::CounterOp> clonedNeuraCounters;
-    clonedKernel.walk(
-        [&](neura::CounterOp counter) { clonedNeuraCounters.push_back(counter); });
+    clonedKernel.walk([&](neura::CounterOp counter) {
+      clonedNeuraCounters.push_back(counter);
+    });
     for (neura::CounterOp counter : clonedNeuraCounters) {
       auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
       if (!id || id.getInt() != axis)
         continue;
       OpBuilder kernelBuilder =
           OpBuilder::atBlockBegin(&clonedKernel.getBody().front());
-      Value kernelLower = kernelBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), lower);
-      Value kernelUpper = kernelBuilder.create<arith::ConstantIndexOp>(
-          source.getLoc(), upper);
-      bool hasFoldedBounds =
-          counter->hasAttr("lower_bound_value") ||
-          counter->hasAttr("upper_bound_value") ||
-          counter->hasAttr("step_value");
+      Value kernelLower =
+          kernelBuilder.create<arith::ConstantIndexOp>(source.getLoc(), lower);
+      Value kernelUpper =
+          kernelBuilder.create<arith::ConstantIndexOp>(source.getLoc(), upper);
+      bool hasFoldedBounds = counter->hasAttr("lower_bound_value") ||
+                             counter->hasAttr("upper_bound_value") ||
+                             counter->hasAttr("step_value");
       counter.getLowerBoundMutable().assign(kernelLower);
       counter.getUpperBoundMutable().assign(kernelUpper);
       counter->setAttr("counter_dynamism",
@@ -3612,8 +3604,7 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
 
   auto join = builder.create<TaskflowJoinOp>(
       source.getLoc(), output, states, source.getWillWrites().front(),
-      builder.getI64IntegerAttr(axis),
-      builder.getDenseI64ArrayAttr({0, 0}),
+      builder.getI64IntegerAttr(axis), builder.getDenseI64ArrayAttr({0, 0}),
       builder.getDenseI64ArrayAttr({seqLen, hidden}));
   join->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
   join->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
@@ -3627,15 +3618,16 @@ static LogicalResult materializeLlamaProducer(func::FuncOp function,
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
   function->setAttr("amoeba.replica.shard_axis",
                     builder.getI64IntegerAttr(axis));
   function->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(seqLen * hidden * reduction));
-  function->setAttr("amoeba.replica.shard_trip_count",
-                    builder.getI64IntegerAttr(
-                        ((axis == 0 ? seqLen : hidden) / replicas) *
-                        (axis == 0 ? hidden : seqLen) * reduction));
+  function->setAttr(
+      "amoeba.replica.shard_trip_count",
+      builder.getI64IntegerAttr(((axis == 0 ? seqLen : hidden) / replicas) *
+                                (axis == 0 ? hidden : seqLen) * reduction));
   return success();
 }
 
@@ -3665,8 +3657,8 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
   if (reductionTripCount <= 0)
     return rejectGemm(source,
                       "GEMM producer needs a positive constant K trip count");
-  int64_t totalTripCount = output.getShape()[0] * output.getShape()[1] *
-                           reductionTripCount;
+  int64_t totalTripCount =
+      output.getShape()[0] * output.getShape()[1] * reductionTripCount;
   if (auto trip = source->getAttrOfType<IntegerAttr>("trip_count"))
     totalTripCount = trip.getInt();
   if (totalTripCount <= 0 || totalTripCount % replicas != 0)
@@ -3681,15 +3673,14 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
     auto replica = cast<TaskflowTaskOp>(builder.clone(*source.getOperation()));
     const auto [lower, upper] =
         balancedShardBounds(output.getShape()[axis], replicaId, replicas);
-    replica->setAttr(
-        "task_name",
-        builder.getStringAttr(sourceName + ".replica." +
-                              std::to_string(replicaId)));
+    replica->setAttr("task_name",
+                     builder.getStringAttr(sourceName + ".replica." +
+                                           std::to_string(replicaId)));
     replica->setAttr("amoeba.replica.parent_task",
                      builder.getStringAttr(sourceName));
-    replica->setAttr("amoeba.replica.id",
-                     builder.getI64IntegerAttr(replicaId));
-    replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+    replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(replicaId));
+    replica->setAttr("amoeba.replica.count",
+                     builder.getI64IntegerAttr(replicas));
     replica->setAttr("amoeba.replica.shard_axis",
                      builder.getI64IntegerAttr(axis));
     replica->setAttr("amoeba.replica.shard_lower",
@@ -3697,8 +3688,7 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
     replica->setAttr("amoeba.replica.shard_upper",
                      builder.getI64IntegerAttr(upper));
     if (source->getAttr("trip_count"))
-      replica->setAttr("trip_count",
-                       builder.getI64IntegerAttr(shardTripCount));
+      replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
     if (source->getAttr("amoeba.selected_trip_count"))
       replica->setAttr("amoeba.selected_trip_count",
                        builder.getI64IntegerAttr(shardTripCount));
@@ -3724,10 +3714,10 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
       if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
         clonedCounters.push_back(counter);
     OpBuilder counterBuilder(clonedCounters[axis]);
-    Value lowerValue = counterBuilder.create<arith::ConstantIndexOp>(
-        source.getLoc(), lower);
-    Value upperValue = counterBuilder.create<arith::ConstantIndexOp>(
-        source.getLoc(), upper);
+    Value lowerValue =
+        counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(), lower);
+    Value upperValue =
+        counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(), upper);
     clonedCounters[axis].getLowerBoundMutable().assign(lowerValue);
     clonedCounters[axis].getUpperBoundMutable().assign(upperValue);
     states.push_back(replica.getDoneWrites().front());
@@ -3737,8 +3727,8 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
       source.getLoc(), output, states, source.getWillWrites().front(),
       builder.getI64IntegerAttr(axis),
       builder.getDenseI64ArrayAttr(SmallVector<int64_t>(output.getRank(), 0)),
-      builder.getDenseI64ArrayAttr(
-          SmallVector<int64_t>(output.getShape().begin(), output.getShape().end())));
+      builder.getDenseI64ArrayAttr(SmallVector<int64_t>(
+          output.getShape().begin(), output.getShape().end())));
   join->setAttr("amoeba.semantic.completion_only", builder.getUnitAttr());
   join->setAttr("amoeba.replica.completion_only", builder.getUnitAttr());
   source.getDoneWrites().front().replaceAllUsesWith(join.getJoined());
@@ -3750,7 +3740,8 @@ static LogicalResult materializeGemmProducer(func::FuncOp function,
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
   function->setAttr("amoeba.replica.shard_axis",
                     builder.getI64IntegerAttr(axis));
   function->setAttr("amoeba.replica.total_trip_count",
@@ -3787,20 +3778,20 @@ struct ReplicaNeuraInPlacePlan {
   unsigned outputReadIndex = 0;
 };
 
-static LogicalResult rejectReplicaNeura(TaskflowTaskOp task,
-                                        StringRef reason) {
+static LogicalResult rejectReplicaNeura(TaskflowTaskOp task, StringRef reason) {
   task.emitError() << reason;
   return failure();
 }
 
-static std::optional<SmallVector<int64_t>>
-replicaCallerShape(Value value) {
+static std::optional<SmallVector<int64_t>> replicaCallerShape(Value value) {
   if (value.getDefiningOp<memref::AllocOp>() ||
       value.getDefiningOp<memref::AllocaOp>()) {
     auto type = dyn_cast<MemRefType>(value.getType());
     if (type && type.hasStaticShape() &&
-        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
-      return SmallVector<int64_t>(type.getShape().begin(), type.getShape().end());
+        llvm::all_of(type.getShape(),
+                     [](int64_t extent) { return extent > 0; }))
+      return SmallVector<int64_t>(type.getShape().begin(),
+                                  type.getShape().end());
     return std::nullopt;
   }
   auto argument = dyn_cast<BlockArgument>(value);
@@ -3809,8 +3800,8 @@ replicaCallerShape(Value value) {
   auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
   if (!function || argument.getOwner() != &function.getBody().front())
     return std::nullopt;
-  Attribute attribute = function.getArgAttr(
-      argument.getArgNumber(), "amoeba.logical_transfer_shape");
+  Attribute attribute = function.getArgAttr(argument.getArgNumber(),
+                                            "amoeba.logical_transfer_shape");
   if (!attribute)
     return std::nullopt;
   SmallVector<int64_t> shape;
@@ -3836,18 +3827,17 @@ static LogicalResult validateReplicaShape(Value value, MemRefType type,
   if (!contract || contract->size() != static_cast<size_t>(type.getRank()))
     return failure();
   for (auto [dimension, extent] : llvm::enumerate(*contract)) {
-    if (extent <= 0 ||
-        (!ShapedType::isDynamic(type.getDimSize(dimension)) &&
-         type.getDimSize(dimension) != extent))
+    if (extent <= 0 || (!ShapedType::isDynamic(type.getDimSize(dimension)) &&
+                        type.getDimSize(dimension) != extent))
       return failure();
   }
   shape.append(contract->begin(), contract->end());
   return success();
 }
 
-static std::optional<unsigned>
-replicaKernelInputIndex(neura::KernelOp kernel, TaskflowTaskOp task,
-                        Value root) {
+static std::optional<unsigned> replicaKernelInputIndex(neura::KernelOp kernel,
+                                                       TaskflowTaskOp task,
+                                                       Value root) {
   if (!kernel.getBody().hasOneBlock() || !task.getBody().hasOneBlock())
     return std::nullopt;
   Block &taskBody = task.getBody().front();
@@ -3867,8 +3857,8 @@ replicaKernelInputIndex(neura::KernelOp kernel, TaskflowTaskOp task,
 static std::optional<unsigned>
 replicaAccessInputIndex(Operation *operation, neura::KernelOp kernel,
                         StringRef foldedBaseAttribute, Value base) {
-  if (auto input = parseKernelInputReference(
-          operation->getAttr(foldedBaseAttribute)))
+  if (auto input =
+          parseKernelInputReference(operation->getAttr(foldedBaseAttribute)))
     return input;
   if (!base || !kernel.getBody().hasOneBlock())
     return std::nullopt;
@@ -3879,11 +3869,10 @@ replicaAccessInputIndex(Operation *operation, neura::KernelOp kernel,
   return std::nullopt;
 }
 
-static std::optional<Value>
-replicaKernelInputRoot(neura::KernelOp kernel, TaskflowTaskOp task,
-                       unsigned inputIndex) {
-  if (inputIndex >= kernel.getInputs().size() ||
-      !task.getBody().hasOneBlock())
+static std::optional<Value> replicaKernelInputRoot(neura::KernelOp kernel,
+                                                   TaskflowTaskOp task,
+                                                   unsigned inputIndex) {
+  if (inputIndex >= kernel.getInputs().size() || !task.getBody().hasOneBlock())
     return std::nullopt;
   Value input = kernel.getInputs()[inputIndex];
   for (Value root : task.getOriginalReadMemrefs())
@@ -3923,13 +3912,12 @@ replicaCounterIndex(Value value, ArrayRef<neura::CounterOp> counters,
   StringRef name = definition->getName().getStringRef();
   if (name == "neura.data_mov" && definition->getNumOperands() == 1)
     return replicaCounterIndex(definition->getOperand(0), counters, depth + 1);
-  if (name == "neura.grant_predicate" &&
-      definition->getNumOperands() == 2)
+  if (name == "neura.grant_predicate" && definition->getNumOperands() == 2)
     return replicaCounterIndex(definition->getOperand(0), counters, depth + 1);
   if (name != "neura.phi" || definition->getNumOperands() == 0)
     return std::nullopt;
-  auto first = replicaCounterIndex(definition->getOperand(0), counters,
-                                   depth + 1);
+  auto first =
+      replicaCounterIndex(definition->getOperand(0), counters, depth + 1);
   if (!first)
     return std::nullopt;
   for (Value operand : definition->getOperands().drop_front()) {
@@ -3958,8 +3946,8 @@ static bool replicaForwardsCounterIndex(Value value, Value expected,
 
 static bool replicaMentionsKernelInput(Operation *operation,
                                        unsigned inputIndex) {
-  for (StringRef attribute : {StringRef("lhs_value"),
-                              StringRef("rhs_value"), StringRef("value")})
+  for (StringRef attribute :
+       {StringRef("lhs_value"), StringRef("rhs_value"), StringRef("value")})
     if (auto input = parseKernelInputReference(operation->getAttr(attribute));
         input && *input == inputIndex)
       return true;
@@ -3990,10 +3978,9 @@ static bool replicaKnownPureNeuraOp(Operation *operation) {
          name == "neura.icmp" || name == "neura.grant_predicate" ||
          name == "neura.mul" || name == "neura.div" || name == "neura.add" ||
          name == "neura.sub" || name == "neura.cast" || name == "neura.not" ||
-         name == "neura.sel" ||
-         name == "neura.ctrl_mov" || name == "neura.data_mov" ||
-         name == "neura.extract_predicate" || name == "neura.return_value" ||
-         name == "neura.yield";
+         name == "neura.sel" || name == "neura.ctrl_mov" ||
+         name == "neura.data_mov" || name == "neura.extract_predicate" ||
+         name == "neura.return_value" || name == "neura.yield";
 }
 
 // A few converted kernels fold a memory argument into a typed neura.constant
@@ -4017,8 +4004,8 @@ static bool verifyFoldedOutputAddressUsers(
           grant->getNumResults() != 1 ||
           grant->getResult(0).getType() != expectedType ||
           !verifyFoldedOutputAddressUsers(grant->getResult(0), expectedType,
-                                           outputInput, rank, visited,
-                                           indexedUses))
+                                          outputInput, rank, visited,
+                                          indexedUses))
         return false;
       continue;
     }
@@ -4027,8 +4014,8 @@ static bool verifyFoldedOutputAddressUsers(
           owner->getNumResults() != 1 ||
           owner->getResult(0).getType() != expectedType ||
           !verifyFoldedOutputAddressUsers(owner->getResult(0), expectedType,
-                                           outputInput, rank, visited,
-                                           indexedUses))
+                                          outputInput, rank, visited,
+                                          indexedUses))
         return false;
       continue;
     }
@@ -4060,9 +4047,11 @@ static bool verifyFoldedOutputAddressUsers(
   return indexedUses != 0;
 }
 
-static bool authenticateFoldedOutputAddress(
-    Operation *operation, ReplicaNeuraInPlacePlan &plan, unsigned outputInput,
-    BlockArgument outputArgument, Value outputRoot, unsigned rank) {
+static bool authenticateFoldedOutputAddress(Operation *operation,
+                                            ReplicaNeuraInPlacePlan &plan,
+                                            unsigned outputInput,
+                                            BlockArgument outputArgument,
+                                            Value outputRoot, unsigned rank) {
   auto constant = dyn_cast<neura::ConstantOp>(operation);
   if (!constant || constant->getNumResults() != 1)
     return false;
@@ -4071,9 +4060,10 @@ static bool authenticateFoldedOutputAddress(
       outputInput >= plan.kernel.getInputs().size())
     return false;
 
-  auto constantType = dyn_cast<neura::PredicatedValue>(
-      constant->getResult(0).getType());
-  auto argumentType = dyn_cast<neura::PredicatedValue>(outputArgument.getType());
+  auto constantType =
+      dyn_cast<neura::PredicatedValue>(constant->getResult(0).getType());
+  auto argumentType =
+      dyn_cast<neura::PredicatedValue>(outputArgument.getType());
   Type abiType = plan.kernel.getInputs()[outputInput].getType();
   auto rootType = dyn_cast<MemRefType>(outputRoot.getType());
   if (!constantType || !argumentType || !rootType ||
@@ -4089,8 +4079,7 @@ static bool authenticateFoldedOutputAddress(
     return false;
   FailureOr<Value> outputStateRoot =
       resolveTaskflowMemoryRoot(plan.task.getWillWrites().front());
-  FailureOr<Value> originalOutputRoot =
-      resolveTaskflowMemoryRoot(outputRoot);
+  FailureOr<Value> originalOutputRoot = resolveTaskflowMemoryRoot(outputRoot);
   if (!authenticatedRoot || *authenticatedRoot != outputRoot ||
       failed(outputStateRoot) || failed(originalOutputRoot) ||
       *outputStateRoot != *originalOutputRoot ||
@@ -4256,8 +4245,7 @@ isVerifiedReplicaCounterZeroIf(scf::IfOp ifOp, ReplicaNeuraInPlacePlan &plan,
 }
 
 static LogicalResult
-proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
-                               Value output) {
+proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan, Value output) {
   auto outputType = dyn_cast<MemRefType>(output.getType());
   if (!outputType || outputType.getRank() < 1 || outputType.getRank() > 3)
     return rejectReplicaNeura(
@@ -4293,7 +4281,8 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
   if (outputInputCount != 1 ||
       *outputInput >= plan.kernel.getBody().front().getNumArguments())
     return rejectReplicaNeura(
-        plan.task, "in-place Neura replica requires one output kernel argument");
+        plan.task,
+        "in-place Neura replica requires one output kernel argument");
 
   Block &kernelBody = plan.kernel.getBody().front();
   BlockArgument outputArgument = kernelBody.getArgument(*outputInput);
@@ -4352,8 +4341,7 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
             "in-place Neura replica output accesses do not preserve the "
             "authenticated shard coordinate map");
     }
-    if (plan.axis < 0 ||
-        plan.axis >= static_cast<int64_t>(mapping.size()) ||
+    if (plan.axis < 0 || plan.axis >= static_cast<int64_t>(mapping.size()) ||
         mapping[plan.axis] == ReplicaOutputCoordinateProof::kConstantAxis)
       return rejectReplicaNeura(
           plan.task, "in-place Neura replica selected shard coordinate is not "
@@ -4384,7 +4372,8 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
       // Coordinate-local loads/stores alone do not prove independence when
       // a carried scalar can pass a value from one cell to the next.
       result = rejectReplicaNeura(
-          plan.task, "in-place Neura replica has unproved carried value feedback");
+          plan.task,
+          "in-place Neura replica has unproved carried value feedback");
       return;
     }
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
@@ -4471,7 +4460,8 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
     for (Value operand : operation->getOperands())
       if (replicaForwardsKernelArgument(operand, outputArgument)) {
         result = rejectReplicaNeura(
-            plan.task, "in-place Neura replica rejects an unknown output alias");
+            plan.task,
+            "in-place Neura replica rejects an unknown output alias");
         return;
       }
     auto conditional = dyn_cast<scf::IfOp>(operation);
@@ -4509,12 +4499,12 @@ proveReplicaNeuraInPlaceRegion(ReplicaNeuraInPlacePlan &plan,
     return failure();
   if (!sawLoad || !sawStore)
     return rejectReplicaNeura(
-        plan.task, "in-place Neura replica requires an indexed load/store pair");
+        plan.task,
+        "in-place Neura replica requires an indexed load/store pair");
   return success();
 }
 
-static LogicalResult
-synchronizeReplicaKernelInputs(neura::KernelOp kernel) {
+static LogicalResult synchronizeReplicaKernelInputs(neura::KernelOp kernel) {
   if (!kernel.getBody().hasOneBlock())
     return rejectReplicaNeura(
         kernel->getParentOfType<TaskflowTaskOp>(),
@@ -4543,8 +4533,8 @@ synchronizeReplicaKernelInputs(neura::KernelOp kernel) {
           uses.push_back(&use);
         argument.setType(expected);
         OpBuilder castBuilder = OpBuilder::atBlockBegin(&body);
-        Value oldView = castBuilder.create<memref::CastOp>(
-            kernel.getLoc(), original, argument);
+        Value oldView = castBuilder.create<memref::CastOp>(kernel.getLoc(),
+                                                           original, argument);
         for (OpOperand *use : uses)
           use->set(oldView);
       } else {
@@ -4556,8 +4546,8 @@ synchronizeReplicaKernelInputs(neura::KernelOp kernel) {
       return failure();
     if (!argument.use_empty())
       return failure();
-    argument.setType(neura::PredicatedValue::get(
-        kernel.getContext(), expected, payload.getPredicateType()));
+    argument.setType(neura::PredicatedValue::get(kernel.getContext(), expected,
+                                                 payload.getPredicateType()));
   }
   return success();
 }
@@ -4573,18 +4563,20 @@ static LogicalResult updateReplicaKernelBounds(neura::KernelOp kernel,
     return failure();
   for (auto [index, counter] : llvm::enumerate(counters)) {
     OpBuilder builder(counter);
-    Value lower = builder.create<arith::ConstantIndexOp>(kernel.getLoc(),
-                                                          lowers[index]);
-    Value upper = builder.create<arith::ConstantIndexOp>(kernel.getLoc(),
-                                                          uppers[index]);
+    Value lower =
+        builder.create<arith::ConstantIndexOp>(kernel.getLoc(), lowers[index]);
+    Value upper =
+        builder.create<arith::ConstantIndexOp>(kernel.getLoc(), uppers[index]);
     counter.getLowerBoundMutable().assign(lower);
     counter.getUpperBoundMutable().assign(upper);
     counter.getStepMutable().assign(
         builder.create<arith::ConstantIndexOp>(kernel.getLoc(), 1));
     if (counter->hasAttr("lower_bound_value"))
-      counter->setAttr("lower_bound_value", builder.getIndexAttr(lowers[index]));
+      counter->setAttr("lower_bound_value",
+                       builder.getIndexAttr(lowers[index]));
     if (counter->hasAttr("upper_bound_value"))
-      counter->setAttr("upper_bound_value", builder.getIndexAttr(uppers[index]));
+      counter->setAttr("upper_bound_value",
+                       builder.getIndexAttr(uppers[index]));
     if (counter->hasAttr("step_value"))
       counter->setAttr("step_value", builder.getIndexAttr(1));
     if (counter->hasAttr("counter_dynamism"))
@@ -4608,9 +4600,9 @@ static void copyReplicaTaskAttributes(TaskflowTaskOp source,
 }
 
 static FailureOr<TaskflowTaskOp>
-createReplicaNeuraPart(OpBuilder &builder,
-                       const ReplicaNeuraInPlacePlan &plan, int64_t part,
-                       int64_t lower, int64_t upper, Value outputStorage) {
+createReplicaNeuraPart(OpBuilder &builder, const ReplicaNeuraInPlacePlan &plan,
+                       int64_t part, int64_t lower, int64_t upper,
+                       Value outputStorage) {
   TaskflowTaskOp source = plan.task;
   std::string name =
       (Twine(source.getTaskName()) + ".replica." + Twine(part)).str();
@@ -4643,8 +4635,8 @@ createReplicaNeuraPart(OpBuilder &builder,
   for (auto [index, operand] : llvm::enumerate(source->getOperands())) {
     if (index >= sourceBody.getNumArguments())
       break;
-    BlockArgument argument =
-        body->addArgument(partTask->getOperand(index).getType(), source.getLoc());
+    BlockArgument argument = body->addArgument(
+        partTask->getOperand(index).getType(), source.getLoc());
     mapping.map(sourceBody.getArgument(index), argument);
   }
   Operation *terminator = sourceBody.getTerminator();
@@ -4680,10 +4672,10 @@ createReplicaNeuraPart(OpBuilder &builder,
     OpBuilder counterBuilder(counter);
     counter.getLowerBoundMutable().assign(
         counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(),
-                                                       taskLowers[index]));
+                                                      taskLowers[index]));
     counter.getUpperBoundMutable().assign(
         counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(),
-                                                       taskUppers[index]));
+                                                      taskUppers[index]));
     counter.getStepMutable().assign(
         counterBuilder.create<arith::ConstantIndexOp>(source.getLoc(), 1));
     counter->setAttr("counter_dynamism",
@@ -4725,22 +4717,22 @@ createReplicaNeuraPart(OpBuilder &builder,
   for (std::optional<int64_t> constant : plan.outputConstantAxes)
     outputConstantAxes.push_back(
         constant ? *constant : std::numeric_limits<int64_t>::min());
-  if (llvm::any_of(plan.outputConstantAxes,
-                   [](std::optional<int64_t> value) {
-                     return value.has_value();
-                   }))
+  if (llvm::any_of(plan.outputConstantAxes, [](std::optional<int64_t> value) {
+        return value.has_value();
+      }))
     partTask->setAttr("amoeba.replica.output_constant_axes",
                       builder.getDenseI64ArrayAttr(outputConstantAxes));
   partTask->setAttr("amoeba.replica.shard_lower",
                     builder.getI64IntegerAttr(lower));
   partTask->setAttr("amoeba.replica.shard_upper",
                     builder.getI64IntegerAttr(upper));
-  partTask->setAttr("trip_count",
-                    builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
+  partTask->setAttr("trip_count", builder.getI64IntegerAttr(
+                                      plan.totalTripCount / plan.factor));
   partTask->setAttr("amoeba.replica.total_trip_count",
                     builder.getI64IntegerAttr(plan.totalTripCount));
-  partTask->setAttr("amoeba.replica.shard_trip_count",
-                    builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
+  partTask->setAttr(
+      "amoeba.replica.shard_trip_count",
+      builder.getI64IntegerAttr(plan.totalTripCount / plan.factor));
   partTask->removeAttr(kSemanticIncomingEdgesAttr);
   partTask->removeAttr("amoeba.tiling.parent_task");
   SmallVector<int64_t> regionLower(plan.producedLowers.begin(),
@@ -4751,8 +4743,8 @@ createReplicaNeuraPart(OpBuilder &builder,
     return failure();
   SmallVector<int64_t> regionUpper(regionLower);
   for (auto [dimension, extent] : llvm::enumerate(plan.producedShape)) {
-    if (extent <= 0 || regionLower[dimension] >
-                           std::numeric_limits<int64_t>::max() - extent)
+    if (extent <= 0 ||
+        regionLower[dimension] > std::numeric_limits<int64_t>::max() - extent)
       return failure();
     regionUpper[dimension] = regionLower[dimension] + extent;
   }
@@ -4775,8 +4767,8 @@ createReplicaNeuraPart(OpBuilder &builder,
     } else {
       inputLowers.push_back(builder.getUnitAttr());
       inputUppers.push_back(builder.getUnitAttr());
-      inputReasons.push_back(builder.getStringAttr(
-          "replica-auxiliary-input-region-unknown"));
+      inputReasons.push_back(
+          builder.getStringAttr("replica-auxiliary-input-region-unknown"));
     }
   }
   partTask->setAttr(kTilingInputRegionLowersAttr,
@@ -4794,12 +4786,13 @@ createReplicaNeuraPart(OpBuilder &builder,
   return partTask;
 }
 
-static FailureOr<unsigned>
-getReadInputIndexForResult(TaskflowTaskOp task, unsigned resultIndex) {
+static FailureOr<unsigned> getReadInputIndexForResult(TaskflowTaskOp task,
+                                                      unsigned resultIndex) {
   if (!task || !task.getBody().hasOneBlock() ||
       resultIndex >= task.getDoneReads().size())
     return failure();
-  auto yield = dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
+  auto yield =
+      dyn_cast<TaskflowYieldOp>(task.getBody().front().getTerminator());
   if (!yield || resultIndex >= yield.getDoneReads().size())
     return failure();
   auto argument = dyn_cast<BlockArgument>(yield.getDoneReads()[resultIndex]);
@@ -4814,8 +4807,8 @@ getReadInputIndexForResult(TaskflowTaskOp task, unsigned resultIndex) {
 
 static FailureOr<ReplicaNeuraInPlacePlan>
 analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
-  if (!task || !task.getBody().hasOneBlock() ||
-      task.getWillReads().empty() || task.getWillWrites().size() != 1 ||
+  if (!task || !task.getBody().hasOneBlock() || task.getWillReads().empty() ||
+      task.getWillWrites().size() != 1 ||
       task.getOriginalReadMemrefs().size() != task.getWillReads().size() ||
       task.getOriginalWriteMemrefs().size() != 1 ||
       task.getDoneWrites().size() != 1 || task.getDoneReads().size() > 1 ||
@@ -4831,7 +4824,8 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
   Value outputRoot = task.getOriginalWriteMemrefs().front();
   if (llvm::count(task.getOriginalReadMemrefs(), outputRoot) != 1)
     return rejectReplicaNeura(
-        task, "in-place Neura replica requires one exact read/write storage root");
+        task,
+        "in-place Neura replica requires one exact read/write storage root");
   FailureOr<Value> outputRootIdentity = resolveTaskflowMemoryRoot(outputRoot);
   bool foundOutputRead = false;
   unsigned outputReadIndex = 0;
@@ -4908,8 +4902,10 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
           task, "in-place Neura replica body has an unsupported top-level op");
   }
   if (!plan.kernel)
-    return rejectReplicaNeura(task, "in-place Neura replica requires one kernel");
-  auto outputType = dyn_cast<MemRefType>(task.getWillWrites().front().getType());
+    return rejectReplicaNeura(task,
+                              "in-place Neura replica requires one kernel");
+  auto outputType =
+      dyn_cast<MemRefType>(task.getWillWrites().front().getType());
   Value root = task.getOriginalWriteMemrefs().front();
   auto rootType = dyn_cast<MemRefType>(root.getType());
   if (!outputType || !rootType || outputType.getRank() != rootType.getRank() ||
@@ -4928,7 +4924,8 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
         task, "in-place Neura replica selected axis is outside its output "
               "shape");
   if (!plan.kernel.getIterArgsInit().empty() || plan.kernel.getNumResults())
-    return rejectReplicaNeura(task, "in-place Neura replica has unproved carried kernel state");
+    return rejectReplicaNeura(
+        task, "in-place Neura replica has unproved carried kernel state");
   if (plan.taskCounters.size() < plan.outputShape.size() ||
       !plan.kernel.getBody().hasOneBlock() ||
       plan.kernel.getBody().front().getNumArguments() !=
@@ -4940,10 +4937,9 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
     auto upper = compileTimeIndex(counter.getUpperBound(), task);
     auto step = compileTimeIndex(counter.getStep(), task);
     bool parentMismatch =
-        index == 0
-            ? static_cast<bool>(counter.getParentIndex())
-            : counter.getParentIndex() !=
-                  plan.taskCounters[index - 1].getCounterIndex();
+        index == 0 ? static_cast<bool>(counter.getParentIndex())
+                   : counter.getParentIndex() !=
+                         plan.taskCounters[index - 1].getCounterIndex();
     if (!lower || !upper || !step || *lower < 0 || *upper <= *lower ||
         *step != 1 || parentMismatch)
       return rejectReplicaNeura(
@@ -4964,36 +4960,35 @@ analyzeReplicaNeuraInPlace(TaskflowTaskOp task, int64_t axis, int64_t factor) {
   // are present and reject a conflict instead of accepting the folded value.
   func::FuncOp parentFunction = task->getParentOfType<func::FuncOp>();
   bool preserveLegacyCounterLookup = isRadarFunction(parentFunction);
-  auto resolveReplicaCounterBound = [&](neura::CounterOp counter,
-                                        StringRef attributeName,
-                                        Value operand) {
-    if (preserveLegacyCounterLookup)
-      return compileTimeCounterBound(counter, attributeName, operand, task,
-                                     plan.kernel);
-    return compileTimeCounterBoundWithAgreement(
-        counter, attributeName, operand, task, plan.kernel);
-  };
+  auto resolveReplicaCounterBound =
+      [&](neura::CounterOp counter, StringRef attributeName, Value operand) {
+        if (preserveLegacyCounterLookup)
+          return compileTimeCounterBound(counter, attributeName, operand, task,
+                                         plan.kernel);
+        return compileTimeCounterBoundWithAgreement(counter, attributeName,
+                                                    operand, task, plan.kernel);
+      };
   for (auto [index, counter] : llvm::enumerate(plan.kernelCounters)) {
     auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
     auto lower = resolveReplicaCounterBound(counter, "lower_bound_value",
                                             counter.getLowerBound());
     auto upper = resolveReplicaCounterBound(counter, "upper_bound_value",
                                             counter.getUpperBound());
-    auto step = resolveReplicaCounterBound(counter, "step_value",
-                                           counter.getStep());
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *lower != plan.taskLowers[index] ||
+    auto step =
+        resolveReplicaCounterBound(counter, "step_value", counter.getStep());
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *lower != plan.taskLowers[index] ||
         *upper != plan.taskUppers[index] || *step != 1)
       return rejectReplicaNeura(
           task, "in-place Neura replica Neura counter bounds are not the "
-              "Taskflow domains");
+                "Taskflow domains");
     plan.kernelLowers.push_back(*lower);
     plan.kernelUppers.push_back(*upper);
   }
   plan.outputCounterAxes = sourceOutputProof.outputCounterAxes;
   plan.outputConstantAxes = sourceOutputProof.outputConstantAxes;
-  if (failed(proveReplicaNeuraInPlaceRegion(
-          plan, task.getWillWrites().front())))
+  if (failed(
+          proveReplicaNeuraInPlaceRegion(plan, task.getWillWrites().front())))
     return failure();
   if (plan.outputCounterAxes.size() != plan.outputShape.size() ||
       plan.outputConstantAxes.size() != plan.outputShape.size())
@@ -5252,9 +5247,10 @@ static std::string quotePassOption(StringRef value) {
   return quoted;
 }
 
-static LogicalResult runSourceNeuraTiler(
-    ModuleOp module, StringRef taskName, int64_t axis, int64_t factor,
-    OwningOpRef<ModuleOp> &trial, std::string &diagnostic) {
+static LogicalResult runSourceNeuraTiler(ModuleOp module, StringRef taskName,
+                                         int64_t axis, int64_t factor,
+                                         OwningOpRef<ModuleOp> &trial,
+                                         std::string &diagnostic) {
   trial = module.clone();
   std::unique_ptr<Pass> pass =
       mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
@@ -5263,11 +5259,10 @@ static LogicalResult runSourceNeuraTiler(
                         " tile-factor=" + std::to_string(factor) +
                         " fusion-mode=none";
   std::string optionError;
-  if (failed(pass->initializeOptions(
-          options, [&](const llvm::Twine &message) {
-            optionError = message.str();
-            return failure();
-          }))) {
+  if (failed(pass->initializeOptions(options, [&](const llvm::Twine &message) {
+        optionError = message.str();
+        return failure();
+      }))) {
     diagnostic = optionError.empty() ? "source tiler option parsing failed"
                                      : optionError;
     return failure();
@@ -5278,16 +5273,15 @@ static LogicalResult runSourceNeuraTiler(
   manager.addPass(std::move(pass));
   LogicalResult result = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(
-                                            diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     result = manager.run(*trial);
   }
   if (failed(result)) {
@@ -5335,7 +5329,8 @@ static bool inferReplicaTripCount(TaskflowTaskOp task, int64_t &tripCount) {
 static bool hasUnprovedGenericReplicaFeedback(TaskflowTaskOp task) {
   bool feedback = false;
   task.walk([&](neura::KernelOp kernel) {
-    feedback |= !kernel.getIterArgsInit().empty() || kernel.getNumResults() != 0;
+    feedback |=
+        !kernel.getIterArgsInit().empty() || kernel.getNumResults() != 0;
   });
   task.walk([&](Operation *operation) {
     feedback |= isa<neura::ReserveOp>(operation);
@@ -5353,9 +5348,9 @@ static Value stripMemrefCasts(Value value) {
 // that was already present when a nested replica was materialized. Follow
 // only those joins, with a bounded visited set and a storage-root check; an
 // arbitrary user or an unclassified join remains a hard failure.
-static bool isCompletionValueRecursive(
-    Value value, Value joined,
-    llvm::SmallPtrSetImpl<Operation *> &visitedJoins) {
+static bool
+isCompletionValueRecursive(Value value, Value joined,
+                           llvm::SmallPtrSetImpl<Operation *> &visitedJoins) {
   value = stripMemrefCasts(value);
   joined = stripMemrefCasts(joined);
   if (!value || !joined)
@@ -5386,8 +5381,9 @@ static bool isCompletionValue(Value value, Value joined) {
   return isCompletionValueRecursive(value, joined, visitedJoins);
 }
 
-static LogicalResult collectCompletionConsumers(
-    Value value, Value joined, SmallVectorImpl<TaskflowTaskOp> &consumers) {
+static LogicalResult
+collectCompletionConsumers(Value value, Value joined,
+                           SmallVectorImpl<TaskflowTaskOp> &consumers) {
   llvm::SmallPtrSet<Operation *, 32> visitedJoins;
   auto storageRoot = [](Value candidate) {
     candidate = stripMemrefCasts(candidate);
@@ -5396,8 +5392,8 @@ static LogicalResult collectCompletionConsumers(
     return candidate;
   };
   const Value joinedRoot = storageRoot(joined);
-  auto collect = [&](auto &&self, Value current, Value anchor)
-      -> LogicalResult {
+  auto collect = [&](auto &&self, Value current,
+                     Value anchor) -> LogicalResult {
     for (OpOperand &use : current.getUses()) {
       Operation *owner = use.getOwner();
       if (auto task = dyn_cast<TaskflowTaskOp>(owner)) {
@@ -5438,9 +5434,10 @@ static LogicalResult collectCompletionConsumers(
 // on each generated tile while retaining a static cast at the completion
 // join.  This keeps the join's exact-region proof intact and does not alter
 // the cloned body or its counter domains.
-static LogicalResult restoreDynamicReplicaOutputShell(
-    TaskflowTaskOp tile, TaskflowJoinOp completionJoin,
-    std::string &diagnostic) {
+static LogicalResult
+restoreDynamicReplicaOutputShell(TaskflowTaskOp tile,
+                                 TaskflowJoinOp completionJoin,
+                                 std::string &diagnostic) {
   if (!tile || !completionJoin || !tile.getBody().hasOneBlock() ||
       tile.getWillWrites().size() != 1 ||
       tile.getOriginalWriteMemrefs().size() != 1 ||
@@ -5528,15 +5525,17 @@ static LogicalResult restoreDynamicReplicaOutputShell(
     for (auto [index, input] : llvm::enumerate(inputs)) {
       if (input != body.getArgument(outputOperand))
         continue;
-      if (matchedKernelOutput || index >= kernel.getBody().front().getNumArguments()) {
+      if (matchedKernelOutput ||
+          index >= kernel.getBody().front().getNumArguments()) {
         diagnostic = "generated tile output has an ambiguous kernel input";
         kernelResult = failure();
         return;
       }
-      BlockArgument kernelArgument = kernel.getBody().front().getArgument(index);
+      BlockArgument kernelArgument =
+          kernel.getBody().front().getArgument(index);
       Type expected = input.getType();
-      if (auto payload = dyn_cast<neura::PredicatedValue>(
-              kernelArgument.getType())) {
+      if (auto payload =
+              dyn_cast<neura::PredicatedValue>(kernelArgument.getType())) {
         kernelArgument.setType(neura::PredicatedValue::get(
             kernel.getContext(), expected, payload.getPredicateType()));
       } else if (isa<MemRefType>(kernelArgument.getType())) {
@@ -5558,16 +5557,17 @@ static LogicalResult restoreDynamicReplicaOutputShell(
   }
 
   OpBuilder castBuilder(completionJoin);
-  Value staticState = castBuilder.create<memref::CastOp>(
-      tile.getLoc(), staticType, oldDone);
+  Value staticState =
+      castBuilder.create<memref::CastOp>(tile.getLoc(), staticType, oldDone);
   completionJoin->setOperand(joinState, staticState);
   return success();
 }
 
-static LogicalResult convertNeuraTilesToReplicas(
-    StringRef functionSymbol, StringRef sourceName, int64_t axis,
-    int64_t factor, OwningOpRef<ModuleOp> &trial,
-    std::string &diagnostic) {
+static LogicalResult convertNeuraTilesToReplicas(StringRef functionSymbol,
+                                                 StringRef sourceName,
+                                                 int64_t axis, int64_t factor,
+                                                 OwningOpRef<ModuleOp> &trial,
+                                                 std::string &diagnostic) {
   func::FuncOp function;
   trial->walk([&](func::FuncOp candidate) {
     if (candidate.getName() == functionSymbol)
@@ -5580,23 +5580,21 @@ static LogicalResult convertNeuraTilesToReplicas(
 
   const std::string tilePrefix =
       (Twine(sourceName) + ".tile." + Twine(axis) + ".").str();
-  const std::string replicaPrefix =
-      (Twine(sourceName) + ".replica.").str();
+  const std::string replicaPrefix = (Twine(sourceName) + ".replica.").str();
   SmallVector<TaskflowTaskOp> tiles;
   std::map<int64_t, TaskflowTaskOp> tileById;
   std::map<std::string, std::string> renamedTasks;
   function.walk([&](TaskflowTaskOp task) {
-    auto parent = task->getAttrOfType<StringAttr>(
-        "amoeba.neura.tiling.parent_task");
-    auto tileAxis = task->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.axis");
-    auto part = task->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.part_index");
+    auto parent =
+        task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
+    auto tileAxis =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
+    auto part =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
     if (!parent || !tileAxis || !part || parent.getValue() != sourceName ||
         tileAxis.getInt() != axis)
       return;
-    if (task.getTaskName() !=
-            (tilePrefix + std::to_string(part.getInt())) ||
+    if (task.getTaskName() != (tilePrefix + std::to_string(part.getInt())) ||
         part.getInt() < 0 || part.getInt() >= factor ||
         !tileById.emplace(part.getInt(), task).second) {
       diagnostic = "source-owned tiler returned an ambiguous tile identity";
@@ -5675,8 +5673,8 @@ static LogicalResult convertNeuraTilesToReplicas(
   // dynamic-output task.  The completion join continues to consume static
   // cast states, so its half-open region and coverage proof remain unchanged.
   for (TaskflowTaskOp tile : tiles) {
-    if (failed(restoreDynamicReplicaOutputShell(tile, completionJoin,
-                                                diagnostic)))
+    if (failed(
+            restoreDynamicReplicaOutputShell(tile, completionJoin, diagnostic)))
       return failure();
     // The source tiler can leave an identity memref.cast on an output base.
     // Fold only casts whose source/result types are identical; the shared
@@ -5780,8 +5778,7 @@ static LogicalResult convertNeuraTilesToReplicas(
                   builder.getI64IntegerAttr(*shardLower));
     tile->setAttr("amoeba.replica.shard_upper",
                   builder.getI64IntegerAttr(*shardUpper));
-    tile->setAttr("trip_count",
-                  builder.getI64IntegerAttr(childTripCounts[id]));
+    tile->setAttr("trip_count", builder.getI64IntegerAttr(childTripCounts[id]));
     tile->setAttr("amoeba.replica.total_trip_count",
                   builder.getI64IntegerAttr(totalTripCount));
     tile->setAttr("amoeba.replica.shard_trip_count",
@@ -5793,11 +5790,10 @@ static LogicalResult convertNeuraTilesToReplicas(
 
   completionJoin->removeAttr("amoeba.neura.joint_rewrite");
   completionJoin->setAttr("amoeba.replica.completion_only",
-                           builder.getUnitAttr());
+                          builder.getUnitAttr());
   SmallVector<TaskflowTaskOp> consumers;
-  if (failed(collectCompletionConsumers(completionJoin.getJoined(),
-                                        completionJoin.getJoined(),
-                                        consumers))) {
+  if (failed(collectCompletionConsumers(
+          completionJoin.getJoined(), completionJoin.getJoined(), consumers))) {
     diagnostic = "completion join has an unclassified downstream user";
     return failure();
   }
@@ -5844,9 +5840,10 @@ static LogicalResult convertNeuraTilesToReplicas(
   return success();
 }
 
-static LogicalResult materializeGenericNeuraReplica(
-    func::FuncOp originalFunction, TaskflowTaskOp source, int64_t axis,
-    int64_t factor) {
+static LogicalResult
+materializeGenericNeuraReplica(func::FuncOp originalFunction,
+                               TaskflowTaskOp source, int64_t axis,
+                               int64_t factor) {
   ModuleOp originalModule = originalFunction->getParentOfType<ModuleOp>();
   if (!originalModule)
     return failure();
@@ -5854,9 +5851,9 @@ static LogicalResult materializeGenericNeuraReplica(
   OwningOpRef<ModuleOp> trial;
   if (failed(runSourceNeuraTiler(originalModule, source.getTaskName(), axis,
                                  factor, trial, diagnostic)) ||
-      failed(convertNeuraTilesToReplicas(
-          originalFunction.getName(), source.getTaskName(), axis, factor,
-          trial, diagnostic))) {
+      failed(convertNeuraTilesToReplicas(originalFunction.getName(),
+                                         source.getTaskName(), axis, factor,
+                                         trial, diagnostic))) {
     source.emitError() << "source-owned post-Neura replica materialization "
                           "failed: "
                        << diagnostic;
@@ -5885,7 +5882,8 @@ static bool isInPlaceNeuraReplicaCandidate(TaskflowTaskOp source) {
   source.walk([&](neura::KernelOp) { hasKernel = true; });
   return hasKernel && !source.getWillReads().empty() &&
          source.getWillWrites().size() == 1 &&
-         source.getOriginalReadMemrefs().size() == source.getWillReads().size() &&
+         source.getOriginalReadMemrefs().size() ==
+             source.getWillReads().size() &&
          source.getOriginalWriteMemrefs().size() == 1 &&
          llvm::count(source.getOriginalReadMemrefs(),
                      source.getOriginalWriteMemrefs().front()) == 1;
@@ -5897,10 +5895,11 @@ static bool isInPlaceNeuraReplicaCandidate(TaskflowTaskOp source) {
 // authenticating the exact output-coordinate map and requiring one exact,
 // evenly divisible counter interval.  Candidate source tiling is performed
 // on private clones so a failed axis cannot partially rewrite the module.
-static LogicalResult chooseOriginalAmoebaAxis(
-    func::FuncOp function, TaskflowTaskOp source, int64_t factor,
-    int64_t &outputAxis, ReplicaOutputCoordinateProof &selectedProof,
-    std::string &error) {
+static LogicalResult
+chooseOriginalAmoebaAxis(func::FuncOp function, TaskflowTaskOp source,
+                         int64_t factor, int64_t &outputAxis,
+                         ReplicaOutputCoordinateProof &selectedProof,
+                         std::string &error) {
   bool inPlace = isInPlaceNeuraReplicaCandidate(source);
   ModuleOp module = function->getParentOfType<ModuleOp>();
   if (!module) {
@@ -6026,14 +6025,13 @@ static LogicalResult chooseOriginalAmoebaAxis(
   return success();
 }
 
-static std::optional<int64_t> positiveSourceInternalMultiplicity(
-    TaskflowTaskOp task) {
-  auto domain = task->getAttrOfType<DictionaryAttr>(
-      kSourceIterationDomainAttr);
+static std::optional<int64_t>
+positiveSourceInternalMultiplicity(TaskflowTaskOp task) {
+  auto domain = task->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
   auto complete = domain ? domain.getAs<BoolAttr>("complete") : BoolAttr();
-  auto multiplicity =
-      domain ? domain.getAs<IntegerAttr>("internal_multiplicity")
-             : IntegerAttr();
+  auto multiplicity = domain
+                          ? domain.getAs<IntegerAttr>("internal_multiplicity")
+                          : IntegerAttr();
   if (!complete || !complete.getValue() || !multiplicity ||
       multiplicity.getInt() <= 0)
     return std::nullopt;
@@ -6050,8 +6048,7 @@ static LogicalResult attachOriginalAmoebaRealization(
     return failure();
   };
   if (!function || !schedulerRecord ||
-      replicaShapes.size() != static_cast<size_t>(factor) ||
-      outputAxis < 0 ||
+      replicaShapes.size() != static_cast<size_t>(factor) || outputAxis < 0 ||
       outputAxis >= static_cast<int64_t>(sourceProof.outputCounterAxes.size()))
     return fail("decision and output-coordinate bindings are incomplete");
   unsigned selectedCounter = sourceProof.outputCounterAxes[outputAxis];
@@ -6073,11 +6070,11 @@ static LogicalResult attachOriginalAmoebaRealization(
     int64_t upper = sourceProof.taskUppers[ordinal];
     if (upper <= lower)
       return fail("source task has an invalid counter interval");
-    originalAxes.push_back(builder.getDictionaryAttr({
-        builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-        builder.getNamedAttr("lower", builder.getI64IntegerAttr(lower)),
-        builder.getNamedAttr("upper", builder.getI64IntegerAttr(upper)),
-        builder.getNamedAttr("step", builder.getI64IntegerAttr(1))}));
+    originalAxes.push_back(builder.getDictionaryAttr(
+        {builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+         builder.getNamedAttr("lower", builder.getI64IntegerAttr(lower)),
+         builder.getNamedAttr("upper", builder.getI64IntegerAttr(upper)),
+         builder.getNamedAttr("step", builder.getI64IntegerAttr(1))}));
   }
 
   SmallVector<TaskflowTaskOp> children;
@@ -6136,11 +6133,11 @@ static LogicalResult attachOriginalAmoebaRealization(
       if (sourceWork > std::numeric_limits<int64_t>::max() / extent)
         return fail("expanded shard source-work count overflows");
       sourceWork *= extent;
-      partitionAxes.push_back(builder.getDictionaryAttr({
-          builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
-          builder.getNamedAttr("lower", builder.getI64IntegerAttr(*lower)),
-          builder.getNamedAttr("upper", builder.getI64IntegerAttr(*upper)),
-          builder.getNamedAttr("step", builder.getI64IntegerAttr(*step))}));
+      partitionAxes.push_back(builder.getDictionaryAttr(
+          {builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(ordinal)),
+           builder.getNamedAttr("lower", builder.getI64IntegerAttr(*lower)),
+           builder.getNamedAttr("upper", builder.getI64IntegerAttr(*upper)),
+           builder.getNamedAttr("step", builder.getI64IntegerAttr(*step))}));
     }
     for (unsigned ordinal = 0; ordinal < childLowers.size(); ++ordinal) {
       if (ordinal == selectedCounter)
@@ -6149,10 +6146,9 @@ static LogicalResult attachOriginalAmoebaRealization(
           childUppers[ordinal] != sourceProof.taskUppers[ordinal])
         return fail("materializer changed a nonselected source counter");
     }
-    int64_t expectedWidth =
-        (sourceProof.taskUppers[selectedCounter] -
-         sourceProof.taskLowers[selectedCounter]) /
-        factor;
+    int64_t expectedWidth = (sourceProof.taskUppers[selectedCounter] -
+                             sourceProof.taskLowers[selectedCounter]) /
+                            factor;
     int64_t expectedLower =
         sourceProof.taskLowers[selectedCounter] + replicaId * expectedWidth;
     if (childLowers[selectedCounter] != expectedLower ||
@@ -6171,24 +6167,25 @@ static LogicalResult attachOriginalAmoebaRealization(
     }
     if (placements.empty())
       return fail("original replica has no placement cells");
-    replicaManifest.push_back(builder.getDictionaryAttr({
-        builder.getNamedAttr("replica_id", builder.getI64IntegerAttr(replicaId)),
-        builder.getNamedAttr("task_name", builder.getStringAttr(
-                                               child.getTaskName())),
-        builder.getNamedAttr("replica_shape", replicaShapes[replicaId]),
-        builder.getNamedAttr("placements", builder.getArrayAttr(placements)),
-        builder.getNamedAttr("partition_bounds",
-                             builder.getArrayAttr(partitionAxes)),
-        builder.getNamedAttr("source_work_count",
-                             builder.getI64IntegerAttr(sourceWork))}));
+    replicaManifest.push_back(builder.getDictionaryAttr(
+        {builder.getNamedAttr("replica_id",
+                              builder.getI64IntegerAttr(replicaId)),
+         builder.getNamedAttr("task_name",
+                              builder.getStringAttr(child.getTaskName())),
+         builder.getNamedAttr("replica_shape", replicaShapes[replicaId]),
+         builder.getNamedAttr("placements", builder.getArrayAttr(placements)),
+         builder.getNamedAttr("partition_bounds",
+                              builder.getArrayAttr(partitionAxes)),
+         builder.getNamedAttr("source_work_count",
+                              builder.getI64IntegerAttr(sourceWork))}));
 
     SmallVector<NamedAttribute> replicaDecisionFields;
-    replicaDecisionFields.push_back(builder.getNamedAttr(
-        "scheduler_record", schedulerRecord));
-    replicaDecisionFields.push_back(builder.getNamedAttr(
-        "replica_shape", replicaShapes[replicaId]));
-    replicaDecisionFields.push_back(builder.getNamedAttr(
-        "placements", builder.getArrayAttr(placements)));
+    replicaDecisionFields.push_back(
+        builder.getNamedAttr("scheduler_record", schedulerRecord));
+    replicaDecisionFields.push_back(
+        builder.getNamedAttr("replica_shape", replicaShapes[replicaId]));
+    replicaDecisionFields.push_back(
+        builder.getNamedAttr("placements", builder.getArrayAttr(placements)));
     child->setAttr(kOriginalAmoebaReplicaDecisionAttr,
                    builder.getDictionaryAttr(replicaDecisionFields));
     child->setAttr(kOriginalAmoebaReplicaPlacementsAttr,
@@ -6199,18 +6196,19 @@ static LogicalResult attachOriginalAmoebaRealization(
         "schema", builder.getStringAttr(
                       "amoeba-source-certified-replica-realization-v1")));
     realizationFields.push_back(builder.getNamedAttr(
-        "status", builder.getStringAttr(
-                      "verified-source-certified-realization-v1")));
+        "status",
+        builder.getStringAttr("verified-source-certified-realization-v1")));
     realizationFields.push_back(builder.getNamedAttr(
-        "origin", builder.getStringAttr(
-                      "orbit-native-materializer-selected-counter-axis-after-f45")));
+        "origin",
+        builder.getStringAttr(
+            "orbit-native-materializer-selected-counter-axis-after-f45")));
     realizationFields.push_back(builder.getNamedAttr(
         "f45_axis_and_bounds_present", builder.getBoolAttr(false)));
     realizationFields.push_back(builder.getNamedAttr(
         "selected_output_axis", builder.getI64IntegerAttr(outputAxis)));
-    realizationFields.push_back(builder.getNamedAttr(
-        "selected_counter_ordinal",
-        builder.getI64IntegerAttr(selectedCounter)));
+    realizationFields.push_back(
+        builder.getNamedAttr("selected_counter_ordinal",
+                             builder.getI64IntegerAttr(selectedCounter)));
     realizationFields.push_back(builder.getNamedAttr(
         "original_replica_count", builder.getI64IntegerAttr(factor)));
     realizationFields.push_back(builder.getNamedAttr(
@@ -6221,12 +6219,12 @@ static LogicalResult attachOriginalAmoebaRealization(
         "partition_bounds", builder.getArrayAttr(partitionAxes)));
     realizationFields.push_back(builder.getNamedAttr(
         "source_work_count", builder.getI64IntegerAttr(sourceWork)));
+    realizationFields.push_back(
+        builder.getNamedAttr("internal_multiplicity",
+                             builder.getI64IntegerAttr(*internalMultiplicity)));
     realizationFields.push_back(builder.getNamedAttr(
-        "internal_multiplicity",
-        builder.getI64IntegerAttr(*internalMultiplicity)));
-    realizationFields.push_back(builder.getNamedAttr(
-        "decision_binding", builder.getStringAttr(
-                                "amoeba.task_scheduler_schedule_info")));
+        "decision_binding",
+        builder.getStringAttr("amoeba.task_scheduler_schedule_info")));
     child->setAttr(kOriginalAmoebaPartitionRealizationAttr,
                    builder.getDictionaryAttr(realizationFields));
 
@@ -6245,24 +6243,28 @@ static LogicalResult attachOriginalAmoebaRealization(
     decisions.append(existing.begin(), existing.end());
   if (llvm::any_of(decisions, [&](Attribute attribute) {
         auto decision = dyn_cast<DictionaryAttr>(attribute);
-        auto parent = decision ? decision.getAs<StringAttr>("parent_task")
-                               : StringAttr();
+        auto parent =
+            decision ? decision.getAs<StringAttr>("parent_task") : StringAttr();
         return parent && parent.getValue() == parentName;
       }))
-    return fail("parent decision was already recorded in the function manifest");
-  decisions.push_back(builder.getDictionaryAttr({
-      builder.getNamedAttr("schema", builder.getStringAttr(
-                                         "amoeba-original-fixed-decision-realization-v1")),
-      builder.getNamedAttr("parent_task", builder.getStringAttr(parentName)),
-      builder.getNamedAttr("original_replica_count",
-                           builder.getI64IntegerAttr(factor)),
-      builder.getNamedAttr("selected_output_axis",
-                           builder.getI64IntegerAttr(outputAxis)),
-      builder.getNamedAttr("selected_counter_ordinal",
-                           builder.getI64IntegerAttr(selectedCounter)),
-      builder.getNamedAttr("original_domain", builder.getArrayAttr(originalAxes)),
-      builder.getNamedAttr("scheduler_record", schedulerRecord),
-      builder.getNamedAttr("replicas", builder.getArrayAttr(replicaManifest))}));
+    return fail(
+        "parent decision was already recorded in the function manifest");
+  decisions.push_back(builder.getDictionaryAttr(
+      {builder.getNamedAttr(
+           "schema", builder.getStringAttr(
+                         "amoeba-original-fixed-decision-realization-v1")),
+       builder.getNamedAttr("parent_task", builder.getStringAttr(parentName)),
+       builder.getNamedAttr("original_replica_count",
+                            builder.getI64IntegerAttr(factor)),
+       builder.getNamedAttr("selected_output_axis",
+                            builder.getI64IntegerAttr(outputAxis)),
+       builder.getNamedAttr("selected_counter_ordinal",
+                            builder.getI64IntegerAttr(selectedCounter)),
+       builder.getNamedAttr("original_domain",
+                            builder.getArrayAttr(originalAxes)),
+       builder.getNamedAttr("scheduler_record", schedulerRecord),
+       builder.getNamedAttr("replicas",
+                            builder.getArrayAttr(replicaManifest))}));
   function->setAttr(kDecisionManifestAttr, builder.getArrayAttr(decisions));
   // Keep the legacy scalar summary for existing tooling. The append-only
   // per-parent manifest above preserves all groups in a multi-task function.
@@ -6277,9 +6279,10 @@ static LogicalResult attachOriginalAmoebaRealization(
   return success();
 }
 
-static LogicalResult materializeOriginalAmoebaFixedDecision(
-    ModuleOp module, func::FuncOp function, func::FuncOp canonicalFunction,
-    TaskflowTaskOp source) {
+static LogicalResult
+materializeOriginalAmoebaFixedDecision(ModuleOp module, func::FuncOp function,
+                                       func::FuncOp canonicalFunction,
+                                       TaskflowTaskOp source) {
   auto reject = [&](StringRef reason) {
     source.emitError() << "original AMOEBA fixed-decision materialization: "
                        << reason;
@@ -6294,8 +6297,7 @@ static LogicalResult materializeOriginalAmoebaFixedDecision(
 
   int64_t factor = 0;
   SmallVector<DictionaryAttr> replicaShapes;
-  if (failed(readOriginalAmoebaReplicaDecision(source, factor,
-                                                replicaShapes)))
+  if (failed(readOriginalAmoebaReplicaDecision(source, factor, replicaShapes)))
     return failure();
   if (factor < 2 || factor > 4)
     return reject("original fixed replica count must be between two and four");
@@ -6330,18 +6332,19 @@ static LogicalResult materializeOriginalAmoebaFixedDecision(
     if (hasUnprovedGenericReplicaFeedback(source))
       return reject("source tiler cannot authenticate kernel feedback state");
     if (failed(materializeGenericNeuraReplica(function, source, outputAxis,
-                                               factor)))
+                                              factor)))
       return failure();
   }
 
-  FailureOr<func::FuncOp> materializedFunction = selectTaskFunction(
-      module, functionSymbol, error);
+  FailureOr<func::FuncOp> materializedFunction =
+      selectTaskFunction(module, functionSymbol, error);
   if (failed(materializedFunction))
-    return reject("cannot reselect the expanded function after materialization");
+    return reject(
+        "cannot reselect the expanded function after materialization");
   func::FuncOp currentFunction = *materializedFunction;
   if (failed(attachOriginalAmoebaRealization(
-          currentFunction, parentName, factor, outputAxis,
-          sourceProof, replicaShapes, schedulerRecord, canonicalSource)))
+          currentFunction, parentName, factor, outputAxis, sourceProof,
+          replicaShapes, schedulerRecord, canonicalSource)))
     return failure();
   // Include the source-certified realization metadata in the final exact task
   // control binding.  The full graph proof still rechecks every existing and
@@ -6355,8 +6358,8 @@ static LogicalResult materializeOriginalAmoebaFixedDecision(
   currentFunction->setAttr(kOriginalAmoebaDecisionModeAttr,
                            builder.getBoolAttr(true));
   if (failed(verify(module.getOperation()))) {
-    currentFunction.emitError(
-        "fixed-decision source-certified realization failed module verification");
+    currentFunction.emitError("fixed-decision source-certified realization "
+                              "failed module verification");
     return failure();
   }
   return success();
@@ -6376,16 +6379,16 @@ static LogicalResult rejectRadarMultiOutput(TaskflowTaskOp source,
 }
 
 static bool isRadarMultiOutputTask(TaskflowTaskOp task) {
-  return task && (task.getTaskName() == "Task_2" ||
-                  task.getTaskName() == "Task_3") &&
-         task.getWillWrites().size() == 2 &&
-         task.getDoneWrites().size() == 2 &&
+  return task &&
+         (task.getTaskName() == "Task_2" || task.getTaskName() == "Task_3") &&
+         task.getWillWrites().size() == 2 && task.getDoneWrites().size() == 2 &&
          task.getOriginalWriteMemrefs().size() == 2;
 }
 
-static LogicalResult validateRadarMultiOutputProducer(
-    func::FuncOp function, TaskflowTaskOp source, int64_t axis,
-    int64_t replicas, SmallVectorImpl<TaskflowTaskOp> &consumers) {
+static LogicalResult
+validateRadarMultiOutputProducer(func::FuncOp function, TaskflowTaskOp source,
+                                 int64_t axis, int64_t replicas,
+                                 SmallVectorImpl<TaskflowTaskOp> &consumers) {
   if (!isRadarFunction(function) || !isRadarMultiOutputTask(source))
     return failure();
   if (axis < 0 || axis > 1 || (replicas != 2 && replicas != 4))
@@ -6410,7 +6413,8 @@ static LogicalResult validateRadarMultiOutputProducer(
         type.getElementType() != IntegerType::get(source.getContext(), 32) ||
         type.isDynamicDim(1) || type.getShape()[1] != 256 ||
         !radarShapeMatches(output, type, {32, 256}) ||
-        outputRoots[index] != output || !isRadarNoAliasArgument(output, function) ||
+        outputRoots[index] != output ||
+        !isRadarNoAliasArgument(output, function) ||
         !distinctOutputs.insert(output).second)
       return rejectRadarMultiOutput(
           source, "Radar multi-output writes need two distinct noalias "
@@ -6484,7 +6488,8 @@ static LogicalResult validateRadarMultiOutputProducer(
     return rejectRadarMultiOutput(
         source, "Radar multi-output kernel carries feedback state");
   SmallVector<neura::CounterOp> neuraCounters;
-  kernel.walk([&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   if (neuraCounters.size() != 2)
     return rejectRadarMultiOutput(
         source, "Radar multi-output kernel requires two Neura counters");
@@ -6497,12 +6502,12 @@ static LogicalResult validateRadarMultiOutputProducer(
     neuraById[id.getInt()] = counter;
   }
   for (int64_t id = 0; id < 2; ++id) {
-    auto lower = compileTimeCounterBound(
-        neuraById[id], "lower_bound_value", neuraById[id].getLowerBound(),
-        source, kernel);
-    auto upper = compileTimeCounterBound(
-        neuraById[id], "upper_bound_value", neuraById[id].getUpperBound(),
-        source, kernel);
+    auto lower =
+        compileTimeCounterBound(neuraById[id], "lower_bound_value",
+                                neuraById[id].getLowerBound(), source, kernel);
+    auto upper =
+        compileTimeCounterBound(neuraById[id], "upper_bound_value",
+                                neuraById[id].getUpperBound(), source, kernel);
     auto step = compileTimeCounterBound(
         neuraById[id], "step_value", neuraById[id].getStep(), source, kernel);
     if (lower != 0 || upper != (id == 0 ? 64 : 32) || step != 1)
@@ -6566,8 +6571,8 @@ static LogicalResult validateRadarMultiOutputProducer(
     }
     storedOutputs.insert(*output);
   });
-  if (badAccess || loads == 0 ||
-      stores != outputs.size() || storedOutputs.size() != outputs.size())
+  if (badAccess || loads == 0 || stores != outputs.size() ||
+      storedOutputs.size() != outputs.size())
     return rejectRadarMultiOutput(
         source, "Radar multi-output indexed accesses do not prove the "
                 "[counter1,counter0] permutation for both outputs");
@@ -6579,8 +6584,8 @@ static LogicalResult validateRadarMultiOutputProducer(
       carriesState = true;
   });
   if (carriesState)
-    return rejectRadarMultiOutput(source,
-                                  "Radar multi-output kernel contains carry state");
+    return rejectRadarMultiOutput(
+        source, "Radar multi-output kernel contains carry state");
 
   // Every completion result must have only ordinary Taskflow consumers, and
   // each consumer must name the corresponding storage root in provenance.
@@ -6590,10 +6595,11 @@ static LogicalResult validateRadarMultiOutputProducer(
       if (!consumer || !llvm::is_contained(consumer.getWillReads(), state))
         return rejectRadarMultiOutput(
             source, "Radar multi-output completion has an unclassified user");
-      unsigned readIndex =
-          llvm::find(consumer.getWillReads(), state) - consumer.getWillReads().begin();
+      unsigned readIndex = llvm::find(consumer.getWillReads(), state) -
+                           consumer.getWillReads().begin();
       if (readIndex >= consumer.getOriginalReadMemrefs().size() ||
-          consumer.getOriginalReadMemrefs()[readIndex] != outputRoots[writeIndex] ||
+          consumer.getOriginalReadMemrefs()[readIndex] !=
+              outputRoots[writeIndex] ||
           llvm::is_contained(consumer.getWillWrites(), outputRoots[writeIndex]))
         return rejectRadarMultiOutput(
             source, "Radar multi-output completion consumer provenance is "
@@ -6604,20 +6610,22 @@ static LogicalResult validateRadarMultiOutputProducer(
   }
   if (consumers.empty())
     return rejectRadarMultiOutput(
-        source, "Radar multi-output task has no downstream completion consumer");
+        source,
+        "Radar multi-output task has no downstream completion consumer");
   return success();
 }
 
-static LogicalResult setRadarMultiOutputConsumerEdges(
-    TaskflowTaskOp consumer, ArrayRef<Value> joinedValues, StringRef parent,
-    OpBuilder &builder) {
+static LogicalResult
+setRadarMultiOutputConsumerEdges(TaskflowTaskOp consumer,
+                                 ArrayRef<Value> joinedValues, StringRef parent,
+                                 OpBuilder &builder) {
   SmallVector<Attribute> incoming;
   bool hadPreviousAnnotations = false;
-  if (auto previous = consumer->getAttrOfType<ArrayAttr>(
-          kSemanticIncomingEdgesAttr))
+  if (auto previous =
+          consumer->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr))
     hadPreviousAnnotations = true;
-  if (auto previous = consumer->getAttrOfType<ArrayAttr>(
-          kSemanticIncomingEdgesAttr))
+  if (auto previous =
+          consumer->getAttrOfType<ArrayAttr>(kSemanticIncomingEdgesAttr))
     for (Attribute entry : previous) {
       auto text = dyn_cast<StringAttr>(entry);
       if (!text)
@@ -6639,13 +6647,15 @@ static LogicalResult setRadarMultiOutputConsumerEdges(
       return failure();
   }
   if (hadPreviousAnnotations)
-    consumer->setAttr(kSemanticIncomingEdgesAttr, builder.getArrayAttr(incoming));
+    consumer->setAttr(kSemanticIncomingEdgesAttr,
+                      builder.getArrayAttr(incoming));
   return success();
 }
 
-static LogicalResult materializeRadarMultiOutputReplica(
-    func::FuncOp function, TaskflowTaskOp source, int64_t axis,
-    int64_t replicas) {
+static LogicalResult materializeRadarMultiOutputReplica(func::FuncOp function,
+                                                        TaskflowTaskOp source,
+                                                        int64_t axis,
+                                                        int64_t replicas) {
   SmallVector<TaskflowTaskOp> consumers;
   if (failed(validateRadarMultiOutputProducer(function, source, axis, replicas,
                                               consumers)))
@@ -6686,25 +6696,25 @@ static LogicalResult materializeRadarMultiOutputReplica(
     // [counter-1,counter-0]; this attribute records that proof for downstream
     // facts/acceptance consumers instead of leaving the mapping implicit in
     // the cloned Neura body.
-    replica->setAttr(
-        "amoeba.replica.output_counter_axes",
-        builder.getDenseI64ArrayAttr(SmallVector<int64_t>{1, 0}));
+    replica->setAttr("amoeba.replica.output_counter_axes",
+                     builder.getDenseI64ArrayAttr(SmallVector<int64_t>{1, 0}));
     replica->setAttr("amoeba.replica.shard_lower",
                      builder.getI64IntegerAttr(lower));
     replica->setAttr("amoeba.replica.shard_upper",
                      builder.getI64IntegerAttr(upper));
-    replica->setAttr("trip_count", builder.getI64IntegerAttr(
-                                      (upper - lower) * counterExtents[1 - axis]));
+    replica->setAttr(
+        "trip_count",
+        builder.getI64IntegerAttr((upper - lower) * counterExtents[1 - axis]));
     if (source->hasAttr("amoeba.selected_trip_count"))
       replica->setAttr("amoeba.selected_trip_count",
                        builder.getI64IntegerAttr((upper - lower) *
                                                  counterExtents[1 - axis]));
-    replica->setAttr("amoeba.replica.total_trip_count",
-                     builder.getI64IntegerAttr(counterExtents[0] *
-                                               counterExtents[1]));
-    replica->setAttr("amoeba.replica.shard_trip_count",
-                     builder.getI64IntegerAttr((upper - lower) *
-                                               counterExtents[1 - axis]));
+    replica->setAttr(
+        "amoeba.replica.total_trip_count",
+        builder.getI64IntegerAttr(counterExtents[0] * counterExtents[1]));
+    replica->setAttr(
+        "amoeba.replica.shard_trip_count",
+        builder.getI64IntegerAttr((upper - lower) * counterExtents[1 - axis]));
     replica->removeAttr(kSemanticIncomingEdgesAttr);
 
     SmallVector<TaskflowCounterOp> clonedTaskCounters;
@@ -6781,12 +6791,13 @@ static LogicalResult materializeRadarMultiOutputReplica(
   builder.setInsertionPointAfter(source);
   SmallVector<Value> joinedValues;
   for (size_t output = 0; output < source.getWillWrites().size(); ++output) {
-    auto originalType = cast<MemRefType>(source.getWillWrites()[output].getType());
+    auto originalType =
+        cast<MemRefType>(source.getWillWrites()[output].getType());
     auto staticType = MemRefType::get(
         ArrayRef<int64_t>(staticOutputShape), originalType.getElementType(),
         originalType.getLayout(), originalType.getMemorySpace());
-    if (!memref::CastOp::areCastCompatible({source.getWillWrites()[output].getType()},
-                                            {staticType}))
+    if (!memref::CastOp::areCastCompatible(
+            {source.getWillWrites()[output].getType()}, {staticType}))
       return rejectRadarMultiOutput(source,
                                     "Radar multi-output output lacks a "
                                     "compatible static completion view");
@@ -6828,7 +6839,7 @@ static LogicalResult materializeRadarMultiOutputReplica(
             !llvm::is_contained(inputs, joined))
           inputs.push_back(joined);
     if (inputs.empty() || failed(setRadarMultiOutputConsumerEdges(
-                                  consumer, inputs, sourceName, builder)))
+                              consumer, inputs, sourceName, builder)))
       return rejectRadarMultiOutput(
           source, "Radar multi-output completion edge annotation failed");
   }
@@ -6837,27 +6848,28 @@ static LogicalResult materializeRadarMultiOutputReplica(
                     builder.getStringAttr(sourceName));
   function->setAttr("amoeba.replica.parent_task",
                     builder.getStringAttr(sourceName));
-  function->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicas));
-  function->setAttr("amoeba.replica.shard_axis", builder.getI64IntegerAttr(axis));
-  function->setAttr("amoeba.replica.total_trip_count",
-                    builder.getI64IntegerAttr(counterExtents[0] *
-                                              counterExtents[1]));
-  function->setAttr("amoeba.replica.shard_trip_count",
-                    builder.getI64IntegerAttr((counterExtents[0] /
-                                               (axis == 0 ? replicas : 1)) *
-                                              (axis == 1 ? counterExtents[1] /
-                                                               replicas
-                                                         : counterExtents[1])));
+  function->setAttr("amoeba.replica.count",
+                    builder.getI64IntegerAttr(replicas));
+  function->setAttr("amoeba.replica.shard_axis",
+                    builder.getI64IntegerAttr(axis));
+  function->setAttr(
+      "amoeba.replica.total_trip_count",
+      builder.getI64IntegerAttr(counterExtents[0] * counterExtents[1]));
+  function->setAttr(
+      "amoeba.replica.shard_trip_count",
+      builder.getI64IntegerAttr(
+          (counterExtents[0] / (axis == 0 ? replicas : 1)) *
+          (axis == 1 ? counterExtents[1] / replicas : counterExtents[1])));
   return success();
 }
-
 
 struct MaterializeJointTaskReplicasPass
     : PassWrapper<MaterializeJointTaskReplicasPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeJointTaskReplicasPass)
 
   MaterializeJointTaskReplicasPass() = default;
-  MaterializeJointTaskReplicasPass(const MaterializeJointTaskReplicasPass &other)
+  MaterializeJointTaskReplicasPass(
+      const MaterializeJointTaskReplicasPass &other)
       : PassWrapper(other) {}
 
   StringRef getArgument() const override {
@@ -6867,13 +6879,12 @@ struct MaterializeJointTaskReplicasPass
     return "Clone a proved terminal task into balanced full DFG shards";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, func::FuncDialect,
-                    memref::MemRefDialect, neura::NeuraDialect,
-                    TaskflowDialect>();
+    registry
+        .insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
+                neura::NeuraDialect, TaskflowDialect>();
   }
 
-  Option<std::string> functionName{*this, "function",
-                                   llvm::cl::init("")};
+  Option<std::string> functionName{*this, "function", llvm::cl::init("")};
   Option<std::string> taskName{*this, "task", llvm::cl::init("consumer")};
   Option<int64_t> replicaCount{*this, "replicas", llvm::cl::init(2)};
   Option<int64_t> shardAxis{*this, "axis", llvm::cl::init(0)};
@@ -6986,9 +6997,9 @@ struct MaterializeJointTaskReplicasPass
           currentSource = task;
         });
         if (!currentSource || duplicateCurrentSource) {
-          current->emitError() << "fixed-decision source task "
-                               << decisionTaskName
-                               << " disappeared or became ambiguous";
+          current->emitError()
+              << "fixed-decision source task " << decisionTaskName
+              << " disappeared or became ambiguous";
           return signalPassFailure();
         }
         if (failed(materializeOriginalAmoebaFixedDecision(
@@ -7021,15 +7032,15 @@ struct MaterializeJointTaskReplicasPass
     bool multiReadInPlaceNeuraCandidate =
         hasNeuraKernelForInPlace && source.getWillReads().size() > 1 &&
         source.getWillWrites().size() == 1 &&
-        source.getOriginalReadMemrefs().size() == source.getWillReads().size() &&
+        source.getOriginalReadMemrefs().size() ==
+            source.getWillReads().size() &&
         source.getOriginalWriteMemrefs().size() == 1 &&
         llvm::count(source.getOriginalReadMemrefs(),
                     source.getOriginalWriteMemrefs().front()) == 1;
     inPlaceNeuraCandidate |= multiReadInPlaceNeuraCandidate;
     bool hasSupportedReplicaReadCompletion =
         source.getDoneReads().empty() ||
-        (multiReadInPlaceNeuraCandidate &&
-         source.getDoneReads().size() == 1);
+        (multiReadInPlaceNeuraCandidate && source.getDoneReads().size() == 1);
     // Fresh Radar Task_2/Task_3 are the intentionally narrow two-output
     // post-Neura ABI.  Dispatch before the historical one-output guard so the
     // validator can authenticate both output coordinates and downstream
@@ -7061,19 +7072,19 @@ struct MaterializeJointTaskReplicasPass
                          "LLaMA function");
         return signalPassFailure();
       }
-      if (failed(materializeLlamaSourceProducer(func, source,
-                                                shardAxis.getValue(),
-                                                replicaCount.getValue())))
+      if (failed(materializeLlamaSourceProducer(
+              func, source, shardAxis.getValue(), replicaCount.getValue())))
         return signalPassFailure();
       return;
     }
     if (taskKind && taskKind.getValue() == "gemm_producer") {
       if (failed(materializeGemmProducer(func, source, shardAxis.getValue(),
-                                            replicaCount.getValue())))
+                                         replicaCount.getValue())))
         return signalPassFailure();
       return;
     }
-    auto sourceOutputType = dyn_cast<MemRefType>(source.getWillWrites().front().getType());
+    auto sourceOutputType =
+        dyn_cast<MemRefType>(source.getWillWrites().front().getType());
     bool canonicalMatmulProducer =
         sourceOutputType && sourceOutputType.hasStaticShape() &&
         sourceOutputType.getRank() == 2 &&
@@ -7082,16 +7093,15 @@ struct MaterializeJointTaskReplicasPass
          sourceOutputType.getShape()[1] == 512) &&
         source.getWillReads().size() == 2 &&
         source.getWillWrites().front().getDefiningOp<memref::AllocaOp>();
-    if ((isRadarFunction(func) &&
-         (source.getTaskName() == "Task_0" ||
-          source.getTaskName() == "Task_1")) ||
+    if ((isRadarFunction(func) && (source.getTaskName() == "Task_0" ||
+                                   source.getTaskName() == "Task_1")) ||
         (canonicalMatmulProducer && isLlamaFunction(func))) {
       LogicalResult result =
           isRadarFunction(func)
               ? materializeRadarProducer(func, source, shardAxis.getValue(),
                                          replicaCount.getValue())
               : materializeLlamaProducer(func, source, shardAxis.getValue(),
-                                            replicaCount.getValue());
+                                         replicaCount.getValue());
       if (failed(result))
         return signalPassFailure();
       return;
@@ -7108,16 +7118,14 @@ struct MaterializeJointTaskReplicasPass
         source.getOriginalReadMemrefs().size() == source.getWillReads().size();
     if (matchingOriginalReads)
       for (auto [index, read] : llvm::enumerate(source.getWillReads()))
-        matchingOriginalReads &=
-            source.getOriginalReadMemrefs()[index] == read;
+        matchingOriginalReads &= source.getOriginalReadMemrefs()[index] == read;
     // A post-Neura producer/consumer task deliberately carries a Taskflow
     // state in will_reads while original_read_memrefs names the storage root.
     // Let the source-owned M/N materializer prove that relationship and
     // convert its complete tile result transactionally.  The legacy generic
     // shell below remains available only for the historical equal-state form.
-    if (!matchingOriginalReads ||
-        source.getOriginalWriteMemrefs().front() !=
-            source.getWillWrites().front()) {
+    if (!matchingOriginalReads || source.getOriginalWriteMemrefs().front() !=
+                                      source.getWillWrites().front()) {
       if (hasUnprovedGenericReplicaFeedback(source)) {
         source.emitError("generic post-Neura replica has unproved carried "
                          "feedback state");
@@ -7144,12 +7152,10 @@ struct MaterializeJointTaskReplicasPass
     // producer/consumer mismatch path above have already taken precedence,
     // while carried iter-args/reserve state remains fail-closed.
     bool hasNonReturnCompletionUse = llvm::any_of(
-        source.getDoneWrites().front().getUsers(), [](Operation *user) {
-          return !isa<func::ReturnOp>(user);
-        });
-    bool dynamicOrNonterminal =
-        (outputType && !outputType.hasStaticShape()) ||
-        hasNonReturnCompletionUse;
+        source.getDoneWrites().front().getUsers(),
+        [](Operation *user) { return !isa<func::ReturnOp>(user); });
+    bool dynamicOrNonterminal = (outputType && !outputType.hasStaticShape()) ||
+                                hasNonReturnCompletionUse;
     bool hasNeuraKernel = false;
     source.walk([&](neura::KernelOp) { hasNeuraKernel = true; });
     if (hasNeuraKernel && dynamicOrNonterminal && matchingOriginalReads &&
@@ -7169,12 +7175,14 @@ struct MaterializeJointTaskReplicasPass
     bool noaliasArgument =
         outputArg && outputArg.getOwner() == &func.getBody().front() &&
         func.getArgAttr(outputArg.getArgNumber(), "amoeba.noalias");
-    bool privateAllocation = output.getDefiningOp<memref::AllocOp>() &&
-                             llvm::all_of(output.getUsers(), [&](Operation *user) {
-                               return user == source.getOperation();
-                             });
+    bool privateAllocation =
+        output.getDefiningOp<memref::AllocOp>() &&
+        llvm::all_of(output.getUsers(), [&](Operation *user) {
+          return user == source.getOperation();
+        });
     if (!outputType || !outputType.hasStaticShape() ||
-        shardAxis.getValue() < 0 || shardAxis.getValue() >= outputType.getRank() ||
+        shardAxis.getValue() < 0 ||
+        shardAxis.getValue() >= outputType.getRank() ||
         outputType.getShape()[shardAxis.getValue()] < 2 ||
         !isSupportedReplicaCount(replicaCount.getValue()) ||
         replicaCount.getValue() < 2 ||
@@ -7186,8 +7194,9 @@ struct MaterializeJointTaskReplicasPass
                        "by factor 2, 4, or 8");
       return signalPassFailure();
     }
-    if (!llvm::all_of(source.getDoneWrites().front().getUsers(),
-                      [](Operation *user) { return isa<func::ReturnOp>(user); }) ||
+    if (!llvm::all_of(
+            source.getDoneWrites().front().getUsers(),
+            [](Operation *user) { return isa<func::ReturnOp>(user); }) ||
         source.getDoneWrites().front().use_empty()) {
       source.emitError("replica source must be terminal in the function");
       return signalPassFailure();
@@ -7208,8 +7217,8 @@ struct MaterializeJointTaskReplicasPass
       }
     }
     auto dimensions = outputType.getShape();
-    bool completeCounters = counters.size() ==
-                            static_cast<size_t>(outputType.getRank());
+    bool completeCounters =
+        counters.size() == static_cast<size_t>(outputType.getRank());
     if (completeCounters)
       for (auto [index, counter] : llvm::enumerate(counters))
         completeCounters &=
@@ -7232,23 +7241,25 @@ struct MaterializeJointTaskReplicasPass
       for (auto [index, value] : llvm::enumerate(hyperblock.getIndices()))
         directHyperblock &= value == counters[index].getCounterIndex();
     if (stores != 1 || !directHyperblock) {
-      source.emitError("replica source needs one direct elementwise store body");
+      source.emitError(
+          "replica source needs one direct elementwise store body");
       return signalPassFailure();
     }
     memref::StoreOp store;
     source.walk([&](memref::StoreOp op) { store = op; });
     Block &hyperBody = hyperblock.getBody().front();
-    bool independentBody = store.getMemRef() ==
-                               body.getArgument(source.getWillReads().size()) &&
-                           store.getIndices().size() == counters.size();
+    bool independentBody =
+        store.getMemRef() == body.getArgument(source.getWillReads().size()) &&
+        store.getIndices().size() == counters.size();
     if (independentBody)
       for (auto [index, value] : llvm::enumerate(store.getIndices()))
         independentBody &= value == hyperBody.getArgument(index);
     for (Operation &operation : hyperBody.without_terminator()) {
       if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
         auto argument = dyn_cast<BlockArgument>(load.getMemRef());
-        independentBody &= argument && argument.getOwner() == &body &&
-                           argument.getArgNumber() < source.getWillReads().size();
+        independentBody &=
+            argument && argument.getOwner() == &body &&
+            argument.getArgNumber() < source.getWillReads().size();
         independentBody &= load.getIndices().size() == counters.size();
         if (independentBody)
           for (auto [index, value] : llvm::enumerate(load.getIndices()))
@@ -7272,8 +7283,7 @@ struct MaterializeJointTaskReplicasPass
       source.emitError("replica trip_count must divide evenly by the factor");
       return signalPassFailure();
     }
-    const int64_t shardTripCount =
-        totalTripCount / replicaCount.getValue();
+    const int64_t shardTripCount = totalTripCount / replicaCount.getValue();
     // The existing output-region contract is used only to prove disjoint
     // memory order. Input-region hints are removed, so producer fanout remains
     // tensor-wide and no semantic tile-local edge is introduced.
@@ -7281,23 +7291,25 @@ struct MaterializeJointTaskReplicasPass
     SmallVector<Value> states;
     const int64_t axis = shardAxis.getValue();
     for (int64_t index = 0; index < replicaCount.getValue(); ++index) {
-      auto replica = cast<TaskflowTaskOp>(builder.clone(*source.getOperation()));
+      auto replica =
+          cast<TaskflowTaskOp>(builder.clone(*source.getOperation()));
       const auto [lower, upper] =
           balancedShardBounds(dimensions[axis], index, replicaCount.getValue());
       replica->setAttr("task_name", builder.getStringAttr(
-          (taskName.getValue() + ".replica." + std::to_string(index))));
+                                        (taskName.getValue() + ".replica." +
+                                         std::to_string(index))));
       replica->setAttr("amoeba.replica.parent_task",
                        builder.getStringAttr(taskName.getValue()));
       replica->setAttr("amoeba.replica.id", builder.getI64IntegerAttr(index));
-      replica->setAttr("amoeba.replica.count", builder.getI64IntegerAttr(replicaCount.getValue()));
+      replica->setAttr("amoeba.replica.count",
+                       builder.getI64IntegerAttr(replicaCount.getValue()));
       replica->setAttr("amoeba.replica.shard_axis",
                        builder.getI64IntegerAttr(axis));
       replica->setAttr("amoeba.replica.shard_lower",
                        builder.getI64IntegerAttr(lower));
       replica->setAttr("amoeba.replica.shard_upper",
                        builder.getI64IntegerAttr(upper));
-      replica->setAttr("trip_count",
-                       builder.getI64IntegerAttr(shardTripCount));
+      replica->setAttr("trip_count", builder.getI64IntegerAttr(shardTripCount));
       if (source->getAttr("amoeba.selected_trip_count"))
         replica->setAttr("amoeba.selected_trip_count",
                          builder.getI64IntegerAttr(shardTripCount));
@@ -7314,22 +7326,22 @@ struct MaterializeJointTaskReplicasPass
       SmallVector<int64_t> regionUpper(dimensions.begin(), dimensions.end());
       regionLower[axis] = lower;
       regionUpper[axis] = upper;
-      replica->setAttr(kTilingOutputRegionLowersAttr,
-                       builder.getArrayAttr(
-                           {builder.getDenseI64ArrayAttr(regionLower)}));
-      replica->setAttr(kTilingOutputRegionUppersAttr,
-                       builder.getArrayAttr(
-                           {builder.getDenseI64ArrayAttr(regionUpper)}));
+      replica->setAttr(
+          kTilingOutputRegionLowersAttr,
+          builder.getArrayAttr({builder.getDenseI64ArrayAttr(regionLower)}));
+      replica->setAttr(
+          kTilingOutputRegionUppersAttr,
+          builder.getArrayAttr({builder.getDenseI64ArrayAttr(regionUpper)}));
       SmallVector<TaskflowCounterOp> clonedCounters;
       for (Operation &operation : replica.getBody().front())
         if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
           clonedCounters.push_back(counter);
       TaskflowCounterOp selectedCounter = clonedCounters[axis];
       OpBuilder inBody(selectedCounter);
-      Value lowerValue = inBody.create<arith::ConstantIndexOp>(source.getLoc(),
-                                                                lower);
-      Value upperValue = inBody.create<arith::ConstantIndexOp>(source.getLoc(),
-                                                                upper);
+      Value lowerValue =
+          inBody.create<arith::ConstantIndexOp>(source.getLoc(), lower);
+      Value upperValue =
+          inBody.create<arith::ConstantIndexOp>(source.getLoc(), upper);
       selectedCounter.getLowerBoundMutable().assign(lowerValue);
       selectedCounter.getUpperBoundMutable().assign(upperValue);
       states.push_back(replica.getDoneWrites().front());

@@ -68,8 +68,7 @@ struct TaskIterationDomainMetadata {
 // certificate/binding. A certified task reports both total source work and
 // mapper firings after proven internal full expansion.
 FailureOr<TaskIterationDomainMetadata>
-resolveTaskIterationDomain(taskflow::TaskflowTaskOp task,
-                           std::string &error);
+resolveTaskIterationDomain(taskflow::TaskflowTaskOp task, std::string &error);
 
 // Internal metadata view for the replica-partition proof. It validates the
 // source certificate and current counter arithmetic while allowing the
@@ -77,8 +76,8 @@ resolveTaskIterationDomain(taskflow::TaskflowTaskOp task,
 // compared with its canonical source. Ordinary scoring must use the strict
 // overload above.
 FailureOr<TaskIterationDomainMetadata>
-resolveTaskIterationDomainForSourcePartitionProof(
-    taskflow::TaskflowTaskOp task, std::string &error);
+resolveTaskIterationDomainForSourcePartitionProof(taskflow::TaskflowTaskOp task,
+                                                  std::string &error);
 
 FailureOr<llvm::SmallVector<TaskMetadata>>
 collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error);
@@ -86,7 +85,6 @@ collectAnalyticalTaskMetadata(func::FuncOp func, std::string &error);
 FailureOr<llvm::SmallVector<TaskMetadata>>
 collectAnalyticalTaskMetadataForSourcePartitionProof(func::FuncOp func,
                                                      std::string &error);
-
 
 FailureOr<func::FuncOp> selectTaskFunction(ModuleOp module,
                                            llvm::StringRef requested,

@@ -48,8 +48,7 @@ static std::string quoteOption(StringRef value) {
 static bool genericStaticUnevenShard(TaskflowTaskOp task, int64_t axis,
                                      int64_t factor) {
   auto kind = task->getAttrOfType<StringAttr>("amoeba.semantic.task_kind");
-  if (task.getTaskName() == "Task_0" ||
-      task.getTaskName() == "Task_0.k.0" ||
+  if (task.getTaskName() == "Task_0" || task.getTaskName() == "Task_0.k.0" ||
       (kind && kind.getValue() == "gemm_producer") ||
       task.getWillWrites().size() != 1)
     return false;
@@ -60,19 +59,16 @@ static bool genericStaticUnevenShard(TaskflowTaskOp task, int64_t axis,
 
 static bool dryRunMaterializer(ModuleOp module, StringRef function,
                                StringRef task, int64_t axis, int64_t factor,
-                               std::string &reason,
-                               std::string &diagnostic) {
+                               std::string &reason, std::string &diagnostic) {
   OwningOpRef<ModuleOp> trial = module.clone();
   auto pass = mlir::amoeba::neura::createMaterializeJointTaskReplicasPass();
-  std::string options = "function=" + quoteOption(function) +
-                        " task=" + quoteOption(task) +
-                        " replicas=" + std::to_string(factor) +
-                        " axis=" + std::to_string(axis);
-  if (failed(pass->initializeOptions(
-          options, [&](const llvm::Twine &message) {
-            reason = message.str();
-            return failure();
-          }))) {
+  std::string options =
+      "function=" + quoteOption(function) + " task=" + quoteOption(task) +
+      " replicas=" + std::to_string(factor) + " axis=" + std::to_string(axis);
+  if (failed(pass->initializeOptions(options, [&](const llvm::Twine &message) {
+        reason = message.str();
+        return failure();
+      }))) {
     reason = "materializer_option_parse_failed";
     return false;
   }
@@ -111,8 +107,8 @@ static bool dryRunMaterializer(ModuleOp module, StringRef function,
   }
   auto materializedTask = (*selected)->getAttrOfType<StringAttr>(
       "amoeba.replica.materialized_task");
-  auto materializedCount = (*selected)->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.count");
+  auto materializedCount =
+      (*selected)->getAttrOfType<IntegerAttr>("amoeba.replica.count");
   if (!materializedTask || materializedTask.getValue() != task ||
       !materializedCount || materializedCount.getInt() != factor) {
     reason = "materializer_success_without_replica_witness";
@@ -196,61 +192,79 @@ public:
                     StringRef diagnostic) {
       if (emitted >= limit)
         return;
-      writeJsonLine(os, llvm::json::Object{
-          {"schema", kSchema.str()}, {"record_type", "action"},
-          {"kind", "replica"}, {"task", task.getTaskName().str()},
-          {"axis", axis}, {"factor", factor},
-          {"status", status.str()}, {"reason", reason.str()},
-          {"diagnostic", diagnostic.str()}});
+      writeJsonLine(os, llvm::json::Object{{"schema", kSchema.str()},
+                                           {"record_type", "action"},
+                                           {"kind", "replica"},
+                                           {"task", task.getTaskName().str()},
+                                           {"axis", axis},
+                                           {"factor", factor},
+                                           {"status", status.str()},
+                                           {"reason", reason.str()},
+                                           {"diagnostic", diagnostic.str()}});
       ++emitted;
-      if (status == "legal") ++legal;
-      else if (status == "illegal") ++illegal;
-      else ++unknown;
+      if (status == "legal")
+        ++legal;
+      else if (status == "illegal")
+        ++illegal;
+      else
+        ++unknown;
     };
-    if (!writeAtomically(outputFile,
-          [&](llvm::raw_ostream &os) {
-            writeJsonLine(os, llvm::json::Object{
-                {"schema", kSchema.str()}, {"record_type", "header"},
-                {"function", function},
-                {"task_count", static_cast<int64_t>(tasks.size())},
-                {"factor_alphabet", llvm::json::Array{1, 2, 4, 8}},
-                {"declared_action_count", declared},
-                {"status", "incomplete"}, {"complete", false},
-                {"scope", "per_task_actions_only"}});
-            for (TaskAxes entry : axes) {
-              emit(os, entry.task, -1, 1, "legal", "identity_no_op", "");
-              for (int64_t axis = 0; axis < entry.axisCount; ++axis) {
-                for (int64_t factor : kFactors) {
-                  if (factor == 1)
-                    continue;
-                  if (emitted >= limit)
-                    break;
-                  std::string proof, diagnostic;
-                  bool proved = dryRunMaterializer(module, function,
-                      entry.task.getTaskName(), axis, factor, proof, diagnostic);
-                  if (!proved &&
-                      genericStaticUnevenShard(entry.task, axis, factor))
-                    proof = "needs_uneven_shard_materializer";
-                  emit(os, entry.task, axis, factor,
-                       proved ? "legal" : "unknown", proof, diagnostic);
+    if (!writeAtomically(
+            outputFile,
+            [&](llvm::raw_ostream &os) {
+              writeJsonLine(
+                  os, llvm::json::Object{
+                          {"schema", kSchema.str()},
+                          {"record_type", "header"},
+                          {"function", function},
+                          {"task_count", static_cast<int64_t>(tasks.size())},
+                          {"factor_alphabet", llvm::json::Array{1, 2, 4, 8}},
+                          {"declared_action_count", declared},
+                          {"status", "incomplete"},
+                          {"complete", false},
+                          {"scope", "per_task_actions_only"}});
+              for (TaskAxes entry : axes) {
+                emit(os, entry.task, -1, 1, "legal", "identity_no_op", "");
+                for (int64_t axis = 0; axis < entry.axisCount; ++axis) {
+                  for (int64_t factor : kFactors) {
+                    if (factor == 1)
+                      continue;
+                    if (emitted >= limit)
+                      break;
+                    std::string proof, diagnostic;
+                    bool proved = dryRunMaterializer(
+                        module, function, entry.task.getTaskName(), axis,
+                        factor, proof, diagnostic);
+                    if (!proved &&
+                        genericStaticUnevenShard(entry.task, axis, factor))
+                      proof = "needs_uneven_shard_materializer";
+                    emit(os, entry.task, axis, factor,
+                         proved ? "legal" : "unknown", proof, diagnostic);
+                  }
                 }
               }
-            }
-            writeJsonLine(os, llvm::json::Object{
-                {"schema", kSchema.str()}, {"record_type", "footer"},
-                {"status", "incomplete"}, {"complete", false},
-                {"declared_action_count", declared},
-                {"emitted_action_count", emitted},
-                {"omitted_action_count", declared - emitted},
-                {"legal_action_count", legal},
-                {"illegal_action_count", illegal},
-                {"unknown_action_count", unknown},
-                {"resource_bound_reached", bounded},
-                {"all_task_factor_pairs_recorded", !bounded},
-                {"first_blocker", bounded ? "max_action_records_reached" :
-                    "joint_graph_replica_closure_not_enumerated"}});
-            return true;
-          }, error)) {
+              writeJsonLine(
+                  os,
+                  llvm::json::Object{
+                      {"schema", kSchema.str()},
+                      {"record_type", "footer"},
+                      {"status", "incomplete"},
+                      {"complete", false},
+                      {"declared_action_count", declared},
+                      {"emitted_action_count", emitted},
+                      {"omitted_action_count", declared - emitted},
+                      {"legal_action_count", legal},
+                      {"illegal_action_count", illegal},
+                      {"unknown_action_count", unknown},
+                      {"resource_bound_reached", bounded},
+                      {"all_task_factor_pairs_recorded", !bounded},
+                      {"first_blocker",
+                       bounded
+                           ? "max_action_records_reached"
+                           : "joint_graph_replica_closure_not_enumerated"}});
+              return true;
+            },
+            error)) {
       selected->emitError() << error;
       return signalPassFailure();
     }

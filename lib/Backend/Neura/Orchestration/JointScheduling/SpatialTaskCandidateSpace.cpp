@@ -9,8 +9,8 @@
 
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -82,8 +82,8 @@ static std::optional<unsigned> exactIndexBitWidth(size_t taskCount) {
   constexpr size_t bitsPerTask = 64;
   if (taskCount > (std::numeric_limits<unsigned>::max() / bitsPerTask) - 1)
     return std::nullopt;
-  return std::max<unsigned>(64, static_cast<unsigned>(bitsPerTask *
-                                                       (taskCount + 1)));
+  return std::max<unsigned>(
+      64, static_cast<unsigned>(bitsPerTask * (taskCount + 1)));
 }
 
 bool visitShapeCartesianProductExact(
@@ -124,8 +124,8 @@ bool visitShapeCartesianProductExact(
 bool visitShapeCartesianProduct(ArrayRef<SmallVector<RectShape>> shapesByTask,
                                 ShapeIndexTupleConsumer consume) {
   return visitShapeCartesianProductExact(
-      shapesByTask, [&](const llvm::APInt &index,
-                        ArrayRef<size_t> shapeIndices) {
+      shapesByTask,
+      [&](const llvm::APInt &index, ArrayRef<size_t> shapeIndices) {
         if (index.getActiveBits() > 64)
           return false;
         return consume(index.getZExtValue(), shapeIndices);
@@ -158,30 +158,29 @@ bool visitShapeCandidateSpace(ArrayRef<SmallVector<RectShape>> shapesByTask,
 
   SmallVector<size_t> selectedIndices;
   uint64_t index = 0;
-  std::function<bool(size_t, int64_t)> visit =
-      [&](size_t taskIndex, int64_t changedTasks) {
-        if (taskIndex == shapesByTask.size()) {
-          if (!consume(index, selectedIndices))
-            return false;
-          if (index == std::numeric_limits<uint64_t>::max())
-            return false;
-          ++index;
-          return true;
-        }
+  std::function<bool(size_t, int64_t)> visit = [&](size_t taskIndex,
+                                                   int64_t changedTasks) {
+    if (taskIndex == shapesByTask.size()) {
+      if (!consume(index, selectedIndices))
+        return false;
+      if (index == std::numeric_limits<uint64_t>::max())
+        return false;
+      ++index;
+      return true;
+    }
 
-        for (auto [shapeIndex, shape] :
-             llvm::enumerate(shapesByTask[taskIndex])) {
-          const int64_t nextChangedTasks =
-              changedTasks + (isUnitShape(shape) ? 0 : 1);
-          if (nextChangedTasks > maxChangedTasks)
-            continue;
-          selectedIndices.push_back(shapeIndex);
-          if (!visit(taskIndex + 1, nextChangedTasks))
-            return false;
-          selectedIndices.pop_back();
-        }
-        return true;
-      };
+    for (auto [shapeIndex, shape] : llvm::enumerate(shapesByTask[taskIndex])) {
+      const int64_t nextChangedTasks =
+          changedTasks + (isUnitShape(shape) ? 0 : 1);
+      if (nextChangedTasks > maxChangedTasks)
+        continue;
+      selectedIndices.push_back(shapeIndex);
+      if (!visit(taskIndex + 1, nextChangedTasks))
+        return false;
+      selectedIndices.pop_back();
+    }
+    return true;
+  };
   return visit(0, 0);
 }
 
@@ -191,9 +190,10 @@ static std::string decimalString(const llvm::APInt &value) {
   return text.str().str();
 }
 
-ShapeCandidateSpaceCounts countShapeCandidateSpace(
-    ArrayRef<SmallVector<RectShape>> shapesByTask,
-    StringRef shapePruningPolicy, int64_t maxChangedTasks) {
+ShapeCandidateSpaceCounts
+countShapeCandidateSpace(ArrayRef<SmallVector<RectShape>> shapesByTask,
+                         StringRef shapePruningPolicy,
+                         int64_t maxChangedTasks) {
   ShapeCandidateSpaceCounts result;
   if (shapePruningPolicy != kShapePruningPolicyNone &&
       shapePruningPolicy != kShapePruningPolicyBoundedChangesFromUnit)
@@ -209,8 +209,7 @@ ShapeCandidateSpaceCounts countShapeCandidateSpace(
   // Every shape count is bounded by the architecture's finite grid. Giving
   // each task 64 bits in the accumulator is therefore sufficient for the
   // exact product even when it exceeds uint64_t.
-  const unsigned width =
-      64u * static_cast<unsigned>(shapesByTask.size() + 1);
+  const unsigned width = 64u * static_cast<unsigned>(shapesByTask.size() + 1);
   SmallVector<llvm::APInt> ways;
   ways.emplace_back(width, 1);
   for (ArrayRef<RectShape> shapes : shapesByTask) {
@@ -227,8 +226,7 @@ ShapeCandidateSpaceCounts countShapeCandidateSpace(
       next.emplace_back(width, 0);
     for (size_t changed = 0; changed < ways.size(); ++changed) {
       next[changed] += ways[changed] * llvm::APInt(width, unitCount);
-      next[changed + 1] +=
-          ways[changed] * llvm::APInt(width, nonUnitCount);
+      next[changed + 1] += ways[changed] * llvm::APInt(width, nonUnitCount);
     }
     ways = std::move(next);
   }
@@ -240,8 +238,8 @@ ShapeCandidateSpaceCounts countShapeCandidateSpace(
   if (shapePruningPolicy == kShapePruningPolicyNone) {
     declared = unrestricted;
   } else {
-    const size_t limit = std::min<size_t>(
-        static_cast<size_t>(maxChangedTasks), shapesByTask.size());
+    const size_t limit = std::min<size_t>(static_cast<size_t>(maxChangedTasks),
+                                          shapesByTask.size());
     for (size_t changed = 0; changed <= limit; ++changed)
       declared += ways[changed];
   }

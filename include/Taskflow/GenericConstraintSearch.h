@@ -3,7 +3,13 @@
 #include "Taskflow/GenericReuse.h"
 #include <optional>
 namespace orbit::taskflow {
-struct GenericConstraintSearchResult {std::optional<GenericReuseProposal> proposal;llvm::json::Object report;};
-GenericConstraintSearchResult searchGenericConstraints(const GenericAnalysis &,const llvm::json::Value &,GenericReuseOptions,int64_t wallMs,uint64_t maxCostProviderCalls);
-}
+struct GenericConstraintSearchResult {
+  std::optional<GenericReuseProposal> proposal;
+  llvm::json::Object report;
+};
+GenericConstraintSearchResult
+searchGenericConstraints(const GenericAnalysis &, const llvm::json::Value &,
+                         GenericReuseOptions, int64_t wallMs,
+                         uint64_t maxCostProviderCalls);
+} // namespace orbit::taskflow
 #endif

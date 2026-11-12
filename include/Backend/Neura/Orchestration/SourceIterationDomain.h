@@ -18,16 +18,16 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
@@ -83,9 +83,9 @@ inline bool checkedMultiply(int64_t lhs, int64_t rhs, int64_t &result) {
   return true;
 }
 
-inline std::optional<int64_t>
-sourceStaticIndex(Value value, taskflow::TaskflowTaskOp task,
-                  llvm::DenseSet<Value> &active) {
+inline std::optional<int64_t> sourceStaticIndex(Value value,
+                                                taskflow::TaskflowTaskOp task,
+                                                llvm::DenseSet<Value> &active) {
   if (!value || !active.insert(value).second)
     return std::nullopt;
   auto eraseActive = llvm::make_scope_exit([&] { active.erase(value); });
@@ -106,8 +106,8 @@ sourceStaticIndex(Value value, taskflow::TaskflowTaskOp task,
   if (auto cast = value.getDefiningOp<arith::IndexCastUIOp>())
     return sourceStaticIndex(cast.getIn(), task, active);
 
-  auto checkedBinary = [&](Value lhs, Value rhs, char operation)
-      -> std::optional<int64_t> {
+  auto checkedBinary = [&](Value lhs, Value rhs,
+                           char operation) -> std::optional<int64_t> {
     std::optional<int64_t> left = sourceStaticIndex(lhs, task, active);
     std::optional<int64_t> right = sourceStaticIndex(rhs, task, active);
     if (!left || !right)
@@ -135,8 +135,8 @@ sourceStaticIndex(Value value, taskflow::TaskflowTaskOp task,
           sourceStaticIndex(operand, task, active);
       if (!constant)
         return std::nullopt;
-      constants.push_back(IntegerAttr::get(
-          IndexType::get(value.getContext()), *constant));
+      constants.push_back(
+          IntegerAttr::get(IndexType::get(value.getContext()), *constant));
     }
     SmallVector<Attribute> folded;
     if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
@@ -158,9 +158,10 @@ sourceStaticIndex(Value value, taskflow::TaskflowTaskOp task,
       return std::nullopt;
     return sourceStaticIndex(inputs[argument.getArgNumber()], task, active);
   }
-  if (auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp())) {
-    std::string name = "amoeba.static_bound.arg." +
-                       std::to_string(argument.getArgNumber());
+  if (auto function =
+          dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp())) {
+    std::string name =
+        "amoeba.static_bound.arg." + std::to_string(argument.getArgNumber());
     if (auto bound = function->getAttrOfType<IntegerAttr>(name))
       return bound.getInt() > 0 ? std::optional<int64_t>(bound.getInt())
                                 : std::nullopt;
@@ -172,8 +173,8 @@ inline std::optional<int64_t>
 sourceStaticAffineBound(affine::AffineForOp loop, bool lower,
                         taskflow::TaskflowTaskOp task) {
   AffineMap map = lower ? loop.getLowerBoundMap() : loop.getUpperBoundMap();
-  ValueRange operands = lower ? loop.getLowerBoundOperands()
-                              : loop.getUpperBoundOperands();
+  ValueRange operands =
+      lower ? loop.getLowerBoundOperands() : loop.getUpperBoundOperands();
   SmallVector<Attribute> constants;
   constants.reserve(operands.size());
   for (Value operand : operands) {
@@ -196,8 +197,10 @@ sourceStaticAffineBound(affine::AffineForOp loop, bool lower,
 inline std::optional<int64_t>
 sourceAffineTripCount(affine::AffineForOp loop, taskflow::TaskflowTaskOp task,
                       int64_t &lower, int64_t &upper, int64_t &step) {
-  std::optional<int64_t> staticLower = sourceStaticAffineBound(loop, true, task);
-  std::optional<int64_t> staticUpper = sourceStaticAffineBound(loop, false, task);
+  std::optional<int64_t> staticLower =
+      sourceStaticAffineBound(loop, true, task);
+  std::optional<int64_t> staticUpper =
+      sourceStaticAffineBound(loop, false, task);
   if (!staticLower || !staticUpper || !loop.getStepAsInt() ||
       loop.getStepAsInt() <= 0 || *staticUpper <= *staticLower)
     return std::nullopt;
@@ -287,7 +290,8 @@ certifySourceIterationDomain(taskflow::TaskflowTaskOp task,
     if (!parent || parent != representedLoops.back() ||
         inner.getNumIterOperands() == 0 ||
         inner.getNumIterOperands() != inner.getNumResults()) {
-      unsupported("unrepresented source loop lacks a certified carried-state parent");
+      unsupported(
+          "unrepresented source loop lacks a certified carried-state parent");
       return info;
     }
     unsigned nestedAffineLoops = 0;
@@ -342,7 +346,8 @@ certifySourceIterationDomain(taskflow::TaskflowTaskOp task,
       Operation *definition = init.getDefiningOp();
       if (!definition || definition->getBlock() != parent.getBody() ||
           !definition->isBeforeInBlock(inner)) {
-        unsupported("internal loop initial state is not computed in its prologue");
+        unsupported(
+            "internal loop initial state is not computed in its prologue");
         return info;
       }
     }
@@ -370,7 +375,8 @@ certifySourceIterationDomain(taskflow::TaskflowTaskOp task,
           return info;
         }
         if (!isa<affine::AffineStoreOp, memref::StoreOp>(owner)) {
-          unsupported("internal carried result is not consumed by a parent-scope store");
+          unsupported("internal carried result is not consumed by a "
+                      "parent-scope store");
           return info;
         }
         hasParentEpilogueUse = true;
@@ -414,14 +420,13 @@ certifySourceIterationDomain(taskflow::TaskflowTaskOp task,
   return info;
 }
 
-inline std::string sourceIterationDomainCanonicalWitness(
-    const SourceIterationDomainInfo &info) {
+inline std::string
+sourceIterationDomainCanonicalWitness(const SourceIterationDomainInfo &info) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   stream << kSourceIterationDomainSchema << '\n'
          << "complete=" << (info.complete ? 1 : 0) << '\n'
-         << "represented_multiplicity=" << info.representedMultiplicity
-         << '\n'
+         << "represented_multiplicity=" << info.representedMultiplicity << '\n'
          << "internal_multiplicity=" << info.internalMultiplicity << '\n'
          << "source_multiplicity=" << info.sourceMultiplicity << '\n'
          << "axis_count=" << info.axes.size() << '\n';
@@ -440,28 +445,30 @@ inline std::string sourceIterationDomainCanonicalWitness(
   return text;
 }
 
-inline DictionaryAttr makeSourceIterationDomainAttr(
-    Builder &builder, const SourceIterationDomainInfo &info) {
+inline DictionaryAttr
+makeSourceIterationDomainAttr(Builder &builder,
+                              const SourceIterationDomainInfo &info) {
   SmallVector<Attribute> axes;
   axes.reserve(info.axes.size());
   for (const SourceIterationAxis &axis : info.axes) {
     axes.push_back(DictionaryAttr::get(
         builder.getContext(),
-        {builder.getNamedAttr("kind", builder.getStringAttr(
-                                            axis.representedByTaskflow
-                                                ? "taskflow-counter"
-                                                : "internal-carried-loop")),
-         builder.getNamedAttr("expanded_inside_mapper_firing",
-                              builder.getBoolAttr(
-                                  axis.expandedInsideMapperFiring)),
-         builder.getNamedAttr("ordinal", builder.getI64IntegerAttr(axis.ordinal)),
+        {builder.getNamedAttr(
+             "kind", builder.getStringAttr(axis.representedByTaskflow
+                                               ? "taskflow-counter"
+                                               : "internal-carried-loop")),
+         builder.getNamedAttr(
+             "expanded_inside_mapper_firing",
+             builder.getBoolAttr(axis.expandedInsideMapperFiring)),
+         builder.getNamedAttr("ordinal",
+                              builder.getI64IntegerAttr(axis.ordinal)),
          builder.getNamedAttr("lower", builder.getI64IntegerAttr(axis.lower)),
          builder.getNamedAttr("upper", builder.getI64IntegerAttr(axis.upper)),
          builder.getNamedAttr("step", builder.getI64IntegerAttr(axis.step)),
          builder.getNamedAttr("extent", builder.getI64IntegerAttr(axis.extent)),
-         builder.getNamedAttr("parent_counter_ordinal",
-                              builder.getI64IntegerAttr(
-                                  axis.parentCounterOrdinal)),
+         builder.getNamedAttr(
+             "parent_counter_ordinal",
+             builder.getI64IntegerAttr(axis.parentCounterOrdinal)),
          builder.getNamedAttr("carried_values",
                               builder.getI64IntegerAttr(axis.carriedValues)),
          builder.getNamedAttr("result_uses",
@@ -471,25 +478,26 @@ inline DictionaryAttr makeSourceIterationDomainAttr(
       builder.getNamedAttr("schema",
                            builder.getStringAttr(kSourceIterationDomainSchema)),
       builder.getNamedAttr("complete", builder.getBoolAttr(info.complete)),
-      builder.getNamedAttr("represented_multiplicity",
-                           builder.getI64IntegerAttr(info.representedMultiplicity)),
-      builder.getNamedAttr("internal_multiplicity",
-                           builder.getI64IntegerAttr(info.internalMultiplicity)),
+      builder.getNamedAttr(
+          "represented_multiplicity",
+          builder.getI64IntegerAttr(info.representedMultiplicity)),
+      builder.getNamedAttr(
+          "internal_multiplicity",
+          builder.getI64IntegerAttr(info.internalMultiplicity)),
       builder.getNamedAttr("source_multiplicity",
                            builder.getI64IntegerAttr(info.sourceMultiplicity)),
       builder.getNamedAttr("axes", builder.getArrayAttr(axes)),
-      builder.getNamedAttr("canonical_witness",
-                           builder.getStringAttr(
-                               sourceIterationDomainCanonicalWitness(info)))};
+      builder.getNamedAttr(
+          "canonical_witness",
+          builder.getStringAttr(sourceIterationDomainCanonicalWitness(info)))};
   if (!info.reason.empty())
-    fields.push_back(builder.getNamedAttr("reason",
-                                         builder.getStringAttr(info.reason)));
+    fields.push_back(
+        builder.getNamedAttr("reason", builder.getStringAttr(info.reason)));
   return DictionaryAttr::get(builder.getContext(), fields);
 }
 
 inline FailureOr<SourceIterationDomainInfo>
-parseSourceIterationDomain(taskflow::TaskflowTaskOp task,
-                           std::string &error) {
+parseSourceIterationDomain(taskflow::TaskflowTaskOp task, std::string &error) {
   auto attr = task->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
   if (!attr) {
     error = "task " + task.getTaskName().str() +
@@ -505,9 +513,8 @@ parseSourceIterationDomain(taskflow::TaskflowTaskOp task,
   auto canonicalWitness = attr.getAs<StringAttr>("canonical_witness");
   if (!schema || schema.getValue() != kSourceIterationDomainSchema ||
       !complete || !represented || !internal || !source || !axes ||
-      !canonicalWitness ||
-      represented.getInt() <= 0 || internal.getInt() <= 0 ||
-      source.getInt() <= 0) {
+      !canonicalWitness || represented.getInt() <= 0 ||
+      internal.getInt() <= 0 || source.getInt() <= 0) {
     error = "task " + task.getTaskName().str() +
             " has a malformed source iteration-domain certificate";
     return failure();
@@ -522,26 +529,29 @@ parseSourceIterationDomain(taskflow::TaskflowTaskOp task,
   for (Attribute axisAttr : axes) {
     auto axisDict = dyn_cast<DictionaryAttr>(axisAttr);
     auto kind = axisDict ? axisDict.getAs<StringAttr>("kind") : StringAttr{};
-    auto expanded = axisDict
-                        ? axisDict.getAs<BoolAttr>(
-                              "expanded_inside_mapper_firing")
-                        : BoolAttr{};
-    auto ordinal = axisDict ? axisDict.getAs<IntegerAttr>("ordinal") : IntegerAttr{};
-    auto lower = axisDict ? axisDict.getAs<IntegerAttr>("lower") : IntegerAttr{};
-    auto upper = axisDict ? axisDict.getAs<IntegerAttr>("upper") : IntegerAttr{};
+    auto expanded =
+        axisDict ? axisDict.getAs<BoolAttr>("expanded_inside_mapper_firing")
+                 : BoolAttr{};
+    auto ordinal =
+        axisDict ? axisDict.getAs<IntegerAttr>("ordinal") : IntegerAttr{};
+    auto lower =
+        axisDict ? axisDict.getAs<IntegerAttr>("lower") : IntegerAttr{};
+    auto upper =
+        axisDict ? axisDict.getAs<IntegerAttr>("upper") : IntegerAttr{};
     auto step = axisDict ? axisDict.getAs<IntegerAttr>("step") : IntegerAttr{};
-    auto extent = axisDict ? axisDict.getAs<IntegerAttr>("extent") : IntegerAttr{};
+    auto extent =
+        axisDict ? axisDict.getAs<IntegerAttr>("extent") : IntegerAttr{};
     auto parent = axisDict
                       ? axisDict.getAs<IntegerAttr>("parent_counter_ordinal")
                       : IntegerAttr{};
     auto carried = axisDict ? axisDict.getAs<IntegerAttr>("carried_values")
                             : IntegerAttr{};
-    auto uses = axisDict ? axisDict.getAs<IntegerAttr>("result_uses")
-                         : IntegerAttr{};
+    auto uses =
+        axisDict ? axisDict.getAs<IntegerAttr>("result_uses") : IntegerAttr{};
     if (!kind || !expanded || !ordinal || !lower || !upper || !step ||
-        !extent || !parent ||
-        !carried || !uses || ordinal.getInt() < 0 || step.getInt() <= 0 ||
-        extent.getInt() <= 0 || upper.getInt() <= lower.getInt() ||
+        !extent || !parent || !carried || !uses || ordinal.getInt() < 0 ||
+        step.getInt() <= 0 || extent.getInt() <= 0 ||
+        upper.getInt() <= lower.getInt() ||
         (kind.getValue() != "taskflow-counter" &&
          kind.getValue() != "internal-carried-loop")) {
       error = "task " + task.getTaskName().str() +
@@ -595,8 +605,7 @@ parseSourceIterationDomain(taskflow::TaskflowTaskOp task,
           axis.parentCounterOrdinal !=
               static_cast<int64_t>(representedCount - 1) ||
           (info.complete && !axis.expandedInsideMapperFiring) ||
-          axis.carriedValues <= 0 ||
-          axis.resultUses <= 0 ||
+          axis.carriedValues <= 0 || axis.resultUses <= 0 ||
           !checkedMultiply(internalProduct, axis.extent, next)) {
         error = "task " + task.getTaskName().str() +
                 " has inconsistent internal source-axis metadata";
@@ -634,7 +643,7 @@ inline std::string
 normalizeFalseDefaultMemoryHintsInBinding(StringRef binding) {
   std::string normalized = binding.str();
   constexpr llvm::StringLiteral operationNames[] = {"\"memref.load\"",
-                                              "\"memref.store\""};
+                                                    "\"memref.store\""};
   constexpr llvm::StringLiteral defaultField = "nontemporal = false";
   for (StringRef operationName : operationNames) {
     size_t searchFrom = 0;
@@ -710,8 +719,9 @@ normalizeFalseDefaultMemoryHintsInBinding(StringRef binding) {
   return normalized;
 }
 
-inline std::string currentSourceIterationControlBinding(
-    taskflow::TaskflowTaskOp task, StringRef domainWitness) {
+inline std::string
+currentSourceIterationControlBinding(taskflow::TaskflowTaskOp task,
+                                     StringRef domainWitness) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   stream << kSourceIterationDomainSchema << '\n'
@@ -729,10 +739,13 @@ inline std::string currentSourceIterationControlBinding(
   SmallVector<Type> inputTypes;
   llvm::DenseSet<Value> seenInputs;
   for (Value operand : task->getOperands()) {
-    if (!seenInputs.insert(operand).second) continue;
-    inputs.push_back(operand); inputTypes.push_back(operand.getType());
+    if (!seenInputs.insert(operand).second)
+      continue;
+    inputs.push_back(operand);
+    inputTypes.push_back(operand.getType());
   }
-  auto wrapper = func::FuncOp::create(task.getLoc(), "__source_domain_binding__",
+  auto wrapper = func::FuncOp::create(
+      task.getLoc(), "__source_domain_binding__",
       FunctionType::get(task.getContext(), inputTypes, {}));
   Block *entry = wrapper.addEntryBlock();
   IRMapping mapping;
@@ -749,14 +762,17 @@ inline std::string currentSourceIterationControlBinding(
   for (NamedAttribute attr : copy->getAttrs()) {
     StringRef name = attr.getName().strref();
     if (name.starts_with("amoeba.mapper_") ||
-        name.starts_with("amoeba.selected_") || name == "amoeba.exact_schedule" ||
+        name.starts_with("amoeba.selected_") ||
+        name == "amoeba.exact_schedule" ||
         name == "amoeba.joint_shape_orientation_fixed" ||
         name == "compiled_ii" || name == "profile_info" ||
         name == "task_orchestration_info" || name == "cgra_count" ||
         name == "cgra_shape" || name == "replicas" || name == "tiling" ||
-        name == "est_latency") derived.push_back(attr.getName());
+        name == "est_latency")
+      derived.push_back(attr.getName());
   }
-  for (StringAttr name : derived) copy->removeAttr(name);
+  for (StringAttr name : derived)
+    copy->removeAttr(name);
   // Generic MLIR round-trips may materialize the default `nontemporal =
   // false` on loads or stores. Treat only that BoolAttr spelling as the same
   // canonical witness; true, malformed, and all other attributes remain
@@ -773,8 +789,8 @@ inline std::string currentSourceIterationControlBinding(
   builder.create<func::ReturnOp>(task.getLoc());
   wrapper.print(stream, OpPrintingFlags().printGenericOpForm().useLocalScope());
   wrapper->destroy();
-  if (auto stored = task->getAttrOfType<StringAttr>(
-          kSourceIterationControlBindingAttr)) {
+  if (auto stored =
+          task->getAttrOfType<StringAttr>(kSourceIterationControlBindingAttr)) {
     if (normalizeFalseDefaultMemoryHintsInBinding(stored.getValue()) ==
         normalizeFalseDefaultMemoryHintsInBinding(text))
       return stored.getValue().str();

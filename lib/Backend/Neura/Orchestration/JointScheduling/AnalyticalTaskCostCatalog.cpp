@@ -16,9 +16,9 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SHA256.h"
 
-#include <cmath>
-#include <array>
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -74,25 +74,21 @@ requiredPositiveDecimal(const llvm::json::Object &object, StringRef key,
                         std::string &error) {
   if (std::optional<int64_t> numeric = object.getInteger(key)) {
     if (*numeric <= 0) {
-      error = "missing or invalid positive decimal field \"" + key.str() +
-              "\"";
+      error = "missing or invalid positive decimal field \"" + key.str() + "\"";
       return std::nullopt;
     }
     return std::to_string(*numeric);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char value) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char value) {
         return value < '0' || value > '9';
       })) {
-    error = "missing or invalid positive decimal field \"" + key.str() +
-            "\"";
+    error = "missing or invalid positive decimal field \"" + key.str() + "\"";
     return std::nullopt;
   }
   StringRef normalized = text->ltrim('0');
   if (normalized.empty()) {
-    error = "missing or invalid positive decimal field \"" + key.str() +
-            "\"";
+    error = "missing or invalid positive decimal field \"" + key.str() + "\"";
     return std::nullopt;
   }
   return normalized.str();
@@ -116,10 +112,10 @@ static bool closeModelValue(double lhs, double rhs) {
 static constexpr std::array<int64_t, 4> kDirectModelMemberSeeds = {
     {17, 41, 113, 239}};
 
-static bool getModelDomainShapes(
-    bool directPerCgra2x2,
-    std::array<std::pair<int64_t, int64_t>, 8> &shapes,
-    std::string &error) {
+static bool
+getModelDomainShapes(bool directPerCgra2x2,
+                     std::array<std::pair<int64_t, int64_t>, 8> &shapes,
+                     std::string &error) {
   if (!directPerCgra2x2) {
     shapes = kFormalMax4CostShapes;
     return true;
@@ -140,11 +136,10 @@ static bool getModelDomainShapes(
   // The direct model schema names a maximum of four physical CGRAs per task.
   // Keep the protocol's oriented rectangle sequence in CGRA coordinates and
   // derive mapper-tile dimensions from the actual loaded architecture.
-  constexpr std::array<std::pair<int64_t, int64_t>, 8> kMaxFourCgraShapes =
-      {{{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
+  constexpr std::array<std::pair<int64_t, int64_t>, 8> kMaxFourCgraShapes = {
+      {{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
   for (auto [index, shape] : llvm::enumerate(kMaxFourCgraShapes))
-    shapes[index] = {shape.first * perCgraRows,
-                     shape.second * perCgraCols};
+    shapes[index] = {shape.first * perCgraRows, shape.second * perCgraCols};
   return true;
 }
 
@@ -157,8 +152,7 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
                               StringRef expectedSourceRepository,
                               StringRef expectedSourceCommit,
                               StringRef expectedArchitecturePath,
-                              StringRef expectedGraphId,
-                              std::string &error,
+                              StringRef expectedGraphId, std::string &error,
                               bool allowModelDomainUnsupported,
                               StringRef expectedCanonicalModuleWitness) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -201,12 +195,11 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     return false;
   }
 
-  const bool directPerCgra2x2 =
-      *modelNamespace == kPerCgra2x2ModelNamespace;
+  const bool directPerCgra2x2 = *modelNamespace == kPerCgra2x2ModelNamespace;
   const std::optional<StringRef> catalogModelSchema =
       metadata->getString("model_schema");
-  if (directPerCgra2x2 ||
-      (catalogModelSchema && *catalogModelSchema == kPerCgra2x2EnsembleSchema)) {
+  if (directPerCgra2x2 || (catalogModelSchema &&
+                           *catalogModelSchema == kPerCgra2x2EnsembleSchema)) {
     std::optional<StringRef> featureContractId =
         metadata->getString("feature_contract_id");
     std::optional<StringRef> shapeProtocolId =
@@ -215,14 +208,14 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         *catalogModelSchema != kPerCgra2x2EnsembleSchema ||
         !featureContractId ||
         *featureContractId != kPerCgra2x2FeatureContractId ||
-        !shapeProtocolId ||
-        *shapeProtocolId != kPerCgra2x2ShapeProtocolId ||
+        !shapeProtocolId || *shapeProtocolId != kPerCgra2x2ShapeProtocolId ||
         !metadata->getBoolean("candidate_only").value_or(false) ||
         metadata->getBoolean("production_ready").value_or(true) ||
         metadata->getBoolean("amoeba_benchmark_overlap_audit_complete")
             .value_or(true) ||
         metadata->getBoolean("old_4x4_labels_reused").value_or(true) ||
-        metadata->getBoolean("supports_whole_program_latency_or_throughput_claim")
+        metadata
+            ->getBoolean("supports_whole_program_latency_or_throughput_claim")
             .value_or(true)) {
       error = "direct per-CGRA cost catalogue does not match its explicit "
               "namespace, schema, feature contract, shape protocol, or "
@@ -231,13 +224,10 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     }
   }
 
-  auto provenanceSchema =
-      requiredString(*metadata, "provenance_schema", error);
-  auto sourceRepository =
-      requiredString(*metadata, "source_repository", error);
+  auto provenanceSchema = requiredString(*metadata, "provenance_schema", error);
+  auto sourceRepository = requiredString(*metadata, "source_repository", error);
   auto sourceCommit = requiredString(*metadata, "source_commit", error);
-  auto architecturePath =
-      requiredString(*metadata, "architecture_path", error);
+  auto architecturePath = requiredString(*metadata, "architecture_path", error);
   auto architectureSchema =
       requiredString(*metadata, "architecture_schema", error);
   auto sourceGraphId = requiredString(*metadata, "source_graph_id", error);
@@ -250,8 +240,7 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
   llvm::json::Object *rankingPolicy = metadata->getObject("ranking_policy");
   if (!provenanceSchema || !sourceRepository || !sourceCommit ||
       !architecturePath || !architectureSchema || !sourceGraphId ||
-      !candidateIdScheme || !candidateCount || !sourceTaskIds ||
-      !rankingPolicy)
+      !candidateIdScheme || !candidateCount || !sourceTaskIds || !rankingPolicy)
     return false;
 
   const llvm::json::Object *diagnostic =
@@ -260,7 +249,8 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
   double runtimeIICeiling = kFormalMax4ModelCeilingII;
   if (diagnosticOverride) {
     std::string architectureError;
-    auto runtimeArchitectureFile = llvm::MemoryBuffer::getFile(*architecturePath);
+    auto runtimeArchitectureFile =
+        llvm::MemoryBuffer::getFile(*architecturePath);
     if (!directPerCgra2x2 || !runtimeArchitectureFile ||
         !validatePerCgra2x2DiagnosticMetadata(
             *metadata, (*runtimeArchitectureFile)->getBuffer(),
@@ -291,12 +281,14 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         metadata->getNumber("model_interval_max_ii");
     const StringRef requiredPolicy =
         diagnosticOverride
-            ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling-v1")
+            ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-"
+                        "ceiling-v1")
             : StringRef("analytical-lower-bound-exceeds-model-ceiling-v1");
-    if (!witness || witness->empty() || expectedCanonicalModuleWitness.empty() ||
+    if (!witness || witness->empty() ||
+        expectedCanonicalModuleWitness.empty() ||
         *witness != expectedCanonicalModuleWitness || !domainPolicy ||
-        *domainPolicy != requiredPolicy ||
-        !intervalMax || !std::isfinite(*intervalMax) ||
+        *domainPolicy != requiredPolicy || !intervalMax ||
+        !std::isfinite(*intervalMax) ||
         *intervalMax != kFormalMax4ModelCeilingII) {
       error = "cost catalogue model-domain proof is not bound to the exact "
               "current canonical module and formal interval";
@@ -304,13 +296,12 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
     }
   }
 
-  if (*provenanceSchema != kCostProvenanceSchema ||
-      sourceRepository->empty() || !isGitCommit(*sourceCommit) ||
-      expectedSourceRepository.empty() || expectedSourceCommit.empty() ||
-      !isGitCommit(expectedSourceCommit) ||
+  if (*provenanceSchema != kCostProvenanceSchema || sourceRepository->empty() ||
+      !isGitCommit(*sourceCommit) || expectedSourceRepository.empty() ||
+      expectedSourceCommit.empty() || !isGitCommit(expectedSourceCommit) ||
       *sourceRepository != expectedSourceRepository ||
-      *sourceCommit != expectedSourceCommit || expectedArchitecturePath.empty() ||
-      architecturePath->empty() ||
+      *sourceCommit != expectedSourceCommit ||
+      expectedArchitecturePath.empty() || architecturePath->empty() ||
       !samePath(*architecturePath, expectedArchitecturePath) ||
       *architectureSchema != kArchitectureSchema ||
       *candidateIdScheme != kCandidateIdScheme ||
@@ -448,11 +439,11 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         bool extrapolated = *lowerBound > kPerCgra2x2TrainingIICeiling;
         for (size_t index = 0; index < members->size(); ++index) {
           const llvm::json::Object *member = (*members)[index].getAsObject();
-          auto memberIndex = member ? member->getInteger("member_index")
-                                    : std::nullopt;
+          auto memberIndex =
+              member ? member->getInteger("member_index") : std::nullopt;
           auto seed = member ? member->getInteger("seed") : std::nullopt;
-          auto value = member ? member->getNumber("predicted_ii")
-                              : std::nullopt;
+          auto value =
+              member ? member->getNumber("predicted_ii") : std::nullopt;
           if (!memberIndex || *memberIndex != static_cast<int64_t>(index) ||
               !seed || *seed != kDirectModelMemberSeeds[index] || !value ||
               !std::isfinite(*value) || *value < *lowerBound ||
@@ -475,9 +466,9 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         if (!closeModelValue(memberMean, *ii) ||
             !closeModelValue(std::sqrt(variance), *reportedStd) ||
             !extrapolationStatus ||
-            *extrapolationStatus !=
-                (extrapolated ? "out-of-training-ceiling"
-                              : "within-training-ceiling")) {
+            *extrapolationStatus != (extrapolated
+                                         ? "out-of-training-ceiling"
+                                         : "within-training-ceiling")) {
           error = "diagnostic direct ensemble aggregate or extrapolation "
                   "status disagrees with its four members";
           return false;
@@ -514,12 +505,12 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         auto rowTrainingCeiling = entry->getNumber("training_ceiling_ii");
         auto extrapolationStatus = entry->getString("extrapolation_status");
         const StringRef expectedReason =
-            diagnosticOverride
-                ? StringRef("analytical-lower-bound-exceeds-diagnostic-runtime-ceiling")
-                : StringRef(kModelDomainUnsupportedReason);
-        if (!reason || *reason != expectedReason ||
-            !lowerBound || !std::isfinite(*lowerBound) || *lowerBound <= 0.0 ||
-            !intervalMax || !std::isfinite(*intervalMax) ||
+            diagnosticOverride ? StringRef("analytical-lower-bound-exceeds-"
+                                           "diagnostic-runtime-ceiling")
+                               : StringRef(kModelDomainUnsupportedReason);
+        if (!reason || *reason != expectedReason || !lowerBound ||
+            !std::isfinite(*lowerBound) || *lowerBound <= 0.0 || !intervalMax ||
+            !std::isfinite(*intervalMax) ||
             *intervalMax != kFormalMax4ModelCeilingII ||
             *lowerBound <= runtimeIICeiling ||
             (diagnosticOverride &&
@@ -528,9 +519,8 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
               *rowTrainingCeiling != kPerCgra2x2TrainingIICeiling ||
               !extrapolationStatus ||
               *extrapolationStatus != "outside-diagnostic-runtime-domain")) ||
-            (!diagnosticOverride &&
-             (rowRuntimeCeiling || rowTrainingCeiling ||
-              extrapolationStatus))) {
+            (!diagnosticOverride && (rowRuntimeCeiling || rowTrainingCeiling ||
+                                     extrapolationStatus))) {
           error = "unsupported model-domain row lacks a valid analytical "
                   "lower-bound proof above the model ceiling";
           return false;
@@ -580,12 +570,10 @@ bool TaskShapeCostCache::load(StringRef path, StringRef expectedFunction,
         if (found == catalog_.end()) {
           error = directPerCgra2x2
                       ? "direct model-domain catalogue is missing task=" +
-                            task.name + " shape=rect-" +
-                            std::to_string(rows) + "x" +
-                            std::to_string(cols)
-                      : "model-domain catalogue is missing task=" +
-                            task.name + " shape=rect-" +
-                            std::to_string(rows) + "x" +
+                            task.name + " shape=rect-" + std::to_string(rows) +
+                            "x" + std::to_string(cols)
+                      : "model-domain catalogue is missing task=" + task.name +
+                            " shape=rect-" + std::to_string(rows) + "x" +
                             std::to_string(cols);
           return false;
         }

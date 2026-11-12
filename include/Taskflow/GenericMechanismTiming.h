@@ -6,7 +6,9 @@ namespace orbit::taskflow {
 // It uses public per-activity costs and ProgramTiming, never a whole-call fit.
 // This function checks the public graph, not checkGenericMapping recursively.
 bool evaluateGenericMechanismCost(const GenericAnalysis &,
-    const GenericMappingPlan &, const llvm::json::Value &model,
-    const llvm::json::Value &target, GenericDirectAIRCost &, std::string &error);
-}
+                                  const GenericMappingPlan &,
+                                  const llvm::json::Value &model,
+                                  const llvm::json::Value &target,
+                                  GenericDirectAIRCost &, std::string &error);
+} // namespace orbit::taskflow
 #endif

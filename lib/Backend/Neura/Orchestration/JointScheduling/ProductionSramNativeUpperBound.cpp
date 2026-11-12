@@ -21,9 +21,9 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 
@@ -88,7 +88,6 @@ struct ExportState {
     if (std::find(reasons.begin(), reasons.end(), reason) == reasons.end())
       reasons.push_back(reason.str());
   }
-
 };
 
 static bool safeMultiply(uint64_t lhs, uint64_t rhs, uint64_t &out) {
@@ -121,8 +120,8 @@ static std::optional<uint64_t> scalarBitWidth(Type type) {
       return std::nullopt;
     uint64_t count = 1;
     for (int64_t extent : vector.getShape()) {
-      if (extent <= 0 || !safeMultiply(count, static_cast<uint64_t>(extent),
-                                        count))
+      if (extent <= 0 ||
+          !safeMultiply(count, static_cast<uint64_t>(extent), count))
         return std::nullopt;
     }
     if (!safeMultiply(count, *width, count))
@@ -258,8 +257,7 @@ static FailureOr<Value> resolveBackingRoot(Value value,
 
   if (auto channel = dyn_cast<taskflow::TaskflowChannelOp>(defining))
     return resolveBackingRoot(channel.getSource(), visited, error);
-  if (auto join =
-          dyn_cast<taskflow::TaskflowReadCompletionJoinOp>(defining))
+  if (auto join = dyn_cast<taskflow::TaskflowReadCompletionJoinOp>(defining))
     return resolveBackingRoot(join.getBaseState(), visited, error);
   if (auto join = dyn_cast<taskflow::TaskflowJoinOp>(defining))
     return resolveBackingRoot(join.getBase(), visited, error);
@@ -277,8 +275,8 @@ static FailureOr<Value> resolveBackingRoot(Value value,
       error = "task result has no taskflow.yield terminator";
       return failure();
     }
-    auto resolveResult = [&](ValueRange results, ValueRange yielded)
-        -> FailureOr<Value> {
+    auto resolveResult = [&](ValueRange results,
+                             ValueRange yielded) -> FailureOr<Value> {
       auto found = llvm::find(results, value);
       if (found == results.end())
         return failure();
@@ -287,8 +285,8 @@ static FailureOr<Value> resolveBackingRoot(Value value,
         return failure();
       Value state = yielded[index];
       auto argument = dyn_cast<BlockArgument>(state);
-      unsigned stateInputs = task.getWillReads().size() +
-                             task.getWillWrites().size();
+      unsigned stateInputs =
+          task.getWillReads().size() + task.getWillWrites().size();
       if (!argument || argument.getOwner() != &task.getBody().front() ||
           argument.getArgNumber() >= stateInputs) {
         error = "task result does not resolve to an original memref operand";
@@ -298,10 +296,12 @@ static FailureOr<Value> resolveBackingRoot(Value value,
                                 visited, error);
     };
 
-    if (auto root = resolveResult(task.getDoneWrites(), terminator.getDoneWrites());
+    if (auto root =
+            resolveResult(task.getDoneWrites(), terminator.getDoneWrites());
         succeeded(root))
       return *root;
-    if (auto root = resolveResult(task.getDoneReads(), terminator.getDoneReads());
+    if (auto root =
+            resolveResult(task.getDoneReads(), terminator.getDoneReads());
         succeeded(root))
       return *root;
     if (error.empty())
@@ -342,10 +342,9 @@ static std::string backingId(func::FuncOp function, Value root,
 static bool parseLocation(Attribute attribute, int64_t rows, int64_t columns,
                           int64_t &cgra, std::string &error) {
   auto dictionary = dyn_cast<DictionaryAttr>(attribute);
-  auto row = dictionary ? dictionary.getAs<IntegerAttr>("row")
-                        : IntegerAttr();
-  auto column = dictionary ? dictionary.getAs<IntegerAttr>("col")
-                           : IntegerAttr();
+  auto row = dictionary ? dictionary.getAs<IntegerAttr>("row") : IntegerAttr();
+  auto column =
+      dictionary ? dictionary.getAs<IntegerAttr>("col") : IntegerAttr();
   if (!row || !column) {
     error = "SRAM location must contain integer row and col fields";
     return false;
@@ -360,7 +359,7 @@ static bool parseLocation(Attribute attribute, int64_t rows, int64_t columns,
 }
 
 static unsigned getOrCreateBacking(ExportState &state, Value root,
-                                    ExtentFact extent) {
+                                   ExtentFact extent) {
   auto found = state.backingIndices.find(root);
   if (found != state.backingIndices.end())
     return found->second;
@@ -376,9 +375,9 @@ static unsigned getOrCreateBacking(ExportState &state, Value root,
   return index;
 }
 
-static void recordBackingAccess(ExportState &state, Value root,
-                                int64_t cgra, StringRef taskName,
-                                StringRef direction, unsigned operandIndex) {
+static void recordBackingAccess(ExportState &state, Value root, int64_t cgra,
+                                StringRef taskName, StringRef direction,
+                                unsigned operandIndex) {
   ExtentFact extent = computeMemrefBytes(root, state.function);
   unsigned backing = getOrCreateBacking(state, root, extent);
   NativeSramBackingRecord &record = state.result.backings[backing];
@@ -407,9 +406,9 @@ static void recordBackingAccess(ExportState &state, Value root,
   state.chargedBackingCgras.insert({backing, cgra});
   int64_t &required = state.result.requiredBytesByCgra[cgra];
   if (required > std::numeric_limits<int64_t>::max() - extent.bytes) {
-    state.addReason((Twine("backing byte sum overflows int64 on CGRA ") +
-                     Twine(cgra))
-                        .str());
+    state.addReason(
+        (Twine("backing byte sum overflows int64 on CGRA ") + Twine(cgra))
+            .str());
     state.result.extentProofComplete = false;
     return;
   }
@@ -443,8 +442,8 @@ static void processMemoryOperands(ExportState &state,
     state.result.placementProofComplete = false;
     state.addReason((Twine("task ") + taskName + " " + direction +
                      "_sram_locations count " + Twine(locations.size()) +
-                     " does not match original_" + direction + "_memrefs count " +
-                     Twine(memrefs.size()))
+                     " does not match original_" + direction +
+                     "_memrefs count " + Twine(memrefs.size()))
                         .str());
   }
   unsigned count = std::min<unsigned>(locations.size(), memrefs.size());
@@ -455,8 +454,8 @@ static void processMemoryOperands(ExportState &state,
                        cgra, locationError)) {
       state.result.placementProofComplete = false;
       state.addReason((Twine("task ") + taskName + " " + direction +
-                       "_sram_locations[" + Twine(index) + "]: " +
-                       locationError)
+                       "_sram_locations[" + Twine(index) +
+                       "]: " + locationError)
                           .str());
       continue;
     }
@@ -466,11 +465,11 @@ static void processMemoryOperands(ExportState &state,
         resolveBackingRoot(memrefs[index], visited, rootError);
     if (failed(root)) {
       state.result.extentProofComplete = false;
-      state.addReason((Twine("task ") + taskName + " " + direction +
-                       " original memref[" + Twine(index) + "]: " +
-                       (rootError.empty() ? "cannot resolve backing root"
-                                           : rootError))
-                          .str());
+      state.addReason(
+          (Twine("task ") + taskName + " " + direction + " original memref[" +
+           Twine(index) + "]: " +
+           (rootError.empty() ? "cannot resolve backing root" : rootError))
+              .str());
       continue;
     }
     recordTaskStorageCoordinate(state, task, *root, cgra, direction);
@@ -478,8 +477,7 @@ static void processMemoryOperands(ExportState &state,
   }
 }
 
-static std::optional<unsigned>
-parseKernelInputReference(Attribute attribute) {
+static std::optional<unsigned> parseKernelInputReference(Attribute attribute) {
   auto text = dyn_cast_or_null<StringAttr>(attribute);
   if (!text)
     return std::nullopt;
@@ -519,37 +517,37 @@ static bool valueReferencesKernelInput(Value value, unsigned inputIndex,
         if (auto reference =
                 parseKernelInputReference(definition->getAttr("value")))
           result = *reference == inputIndex;
-      } else if (name == "neura.grant_once" ||
-                 name == "neura.grant_always") {
+      } else if (name == "neura.grant_once" || name == "neura.grant_always") {
         // Neura's folded grant form keeps the value in constant_value and
         // has no SSA operand.  Require both representations to agree when
         // present; an invalid reference must never fall back to the operand.
         Attribute folded = definition->getAttr("constant_value");
         auto reference = parseKernelInputReference(folded);
         bool hasOperand = definition->getNumOperands() == 1;
-        bool operandMatches = hasOperand && valueReferencesKernelInput(
-            definition->getOperand(0), inputIndex, kernel, visiting, depth + 1);
+        bool operandMatches =
+            hasOperand &&
+            valueReferencesKernelInput(definition->getOperand(0), inputIndex,
+                                       kernel, visiting, depth + 1);
         result = definition->getNumOperands() <= 1 &&
                  (folded ? reference && *reference == inputIndex &&
                                (!hasOperand || operandMatches)
                          : operandMatches);
-      } else if (name == "neura.data_mov" ||
-                 name == "neura.grant_predicate" ||
+      } else if (name == "neura.data_mov" || name == "neura.grant_predicate" ||
                  name == "neura.ctrl_mov" || name == "neura.cast" ||
                  name == "neura.phi_start") {
-        result = definition->getNumOperands() >= 1 &&
-                 valueReferencesKernelInput(definition->getOperand(0),
-                                            inputIndex, kernel, visiting,
-                                            depth + 1);
+        result =
+            definition->getNumOperands() >= 1 &&
+            valueReferencesKernelInput(definition->getOperand(0), inputIndex,
+                                       kernel, visiting, depth + 1);
       } else if (name == "neura.phi" || name == "neura.sel") {
         unsigned first = name == "neura.sel" ? 1u : 0u;
         result = first < definition->getNumOperands();
         for (unsigned operand = first;
              result && operand < definition->getNumOperands(); ++operand) {
           DenseSet<Value> armVisiting = visiting;
-          result = valueReferencesKernelInput(
-              definition->getOperand(operand), inputIndex, kernel,
-              armVisiting, depth + 1);
+          result = valueReferencesKernelInput(definition->getOperand(operand),
+                                              inputIndex, kernel, armVisiting,
+                                              depth + 1);
         }
       }
     }
@@ -574,8 +572,8 @@ traceKernelInput(Value value, ::mlir::neura::KernelOp kernel) {
 
 static FailureOr<Value>
 resolveKernelInputBacking(taskflow::TaskflowTaskOp task,
-                         ::mlir::neura::KernelOp kernel, unsigned inputIndex,
-                         DenseSet<Operation *> &visited, std::string &error) {
+                          ::mlir::neura::KernelOp kernel, unsigned inputIndex,
+                          DenseSet<Operation *> &visited, std::string &error) {
   if (inputIndex >= kernel.getInputs().size()) {
     error = "indexed operation references a kernel input outside kernel.inputs";
     return failure();
@@ -626,8 +624,8 @@ static void inspectIndexedAccesses(ExportState &state,
 
     const uint64_t ordinal = state.nextIndexedAccessOrdinal++;
     StringRef direction = isLoad ? StringRef("read") : StringRef("write");
-    StringRef referenceAttr = isLoad ? StringRef("lhs_value")
-                                     : StringRef("rhs_value");
+    StringRef referenceAttr =
+        isLoad ? StringRef("lhs_value") : StringRef("rhs_value");
     NativeSramIndexedAccessRecord record;
     record.task = task.getTaskName().str();
     record.direction = direction.str();
@@ -656,9 +654,9 @@ static void inspectIndexedAccesses(ExportState &state,
         record.symbolicReference = "<non-string>";
       foldedInput = parseKernelInputReference(reference);
       if (!foldedInput) {
-        failCoverage((Twine("invalid ") + referenceAttr +
-                      " kernel-input reference")
-                         .str());
+        failCoverage(
+            (Twine("invalid ") + referenceAttr + " kernel-input reference")
+                .str());
         return;
       }
     }
@@ -673,11 +671,13 @@ static void inspectIndexedAccesses(ExportState &state,
     if (base) {
       baseInput = traceKernelInput(base, kernel);
       if (!baseInput) {
-        failCoverage("explicit indexed base has ambiguous or unresolved kernel-input provenance");
+        failCoverage("explicit indexed base has ambiguous or unresolved "
+                     "kernel-input provenance");
         return;
       }
       if (foldedInput && *foldedInput != *baseInput) {
-        failCoverage("folded kernel-input reference disagrees with explicit indexed base");
+        failCoverage("folded kernel-input reference disagrees with explicit "
+                     "indexed base");
         return;
       }
     }
@@ -697,8 +697,8 @@ static void inspectIndexedAccesses(ExportState &state,
 
     DenseSet<Operation *> visited;
     std::string rootError;
-    FailureOr<Value> root = resolveKernelInputBacking(
-        task, kernel, *input, visited, rootError);
+    FailureOr<Value> root =
+        resolveKernelInputBacking(task, kernel, *input, visited, rootError);
     if (failed(root)) {
       failCoverage(rootError.empty() ? "cannot resolve indexed backing root"
                                      : StringRef(rootError));
@@ -706,23 +706,26 @@ static void inspectIndexedAccesses(ExportState &state,
     }
     record.storageRootProven = true;
 
-    auto taskCoordinates = state.taskStorageCoordinates.find(task.getOperation());
+    auto taskCoordinates =
+        state.taskStorageCoordinates.find(task.getOperation());
     if (taskCoordinates == state.taskStorageCoordinates.end()) {
       failCoverage("task has no scheduler storage-coordinate records");
       return;
     }
-    const auto &byRoot = isLoad ? taskCoordinates->second.reads
-                                : taskCoordinates->second.writes;
+    const auto &byRoot =
+        isLoad ? taskCoordinates->second.reads : taskCoordinates->second.writes;
     auto coordinates = byRoot.find(*root);
     if (coordinates == byRoot.end() || coordinates->second.empty()) {
-      failCoverage((Twine("indexed backing root is omitted from the task's scheduled ") +
-                    direction + " memory operands")
-                       .str());
+      failCoverage(
+          (Twine("indexed backing root is omitted from the task's scheduled ") +
+           direction + " memory operands")
+              .str());
       return;
     }
     auto backing = state.backingIndices.find(*root);
     if (backing == state.backingIndices.end()) {
-      failCoverage("indexed backing root was not exported from original task operands");
+      failCoverage(
+          "indexed backing root was not exported from original task operands");
       return;
     }
     record.backingId = state.result.backings[backing->second].id;
@@ -804,12 +807,11 @@ static void exportFunction(ExportState &state) {
       state.sawStorageResidencyContract = true;
     if (task->hasAttr(kStorageCopyBindingAttr))
       state.sawStorageCopyBindingContract = true;
-    processMemoryOperands(
-        state, task, task.getOriginalReadMemrefs(),
-        info.getAs<ArrayAttr>("read_sram_locations"), "read");
-    processMemoryOperands(
-        state, task, task.getOriginalWriteMemrefs(),
-        info.getAs<ArrayAttr>("write_sram_locations"), "write");
+    processMemoryOperands(state, task, task.getOriginalReadMemrefs(),
+                          info.getAs<ArrayAttr>("read_sram_locations"), "read");
+    processMemoryOperands(state, task, task.getOriginalWriteMemrefs(),
+                          info.getAs<ArrayAttr>("write_sram_locations"),
+                          "write");
     inspectIndexedAccesses(state, task);
   });
 
@@ -839,8 +841,8 @@ static void exportFunction(ExportState &state) {
 
   compareAliasProof(state);
 
-  uint64_t indexedAccesses = state.result.indexedLoadCount +
-                             state.result.indexedStoreCount;
+  uint64_t indexedAccesses =
+      state.result.indexedLoadCount + state.result.indexedStoreCount;
   state.result.indexedStorageCoverageComplete =
       indexedAccesses == state.result.indexedStorageCoverageCount &&
       state.result.indexedStorageCoverageFailureCount == 0;
@@ -851,8 +853,8 @@ static void exportFunction(ExportState &state) {
   state.result.indexedAddressProofComplete =
       indexedAccesses == state.result.indexedAddressProofCount;
   if (indexedAccesses != 0 && !state.result.indexedAddressProofComplete)
-    state.addReason(
-        "native neura.load_indexed/store_indexed operations have no source-verified physical SRAM address binding");
+    state.addReason("native neura.load_indexed/store_indexed operations have "
+                    "no source-verified physical SRAM address binding");
 
   // The native scheduler's coordinate assignment is not a proof that a
   // buffer stayed resident or that a copy was bound to one physical SRAM.
@@ -889,27 +891,27 @@ static ArrayAttr makeBackingRecords(MLIRContext *context,
   attrs.reserve(records.size());
   for (const NativeSramBackingRecord &record : records) {
     SmallVector<NamedAttribute> fields;
-    fields.push_back(builder.getNamedAttr("id",
-                                         builder.getStringAttr(record.id)));
+    fields.push_back(
+        builder.getNamedAttr("id", builder.getStringAttr(record.id)));
     fields.push_back(builder.getNamedAttr(
         "root_kind", builder.getStringAttr(record.rootKind)));
-    fields.push_back(builder.getNamedAttr(
-        "bytes", builder.getI64IntegerAttr(record.bytes)));
+    fields.push_back(
+        builder.getNamedAttr("bytes", builder.getI64IntegerAttr(record.bytes)));
     fields.push_back(builder.getNamedAttr(
         "extent_proven", builder.getBoolAttr(record.extentProven)));
-    fields.push_back(builder.getNamedAttr(
-        "alias_identity_proven",
-        builder.getBoolAttr(record.aliasIdentityProven)));
+    fields.push_back(
+        builder.getNamedAttr("alias_identity_proven",
+                             builder.getBoolAttr(record.aliasIdentityProven)));
     fields.push_back(builder.getNamedAttr(
         "copy_binding_proven", builder.getBoolAttr(record.copyBindingProven)));
     fields.push_back(builder.getNamedAttr(
-        "observed_accesses",
-        builder.getI64IntegerAttr(static_cast<int64_t>(record.observedAccesses))));
+        "observed_accesses", builder.getI64IntegerAttr(static_cast<int64_t>(
+                                 record.observedAccesses))));
     SmallVector<Attribute> cgras;
     for (int64_t cgra : record.observedCgras)
       cgras.push_back(builder.getI64IntegerAttr(cgra));
-    fields.push_back(builder.getNamedAttr("observed_cgras",
-                                         builder.getArrayAttr(cgras)));
+    fields.push_back(
+        builder.getNamedAttr("observed_cgras", builder.getArrayAttr(cgras)));
     attrs.push_back(builder.getDictionaryAttr(fields));
   }
   return builder.getArrayAttr(attrs);
@@ -924,12 +926,12 @@ static ArrayAttr makeAccessRecords(MLIRContext *context,
     attrs.push_back(builder.getDictionaryAttr({
         builder.getNamedAttr("task", builder.getStringAttr(access.task)),
         builder.getNamedAttr("direction",
-                            builder.getStringAttr(access.direction)),
-        builder.getNamedAttr(
-            "operand_index",
-            builder.getI64IntegerAttr(static_cast<int64_t>(access.operandIndex))),
+                             builder.getStringAttr(access.direction)),
+        builder.getNamedAttr("operand_index",
+                             builder.getI64IntegerAttr(
+                                 static_cast<int64_t>(access.operandIndex))),
         builder.getNamedAttr("backing_id",
-                            builder.getStringAttr(access.backingId)),
+                             builder.getStringAttr(access.backingId)),
         builder.getNamedAttr("cgra", builder.getI64IntegerAttr(access.cgra)),
         builder.getNamedAttr("bytes", builder.getI64IntegerAttr(access.bytes)),
     }));
@@ -937,39 +939,37 @@ static ArrayAttr makeAccessRecords(MLIRContext *context,
   return builder.getArrayAttr(attrs);
 }
 
-static ArrayAttr makeIndexedAccessRecords(
-    MLIRContext *context,
-    ArrayRef<NativeSramIndexedAccessRecord> accesses) {
+static ArrayAttr
+makeIndexedAccessRecords(MLIRContext *context,
+                         ArrayRef<NativeSramIndexedAccessRecord> accesses) {
   Builder builder(context);
   SmallVector<Attribute> attrs;
   attrs.reserve(accesses.size());
   for (const NativeSramIndexedAccessRecord &access : accesses) {
     SmallVector<NamedAttribute> fields;
-    fields.push_back(builder.getNamedAttr(
-        "task", builder.getStringAttr(access.task)));
+    fields.push_back(
+        builder.getNamedAttr("task", builder.getStringAttr(access.task)));
     fields.push_back(builder.getNamedAttr(
         "direction", builder.getStringAttr(access.direction)));
     fields.push_back(builder.getNamedAttr(
-        "ordinal", builder.getI64IntegerAttr(
-                        static_cast<int64_t>(access.ordinal))));
+        "ordinal",
+        builder.getI64IntegerAttr(static_cast<int64_t>(access.ordinal))));
     fields.push_back(builder.getNamedAttr(
         "kernel_input", builder.getI64IntegerAttr(access.kernelInput)));
     fields.push_back(builder.getNamedAttr(
-        "symbolic_reference",
-        builder.getStringAttr(access.symbolicReference)));
+        "symbolic_reference", builder.getStringAttr(access.symbolicReference)));
     fields.push_back(builder.getNamedAttr(
         "backing_id", builder.getStringAttr(access.backingId)));
     fields.push_back(builder.getNamedAttr(
-        "storage_root_proven",
-        builder.getBoolAttr(access.storageRootProven)));
+        "storage_root_proven", builder.getBoolAttr(access.storageRootProven)));
     fields.push_back(builder.getNamedAttr(
         "scheduler_binding_proven",
         builder.getBoolAttr(access.schedulerBindingProven)));
     SmallVector<Attribute> cgras;
     for (int64_t cgra : access.boundCgras)
       cgras.push_back(builder.getI64IntegerAttr(cgra));
-    fields.push_back(builder.getNamedAttr("bound_cgras",
-                                         builder.getArrayAttr(cgras)));
+    fields.push_back(
+        builder.getNamedAttr("bound_cgras", builder.getArrayAttr(cgras)));
     attrs.push_back(builder.getDictionaryAttr(fields));
   }
   return builder.getArrayAttr(attrs);
@@ -994,15 +994,14 @@ struct ExportProductionSramNativeUpperBoundPass
   }
 
   Option<std::string> functionName{
-      *this, "function",
-      llvm::cl::desc("Optional func.func symbol to inspect"),
+      *this, "function", llvm::cl::desc("Optional func.func symbol to inspect"),
       llvm::cl::init("")};
-  Option<int64_t> gridRows{
-      *this, "grid-rows", llvm::cl::desc("Fabric row count"),
-      llvm::cl::init(4)};
-  Option<int64_t> gridColumns{
-      *this, "grid-columns", llvm::cl::desc("Fabric column count"),
-      llvm::cl::init(4)};
+  Option<int64_t> gridRows{*this, "grid-rows",
+                           llvm::cl::desc("Fabric row count"),
+                           llvm::cl::init(4)};
+  Option<int64_t> gridColumns{*this, "grid-columns",
+                              llvm::cl::desc("Fabric column count"),
+                              llvm::cl::init(4)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -1021,9 +1020,8 @@ struct ExportProductionSramNativeUpperBoundPass
 
     auto merge = [&](func::FuncOp function) {
       foundFunction = true;
-      NativeSramUpperBoundResult current =
-          exportNativeSramUpperBound(function, gridRows.getValue(),
-                                     gridColumns.getValue());
+      NativeSramUpperBoundResult current = exportNativeSramUpperBound(
+          function, gridRows.getValue(), gridColumns.getValue());
       aggregate.taskCount += current.taskCount;
       aggregate.observedAccessCount += current.observedAccessCount;
       aggregate.extentProofComplete &= current.extentProofComplete;
@@ -1049,16 +1047,17 @@ struct ExportProductionSramNativeUpperBoundPass
           value += entry.second;
       }
       aggregate.backings.insert(aggregate.backings.end(),
-                               current.backings.begin(), current.backings.end());
+                                current.backings.begin(),
+                                current.backings.end());
       aggregate.accesses.insert(aggregate.accesses.end(),
-                               current.accesses.begin(), current.accesses.end());
-      aggregate.indexedAccesses.insert(
-          aggregate.indexedAccesses.end(), current.indexedAccesses.begin(),
-          current.indexedAccesses.end());
+                                current.accesses.begin(),
+                                current.accesses.end());
+      aggregate.indexedAccesses.insert(aggregate.indexedAccesses.end(),
+                                       current.indexedAccesses.begin(),
+                                       current.indexedAccesses.end());
       if (!current.reason.empty())
-        reasons.push_back((Twine(function.getSymName()) + ": " +
-                           current.reason)
-                              .str());
+        reasons.push_back(
+            (Twine(function.getSymName()) + ": " + current.reason).str());
     };
 
     for (func::FuncOp function : module.getOps<func::FuncOp>()) {
@@ -1080,42 +1079,46 @@ struct ExportProductionSramNativeUpperBoundPass
     if (!foundFunction)
       aggregate.indexedStorageCoverageComplete = false;
     aggregate.reason = joinReasons(reasons);
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_upper_bound_status",
-                    StringAttr::get(context, "pending"));
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_upper_bound_reason",
-                    StringAttr::get(context, aggregate.reason));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_upper_bound_status",
+        StringAttr::get(context, "pending"));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_upper_bound_reason",
+        StringAttr::get(context, aggregate.reason));
     module->setAttr(
         "amoeba.joint_scheduling_sram_conservative_upper_bound_policy",
-        StringAttr::get(
-            context,
-            "whole_schedule_no_eviction_full_backing_per_observed_sram_location"));
+        StringAttr::get(context, "whole_schedule_no_eviction_full_backing_per_"
+                                 "observed_sram_location"));
     int64_t cgraCount =
         gridRows > 0 && gridColumns > 0 &&
                 gridRows <= std::numeric_limits<int64_t>::max() / gridColumns
             ? gridRows * gridColumns
             : 0;
     if (cgraCount > 0)
-      module->setAttr("amoeba.joint_scheduling_sram_conservative_required_bytes_by_cgra",
-                      makeI64Array(context, aggregate.requiredBytesByCgra,
-                                   cgraCount));
+      module->setAttr(
+          "amoeba.joint_scheduling_sram_conservative_required_bytes_by_cgra",
+          makeI64Array(context, aggregate.requiredBytesByCgra, cgraCount));
     module->setAttr("amoeba.joint_scheduling_sram_conservative_backings",
                     makeBackingRecords(context, aggregate.backings));
     module->setAttr("amoeba.joint_scheduling_sram_conservative_accesses",
                     makeAccessRecords(context, aggregate.accesses));
     module->setAttr("amoeba.joint_scheduling_sram_conservative_extent_proven",
                     BoolAttr::get(context, aggregate.extentProofComplete));
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_placement_proven",
-                    BoolAttr::get(context, aggregate.placementProofComplete));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_placement_proven",
+        BoolAttr::get(context, aggregate.placementProofComplete));
     module->setAttr("amoeba.joint_scheduling_sram_conservative_alias_proven",
                     BoolAttr::get(context, aggregate.aliasProofComplete));
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_copy_binding_proven",
-                    BoolAttr::get(context, aggregate.copyBindingProofComplete));
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_task_count",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     aggregate.taskCount));
-    module->setAttr("amoeba.joint_scheduling_sram_conservative_observed_access_count",
-                    IntegerAttr::get(IntegerType::get(context, 64),
-                                     aggregate.observedAccessCount));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_copy_binding_proven",
+        BoolAttr::get(context, aggregate.copyBindingProofComplete));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_task_count",
+        IntegerAttr::get(IntegerType::get(context, 64), aggregate.taskCount));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_conservative_observed_access_count",
+        IntegerAttr::get(IntegerType::get(context, 64),
+                         aggregate.observedAccessCount));
     module->setAttr("amoeba.joint_scheduling_sram_indexed_load_count",
                     IntegerAttr::get(IntegerType::get(context, 64),
                                      aggregate.indexedLoadCount));
@@ -1125,8 +1128,9 @@ struct ExportProductionSramNativeUpperBoundPass
     module->setAttr("amoeba.joint_scheduling_sram_indexed_address_proof_count",
                     IntegerAttr::get(IntegerType::get(context, 64),
                                      aggregate.indexedAddressProofCount));
-    module->setAttr("amoeba.joint_scheduling_sram_indexed_address_proven",
-                    BoolAttr::get(context, aggregate.indexedAddressProofComplete));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_indexed_address_proven",
+        BoolAttr::get(context, aggregate.indexedAddressProofComplete));
     module->setAttr(
         "amoeba.joint_scheduling_sram_indexed_storage_coverage_count",
         IntegerAttr::get(IntegerType::get(context, 64),
@@ -1138,16 +1142,17 @@ struct ExportProductionSramNativeUpperBoundPass
     module->setAttr(
         "amoeba.joint_scheduling_sram_indexed_storage_coverage_proven",
         BoolAttr::get(context, aggregate.indexedStorageCoverageComplete));
-    module->setAttr("amoeba.joint_scheduling_sram_indexed_accesses",
-                    makeIndexedAccessRecords(context,
-                                             aggregate.indexedAccesses));
+    module->setAttr(
+        "amoeba.joint_scheduling_sram_indexed_accesses",
+        makeIndexedAccessRecords(context, aggregate.indexedAccesses));
   }
 };
 
 } // namespace
 
-NativeSramUpperBoundResult exportNativeSramUpperBound(
-    func::FuncOp function, int64_t gridRows, int64_t gridColumns) {
+NativeSramUpperBoundResult exportNativeSramUpperBound(func::FuncOp function,
+                                                      int64_t gridRows,
+                                                      int64_t gridColumns) {
   ExportState state;
   state.function = function;
   state.gridRows = gridRows;

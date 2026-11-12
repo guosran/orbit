@@ -835,9 +835,8 @@ private:
     // read_memrefs contain SSA results, not raw allocs).
     auto orig_reads = task_op.getOriginalReadMemrefs();
     for (unsigned i = 0; i < num_reads; ++i) {
-      Value orig_memref = (i < orig_reads.size())
-                              ? orig_reads[i]
-                              : task_op.getWillReads()[i];
+      Value orig_memref =
+          (i < orig_reads.size()) ? orig_reads[i] : task_op.getWillReads()[i];
       if (orig_memref == intermediate) {
         // Intermediate memref — no corresponding fused arg. Skip.
         orig_arg_idx++;
@@ -857,9 +856,8 @@ private:
     // Maps write_memrefs block args.
     auto orig_writes = task_op.getOriginalWriteMemrefs();
     for (unsigned i = 0; i < num_writes; ++i) {
-      Value orig_memref = (i < orig_writes.size())
-                              ? orig_writes[i]
-                              : task_op.getWillWrites()[i];
+      Value orig_memref = (i < orig_writes.size()) ? orig_writes[i]
+                                                   : task_op.getWillWrites()[i];
       if (orig_memref == intermediate) {
         orig_arg_idx++;
         continue;

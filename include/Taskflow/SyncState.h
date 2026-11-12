@@ -2,8 +2,8 @@
 #define ORBIT_TASKFLOW_SYNC_STATE_H
 
 #include "llvm/Support/JSON.h"
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,8 +17,14 @@ struct PhysicalBORange {
 };
 enum class SyncDirection { ToDevice, FromDevice };
 enum class SyncObservationKind {
-  HostRead, HostWrite, SyncBegin, SyncComplete,
-  DeviceSubmit, WaitSuccess, WaitFailure, UnknownMutation
+  HostRead,
+  HostWrite,
+  SyncBegin,
+  SyncComplete,
+  DeviceSubmit,
+  WaitSuccess,
+  WaitFailure,
+  UnknownMutation
 };
 struct SyncDeclaredAccess {
   PhysicalBORange range;
@@ -36,7 +42,11 @@ struct SyncObservation {
   std::vector<SyncDeclaredAccess> accesses;
 };
 enum class SyncCallForm { ImplicitFullBuffer, ExplicitRange };
-enum class SyncObserverBoundary { MinimalAPI, DetailedCompatibility, BatchOuter };
+enum class SyncObserverBoundary {
+  MinimalAPI,
+  DetailedCompatibility,
+  BatchOuter
+};
 struct SyncQueryContext {
   std::optional<SyncCallForm> callForm;
   std::optional<SyncObserverBoundary> observerBoundary;
@@ -73,6 +83,7 @@ public:
   bool observe(const SyncObservation &, std::string &error);
   bool query(const PhysicalBORange &, const SyncQueryContext &,
              SyncQueryResult &, std::string &error) const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl;

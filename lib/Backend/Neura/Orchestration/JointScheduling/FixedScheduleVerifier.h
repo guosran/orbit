@@ -54,14 +54,15 @@ public:
   // Optional exact reservation save/restore. Providers that cannot expose
   // every future-affecting field fail closed and retain prefix replay.
   virtual bool supportsReservationCheckpoint() const { return false; }
-  virtual bool captureReservationCheckpoint(
-      ReservationCheckpoint &checkpoint, std::string &error) const {
+  virtual bool captureReservationCheckpoint(ReservationCheckpoint &checkpoint,
+                                            std::string &error) const {
     checkpoint = {};
     error = "communication model does not expose reservation checkpoints";
     return false;
   }
-  virtual bool restoreReservationCheckpoint(
-      const ReservationCheckpoint &checkpoint, std::string &error) {
+  virtual bool
+  restoreReservationCheckpoint(const ReservationCheckpoint &checkpoint,
+                               std::string &error) {
     (void)checkpoint;
     error = "communication model does not expose reservation checkpoints";
     return false;
@@ -69,7 +70,7 @@ public:
   // A lower bound valid for every endpoint, release cycle and reservation
   // state. Models without such a proof retain the conservative zero bound.
   virtual bool getTransferLowerBound(unsigned, unsigned, int64_t &cycles,
-                                    std::string &) const {
+                                     std::string &) const {
     cycles = 0;
     return true;
   }
@@ -77,10 +78,11 @@ public:
   // universal edge bound, so existing mock models retain identical behavior.
   // A model may return cycles=0 for an unavailable/disconnected endpoint;
   // endpoint legality is still decided by getTransferReadyCycle().
-  virtual bool getTransferLowerBoundForEndpoints(
-      unsigned producer, unsigned consumer, int sourceRow, int sourceCol,
-      int destinationRow, int destinationCol, int64_t &cycles,
-      std::string &error) const {
+  virtual bool
+  getTransferLowerBoundForEndpoints(unsigned producer, unsigned consumer,
+                                    int sourceRow, int sourceCol,
+                                    int destinationRow, int destinationCol,
+                                    int64_t &cycles, std::string &error) const {
     (void)sourceRow;
     (void)sourceCol;
     (void)destinationRow;

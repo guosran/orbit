@@ -34,9 +34,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Backend/Neura/NeuraBackendPasses.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
-#include "Backend/Neura/NeuraBackendPasses.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

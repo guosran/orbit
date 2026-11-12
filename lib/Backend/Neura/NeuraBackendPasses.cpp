@@ -14,9 +14,7 @@ void mlir::amoeba::neura::registerTaskflowConversionPassPipeline() {
         pm.addPass(mlir::createConvertAffineToTaskflowPass());
         pm.addPass(
             mlir::amoeba::neura::createConstructHyperblockFromTaskPass());
-        pm.addPass(
-            mlir::amoeba::neura::createClassifyTaskAndCounterPass());
-        pm.addPass(
-            mlir::amoeba::neura::createConvertTaskflowToNeuraPass());
+        pm.addPass(mlir::amoeba::neura::createClassifyTaskAndCounterPass());
+        pm.addPass(mlir::amoeba::neura::createConvertTaskflowToNeuraPass());
       });
 }

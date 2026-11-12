@@ -11,41 +11,41 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalMLPInference.h"
+#include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
-#include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
-#include "NeuraDialect/Architecture/Architecture.h"
+#include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
 #include "Backend/Neura/Orchestration/JointScheduling/InterTaskNetwork.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
-#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
+#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 #include "JointNeighborhoodActions.h"
 #include "NeighborhoodReplaySelection.h"
-#include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
-#include "TaskflowFissionSourceReplay.h"
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "ProductionSchedulerAdapter.h"
 #include "ProgramGraphAmoeba.h"
+#include "TaskflowFissionSourceReplay.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
-#include "Backend/Neura/Transforms/Optimizations/TaskflowFission.h"
 
-#include "TaskflowDialect/TaskflowOps.h"
+#include "NeuraDialect/NeuraOps.h"
 #include "Taskflow/Search.h"
 #include "Taskflow/StaticMapping.h"
-#include "NeuraDialect/NeuraOps.h"
+#include "TaskflowDialect/TaskflowOps.h"
 
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -60,12 +60,12 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
-#include <cmath>
 #include <chrono>
-#include <fstream>
-#include <functional>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -95,7 +95,8 @@ constexpr StringLiteral kTypedActionHistorySchema =
 constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
 constexpr StringLiteral kParentProgressPolicy =
     "semantic-parent-family-ordered-suffix-v1";
-constexpr StringLiteral kDirectionalPolicy = "schedule-structure-window-axis-tie-v35";
+constexpr StringLiteral kDirectionalPolicy =
+    "schedule-structure-window-axis-tie-v35";
 constexpr StringLiteral kDirectionalSchema = "orbit-directional-search-v1";
 constexpr uint64_t kDirectionalCount = 3, kDirectionalParameters = 3;
 constexpr uint64_t kDirectionalWindowCharges = 4, kDirectionalZeroDebitCap = 64;
@@ -119,12 +120,10 @@ static constexpr int64_t kFormalMax4CgraRows[] = {1, 1, 2, 1, 3, 1, 2, 4};
 static constexpr int64_t kFormalMax4CgraCols[] = {1, 2, 1, 3, 1, 4, 2, 1};
 
 static bool cgraShapeToMapperTileShape(int64_t cgraRows, int64_t cgraCols,
-                                       int64_t perCgraRows,
-                                       int64_t perCgraCols,
+                                       int64_t perCgraRows, int64_t perCgraCols,
                                        int64_t &mapperRows,
                                        int64_t &mapperCols) {
-  if (cgraRows <= 0 || cgraCols <= 0 || perCgraRows <= 0 ||
-      perCgraCols <= 0 ||
+  if (cgraRows <= 0 || cgraCols <= 0 || perCgraRows <= 0 || perCgraCols <= 0 ||
       cgraRows > std::numeric_limits<int64_t>::max() / perCgraRows ||
       cgraCols > std::numeric_limits<int64_t>::max() / perCgraCols)
     return false;
@@ -199,8 +198,8 @@ static bool ensureDirectory(StringRef path, std::string &error) {
   }
   std::error_code ec = llvm::sys::fs::create_directories(path);
   if (ec) {
-    error = "cannot create neighborhood search directory " + path.str() +
-            ": " + ec.message();
+    error = "cannot create neighborhood search directory " + path.str() + ": " +
+            ec.message();
     return false;
   }
   return true;
@@ -209,13 +208,13 @@ static bool ensureDirectory(StringRef path, std::string &error) {
 static std::string actionSignature(const NeighborhoodAction &action) {
   std::string text = action.family + ":" + action.label + ":" +
                      action.shapeTask + ":" + std::to_string(action.shapeRows) +
-                     "x" + std::to_string(action.shapeCols) + ":reset=" +
-                     (action.canonicalReset ? "1" : "0");
+                     "x" + std::to_string(action.shapeCols) +
+                     ":reset=" + (action.canonicalReset ? "1" : "0");
   for (const NeighborhoodPrimitive &primitive : action.primitives) {
     text += ":" + primitive.kind + ":" + primitive.firstTask + ":" +
-            primitive.secondTask + ":" + primitive.mode + ":axis=" +
-            std::to_string(primitive.axis) + ":factor=" +
-            std::to_string(primitive.factor);
+            primitive.secondTask + ":" + primitive.mode +
+            ":axis=" + std::to_string(primitive.axis) +
+            ":factor=" + std::to_string(primitive.factor);
     for (unsigned node : primitive.leftNodes)
       text += ":left=" + std::to_string(node);
   }
@@ -240,12 +239,12 @@ static bool parseShape(StringRef value, int64_t &rows, int64_t &cols) {
     return false;
   StringRef rowText = value.take_front(separator);
   StringRef colText = value.drop_front(separator + 1);
-  return !rowText.getAsInteger(10, rows) &&
-         !colText.getAsInteger(10, cols) && rows > 0 && cols > 0;
+  return !rowText.getAsInteger(10, rows) && !colText.getAsInteger(10, cols) &&
+         rows > 0 && cols > 0;
 }
 
-static std::optional<std::pair<int64_t, int64_t>> taskShapeFromAttrs(
-    taskflow::TaskflowTaskOp task) {
+static std::optional<std::pair<int64_t, int64_t>>
+taskShapeFromAttrs(taskflow::TaskflowTaskOp task) {
   if (auto shape = task->getAttrOfType<StringAttr>("cgra_shape")) {
     int64_t rows = 0, cols = 0;
     if (parseShape(shape.getValue(), rows, cols))
@@ -254,8 +253,7 @@ static std::optional<std::pair<int64_t, int64_t>> taskShapeFromAttrs(
   return std::nullopt;
 }
 
-static std::vector<NeighborhoodShape>
-initialShapes(func::FuncOp function) {
+static std::vector<NeighborhoodShape> initialShapes(func::FuncOp function) {
   std::vector<NeighborhoodShape> shapes;
   function.walk([&](taskflow::TaskflowTaskOp task) {
     NeighborhoodShape shape;
@@ -270,7 +268,7 @@ initialShapes(func::FuncOp function) {
 }
 
 static const NeighborhoodShape *findShape(ArrayRef<NeighborhoodShape> shapes,
-                                           StringRef task) {
+                                          StringRef task) {
   for (const NeighborhoodShape &shape : shapes)
     if (shape.task == task)
       return &shape;
@@ -307,16 +305,15 @@ static bool runPassOnModule(ModuleOp module, std::unique_ptr<Pass> pass,
   LogicalResult runResult = failure();
   LogicalResult verifyResult = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(
-                                            diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     runResult = manager.run(module);
     if (succeeded(runResult))
       verifyResult = verify(module.getOperation());
@@ -338,8 +335,8 @@ static bool extractStructuralFacts(ModuleOp module, StringRef functionName,
                                    StringRef outputDir, uint64_t serial,
                                    std::string &key, std::string &reason,
                                    std::string &diagnostic) {
-  std::string factsPath = outputDir.str() + "/.facts-" +
-                          std::to_string(serial) + ".json";
+  std::string factsPath =
+      outputDir.str() + "/.facts-" + std::to_string(serial) + ".json";
   auto pass = mlir::amoeba::neura::createExtractJointTaskGraphFactsPass();
   std::string options = "function=" + quoteOption(functionName) +
                         " output=" + quoteOption(factsPath) +
@@ -364,7 +361,8 @@ static bool extractStructuralFacts(ModuleOp module, StringRef functionName,
     llvm::sys::fs::remove(factsPath);
     return false;
   }
-  llvm::Expected<json::Value> parsed = llvm::json::parse((*buffer)->getBuffer());
+  llvm::Expected<json::Value> parsed =
+      llvm::json::parse((*buffer)->getBuffer());
   if (!parsed) {
     reason = "facts_output_invalid_json";
     llvm::consumeError(parsed.takeError());
@@ -392,7 +390,8 @@ static std::optional<int64_t> durationFromCost(const TaskShapeCost &cost,
                          static_cast<long double>(cost.predictedII) *
                              static_cast<long double>(tripCount - 1);
   if (!std::isfinite(duration) || duration <= 0.0L ||
-      duration > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+      duration >
+          static_cast<long double>(std::numeric_limits<int64_t>::max())) {
     error = "ML II/startup duration is outside scheduler range";
     return std::nullopt;
   }
@@ -402,11 +401,13 @@ static std::optional<int64_t> durationFromCost(const TaskShapeCost &cost,
 
 static bool sameTaskSet(ArrayRef<TaskMetadata> tasks,
                         ArrayRef<NeighborhoodShape> shapes) {
-  if (tasks.size() != shapes.size()) return false;
+  if (tasks.size() != shapes.size())
+    return false;
   std::set<std::string> names;
   for (unsigned index = 0; index < tasks.size(); ++index)
     if (tasks[index].name != shapes[index].task ||
-        !names.insert(shapes[index].task).second) return false;
+        !names.insert(shapes[index].task).second)
+      return false;
   return true;
 }
 
@@ -484,8 +485,8 @@ static bool parseStringArray(const json::Array *array,
 static bool parseTypedAction(const json::Object &object,
                              NeighborhoodAction &action);
 
-static json::Object typedActionHistoryObject(
-    const SearchState::TypedActionHistory &history) {
+static json::Object
+typedActionHistoryObject(const SearchState::TypedActionHistory &history) {
   json::Array initialShapes, actions, fissionActions;
   for (const NeighborhoodShape &shape : history.initialShapes)
     initialShapes.push_back(shapeObject(shape));
@@ -493,17 +494,17 @@ static json::Object typedActionHistoryObject(
     actions.push_back(typedActionObject(action));
   for (const NeighborhoodAction &action : history.fissionActions)
     fissionActions.push_back(typedActionObject(action));
-  return json::Object{
-      {"schema", kTypedActionHistorySchema}, {"known", history.known},
-      {"canonicalFactKey", history.canonicalFactKey},
-      {"initialShapes", std::move(initialShapes)},
-      {"actions", std::move(actions)},
-      {"fissionActions", std::move(fissionActions)},
-      {"unknownReason", history.unknownReason}};
+  return json::Object{{"schema", kTypedActionHistorySchema},
+                      {"known", history.known},
+                      {"canonicalFactKey", history.canonicalFactKey},
+                      {"initialShapes", std::move(initialShapes)},
+                      {"actions", std::move(actions)},
+                      {"fissionActions", std::move(fissionActions)},
+                      {"unknownReason", history.unknownReason}};
 }
 
-static json::Object controlRoleProvenanceObject(
-    const ControlRoleProvenance &provenance) {
+static json::Object
+controlRoleProvenanceObject(const ControlRoleProvenance &provenance) {
   return json::Object{
       {"candidate_path", provenance.candidatePath},
       {"action_path", stringArray(provenance.path)},
@@ -518,9 +519,9 @@ static json::Object controlRoleProvenanceMapObject(
   return object;
 }
 
-static bool parseTypedActionHistoryObject(
-    const json::Object &object,
-    SearchState::TypedActionHistory &history) {
+static bool
+parseTypedActionHistoryObject(const json::Object &object,
+                              SearchState::TypedActionHistory &history) {
   auto schema = object.getString("schema");
   auto known = object.getBoolean("known");
   auto canonicalFactKey = object.getString("canonicalFactKey");
@@ -571,8 +572,8 @@ static bool parseTypedActionHistoryObject(
   return true;
 }
 
-static SearchState::TypedActionHistory portableActionHistory(
-    const SearchState::TypedActionHistory &history) {
+static SearchState::TypedActionHistory
+portableActionHistory(const SearchState::TypedActionHistory &history) {
   SearchState::TypedActionHistory result;
   result.known = history.known;
   result.canonicalFactKey = history.canonicalFactKey;
@@ -583,12 +584,11 @@ static SearchState::TypedActionHistory portableActionHistory(
   return result;
 }
 
-static void markActionHistoryUnknown(
-    SearchState::TypedActionHistory &history, StringRef reason) {
+static void markActionHistoryUnknown(SearchState::TypedActionHistory &history,
+                                     StringRef reason) {
   history.known = false;
-  history.unknownReason = reason.empty()
-                              ? "typed_action_history_not_authenticated"
-                              : reason.str();
+  history.unknownReason =
+      reason.empty() ? "typed_action_history_not_authenticated" : reason.str();
   history.canonicalFactKey.clear();
   history.initialShapes.clear();
   history.actions.clear();
@@ -597,9 +597,8 @@ static void markActionHistoryUnknown(
   history.taskProducers.clear();
 }
 
-static void importTypedActionHistory(
-    const json::Object &record,
-    SearchState::TypedActionHistory &history) {
+static void importTypedActionHistory(const json::Object &record,
+                                     SearchState::TypedActionHistory &history) {
   const json::Object *object = record.getObject("action_history");
   if (!object) {
     markActionHistoryUnknown(history,
@@ -608,8 +607,7 @@ static void importTypedActionHistory(
   }
   SearchState::TypedActionHistory imported;
   if (!parseTypedActionHistoryObject(*object, imported)) {
-    markActionHistoryUnknown(history,
-                             "seed_typed_action_history_malformed");
+    markActionHistoryUnknown(history, "seed_typed_action_history_malformed");
     return;
   }
   if (!imported.known) {
@@ -627,43 +625,56 @@ struct UnsupportedUnitQuery {
   std::string reason;
 };
 
-static std::vector<int64_t> numericTieKey(ArrayRef<TaskShapeChoice> choices,
-                                         const ProductionScheduledResult &schedule) {
+static std::vector<int64_t>
+numericTieKey(ArrayRef<TaskShapeChoice> choices,
+              const ProductionScheduledResult &schedule) {
   std::vector<int64_t> key;
   for (const auto &choice : choices) {
-    key.push_back(choice.shape.rows); key.push_back(choice.shape.cols);
+    key.push_back(choice.shape.rows);
+    key.push_back(choice.shape.cols);
   }
   for (const auto &placement : schedule.placements) {
-    key.push_back(placement.task); key.push_back(placement.row);
-    key.push_back(placement.col); key.push_back(placement.start);
-    key.push_back(placement.end); key.push_back(placement.idleCycles);
+    key.push_back(placement.task);
+    key.push_back(placement.row);
+    key.push_back(placement.col);
+    key.push_back(placement.start);
+    key.push_back(placement.end);
+    key.push_back(placement.idleCycles);
   }
-  for (unsigned task : schedule.dispatch) key.push_back(task);
+  for (unsigned task : schedule.dispatch)
+    key.push_back(task);
   return key;
 }
 static bool archiveLess(const ArchiveRecord &lhs, const ArchiveRecord &rhs) {
-  if (lhs.valid != rhs.valid) return lhs.valid > rhs.valid;
-  if (lhs.score != rhs.score) return lhs.score < rhs.score;
+  if (lhs.valid != rhs.valid)
+    return lhs.valid > rhs.valid;
+  if (lhs.score != rhs.score)
+    return lhs.score < rhs.score;
   auto left = numericTieKey(lhs.choices, lhs.schedule);
   auto right = numericTieKey(rhs.choices, rhs.schedule);
-  if (left != right) return left < right;
-  if (lhs.key != rhs.key) return lhs.key < rhs.key;
+  if (left != right)
+    return left < right;
+  if (lhs.key != rhs.key)
+    return lhs.key < rhs.key;
   return lhs.id < rhs.id;
 }
 static bool stateLess(const SearchState &lhs, const SearchState &rhs) {
-  if (lhs.scored != rhs.scored) return lhs.scored > rhs.scored;
-  if (lhs.score != rhs.score) return lhs.score < rhs.score;
+  if (lhs.scored != rhs.scored)
+    return lhs.scored > rhs.scored;
+  if (lhs.score != rhs.score)
+    return lhs.score < rhs.score;
   auto left = numericTieKey(lhs.choices, lhs.schedule);
   auto right = numericTieKey(rhs.choices, rhs.schedule);
-  if (left != right) return left < right;
-  if (lhs.key != rhs.key) return lhs.key < rhs.key;
+  if (left != right)
+    return left < right;
+  if (lhs.key != rhs.key)
+    return lhs.key < rhs.key;
   return lhs.id < rhs.id;
 }
 
 static json::Object shapeObject(const NeighborhoodShape &shape) {
-  return json::Object{{"task", shape.task},
-                      {"rows", shape.rows},
-                      {"cols", shape.cols}};
+  return json::Object{
+      {"task", shape.task}, {"rows", shape.rows}, {"cols", shape.cols}};
 }
 
 static json::Array stringArray(ArrayRef<std::string> values) {
@@ -698,16 +709,17 @@ static json::Array costRecords(ArrayRef<TaskShapeChoice> choices,
     if (index < costs.size()) {
       record["predicted_ii"] = costs[index].predictedII;
       record["startup_cycles"] = costs[index].startupCycles;
-      record["support_status"] = costs[index].supported ? "supported"
-                                                           : "unsupported";
+      record["support_status"] =
+          costs[index].supported ? "supported" : "unsupported";
     }
     result.push_back(std::move(record));
   }
   return result;
 }
 
-static json::Array scheduleRecords(ArrayRef<TaskShapeChoice> choices,
-                                   ArrayRef<ExactSchedulePlacement> placements) {
+static json::Array
+scheduleRecords(ArrayRef<TaskShapeChoice> choices,
+                ArrayRef<ExactSchedulePlacement> placements) {
   json::Array result;
   for (const ExactSchedulePlacement &placement : placements) {
     if (placement.task >= choices.size())
@@ -755,12 +767,11 @@ static json::Object archiveObject(const ArchiveRecord &record) {
       {"alternate_action_paths", json::Array{}},
       {"shapes", json::Array{}},
       {"task_choices", choiceRecords(record.choices)},
-      {"task_costs", costRecords(record.choices, record.costs,
-                                  record.durations)},
-      {"task_schedule", scheduleRecords(record.choices,
-                                         record.schedule.placements)},
-      {"dispatch_order", indexArray(record.schedule.dispatch,
-                                     record.choices)},
+      {"task_costs",
+       costRecords(record.choices, record.costs, record.durations)},
+      {"task_schedule",
+       scheduleRecords(record.choices, record.schedule.placements)},
+      {"dispatch_order", indexArray(record.schedule.dispatch, record.choices)},
       {"replayed_communication_edges",
        static_cast<int64_t>(record.schedule.replayedEdges)},
       {"communication_trace_known", record.schedule.replayedEdgesKnown},
@@ -770,9 +781,8 @@ static json::Object archiveObject(const ArchiveRecord &record) {
       {"control_role_provenance",
        controlRoleProvenanceMapObject(record.controlRoleProvenance)},
       {"graph_variant_id", record.graphId},
-      {"predicted_whole_program_cycles", record.valid
-                                             ? json::Value(record.score)
-                                             : json::Value(nullptr)},
+      {"predicted_whole_program_cycles",
+       record.valid ? json::Value(record.score) : json::Value(nullptr)},
       {"valid", record.valid},
       {"reject_reason", record.rejectReason},
       {"round", record.round}};
@@ -844,11 +854,13 @@ static std::optional<std::string> readCatalogGraphId(StringRef path) {
       llvm::MemoryBuffer::getFile(path);
   if (!buffer)
     return std::nullopt;
-  llvm::Expected<json::Value> parsed = llvm::json::parse((*buffer)->getBuffer());
+  llvm::Expected<json::Value> parsed =
+      llvm::json::parse((*buffer)->getBuffer());
   if (!parsed)
     return std::nullopt;
   json::Object *root = parsed->getAsObject();
-  json::Object *metadata = root ? root->getObject("predictor_metadata") : nullptr;
+  json::Object *metadata =
+      root ? root->getObject("predictor_metadata") : nullptr;
   auto graph = metadata ? metadata->getString("source_graph_id")
                         : std::optional<StringRef>();
   return graph ? std::optional<std::string>(graph->str()) : std::nullopt;
@@ -888,42 +900,42 @@ static bool writeFiniteShapeDomain(StringRef path, func::FuncOp function,
     json::Array shapes;
     for (unsigned index = 0; index < 8; ++index) {
       int64_t mapperRows = 0, mapperCols = 0;
-      if (!cgraShapeToMapperTileShape(
-              kFormalMax4CgraRows[index], kFormalMax4CgraCols[index],
-              perCgraRows, perCgraCols, mapperRows, mapperCols)) {
+      if (!cgraShapeToMapperTileShape(kFormalMax4CgraRows[index],
+                                      kFormalMax4CgraCols[index], perCgraRows,
+                                      perCgraCols, mapperRows, mapperCols)) {
         error = "formal CGRA shape cannot be represented in mapper tiles";
         return false;
       }
-      shapes.push_back(json::Object{{"kind", "rect"},
-                                    {"rows", kFormalMax4CgraRows[index]},
-                                    {"cols", kFormalMax4CgraCols[index]},
-                                    {"cgra_count", kFormalMax4CgraRows[index] * kFormalMax4CgraCols[index]},
-                                    {"cgra_shape",
-                                     std::to_string(kFormalMax4CgraRows[index]) + "x" +
-                                         std::to_string(kFormalMax4CgraCols[index])},
-                                    {"mapper_tile_rows", mapperRows},
-                                    {"mapper_tile_cols", mapperCols}});
+      shapes.push_back(json::Object{
+          {"kind", "rect"},
+          {"rows", kFormalMax4CgraRows[index]},
+          {"cols", kFormalMax4CgraCols[index]},
+          {"cgra_count",
+           kFormalMax4CgraRows[index] * kFormalMax4CgraCols[index]},
+          {"cgra_shape", std::to_string(kFormalMax4CgraRows[index]) + "x" +
+                             std::to_string(kFormalMax4CgraCols[index])},
+          {"mapper_tile_rows", mapperRows},
+          {"mapper_tile_cols", mapperCols}});
     }
     factors.push_back(json::Object{{"task", task.name},
                                    {"trip_count", task.tripCount},
                                    {"shapes", std::move(shapes)}});
     candidateCount *= 8;
   }
-  json::Object header{
-      {"record_type", "space"},
-      {"schema", kFactoredSpaceSchema},
-      {"representation", "factored"},
-      {"exact", true},
-      {"function", function.getSymName()},
-      {"graph_variant_id", graphId},
-      {"search_scope", kFactoredSearchScope},
-      {"shape_policy", kShapePolicy},
-      {"shape_pruning_policy", kShapePruningPolicyNone},
-      {"spatial_capacity_policy", kSpatialCapacityPolicy},
-      {"max_cgras_per_task", 4},
-      {"max_changed_tasks", -1},
-      {"candidate_count", decimal128(candidateCount)},
-      {"factors", std::move(factors)}};
+  json::Object header{{"record_type", "space"},
+                      {"schema", kFactoredSpaceSchema},
+                      {"representation", "factored"},
+                      {"exact", true},
+                      {"function", function.getSymName()},
+                      {"graph_variant_id", graphId},
+                      {"search_scope", kFactoredSearchScope},
+                      {"shape_policy", kShapePolicy},
+                      {"shape_pruning_policy", kShapePruningPolicyNone},
+                      {"spatial_capacity_policy", kSpatialCapacityPolicy},
+                      {"max_cgras_per_task", 4},
+                      {"max_changed_tasks", -1},
+                      {"candidate_count", decimal128(candidateCount)},
+                      {"factors", std::move(factors)}};
   json::Object footer{{"record_type", "footer"},
                       {"schema", kFactoredSpaceSchema},
                       {"representation", "factored"},
@@ -940,12 +952,11 @@ static bool runCurrentCostPredictor(
     StringRef candidateId, StringRef outputDirectory, StringRef modelFile,
     StringRef cacheFile, StringRef checkpointDirectory,
     StringRef architectureContract, StringRef architecturePath,
-    int64_t perCgraRows, int64_t perCgraCols,
-    StringRef sourceRepository, StringRef sourceCommit,
-    StringRef architectureTransferCatalog, StringRef modelNamespace,
-    int64_t diagnosticIICeiling,
-    bool allowUnsupportedAboveModelCeiling,
-    std::string &costPath, std::string &error, bool &fatalFailure) {
+    int64_t perCgraRows, int64_t perCgraCols, StringRef sourceRepository,
+    StringRef sourceCommit, StringRef architectureTransferCatalog,
+    StringRef modelNamespace, int64_t diagnosticIICeiling,
+    bool allowUnsupportedAboveModelCeiling, std::string &costPath,
+    std::string &error, bool &fatalFailure) {
   fatalFailure = false;
   if (modelFile.empty() || cacheFile.empty() || architectureContract.empty() ||
       architecturePath.empty() || sourceRepository.empty() ||
@@ -961,8 +972,8 @@ static bool runCurrentCostPredictor(
   }
   costPath = outputDirectory.str() + "/costs-" + candidateId.str() + ".json";
   std::string spacePath = spacesDirectory + "/" + candidateId.str() + ".jsonl";
-  if (!writeFiniteShapeDomain(spacePath, function, candidateId,
-                              perCgraRows, perCgraCols, error)) {
+  if (!writeFiniteShapeDomain(spacePath, function, candidateId, perCgraRows,
+                              perCgraCols, error)) {
     fatalFailure = true;
     return false;
   }
@@ -977,8 +988,7 @@ static bool runCurrentCostPredictor(
       " source-git-commit=" + quoteOption(sourceCommit) +
       " graph-variant-id=" + quoteOption(candidateId) +
       " model-namespace=" + quoteOption(modelNamespace) +
-      " cache=" + quoteOption(cacheFile) + " output=" +
-      quoteOption(costPath);
+      " cache=" + quoteOption(cacheFile) + " output=" + quoteOption(costPath);
   if (diagnosticIICeiling == 23)
     outputOptions += " diagnostic-ii-ceiling=23";
   if (allowUnsupportedAboveModelCeiling)
@@ -1012,13 +1022,12 @@ static bool runCurrentCostPredictor(
 }
 
 static bool requireCostIICeiling(const TaskShapeCost *cost,
-                                int64_t expectedCeiling,
-                                std::string &error) {
+                                 int64_t expectedCeiling, std::string &error) {
   if (!cost || cost->runtimeIICeiling == static_cast<double>(expectedCeiling))
     return true;
   error = "cost catalogue runtime II ceiling mismatch: expected=" +
-          std::to_string(expectedCeiling) + ":actual=" +
-          std::to_string(cost->runtimeIICeiling);
+          std::to_string(expectedCeiling) +
+          ":actual=" + std::to_string(cost->runtimeIICeiling);
   return false;
 }
 
@@ -1033,10 +1042,12 @@ static bool writeModule(ModuleOp module, StringRef path, std::string &error) {
       error);
 }
 
-
 static bool readFileBytes(StringRef path, std::string &bytes,
                           std::string &error, bool optional = false) {
-  if (path.empty() && optional) { bytes.clear(); return true; }
+  if (path.empty() && optional) {
+    bytes.clear();
+    return true;
+  }
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
     error = "cannot read bound contract " + path.str() + ": " +
@@ -1057,7 +1068,8 @@ static bool fatalStorageError(StringRef text) {
          StringRef(lower).contains("disk guard") ||
          StringRef(lower).contains("cannot create temporary output") ||
          (StringRef(lower).contains("cannot publish") &&
-          !StringRef(lower).contains("cannot publish an exact output region")) ||
+          !StringRef(lower).contains(
+              "cannot publish an exact output region")) ||
          StringRef(lower).contains("failed while writing") ||
          StringRef(lower).contains("read-only file system") ||
          StringRef(lower).contains("input/output error") ||
@@ -1071,14 +1083,20 @@ static json::Object actionObject(const NeighborhoodAction &action) {
     for (unsigned node : primitive.leftNodes)
       leftNodes.push_back(static_cast<int64_t>(node));
     primitives.push_back(json::Object{{"kind", primitive.kind},
-        {"first_task", primitive.firstTask}, {"second_task", primitive.secondTask},
-        {"mode", primitive.mode}, {"axis", primitive.axis},
-        {"factor", primitive.factor}, {"left_nodes", std::move(leftNodes)}});
+                                      {"first_task", primitive.firstTask},
+                                      {"second_task", primitive.secondTask},
+                                      {"mode", primitive.mode},
+                                      {"axis", primitive.axis},
+                                      {"factor", primitive.factor},
+                                      {"left_nodes", std::move(leftNodes)}});
   }
-  return json::Object{{"family", action.family}, {"label", action.label},
-      {"shape_task", action.shapeTask}, {"shape_rows", action.shapeRows},
-      {"shape_cols", action.shapeCols}, {"canonical_reset", action.canonicalReset},
-      {"primitives", std::move(primitives)}};
+  return json::Object{{"family", action.family},
+                      {"label", action.label},
+                      {"shape_task", action.shapeTask},
+                      {"shape_rows", action.shapeRows},
+                      {"shape_cols", action.shapeCols},
+                      {"canonical_reset", action.canonicalReset},
+                      {"primitives", std::move(primitives)}};
 }
 
 static json::Object typedActionObject(const NeighborhoodAction &action) {
@@ -1087,18 +1105,21 @@ static json::Object typedActionObject(const NeighborhoodAction &action) {
     json::Array leftNodes;
     for (unsigned node : primitive.leftNodes)
       leftNodes.push_back(static_cast<int64_t>(node));
-    primitives.push_back(json::Object{
-        {"kind", primitive.kind}, {"firstTask", primitive.firstTask},
-        {"secondTask", primitive.secondTask}, {"axis", primitive.axis},
-        {"factor", primitive.factor}, {"mode", primitive.mode},
-        {"leftNodes", std::move(leftNodes)}});
+    primitives.push_back(json::Object{{"kind", primitive.kind},
+                                      {"firstTask", primitive.firstTask},
+                                      {"secondTask", primitive.secondTask},
+                                      {"axis", primitive.axis},
+                                      {"factor", primitive.factor},
+                                      {"mode", primitive.mode},
+                                      {"leftNodes", std::move(leftNodes)}});
   }
-  return json::Object{
-      {"family", action.family}, {"label", action.label},
-      {"primitives", std::move(primitives)},
-      {"shapeTask", action.shapeTask}, {"shapeRows", action.shapeRows},
-      {"shapeCols", action.shapeCols},
-      {"canonicalReset", action.canonicalReset}};
+  return json::Object{{"family", action.family},
+                      {"label", action.label},
+                      {"primitives", std::move(primitives)},
+                      {"shapeTask", action.shapeTask},
+                      {"shapeRows", action.shapeRows},
+                      {"shapeCols", action.shapeCols},
+                      {"canonicalReset", action.canonicalReset}};
 }
 
 static bool parseTypedAction(const json::Object &object,
@@ -1123,10 +1144,10 @@ static bool parseTypedAction(const json::Object &object,
   for (const json::Value &value : *primitives) {
     const json::Object *primitive = value.getAsObject();
     auto kind = primitive ? primitive->getString("kind") : std::nullopt;
-    auto firstTask = primitive ? primitive->getString("firstTask")
-                               : std::nullopt;
-    auto secondTask = primitive ? primitive->getString("secondTask")
-                                 : std::nullopt;
+    auto firstTask =
+        primitive ? primitive->getString("firstTask") : std::nullopt;
+    auto secondTask =
+        primitive ? primitive->getString("secondTask") : std::nullopt;
     auto mode = primitive ? primitive->getString("mode") : std::nullopt;
     auto axis = primitive ? primitive->getInteger("axis") : std::nullopt;
     auto factor = primitive ? primitive->getInteger("factor") : std::nullopt;
@@ -1136,15 +1157,14 @@ static bool parseTypedAction(const json::Object &object,
       return false;
     if (primitive->get("leftNodes") && !leftNodes)
       return false;
-    NeighborhoodPrimitive parsed{kind->str(), firstTask->str(),
-                                 secondTask->str(), mode->str(), *axis,
-                                 *factor};
+    NeighborhoodPrimitive parsed{
+        kind->str(), firstTask->str(), secondTask->str(), mode->str(),
+        *axis,       *factor};
     if (leftNodes)
       for (const json::Value &value : *leftNodes) {
         auto node = value.getAsInteger();
         if (!node || *node < 0 ||
-            static_cast<uint64_t>(*node) >
-                std::numeric_limits<unsigned>::max())
+            static_cast<uint64_t>(*node) > std::numeric_limits<unsigned>::max())
           return false;
         parsed.leftNodes.push_back(static_cast<unsigned>(*node));
       }
@@ -1157,35 +1177,44 @@ static bool parseTypedAction(const json::Object &object,
   return true;
 }
 
-static bool parseAction(const json::Object &object, NeighborhoodAction &action) {
+static bool parseAction(const json::Object &object,
+                        NeighborhoodAction &action) {
   auto family = object.getString("family"), label = object.getString("label"),
        task = object.getString("shape_task");
-  auto rows = object.getInteger("shape_rows"), cols = object.getInteger("shape_cols");
+  auto rows = object.getInteger("shape_rows"),
+       cols = object.getInteger("shape_cols");
   auto reset = object.getBoolean("canonical_reset");
   auto primitives = object.getArray("primitives");
   if (!family || !label || !task || !rows || !cols || !reset || !primitives)
     return false;
-  action.family = family->str(); action.label = label->str();
-  action.shapeTask = task->str(); action.shapeRows = *rows;
-  action.shapeCols = *cols; action.canonicalReset = *reset;
+  action.family = family->str();
+  action.label = label->str();
+  action.shapeTask = task->str();
+  action.shapeRows = *rows;
+  action.shapeCols = *cols;
+  action.canonicalReset = *reset;
   for (const auto &value : *primitives) {
     const auto *primitive = value.getAsObject();
-    if (!primitive) return false;
-    auto kind = primitive->getString("kind"), first = primitive->getString("first_task"),
-         second = primitive->getString("second_task"), mode = primitive->getString("mode");
-    auto axis = primitive->getInteger("axis"), factor = primitive->getInteger("factor");
+    if (!primitive)
+      return false;
+    auto kind = primitive->getString("kind"),
+         first = primitive->getString("first_task"),
+         second = primitive->getString("second_task"),
+         mode = primitive->getString("mode");
+    auto axis = primitive->getInteger("axis"),
+         factor = primitive->getInteger("factor");
     const json::Array *leftNodes = primitive->getArray("left_nodes");
-    if (!kind || !first || !second || !mode || !axis || !factor) return false;
+    if (!kind || !first || !second || !mode || !axis || !factor)
+      return false;
     if (primitive->get("left_nodes") && !leftNodes)
       return false;
     NeighborhoodPrimitive parsed{kind->str(), first->str(), second->str(),
-                                 mode->str(), *axis, *factor};
+                                 mode->str(), *axis,        *factor};
     if (leftNodes)
       for (const json::Value &nodeValue : *leftNodes) {
         auto node = nodeValue.getAsInteger();
         if (!node || *node < 0 ||
-            static_cast<uint64_t>(*node) >
-                std::numeric_limits<unsigned>::max())
+            static_cast<uint64_t>(*node) > std::numeric_limits<unsigned>::max())
           return false;
         parsed.leftNodes.push_back(static_cast<unsigned>(*node));
       }
@@ -1225,7 +1254,9 @@ struct DirectionalChoice {
   double priorityProxy = 0;
   std::vector<std::string> signatures;
 };
-struct DirectionalFeedback { uint64_t attempts = 0, charged = 0; };
+struct DirectionalFeedback {
+  uint64_t attempts = 0, charged = 0;
+};
 struct DirectionalWindow {
   std::string parentKey, parentID, triggerFamily;
   std::set<std::string> targets, families;
@@ -1234,7 +1265,8 @@ struct DirectionalWindow {
   std::map<std::vector<int64_t>, uint64_t> coTilingAxisAttempts;
 };
 struct DirectionalSelection {
-  std::string mode = "original", baselineSignature, baselineParentID, baselineParentKey;
+  std::string mode = "original", baselineSignature, baselineParentID,
+              baselineParentKey;
   std::string reason, directionKey;
   uint64_t selectedPendingOffset = 0;
   bool preferred = false, window = false;
@@ -1247,8 +1279,8 @@ struct ParentPendingProgress {
 
 static std::string parentProgressEdgeKey(StringRef parentKey,
                                          const NeighborhoodAction &action) {
-  return jsonText(json::Value(json::Array{
-      parentKey, typedActionObject(action)}));
+  return jsonText(
+      json::Value(json::Array{parentKey, typedActionObject(action)}));
 }
 
 struct FamilyFunnelCounters {
@@ -1284,8 +1316,8 @@ struct CandidateCostCacheObservation {
   bool reused = false;
 };
 
-static json::Object familyFunnelCountersObject(
-    const FamilyFunnelCounters &counters) {
+static json::Object
+familyFunnelCountersObject(const FamilyFunnelCounters &counters) {
   json::Object rejectReasons;
   for (const auto &[reason, count] : counters.rejectReasons)
     rejectReasons[reason] = static_cast<int64_t>(count);
@@ -1302,8 +1334,7 @@ static json::Object familyFunnelCountersObject(
       {"duplicate", static_cast<int64_t>(counters.duplicate)},
       {"cost_preparation_attempted",
        static_cast<int64_t>(counters.costPreparationAttempted)},
-      {"fresh_cost_prepared",
-       static_cast<int64_t>(counters.freshCostPrepared)},
+      {"fresh_cost_prepared", static_cast<int64_t>(counters.freshCostPrepared)},
       {"fresh_cost_scored", static_cast<int64_t>(counters.freshCostScored)},
       {"cache_reused", static_cast<int64_t>(counters.cacheReused)},
       {"cost_shape_cache_hits",
@@ -1344,15 +1375,15 @@ static bool parseFamilyFunnelCounters(const json::Object &object,
       !readCount("fresh_cost_scored", counters.freshCostScored) ||
       !readCount("cache_reused", counters.cacheReused) ||
       !readCount("cost_shape_cache_hits", counters.costShapeCacheHits) ||
-      !readCount("cost_shape_cache_misses",
-                 counters.costShapeCacheMisses) ||
+      !readCount("cost_shape_cache_misses", counters.costShapeCacheMisses) ||
       !readCount("scheduler_calls", counters.schedulerCalls) ||
       !readCount("scheduler_pass", counters.schedulerPass) ||
       !readCount("scheduler_reject", counters.schedulerReject) ||
       !readCount("archive", counters.archive) ||
       !readCount("pending_unattempted", counters.pendingUnattempted) ||
-      !parseStringArray(object.getArray("pending_unattempted_action_signatures"),
-                        counters.pendingUnattemptedActionSignatures))
+      !parseStringArray(
+          object.getArray("pending_unattempted_action_signatures"),
+          counters.pendingUnattemptedActionSignatures))
     return false;
   const json::Object *reasons = object.getObject("reject_reasons");
   const json::Object *pendingReasons =
@@ -1370,8 +1401,8 @@ static bool parseFamilyFunnelCounters(const json::Object &object,
     auto count = value.getAsInteger();
     if (!count || *count < 0)
       return false;
-    counters.pendingUnattemptedReasons.emplace(
-        reasonRef.str(), static_cast<uint64_t>(*count));
+    counters.pendingUnattemptedReasons.emplace(reasonRef.str(),
+                                               static_cast<uint64_t>(*count));
   }
   return true;
 }
@@ -1383,8 +1414,8 @@ static json::Array typedActionArray(ArrayRef<NeighborhoodAction> actions) {
   return result;
 }
 
-static std::set<std::string> typedHistoryFamilies(
-    const SearchState::TypedActionHistory &history) {
+static std::set<std::string>
+typedHistoryFamilies(const SearchState::TypedActionHistory &history) {
   std::set<std::string> families;
   if (!history.known)
     return families;
@@ -1399,10 +1430,9 @@ static std::string familyWitnessFilename(StringRef candidateID) {
   auto safe = [](StringRef value) {
     std::string result;
     for (char character : value) {
-      const bool alphaNumeric =
-          (character >= 'a' && character <= 'z') ||
-          (character >= 'A' && character <= 'Z') ||
-          (character >= '0' && character <= '9');
+      const bool alphaNumeric = (character >= 'a' && character <= 'z') ||
+                                (character >= 'A' && character <= 'Z') ||
+                                (character >= '0' && character <= '9');
       result.push_back(alphaNumeric || character == '-' || character == '_'
                            ? character
                            : '-');
@@ -1482,8 +1512,9 @@ static uint64_t currentTargetCycles(const SearchState &parent,
   }
   uint64_t priority = 0;
   for (const std::string &target : targets)
-    for (unsigned index = 0; index < parent.choices.size() &&
-                             index < parent.durations.size(); ++index)
+    for (unsigned index = 0;
+         index < parent.choices.size() && index < parent.durations.size();
+         ++index)
       if (parent.choices[index].task == target)
         priority = std::max<uint64_t>(
             priority, static_cast<uint64_t>(
@@ -1491,21 +1522,21 @@ static uint64_t currentTargetCycles(const SearchState &parent,
   return priority;
 }
 
-static uint64_t perRoundScoreQuota(uint64_t scoredCount,
-                                   uint64_t maxCandidates,
-                                   int64_t roundsRemaining, uint64_t scale = 1) {
+static uint64_t perRoundScoreQuota(uint64_t scoredCount, uint64_t maxCandidates,
+                                   int64_t roundsRemaining,
+                                   uint64_t scale = 1) {
   if (roundsRemaining <= 0 || scoredCount >= maxCandidates)
     return 0;
   const uint64_t remaining = maxCandidates - scoredCount;
   const uint64_t divisor = static_cast<uint64_t>(roundsRemaining);
-  const uint64_t base = remaining / divisor + (remaining % divisor != 0 ? 1 : 0);
+  const uint64_t base =
+      remaining / divisor + (remaining % divisor != 0 ? 1 : 0);
   return std::min(remaining, base * scale);
 }
 
 static bool ordinaryActionFamilyHasKnownTaskEffects(StringRef family) {
   return family == "shape" || family == "replica" || family == "tiling" ||
-         family == "k-tiling" ||
-         family == "producer-consumer-co-tiling" ||
+         family == "k-tiling" || family == "producer-consumer-co-tiling" ||
          family == "producer-consumer-co-k-tiling" || family == "fusion" ||
          family == "fusion-plus-tiling" || family == "tiling-plus-fusion" ||
          family == "fusion-plus-shape" || family == "sibling-fusion";
@@ -1517,12 +1548,10 @@ static bool ordinaryFamilyAllowsPrimitiveKind(StringRef family,
     return kind == "replica";
   if (family == "tiling" || family == "producer-consumer-co-tiling" ||
       family == "fusion-plus-tiling" || family == "tiling-plus-fusion")
-    return kind == "tile" ||
-           ((family == "fusion-plus-tiling" ||
-             family == "tiling-plus-fusion") &&
-            kind == "fusion");
-  if (family == "k-tiling" ||
-      family == "producer-consumer-co-k-tiling")
+    return kind == "tile" || ((family == "fusion-plus-tiling" ||
+                               family == "tiling-plus-fusion") &&
+                              kind == "fusion");
+  if (family == "k-tiling" || family == "producer-consumer-co-k-tiling")
     return kind == "k-tile";
   if (family == "fusion")
     return kind == "fusion";
@@ -1533,8 +1562,9 @@ static bool ordinaryFamilyAllowsPrimitiveKind(StringRef family,
   return false;
 }
 
-static std::string ordinaryActionFootprintFailure(
-    const NeighborhoodAction &action, std::set<std::string> &footprint) {
+static std::string
+ordinaryActionFootprintFailure(const NeighborhoodAction &action,
+                               std::set<std::string> &footprint) {
   footprint.clear();
   if (action.canonicalReset || action.family == "canonical-reset")
     return "canonical_reset";
@@ -1559,8 +1589,7 @@ static std::string ordinaryActionFootprintFailure(
   bool sawPrimitive = false;
   for (const NeighborhoodPrimitive &primitive : action.primitives) {
     const StringRef kind = primitive.kind;
-    const bool fusionPrimitive = kind == "fusion" ||
-                                 kind == "sibling-fusion";
+    const bool fusionPrimitive = kind == "fusion" || kind == "sibling-fusion";
     if (kind != "tile" && kind != "k-tile" && kind != "replica" &&
         !fusionPrimitive)
       return "unknown_primitive_kind";
@@ -1568,9 +1597,8 @@ static std::string ordinaryActionFootprintFailure(
       return "unknown_primitive_family";
     if (primitive.firstTask.empty())
       return "unknown_footprint";
-    if (fusionPrimitive &&
-        (primitive.secondTask.empty() ||
-         primitive.secondTask == primitive.firstTask))
+    if (fusionPrimitive && (primitive.secondTask.empty() ||
+                            primitive.secondTask == primitive.firstTask))
       return "unknown_footprint";
     if (!fusionPrimitive && !primitive.secondTask.empty())
       return "unknown_footprint";
@@ -1584,8 +1612,7 @@ static std::string ordinaryActionFootprintFailure(
   if (action.family == "replica" &&
       (!sawPrimitive || action.primitives.size() != 1))
     return "unknown_footprint";
-  if (action.family == "tiling" &&
-      (!sawTile || action.primitives.size() != 1))
+  if (action.family == "tiling" && (!sawTile || action.primitives.size() != 1))
     return "unknown_footprint";
   if (action.family == "k-tiling" && action.primitives.size() != 1)
     return "unknown_footprint";
@@ -1602,17 +1629,16 @@ static std::string ordinaryActionFootprintFailure(
   if (action.family == "tiling-plus-fusion" &&
       (action.primitives.size() != 3 || !sawTile || !sawFusion))
     return "unknown_footprint";
-  if (fusionShapeFamily &&
-      (action.primitives.size() != 1 || !sawFusion))
+  if (fusionShapeFamily && (action.primitives.size() != 1 || !sawFusion))
     return "unknown_footprint";
   if (footprint.empty())
     return "global_or_unknown_footprint";
   return {};
 }
 
-static std::string fissionHistoryConflictReason(
-    const SearchState::TypedActionHistory &history,
-    const NeighborhoodAction &fission) {
+static std::string
+fissionHistoryConflictReason(const SearchState::TypedActionHistory &history,
+                             const NeighborhoodAction &fission) {
   if (!history.known)
     return "history_unknown";
   if (fission.primitives.size() != 1 ||
@@ -1643,12 +1669,12 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
     ModuleOp preparedTaskflowSource, uint64_t maxFissionActionsPerTask,
     ArrayRef<NeighborhoodAction> canonicalFissionActions,
     FamilyFunnelRound &roundFunnel, bool descendingShapes,
-    const std::function<std::string(const SearchState &, NeighborhoodAction &)> &filter,
+    const std::function<std::string(const SearchState &, NeighborhoodAction &)>
+        &filter,
     std::string &enumerationError) {
   enumerationError.clear();
   const bool fissionStage =
-      stage == "full-joint-fission" || stage == "s6" ||
-      stage == "S6" ||
+      stage == "full-joint-fission" || stage == "s6" || stage == "S6" ||
       stage == "shape-temporal-replica-tiling-fusion-fission";
   using TargetMap = std::map<std::string, TargetActionStream>;
   using FamilyMap = std::map<std::string, TargetMap>;
@@ -1683,8 +1709,7 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
       }
       if (fissionStage && action.family == "fission") {
         const std::string reason =
-            fissionHistoryConflictReason(indexed.value().actionHistory,
-                                         action);
+            fissionHistoryConflictReason(indexed.value().actionHistory, action);
         if (!reason.empty()) {
           ++roundFunnel[action.family].reject;
           ++roundFunnel[action.family].rejectReasons["menu:" + reason];
@@ -1702,8 +1727,7 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
       TargetActionStream &stream = families[family][target];
       stream.target = target;
       stream.targetCycles = std::max(stream.targetCycles, targetCycles);
-      stream.actions.push_back(
-          {targetCycles, std::move(action), {}});
+      stream.actions.push_back({targetCycles, std::move(action), {}});
       CostGuidedAction &queued = stream.actions.back();
       queued.signature = actionSignature(queued.action);
       familyNames.insert(family);
@@ -1718,26 +1742,31 @@ static std::vector<PendingNeighbor> enumerateBalancedPendingNeighbors(
       familyStream.parent = parent;
       familyStream.family = family;
       for (auto &[target, targetStream] : targets) {
-        llvm::sort(targetStream.actions, [descendingShapes](const CostGuidedAction &left,
-                                             const CostGuidedAction &right) {
-          if (left.targetCycles != right.targetCycles)
-            return left.targetCycles > right.targetCycles;
-          if (descendingShapes && left.action.family == "shape" && right.action.family == "shape") {
-            const int64_t leftArea = left.action.shapeRows * left.action.shapeCols;
-            const int64_t rightArea = right.action.shapeRows * right.action.shapeCols;
-            if (leftArea != rightArea) return leftArea > rightArea;
-          }
-          return left.signature < right.signature;
-        });
+        llvm::sort(targetStream.actions,
+                   [descendingShapes](const CostGuidedAction &left,
+                                      const CostGuidedAction &right) {
+                     if (left.targetCycles != right.targetCycles)
+                       return left.targetCycles > right.targetCycles;
+                     if (descendingShapes && left.action.family == "shape" &&
+                         right.action.family == "shape") {
+                       const int64_t leftArea =
+                           left.action.shapeRows * left.action.shapeCols;
+                       const int64_t rightArea =
+                           right.action.shapeRows * right.action.shapeCols;
+                       if (leftArea != rightArea)
+                         return leftArea > rightArea;
+                     }
+                     return left.signature < right.signature;
+                   });
         familyStream.targets.push_back(std::move(targetStream));
       }
-      llvm::stable_sort(familyStream.targets,
-                        [](const TargetActionStream &left,
-                           const TargetActionStream &right) {
-        if (left.targetCycles != right.targetCycles)
-          return left.targetCycles > right.targetCycles;
-        return left.target < right.target;
-      });
+      llvm::stable_sort(
+          familyStream.targets,
+          [](const TargetActionStream &left, const TargetActionStream &right) {
+            if (left.targetCycles != right.targetCycles)
+              return left.targetCycles > right.targetCycles;
+            return left.target < right.target;
+          });
     }
 
   std::vector<PendingNeighbor> pending;
@@ -1779,16 +1808,17 @@ successfulActionFamilyScores(ArrayRef<ArchiveRecord> archive, int64_t round) {
   return scores;
 }
 
-static std::map<std::string, uint64_t> pendingActionFamilyCounts(
-    ArrayRef<PendingNeighbor> pending, size_t cursor) {
+static std::map<std::string, uint64_t>
+pendingActionFamilyCounts(ArrayRef<PendingNeighbor> pending, size_t cursor) {
   std::map<std::string, uint64_t> counts;
   for (size_t index = cursor; index < pending.size(); ++index)
     ++counts[pending[index].action.family];
   return counts;
 }
 
-static void consumePendingActionFamily(
-    std::map<std::string, uint64_t> &remaining, StringRef family) {
+static void
+consumePendingActionFamily(std::map<std::string, uint64_t> &remaining,
+                           StringRef family) {
   auto found = remaining.find(family.str());
   if (found == remaining.end())
     return;
@@ -1805,8 +1835,8 @@ static void prioritizeNextPendingActionFamily(
     return;
 
   std::map<std::string, size_t> firstByFamily;
-  for (size_t index = cursor;
-       index < pending.size() && firstByFamily.size() < remainingFamilies.size();
+  for (size_t index = cursor; index < pending.size() &&
+                              firstByFamily.size() < remainingFamilies.size();
        ++index)
     if (remainingFamilies.count(pending[index].action.family))
       firstByFamily.try_emplace(pending[index].action.family, index);
@@ -1910,8 +1940,8 @@ static bool runPrivateProductionScores(
   if (jobs.empty())
     return true;
 
-  const unsigned workerCount = std::max<unsigned>(
-      1, std::min<unsigned>(requestedWorkers, jobs.size()));
+  const unsigned workerCount =
+      std::max<unsigned>(1, std::min<unsigned>(requestedWorkers, jobs.size()));
   // Context construction and registry mutation stay on the owner thread.
   // Each worker then reuses exactly one disabled-threading context and its
   // bounded exact-IR cache across all batches in this pass.
@@ -1930,85 +1960,87 @@ static bool runPrivateProductionScores(
       PersistentParallelWorker &workerState = *workerPool.workers[worker];
       MLIRContext &context = *workerState.context;
       for (size_t index = worker; index < jobs.size(); index += workerCount) {
-          const ParallelScoreJob &job = jobs[index];
-          ParallelScoreResult &result = results[index];
-          std::string diagnostic;
-          std::string localError;
-          ModuleOp module;
-          FailureOr<func::FuncOp> selected = failure();
-          {
-            ScopedDiagnosticHandler capture(
-                &context, [&](Diagnostic &entry) {
-                  if (diagnostic.empty()) {
-                    llvm::raw_string_ostream stream(diagnostic);
-                    entry.print(stream);
-                  }
-                  return success();
-                });
-            for (PrivateModuleCacheEntry &entry : workerState.moduleCache) {
-              if (entry.moduleIR == job.moduleIR) {
-                module = entry.module.get();
-                ++workerState.cacheHits;
-                break;
-              }
+        const ParallelScoreJob &job = jobs[index];
+        ParallelScoreResult &result = results[index];
+        std::string diagnostic;
+        std::string localError;
+        ModuleOp module;
+        FailureOr<func::FuncOp> selected = failure();
+        {
+          ScopedDiagnosticHandler capture(&context, [&](Diagnostic &entry) {
+            if (diagnostic.empty()) {
+              llvm::raw_string_ostream stream(diagnostic);
+              entry.print(stream);
             }
-            if (!module) {
-              ++workerState.cacheMisses;
-              OwningOpRef<ModuleOp> parsed =
-                  parseSourceString<ModuleOp>(job.moduleIR, &context);
-              if (!parsed || failed(verify(parsed->getOperation()))) {
-                result.fatal = true;
-                result.error = diagnostic.empty()
-                                   ? "parallel worker could not parse or verify candidate"
-                                   : diagnostic;
-                result.finished = true;
-                continue;
-              }
-              if (workerState.moduleCache.size() >=
-                  kPrivateModuleCacheCapacity)
-                workerState.moduleCache.erase(workerState.moduleCache.begin());
-              workerState.moduleCache.push_back(
-                  {job.moduleIR, std::move(parsed)});
-              module = workerState.moduleCache.back().module.get();
+            return success();
+          });
+          for (PrivateModuleCacheEntry &entry : workerState.moduleCache) {
+            if (entry.moduleIR == job.moduleIR) {
+              module = entry.module.get();
+              ++workerState.cacheHits;
+              break;
             }
-            selected = selectTaskFunction(module, job.functionName, localError);
-            if (failed(selected)) {
-              result.fatal = true;
-              result.error = localError.empty()
-                                 ? "parallel worker could not select candidate function"
-                                 : localError;
-              result.finished = true;
-              continue;
-            }
-            if (!scheduleWithAmoebaProductionPass(
-                    module, *selected, job.choices, job.durations,
-                    job.candidateID, job.fixedDispatch, result.schedule,
-                    localError)) {
-              // A production scheduler rejection is a normal candidate
-              // result.  Parse/selection failures above are infrastructure
-              // failures and discard the whole unfinished batch.
-              result.error = localError.empty()
-                                 ? "production scheduler rejected candidate"
-                                 : localError;
-              result.finished = true;
-              continue;
-            }
-            result.scored = true;
-            result.finished = true;
           }
+          if (!module) {
+            ++workerState.cacheMisses;
+            OwningOpRef<ModuleOp> parsed =
+                parseSourceString<ModuleOp>(job.moduleIR, &context);
+            if (!parsed || failed(verify(parsed->getOperation()))) {
+              result.fatal = true;
+              result.error =
+                  diagnostic.empty()
+                      ? "parallel worker could not parse or verify candidate"
+                      : diagnostic;
+              result.finished = true;
+              continue;
+            }
+            if (workerState.moduleCache.size() >= kPrivateModuleCacheCapacity)
+              workerState.moduleCache.erase(workerState.moduleCache.begin());
+            workerState.moduleCache.push_back(
+                {job.moduleIR, std::move(parsed)});
+            module = workerState.moduleCache.back().module.get();
+          }
+          selected = selectTaskFunction(module, job.functionName, localError);
+          if (failed(selected)) {
+            result.fatal = true;
+            result.error =
+                localError.empty()
+                    ? "parallel worker could not select candidate function"
+                    : localError;
+            result.finished = true;
+            continue;
+          }
+          if (!scheduleWithAmoebaProductionPass(module, *selected, job.choices,
+                                                job.durations, job.candidateID,
+                                                job.fixedDispatch,
+                                                result.schedule, localError)) {
+            // A production scheduler rejection is a normal candidate
+            // result.  Parse/selection failures above are infrastructure
+            // failures and discard the whole unfinished batch.
+            result.error = localError.empty()
+                               ? "production scheduler rejected candidate"
+                               : localError;
+            result.finished = true;
+            continue;
+          }
+          result.scored = true;
+          result.finished = true;
+        }
       }
     });
   }
   for (std::thread &worker : workers)
     worker.join();
   for (unsigned worker = 0; worker < workerCount; ++worker) {
-    cacheHits += workerPool.workers[worker]->cacheHits - cacheHitsBefore[worker];
+    cacheHits +=
+        workerPool.workers[worker]->cacheHits - cacheHitsBefore[worker];
     cacheMisses +=
         workerPool.workers[worker]->cacheMisses - cacheMissesBefore[worker];
   }
   for (const ParallelScoreResult &result : results) {
     if (result.fatal) {
-      error = result.error.empty() ? "parallel scoring worker failed" : result.error;
+      error = result.error.empty() ? "parallel scoring worker failed"
+                                   : result.error;
       return false;
     }
     if (!result.finished) {
@@ -2019,19 +2051,22 @@ static bool runPrivateProductionScores(
   return true;
 }
 
-static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record,
-                               std::string &error) {
-  auto id = object.getString("candidate_id"), key = object.getString("candidate_key"),
+static bool parseArchiveObject(const json::Object &object,
+                               ArchiveRecord &record, std::string &error) {
+  auto id = object.getString("candidate_id"),
+       key = object.getString("candidate_key"),
        fact = object.getString("graph_facts_key");
   auto valid = object.getBoolean("valid");
   if (!id || !key || !fact || !valid) {
     error = "checkpoint archive record lacks source-owned candidate identity";
     return false;
   }
-  record.id = id->str(); record.key = key->str(); record.factKey = fact->str();
+  record.id = id->str();
+  record.key = key->str();
+  record.factKey = fact->str();
   record.valid = *valid;
-  record.score = object.getInteger("predicted_whole_program_cycles").value_or(
-      std::numeric_limits<int64_t>::max());
+  record.score = object.getInteger("predicted_whole_program_cycles")
+                     .value_or(std::numeric_limits<int64_t>::max());
   record.candidatePath = object.getString("candidate_path").value_or("").str();
   record.parentId = object.getString("parent_candidate_id").value_or("").str();
   record.graphId = object.getString("graph_variant_id").value_or("").str();
@@ -2064,10 +2099,10 @@ static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record
   for (const auto &[roleRef, value] : *roleProvenance) {
     std::string role = roleRef.str();
     const json::Object *entry = value.getAsObject();
-    auto candidatePath = entry ? entry->getString("candidate_path")
-                               : std::optional<StringRef>();
-    const json::Object *history = entry ? entry->getObject("action_history")
-                                        : nullptr;
+    auto candidatePath =
+        entry ? entry->getString("candidate_path") : std::optional<StringRef>();
+    const json::Object *history =
+        entry ? entry->getObject("action_history") : nullptr;
     ControlRoleProvenance provenance;
     if (!entry || !candidatePath || !history ||
         !parseStringArray(entry->getArray("action_path"), provenance.path) ||
@@ -2078,8 +2113,9 @@ static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record
       return false;
     }
     provenance.candidatePath = candidatePath->str();
-    if (!record.controlRoleProvenance.emplace(std::move(role),
-                                               std::move(provenance)).second) {
+    if (!record.controlRoleProvenance
+             .emplace(std::move(role), std::move(provenance))
+             .second) {
       error = "checkpoint archive repeats a control-role provenance entry";
       return false;
     }
@@ -2095,80 +2131,108 @@ static bool parseArchiveObject(const json::Object &object, ArchiveRecord &record
   if (auto alternatives = object.getArray("alternate_action_paths"))
     for (const auto &value : *alternatives) {
       std::vector<std::string> path;
-      if (!parseStringArray(value.getAsArray(), path)) return false;
+      if (!parseStringArray(value.getAsArray(), path))
+        return false;
       record.alternatePaths.push_back(std::move(path));
     }
-  if (!record.valid) return true;
-  auto choices = object.getArray("task_choices"), costs = object.getArray("task_costs"),
-       schedule = object.getArray("task_schedule"), dispatch = object.getArray("dispatch_order");
-  if (!choices || !costs || !schedule || !dispatch || choices->size() != costs->size()) {
-    error = "checkpoint scored record lacks cost and production schedule witnesses";
+  if (!record.valid)
+    return true;
+  auto choices = object.getArray("task_choices"),
+       costs = object.getArray("task_costs"),
+       schedule = object.getArray("task_schedule"),
+       dispatch = object.getArray("dispatch_order");
+  if (!choices || !costs || !schedule || !dispatch ||
+      choices->size() != costs->size()) {
+    error =
+        "checkpoint scored record lacks cost and production schedule witnesses";
     return false;
   }
   std::map<std::string, unsigned> indices;
   for (const auto &value : *choices) {
     const auto *choice = value.getAsObject();
-    if (!choice) return false;
+    if (!choice)
+      return false;
     auto task = choice->getString("task");
     auto rows = choice->getInteger("rows"), cols = choice->getInteger("cols"),
          mapperRows = choice->getInteger("mapper_tile_rows"),
          mapperCols = choice->getInteger("mapper_tile_cols"),
          trip = choice->getInteger("trip_count");
     if (!task || !rows || !cols || !mapperRows || !mapperCols || !trip ||
-        !indices.emplace(task->str(), record.choices.size()).second) return false;
-    record.choices.push_back({task->str(), *trip, {*rows, *cols, *mapperRows, *mapperCols}});
+        !indices.emplace(task->str(), record.choices.size()).second)
+      return false;
+    record.choices.push_back(
+        {task->str(), *trip, {*rows, *cols, *mapperRows, *mapperCols}});
   }
   for (unsigned index = 0; index < costs->size(); ++index) {
     const auto *cost = (*costs)[index].getAsObject();
-    if (!cost || cost->getString("task") != record.choices[index].task) return false;
-    auto ii = cost->getNumber("predicted_ii"), startup = cost->getNumber("startup_cycles");
+    if (!cost || cost->getString("task") != record.choices[index].task)
+      return false;
+    auto ii = cost->getNumber("predicted_ii"),
+         startup = cost->getNumber("startup_cycles");
     auto duration = cost->getInteger("predicted_duration");
-    if (!ii || !startup || !duration) return false;
+    if (!ii || !startup || !duration)
+      return false;
     record.costs.push_back({*ii, *startup, true});
     record.durations.push_back(*duration);
   }
   for (const auto &value : *schedule) {
     const auto *entry = value.getAsObject();
-    if (!entry) return false;
+    if (!entry)
+      return false;
     auto task = entry->getString("task");
     auto row = entry->getInteger("row"), col = entry->getInteger("col"),
-         start = entry->getInteger("start_cycle"), end = entry->getInteger("end_cycle");
-    if (!task || !row || !col || !start || !end || !indices.count(task->str())) return false;
+         start = entry->getInteger("start_cycle"),
+         end = entry->getInteger("end_cycle");
+    if (!task || !row || !col || !start || !end || !indices.count(task->str()))
+      return false;
     ExactSchedulePlacement placement;
-    placement.task = indices[task->str()]; placement.row = *row; placement.col = *col;
-    placement.start = *start; placement.end = *end;
+    placement.task = indices[task->str()];
+    placement.row = *row;
+    placement.col = *col;
+    placement.start = *start;
+    placement.end = *end;
     placement.idleCycles = entry->getInteger("idle_cycles").value_or(0);
     record.schedule.placements.push_back(placement);
   }
   for (const auto &value : *dispatch) {
     auto task = value.getAsString();
-    if (!task || !indices.count(task->str())) return false;
+    if (!task || !indices.count(task->str()))
+      return false;
     record.schedule.dispatch.push_back(indices[task->str()]);
   }
   record.schedule.order = record.schedule.dispatch;
   record.schedule.makespan = record.score;
-  record.schedule.replayedEdges = object.getInteger("replayed_communication_edges").value_or(0);
-  record.schedule.replayedEdgesKnown = object.getBoolean("communication_trace_known").value_or(false);
+  record.schedule.replayedEdges =
+      object.getInteger("replayed_communication_edges").value_or(0);
+  record.schedule.replayedEdgesKnown =
+      object.getBoolean("communication_trace_known").value_or(false);
   return true;
 }
 
 static ArchiveRecord stateRecord(const SearchState &state) {
   ArchiveRecord record;
-  record.id = state.id; record.key = state.key; record.factKey = state.factKey;
-  record.parentId = state.parentId; record.path = state.path;
+  record.id = state.id;
+  record.key = state.key;
+  record.factKey = state.factKey;
+  record.parentId = state.parentId;
+  record.path = state.path;
   record.actionHistory = portableActionHistory(state.actionHistory);
-  record.shapes = state.shapes; record.choices = state.choices;
-  record.costs = state.costs; record.durations = state.durations;
-  record.schedule = state.schedule; record.costPath = state.costPath;
-  record.control = state.control; record.controlRoles = state.controlRoles;
+  record.shapes = state.shapes;
+  record.choices = state.choices;
+  record.costs = state.costs;
+  record.durations = state.durations;
+  record.schedule = state.schedule;
+  record.costPath = state.costPath;
+  record.control = state.control;
+  record.controlRoles = state.controlRoles;
   for (const std::string &role : record.controlRoles) {
     ControlRoleProvenance provenance;
     provenance.path = state.path;
-    provenance.actionHistory =
-        portableActionHistory(state.actionHistory);
+    provenance.actionHistory = portableActionHistory(state.actionHistory);
     record.controlRoleProvenance.emplace(role, std::move(provenance));
   }
-  record.score = state.score; record.valid = state.scored;
+  record.score = state.score;
+  record.valid = state.scored;
   record.rejectReason = state.rejectReason;
   return record;
 }
@@ -2183,34 +2247,47 @@ static json::Object stateObject(const SearchState &state) {
 static bool parseState(const json::Object &object, MLIRContext *context,
                        SearchState &state, std::string &error) {
   ArchiveRecord record;
-  if (!parseArchiveObject(object, record, error)) return false;
+  if (!parseArchiveObject(object, record, error))
+    return false;
   auto ir = object.getString("module_ir");
-  if (!ir) { error = "checkpoint missing exact materialized module snapshot"; return false; }
+  if (!ir) {
+    error = "checkpoint missing exact materialized module snapshot";
+    return false;
+  }
   state.module = parseSourceString<ModuleOp>(*ir, context);
-  if (!state.module) { error = "checkpoint materialized module snapshot does not parse"; return false; }
-  state.id = record.id; state.key = record.key; state.factKey = record.factKey;
-  state.parentId = record.parentId; state.path = std::move(record.path);
+  if (!state.module) {
+    error = "checkpoint materialized module snapshot does not parse";
+    return false;
+  }
+  state.id = record.id;
+  state.key = record.key;
+  state.factKey = record.factKey;
+  state.parentId = record.parentId;
+  state.path = std::move(record.path);
   state.actionHistory = std::move(record.actionHistory);
-  state.shapes = std::move(record.shapes); state.choices = std::move(record.choices);
-  state.costs = std::move(record.costs); state.durations = std::move(record.durations);
-  state.schedule = std::move(record.schedule); state.costPath = record.costPath;
-  state.control = record.control; state.controlRoles = std::move(record.controlRoles);
-  state.score = record.score; state.scored = record.valid;
+  state.shapes = std::move(record.shapes);
+  state.choices = std::move(record.choices);
+  state.costs = std::move(record.costs);
+  state.durations = std::move(record.durations);
+  state.schedule = std::move(record.schedule);
+  state.costPath = record.costPath;
+  state.control = record.control;
+  state.controlRoles = std::move(record.controlRoles);
+  state.score = record.score;
+  state.scored = record.valid;
   state.keyReserved = object.getBoolean("key_reserved").value_or(true);
   return true;
 }
 static bool parseStageFixed(StringRef stage) {
   return stage == "S1" || stage == "s1" || stage == "shape" ||
-         stage == "shape-only" ||
-         stage.contains("fixed") || stage.contains("dependency-ready");
+         stage == "shape-only" || stage.contains("fixed") ||
+         stage.contains("dependency-ready");
 }
 
-static bool parseCheckpointHeader(const json::Object &object, StringRef function,
-                                  StringRef stage, StringRef sourceRepository,
-                                  StringRef sourceCommit, StringRef architecture,
-                                  StringRef protocol,
-                                  int64_t diagnosticIICeiling,
-                                  std::string &error) {
+static bool parseCheckpointHeader(
+    const json::Object &object, StringRef function, StringRef stage,
+    StringRef sourceRepository, StringRef sourceCommit, StringRef architecture,
+    StringRef protocol, int64_t diagnosticIICeiling, std::string &error) {
   auto schema = object.getString("schema");
   auto savedFunction = object.getString("function");
   auto savedStage = object.getString("stage");
@@ -2227,10 +2304,9 @@ static bool parseCheckpointHeader(const json::Object &object, StringRef function
        (!savedDiagnosticIICeiling || *savedDiagnosticIICeiling != 23)) ||
       (diagnosticIICeiling == 20 && savedDiagnosticIICeiling &&
        *savedDiagnosticIICeiling != 20) ||
-      *savedFunction != function ||
-      *savedStage != stage || *savedRepository != sourceRepository ||
-      *savedCommit != sourceCommit || *savedArchitecture != architecture ||
-      *savedProtocol != protocol) {
+      *savedFunction != function || *savedStage != stage ||
+      *savedRepository != sourceRepository || *savedCommit != sourceCommit ||
+      *savedArchitecture != architecture || *savedProtocol != protocol) {
     error = "neighborhood checkpoint version/provenance binding mismatch";
     return false;
   }
@@ -2238,8 +2314,7 @@ static bool parseCheckpointHeader(const json::Object &object, StringRef function
 }
 
 class SearchJointNeighborhoodPass
-    : public PassWrapper<SearchJointNeighborhoodPass,
-                         OperationPass<ModuleOp>> {
+    : public PassWrapper<SearchJointNeighborhoodPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SearchJointNeighborhoodPass)
 
@@ -2253,8 +2328,10 @@ public:
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect,arith::ArithDialect,cf::ControlFlowDialect,
-        LLVM::LLVMDialect,memref::MemRefDialect,scf::SCFDialect,math::MathDialect>();
+    registry
+        .insert<affine::AffineDialect, arith::ArithDialect,
+                cf::ControlFlowDialect, LLVM::LLVMDialect,
+                memref::MemRefDialect, scf::SCFDialect, math::MathDialect>();
     registerTaskflowFissionCanonicalLoweringDependencies(registry);
     // These passes run in nested managers while the outer manager has already
     // entered its execution context. Declare their dialects here so loading a
@@ -2274,32 +2351,42 @@ public:
   Option<std::string> outputDir{*this, "output-dir", llvm::cl::init("")};
   Option<std::string> functionName{*this, "function", llvm::cl::init("")};
   Option<std::string> stage{*this, "stage", llvm::cl::init("")};
-  Option<std::string> decisionFlow{*this, "decision-flow", llvm::cl::init("legacy")};
-  Option<int64_t> graphBudgetPercent{*this, "graph-budget-percent", llvm::cl::init(50)};
-  Option<std::string> finiteDomainFile{*this, "finite-domain-file", llvm::cl::init("")};
-  Option<bool> fairPendingRetention{*this, "fair-pending-retention", llvm::cl::init(false)};
+  Option<std::string> decisionFlow{*this, "decision-flow",
+                                   llvm::cl::init("legacy")};
+  Option<int64_t> graphBudgetPercent{*this, "graph-budget-percent",
+                                     llvm::cl::init(50)};
+  Option<std::string> finiteDomainFile{*this, "finite-domain-file",
+                                       llvm::cl::init("")};
+  Option<bool> fairPendingRetention{*this, "fair-pending-retention",
+                                    llvm::cl::init(false)};
   // Opt-in controller experiment: promote candidates at quota boundaries while
   // preserving unattempted edges of parents that remain eligible.
-  Option<bool> refreshFrontier{*this, "refresh-frontier", llvm::cl::init(false)};
+  Option<bool> refreshFrontier{*this, "refresh-frontier",
+                               llvm::cl::init(false)};
   Option<bool> parentProgress{*this, "parent-progress", llvm::cl::init(false)};
-  Option<bool> directionalSearch{*this, "directional-search", llvm::cl::init(false)};
-  Option<std::string> diagnosticPath{*this, "diagnostic-path", llvm::cl::init("")};
-  Option<bool> diagnosticContinue{*this, "diagnostic-continue", llvm::cl::init(false)};
-  Option<int64_t> roundQuotaScale{*this, "round-quota-scale", llvm::cl::init(1)};
-  Option<std::string> featurePolicy{*this, "feature-policy", llvm::cl::init("all")};
-  Option<std::string> shapeEnumerationOrder{*this, "shape-enumeration-order", llvm::cl::init("ascending")};
+  Option<bool> directionalSearch{*this, "directional-search",
+                                 llvm::cl::init(false)};
+  Option<std::string> diagnosticPath{*this, "diagnostic-path",
+                                     llvm::cl::init("")};
+  Option<bool> diagnosticContinue{*this, "diagnostic-continue",
+                                  llvm::cl::init(false)};
+  Option<int64_t> roundQuotaScale{*this, "round-quota-scale",
+                                  llvm::cl::init(1)};
+  Option<std::string> featurePolicy{*this, "feature-policy",
+                                    llvm::cl::init("all")};
+  Option<std::string> shapeEnumerationOrder{*this, "shape-enumeration-order",
+                                            llvm::cl::init("ascending")};
   Option<std::string> parentCostFile{*this, "parent-cost-file",
                                      llvm::cl::init("")};
   Option<std::string> architecturePath{*this, "architecture-path",
                                        llvm::cl::init("")};
   Option<std::string> sourceRepository{*this, "source-repository",
-                                      llvm::cl::init("")};
+                                       llvm::cl::init("")};
   Option<std::string> sourceCommit{*this, "source-commit", llvm::cl::init("")};
   Option<std::string> modelPath{*this, "model", llvm::cl::init("")};
   Option<std::string> cachePath{*this, "cache", llvm::cl::init("")};
-  Option<std::string> architectureContract{
-      *this, "architecture-contract",
-      llvm::cl::init("")};
+  Option<std::string> architectureContract{*this, "architecture-contract",
+                                           llvm::cl::init("")};
   Option<std::string> architectureTransferCatalog{
       *this, "architecture-transfer-catalog", llvm::cl::init("")};
   Option<std::string> modelNamespace{
@@ -2313,20 +2400,22 @@ public:
   Option<std::string> seedManifest{*this, "seed-manifest", llvm::cl::init("")};
   Option<std::string> previousWinner{*this, "previous-winner",
                                      llvm::cl::init("")};
-  Option<std::string> historicalNativeWinner{
-      *this, "historical-native-winner", llvm::cl::init("")};
+  Option<std::string> historicalNativeWinner{*this, "historical-native-winner",
+                                             llvm::cl::init("")};
   Option<std::string> activeTransferArgumentsText{
       *this, "active-transfer-arguments",
       llvm::cl::desc("Ordered comma-separated memref arguments whose static "
-                      "active-transfer proofs participate in search identity."),
+                     "active-transfer proofs participate in search identity."),
       llvm::cl::init("")};
   Option<bool> activeTransferRequireProven{
       *this, "active-transfer-require-proven",
       llvm::cl::desc("Reject candidates unless every opted-in active-transfer "
                      "argument remains statically proven."),
       llvm::cl::init(true)};
-  Option<bool> requireSourceIterationDomain{*this, "require-source-iteration-domain",
-      llvm::cl::desc("Require complete source-domain proofs on every canonical task"),
+  Option<bool> requireSourceIterationDomain{
+      *this, "require-source-iteration-domain",
+      llvm::cl::desc(
+          "Require complete source-domain proofs on every canonical task"),
       llvm::cl::init(false)};
   Option<bool> bootstrapSupportedShapes{
       *this, "bootstrap-supported-shapes",
@@ -2334,7 +2423,8 @@ public:
                      "the model interval, initialize that task to the "
                      "minimum-area supported model shape"),
       llvm::cl::init(false)};
-  Option<int64_t> maxRounds{*this, "max-rounds", llvm::cl::init(kDefaultRounds)};
+  Option<int64_t> maxRounds{*this, "max-rounds",
+                            llvm::cl::init(kDefaultRounds)};
   Option<int64_t> maxCandidates{*this, "max-candidates",
                                 llvm::cl::init(kDefaultCandidates)};
   Option<int64_t> beamWidth{*this, "beam-width", llvm::cl::init(kDefaultBeam)};
@@ -2343,26 +2433,36 @@ public:
   Option<std::string> checkpoint{*this, "checkpoint", llvm::cl::init("")};
   Option<bool> resume{*this, "resume", llvm::cl::init(false)};
 
-  Option<std::string> protocolFile{*this, "protocol",
+  Option<std::string> protocolFile{
+      *this, "protocol",
       llvm::cl::init("config/protocols/amoeba_input0_neighborhood_v3.json")};
-  Option<std::string> sourceContractFile{*this, "source-contract-file", llvm::cl::init("")};
-  Option<int64_t> checkpointActions{*this, "checkpoint-actions", llvm::cl::init(128)};
-  Option<int64_t> pauseAfterCandidates{*this, "test-pause-after-candidates", llvm::cl::init(0)};
-  Option<int64_t> minimumFreeBytes{*this, "minimum-free-bytes", llvm::cl::init(16777216)};
+  Option<std::string> sourceContractFile{*this, "source-contract-file",
+                                         llvm::cl::init("")};
+  Option<int64_t> checkpointActions{*this, "checkpoint-actions",
+                                    llvm::cl::init(128)};
+  Option<int64_t> pauseAfterCandidates{*this, "test-pause-after-candidates",
+                                       llvm::cl::init(0)};
+  Option<int64_t> minimumFreeBytes{*this, "minimum-free-bytes",
+                                   llvm::cl::init(16777216)};
   // One preserves the pre-existing serial scorer exactly.  Values above one
   // parallelize only the production scheduler invocation after all candidate
   // preparation and identity decisions have been committed by the owner.
   Option<int64_t> scoringWorkers{*this, "scoring-workers", llvm::cl::init(1)};
-  Option<int64_t> maxPartitionFactor{*this, "max-partition-factor", llvm::cl::init(4)};
+  Option<int64_t> maxPartitionFactor{*this, "max-partition-factor",
+                                     llvm::cl::init(4)};
   Option<std::string> preparedSourceFile{*this, "prepared-source-file",
                                          llvm::cl::init("")};
   Option<int64_t> maxFissionActionsPerTask{
       *this, "max-fission-actions-per-task", llvm::cl::init(64)};
 
-  Option<std::string> structuredBackend{*this, "backend", llvm::cl::init("amoeba")};
-  Option<std::string> structuredPlan{*this, "structured-plan", llvm::cl::init("")};
-  Option<std::string> structuredEvaluator{*this, "evaluator", llvm::cl::init("")};
-  Option<std::string> structuredConfig{*this, "target-config", llvm::cl::init("")};
+  Option<std::string> structuredBackend{*this, "backend",
+                                        llvm::cl::init("amoeba")};
+  Option<std::string> structuredPlan{*this, "structured-plan",
+                                     llvm::cl::init("")};
+  Option<std::string> structuredEvaluator{*this, "evaluator",
+                                          llvm::cl::init("")};
+  Option<std::string> structuredConfig{*this, "target-config",
+                                       llvm::cl::init("")};
 
   void runOnOperation() override {
     ModuleOp canonical = getOperation();
@@ -2372,79 +2472,128 @@ public:
       signalPassFailure();
     };
     if (decisionFlow == "program-graph") {
-      if(structuredBackend!="amoeba") {fatal("program-graph decision flow requires backend=amoeba");return;}
-      orbit::taskflow::SearchOptions options{"amoeba","native",outputDir,structuredConfig,checkpoint,maxRounds,maxCandidates,beamWidth,resume};
+      if (structuredBackend != "amoeba") {
+        fatal("program-graph decision flow requires backend=amoeba");
+        return;
+      }
+      orbit::taskflow::SearchOptions options{
+          "amoeba",         "native",   outputDir,
+          structuredConfig, checkpoint, maxRounds,
+          maxCandidates,    beamWidth,  resume};
       ProgramGraphAmoebaOptions backend;
-      backend.function=functionName;backend.architecture=architecturePath;backend.architectureContract=architectureContract;
-      backend.model=modelPath;backend.cache=cachePath;backend.sourceRepository=sourceRepository;backend.sourceCommit=sourceCommit;
-      backend.architectureTransferCatalog=architectureTransferCatalog;backend.modelNamespace=modelNamespace;backend.context=canonical.getContext();
-      if(!configureProgramGraphAmoebaSearch(canonical,options,backend,error) ||
-          !orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},options,error)) fatal(error);
+      backend.function = functionName;
+      backend.architecture = architecturePath;
+      backend.architectureContract = architectureContract;
+      backend.model = modelPath;
+      backend.cache = cachePath;
+      backend.sourceRepository = sourceRepository;
+      backend.sourceCommit = sourceCommit;
+      backend.architectureTransferCatalog = architectureTransferCatalog;
+      backend.modelNamespace = modelNamespace;
+      backend.context = canonical.getContext();
+      if (!configureProgramGraphAmoebaSearch(canonical, options, backend,
+                                             error) ||
+          !orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},
+                                                options, error))
+        fatal(error);
       return;
     }
-    if (decisionFlow == "structured" && structuredBackend == "air" && !canonical.getBody()->empty()) {
-      orbit::taskflow::SearchOptions options{structuredBackend,structuredEvaluator,outputDir,structuredConfig,checkpoint,maxRounds,maxCandidates,beamWidth,resume};
-      llvm::raw_string_ostream stream(options.nativeSourceMLIR);canonical.print(stream);
-      if (!orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},options,error)) fatal(error);
+    if (decisionFlow == "structured" && structuredBackend == "air" &&
+        !canonical.getBody()->empty()) {
+      orbit::taskflow::SearchOptions options{
+          structuredBackend, structuredEvaluator, outputDir,
+          structuredConfig,  checkpoint,          maxRounds,
+          maxCandidates,     beamWidth,           resume};
+      llvm::raw_string_ostream stream(options.nativeSourceMLIR);
+      canonical.print(stream);
+      if (!orbit::taskflow::runStructuredSearch(orbit::taskflow::Program{},
+                                                options, error))
+        fatal(error);
       return;
     }
     if (decisionFlow == "structured") {
       auto bytes = llvm::MemoryBuffer::getFile(structuredPlan);
-      if (!bytes) { fatal("cannot read structured-plan"); return; }
+      if (!bytes) {
+        fatal("cannot read structured-plan");
+        return;
+      }
       auto json = llvm::json::parse((*bytes)->getBuffer());
-      if (!json) { fatal(llvm::toString(json.takeError())); return; }
+      if (!json) {
+        fatal(llvm::toString(json.takeError()));
+        return;
+      }
       orbit::taskflow::Program program;
-      if (!orbit::taskflow::parsePlan(*json, program, error)) { fatal(error); return; }
-      // A supplied source module must agree with the explicit structured source.
-      // Empty modules support the source-plan-only entry point deliberately.
+      if (!orbit::taskflow::parsePlan(*json, program, error)) {
+        fatal(error);
+        return;
+      }
+      // A supplied source module must agree with the explicit structured
+      // source. Empty modules support the source-plan-only entry point
+      // deliberately.
       if (!canonical.getBody()->empty()) {
         auto witness = canonical->getAttrOfType<StringAttr>("orbit.plan");
-        if (!witness) { fatal("structured mode requires orbit.plan on nonempty input module"); return; }
+        if (!witness) {
+          fatal("structured mode requires orbit.plan on nonempty input module");
+          return;
+        }
         auto witnessed = llvm::json::parse(witness.getValue());
         orbit::taskflow::Program witnessedProgram;
-        if (!witnessed) { fatal(llvm::toString(witnessed.takeError())); return; }
+        if (!witnessed) {
+          fatal(llvm::toString(witnessed.takeError()));
+          return;
+        }
         if (!orbit::taskflow::parsePlan(*witnessed, witnessedProgram, error) ||
             orbit::taskflow::canonicalSearchIdentity(witnessedProgram) !=
                 orbit::taskflow::canonicalSearchIdentity(program)) {
-          fatal("input module witness differs from structured-plan"); return;
+          fatal("input module witness differs from structured-plan");
+          return;
         }
-        auto expected = parseSourceString<ModuleOp>(orbit::taskflow::emitTaskflow(witnessedProgram), canonical.getContext());
+        auto expected = parseSourceString<ModuleOp>(
+            orbit::taskflow::emitTaskflow(witnessedProgram),
+            canonical.getContext());
         OwningOpRef<ModuleOp> actual(canonical.clone());
         actual->getOperation()->removeAttr("orbit.plan");
         if (!expected || failed(verify(canonical)) ||
-            !OperationEquivalence::isEquivalentTo(actual->getOperation(), expected->getOperation(),
+            !OperationEquivalence::isEquivalentTo(
+                actual->getOperation(), expected->getOperation(),
                 OperationEquivalence::Flags::IgnoreLocations)) {
-          fatal("input Taskflow body differs from structured witness"); return;
+          fatal("input Taskflow body differs from structured witness");
+          return;
         }
       }
       if (structuredBackend == "static" &&
           (structuredEvaluator.empty() || structuredEvaluator == "native") &&
           !canonical.getBody()->empty()) {
         orbit::taskflow::StaticAnalysis analysis;
-        if (!orbit::taskflow::analyzeStaticProgram(canonical, analysis, error)) {
-          fatal(error); return;
+        if (!orbit::taskflow::analyzeStaticProgram(canonical, analysis,
+                                                   error)) {
+          fatal(error);
+          return;
         }
         program = std::move(analysis.program);
       }
-      orbit::taskflow::SearchOptions options{structuredBackend, structuredEvaluator,
-          outputDir, structuredConfig, checkpoint, maxRounds, maxCandidates,
-          beamWidth, resume};
-      if (!orbit::taskflow::runStructuredSearch(program, options, error)) fatal(error);
+      orbit::taskflow::SearchOptions options{
+          structuredBackend, structuredEvaluator, outputDir,
+          structuredConfig,  checkpoint,          maxRounds,
+          maxCandidates,     beamWidth,           resume};
+      if (!orbit::taskflow::runStructuredSearch(program, options, error))
+        fatal(error);
       return;
     }
     if (outputDir.empty() || functionName.empty() || stage.empty() ||
         maxRounds <= 0 || maxCandidates <= 0 || beamWidth <= 0 ||
-        diversitySlots <= 0 || diversitySlots > beamWidth || checkpointActions <= 0 ||
-        minimumFreeBytes < 0 || scoringWorkers <= 0 ||
+        diversitySlots <= 0 || diversitySlots > beamWidth ||
+        checkpointActions <= 0 || minimumFreeBytes < 0 || scoringWorkers <= 0 ||
         scoringWorkers > kMaxScoringWorkers ||
         (maxPartitionFactor != 4 && maxPartitionFactor != 8) ||
-        maxFissionActionsPerTask <= 0 ||
-        sourceContractFile.empty()) {
-      fatal("neighborhood search requires positive budgets, valid beam/diversity limits, and source-contract-file");
+        maxFissionActionsPerTask <= 0 || sourceContractFile.empty()) {
+      fatal("neighborhood search requires positive budgets, valid "
+            "beam/diversity limits, and source-contract-file");
       return;
     }
     if ((roundQuotaScale != 1 && roundQuotaScale != 2) ||
-        (shapeEnumerationOrder != "ascending" && shapeEnumerationOrder != "descending") ||
+        (shapeEnumerationOrder != "ascending" &&
+         shapeEnumerationOrder != "descending") ||
         (featurePolicy != "all" && featurePolicy != "shape-only" &&
          featurePolicy != "fusion-off" && featurePolicy != "fission-off" &&
          featurePolicy != "structural-off" &&
@@ -2453,62 +2602,93 @@ public:
          featurePolicy != "cumulative-replica" &&
          featurePolicy != "cumulative-tiling" &&
          featurePolicy != "cumulative-fusion")) {
-      fatal("invalid round-quota-scale(1/2), shape-enumeration-order, or feature-policy"); return;
+      fatal("invalid round-quota-scale(1/2), shape-enumeration-order, or "
+            "feature-policy");
+      return;
     }
     if ((decisionFlow != "legacy" && decisionFlow != "joint" &&
          decisionFlow != "sequential" && decisionFlow != "alternating") ||
-        (graphBudgetPercent != 25 && graphBudgetPercent != 50 && graphBudgetPercent != 75)) {
-      fatal("decision-flow must be legacy/joint/sequential/alternating; graph-budget-percent must be25/50/75"); return;
+        (graphBudgetPercent != 25 && graphBudgetPercent != 50 &&
+         graphBudgetPercent != 75)) {
+      fatal("decision-flow must be legacy/joint/sequential/alternating; "
+            "graph-budget-percent must be25/50/75");
+      return;
     }
     if (decisionFlow != "legacy" &&
         (resume || pauseAfterCandidates > 0 || !seedManifest.empty() ||
-         !previousWinner.empty() || !historicalNativeWinner.empty() || stageNumber(stage) < 5)) {
-      fatal("standalone flows require fresh identity-only S5/S6 search, without resume/pause or external seeds"); return;
+         !previousWinner.empty() || !historicalNativeWinner.empty() ||
+         stageNumber(stage) < 5)) {
+      fatal("standalone flows require fresh identity-only S5/S6 search, "
+            "without resume/pause or external seeds");
+      return;
     }
     if (decisionFlow == "sequential" && maxCandidates < 2) {
-      fatal("sequential needs one unique evaluation per phase allowance"); return;
+      fatal("sequential needs one unique evaluation per phase allowance");
+      return;
     }
     if (refreshFrontier && (scoringWorkers != 1 || decisionFlow != "joint")) {
-      fatal("refresh-frontier currently requires Joint with one scoring worker"); return;
+      fatal(
+          "refresh-frontier currently requires Joint with one scoring worker");
+      return;
     }
     if (parentProgress && (!refreshFrontier || !fairPendingRetention ||
-        decisionFlow != "joint" || scoringWorkers != 1 ||
-        !diagnosticPath.empty() || diagnosticContinue)) {
-      fatal("parent-progress requires fresh Joint refresh with fair pending retention, one scorer, and no diagnostic path"); return;
+                           decisionFlow != "joint" || scoringWorkers != 1 ||
+                           !diagnosticPath.empty() || diagnosticContinue)) {
+      fatal("parent-progress requires fresh Joint refresh with fair pending "
+            "retention, one scorer, and no diagnostic path");
+      return;
     }
-    if (directionalSearch && (!parentProgress ||
-        (featurePolicy != "all" && featurePolicy != "cumulative-shape" &&
-         featurePolicy != "cumulative-replica" &&
-         featurePolicy != "cumulative-tiling" &&
-         featurePolicy != "cumulative-fusion") ||
-        shapeEnumerationOrder != "ascending" || roundQuotaScale != 1)) {
-      fatal("directional-search requires the fresh parent-progress all-space ascending baseline"); return;
+    if (directionalSearch &&
+        (!parentProgress ||
+         (featurePolicy != "all" && featurePolicy != "cumulative-shape" &&
+          featurePolicy != "cumulative-replica" &&
+          featurePolicy != "cumulative-tiling" &&
+          featurePolicy != "cumulative-fusion") ||
+         shapeEnumerationOrder != "ascending" || roundQuotaScale != 1)) {
+      fatal("directional-search requires the fresh parent-progress all-space "
+            "ascending baseline");
+      return;
     }
-    if (!validateDirectionalProtocol(error)) { fatal(error); return; }
-    activePhase = (decisionFlow == "sequential" || decisionFlow == "alternating") ? "A" : decisionFlow.getValue();
-    phaseABudget = decisionFlow == "sequential" ?
-        static_cast<uint64_t>(maxCandidates.getValue() * graphBudgetPercent.getValue() / 100) :
-        static_cast<uint64_t>(maxCandidates.getValue());
-    phaseBBudget = static_cast<uint64_t>(maxCandidates.getValue()) - phaseABudget;
-    phaseLimit = decisionFlow == "alternating" ? static_cast<uint64_t>(maxCandidates.getValue()/4) : phaseABudget;
+    if (!validateDirectionalProtocol(error)) {
+      fatal(error);
+      return;
+    }
+    activePhase =
+        (decisionFlow == "sequential" || decisionFlow == "alternating")
+            ? "A"
+            : decisionFlow.getValue();
+    phaseABudget =
+        decisionFlow == "sequential"
+            ? static_cast<uint64_t>(maxCandidates.getValue() *
+                                    graphBudgetPercent.getValue() / 100)
+            : static_cast<uint64_t>(maxCandidates.getValue());
+    phaseBBudget =
+        static_cast<uint64_t>(maxCandidates.getValue()) - phaseABudget;
+    phaseLimit = decisionFlow == "alternating"
+                     ? static_cast<uint64_t>(maxCandidates.getValue() / 4)
+                     : phaseABudget;
     uint64_t blockStartEvaluations = 0;
     unsigned alternatingBlock = 0;
-    if (!readFiniteDomain(error)) { fatal(error); return; }
+    if (!readFiniteDomain(error)) {
+      fatal(error);
+      return;
+    }
     if (diagnosticIICeiling != 20 && diagnosticIICeiling != 23) {
       fatal("diagnostic-ii-ceiling accepts only 20 (default) or 23");
       return;
     }
     if (diagnosticIICeiling == 23 &&
-        (StringRef(modelNamespace.getValue()) !=
-             kPerCgra2x2ModelNamespace ||
-         !bootstrapSupportedShapes ||
-         !architectureTransferCatalog.empty())) {
+        (StringRef(modelNamespace.getValue()) != kPerCgra2x2ModelNamespace ||
+         !bootstrapSupportedShapes || !architectureTransferCatalog.empty())) {
       fatal("diagnostic-ii-ceiling=23 requires the direct per-CGRA 2x2 "
             "model namespace, bootstrap-supported-shapes=true, and no "
             "architecture-transfer-catalog");
       return;
     }
-    if (!stageNumber(stage)) { fatal("unknown cumulative ablation stage"); return; }
+    if (!stageNumber(stage)) {
+      fatal("unknown cumulative ablation stage");
+      return;
+    }
     const bool fissionStage = stageNumber(stage) == 6;
     if (fissionStage != !preparedSourceFile.empty()) {
       fatal(fissionStage
@@ -2522,8 +2702,8 @@ public:
         fatal(error);
         return;
       }
-      preparedTaskflowSource = parseSourceString<ModuleOp>(
-          sourceBytes, canonical.getContext());
+      preparedTaskflowSource =
+          parseSourceString<ModuleOp>(sourceBytes, canonical.getContext());
       if (!preparedTaskflowSource ||
           failed(verify(preparedTaskflowSource->getOperation()))) {
         fatal("prepared-source-file is not a verified ModuleOp");
@@ -2564,9 +2744,10 @@ public:
       const json::Object *protocolObject = protocolValue->getAsObject();
       const json::Object *protocolSearch =
           protocolObject ? protocolObject->getObject("search") : nullptr;
-      std::optional<StringRef> policy = protocolSearch
-          ? protocolSearch->getString("supported_shape_bootstrap_policy")
-          : std::nullopt;
+      std::optional<StringRef> policy =
+          protocolSearch
+              ? protocolSearch->getString("supported_shape_bootstrap_policy")
+              : std::nullopt;
       if (!policy || *policy != kSupportedShapeBootstrapPolicy) {
         fatal("supported-shape bootstrap requires the matching policy in the "
               "bound common protocol");
@@ -2574,24 +2755,28 @@ public:
       }
     }
     if (!parseStageFixed(stage) && maxCandidates < 2) {
-      fatal("S2-S5 candidate budget must accommodate identity and a neighbor"); return;
+      fatal("S2-S5 candidate budget must accommodate identity and a neighbor");
+      return;
     }
     // Each ablation may start directly from its canonical identity. Importing
     // a previous measured winner is optional for historical warm-start runs.
     const std::string &schedulerArchitecture =
         ::mlir::amoeba::getNeuraArchitectureSpecFile();
     if (schedulerArchitecture.empty() || architecturePath.empty()) {
-      fatal("neighborhood search requires the production scheduler architecture-spec and bound architecture-path");
+      fatal("neighborhood search requires the production scheduler "
+            "architecture-spec and bound architecture-path");
       return;
     }
     if (schedulerArchitecture != architecturePath.getValue()) {
       std::string schedulerBytes, boundBytes;
       if (!readFileBytes(schedulerArchitecture, schedulerBytes, error) ||
           !readFileBytes(architecturePath, boundBytes, error)) {
-        fatal(error); return;
+        fatal(error);
+        return;
       }
       if (schedulerBytes != boundBytes) {
-        fatal("production scheduler architecture-spec differs from the bound task-cost architecture");
+        fatal("production scheduler architecture-spec differs from the bound "
+              "task-cost architecture");
         return;
       }
     }
@@ -2603,8 +2788,7 @@ public:
       fatal("architecture has non-positive per-CGRA mapper dimensions");
       return;
     }
-    if (diagnosticIICeiling == 23 &&
-        (perCgraRows != 2 || perCgraCols != 2)) {
+    if (diagnosticIICeiling == 23 && (perCgraRows != 2 || perCgraCols != 2)) {
       fatal("diagnostic-ii-ceiling=23 requires the validated 2x2 per-CGRA "
             "architecture");
       return;
@@ -2629,7 +2813,8 @@ public:
                                             architecture.getMultiCgraColumns(),
                                             error)) {
         fatal("inter-task network override does not match the production "
-              "CGRA grid: " + error);
+              "CGRA grid: " +
+              error);
         return;
       }
       interTaskNetworkSpecOverrideBytes = std::move(networkBytes);
@@ -2663,10 +2848,15 @@ public:
       return;
     }
     const std::string candidatesDir = outputDir + "/candidates";
-    const std::string checkpointPath = checkpoint.empty() ? outputDir + "/checkpoint.json" : checkpoint;
+    const std::string checkpointPath =
+        checkpoint.empty() ? outputDir + "/checkpoint.json" : checkpoint;
     journalPath = outputDir + "/archive.journal.jsonl";
-    FailureOr<func::FuncOp> selected = selectTaskFunction(canonical, functionName, error);
-    if (failed(selected)) { fatal(error); return; }
+    FailureOr<func::FuncOp> selected =
+        selectTaskFunction(canonical, functionName, error);
+    if (failed(selected)) {
+      fatal(error);
+      return;
+    }
     if (!parseActiveTransferArguments(activeTransferArgumentsText.getValue(),
                                       activeTransferArguments, error)) {
       fatal(error);
@@ -2685,12 +2875,16 @@ public:
     selected->walk([&](taskflow::TaskflowTaskOp task) {
       sourceDomainEnabled |= task->hasAttr(kSourceIterationDomainAttr);
     });
-    if (sourceDomainEnabled &&
-        failed(verifySourceIterationDomainPartition(*selected, *selected, error))) {
-      fatal("canonical source-domain proof failed: " + error); return;
+    if (sourceDomainEnabled && failed(verifySourceIterationDomainPartition(
+                                   *selected, *selected, error))) {
+      fatal("canonical source-domain proof failed: " + error);
+      return;
     }
     auto metadata = collectAnalyticalTaskMetadata(*selected, error);
-    if (failed(metadata) || metadata->empty()) { fatal(error.empty() ? "function has no analytical tasks" : error); return; }
+    if (failed(metadata) || metadata->empty()) {
+      fatal(error.empty() ? "function has no analytical tasks" : error);
+      return;
+    }
     TaskShapeCostCache costCache;
     bool costCacheLoaded = false;
     canonicalCostPath.clear();
@@ -2705,11 +2899,15 @@ public:
       }
       std::string expectedWitness =
           bootstrapSupportedShapes ? neighborhoodReplaySourceText(canonical)
-                                  : std::string();
-      if (!graphId || !costCache.load(parentCostFile, functionName, *metadata,
-          sourceRepository, sourceCommit, architecturePath, *graphId, error,
-          bootstrapSupportedShapes, expectedWitness)) {
-        fatal("parent cost catalogue does not match current cost protocol: " + error); return;
+                                   : std::string();
+      if (!graphId ||
+          !costCache.load(parentCostFile, functionName, *metadata,
+                          sourceRepository, sourceCommit, architecturePath,
+                          *graphId, error, bootstrapSupportedShapes,
+                          expectedWitness)) {
+        fatal("parent cost catalogue does not match current cost protocol: " +
+              error);
+        return;
       }
       costCacheLoaded = true;
       canonicalCostPath = parentCostFile;
@@ -2722,16 +2920,18 @@ public:
       OwningOpRef<ModuleOp> predictorModule = canonical.clone();
       auto predictorFunction =
           selectTaskFunction(*predictorModule, functionName, error);
-      if (failed(predictorFunction)) { fatal(error); return; }
+      if (failed(predictorFunction)) {
+        fatal(error);
+        return;
+      }
       const std::string catalogueId = "canonical-supported-bootstrap";
       bool fatalPredictorFailure = false;
       if (!runCurrentCostPredictor(
               *predictorModule, *predictorFunction, functionName, catalogueId,
               outputDir, modelPath, cachePath, checkpointDirectoryForModel(),
               effectiveArchitectureContract, architecturePath, perCgraRows,
-              perCgraCols, sourceRepository,
-              sourceCommit, architectureTransferCatalog, modelNamespace,
-              diagnosticIICeiling,
+              perCgraCols, sourceRepository, sourceCommit,
+              architectureTransferCatalog, modelNamespace, diagnosticIICeiling,
               /*allowUnsupportedAboveModelCeiling=*/true, canonicalCostPath,
               error, fatalPredictorFailure)) {
         fatal("cannot generate canonical supported-shape catalogue: " + error);
@@ -2746,15 +2946,18 @@ public:
           !costCache.load(
               canonicalCostPath, functionName, *metadata, sourceRepository,
               sourceCommit, architecturePath, *graphId, error,
-              /*allowModelDomainUnsupported=*/true,
-              expectedWitness)) {
+              /*allowModelDomainUnsupported=*/true, expectedWitness)) {
         fatal("generated canonical model-domain catalogue failed source "
-              "validation: " + error);
+              "validation: " +
+              error);
         return;
       }
       costCacheLoaded = true;
     }
-    if (!costCacheLoaded && modelPath.empty()) { fatal("validated parent costs or C++ predictor required"); return; }
+    if (!costCacheLoaded && modelPath.empty()) {
+      fatal("validated parent costs or C++ predictor required");
+      return;
+    }
     canonicalBootstrapApplied = false;
     canonicalAllUnitCostStatus = "supported";
     canonicalAllUnitControlScored = false;
@@ -2770,12 +2973,11 @@ public:
                                      [&](const NeighborhoodShape &shape) {
                                        return shape.task == task.name;
                                      });
-        if (shapeIt == canonicalIdentityShapes.end() ||
-            shapeIt->rows != 1 || shapeIt->cols != 1)
+        if (shapeIt == canonicalIdentityShapes.end() || shapeIt->rows != 1 ||
+            shapeIt->cols != 1)
           continue;
-        TaskShapeChoice unitChoice{
-            task.name, task.tripCount,
-            RectShape{1, 1, perCgraRows, perCgraCols}};
+        TaskShapeChoice unitChoice{task.name, task.tripCount,
+                                   RectShape{1, 1, perCgraRows, perCgraCols}};
         std::string costError;
         const TaskShapeCost *unitCost = costCache.get(unitChoice, costError);
         if (!requireCostIICeiling(unitCost, diagnosticIICeiling, costError)) {
@@ -2790,15 +2992,15 @@ public:
           continue;
         if (!unitCost->modelDomainUnsupported) {
           fatal("canonical unit-shape query is unsupported without a "
-                "validated model-domain proof for task=" + task.name);
+                "validated model-domain proof for task=" +
+                task.name);
           return;
         }
         canonicalBootstrapApplied = true;
         canonicalAllUnitCostStatus = kModelDomainUnsupportedStatus.str();
         canonicalAllUnitUnsupportedQueries.push_back(
             {task.name, perCgraRows, perCgraCols,
-             unitCost->analyticalLowerBound,
-             unitCost->unsupportedReason});
+             unitCost->analyticalLowerBound, unitCost->unsupportedReason});
         bool foundSupported = false;
         for (unsigned index = 0; index < 8; ++index) {
           int64_t mapperRows = 0, mapperCols = 0;
@@ -2808,14 +3010,13 @@ public:
             fatal("formal CGRA shape cannot be represented in mapper tiles");
             return;
           }
-          TaskShapeChoice choice{
-              task.name, task.tripCount,
-              RectShape{kFormalMax4CgraRows[index],
-                        kFormalMax4CgraCols[index], mapperRows,
-                        mapperCols}};
+          TaskShapeChoice choice{task.name, task.tripCount,
+                                 RectShape{kFormalMax4CgraRows[index],
+                                           kFormalMax4CgraCols[index],
+                                           mapperRows, mapperCols}};
           const TaskShapeCost *shapeCost = costCache.get(choice, costError);
           if (!requireCostIICeiling(shapeCost, diagnosticIICeiling,
-                                   costError)) {
+                                    costError)) {
             fatal(costError);
             return;
           }
@@ -2836,62 +3037,81 @@ public:
           return;
         }
       }
-      canonicalAllUnitControlScored = sourceIdentityWasAllUnit &&
-                                      !canonicalBootstrapApplied;
+      canonicalAllUnitControlScored =
+          sourceIdentityWasAllUnit && !canonicalBootstrapApplied;
     }
     std::string binding;
     historicalNativeWinnerBoundBytes.clear();
-    if (!buildBinding(canonical, binding, error)) { fatal(error); return; }
+    if (!buildBinding(canonical, binding, error)) {
+      fatal(error);
+      return;
+    }
     bindingPath = checkpointPath + ".binding.json";
     if (resume) {
       std::string savedBinding;
-      if (!readFileBytes(bindingPath, savedBinding, error) || savedBinding != binding) {
-        fatal(error.empty() ? "neighborhood exact byte/options binding mismatch" : error); return;
+      if (!readFileBytes(bindingPath, savedBinding, error) ||
+          savedBinding != binding) {
+        fatal(error.empty() ? "neighborhood exact byte/options binding mismatch"
+                            : error);
+        return;
       }
     } else {
-      if (llvm::sys::fs::exists(checkpointPath) || llvm::sys::fs::exists(journalPath)) {
-        fatal("search output already contains continuation state; use resume or a new isolated directory"); return;
+      if (llvm::sys::fs::exists(checkpointPath) ||
+          llvm::sys::fs::exists(journalPath)) {
+        fatal("search output already contains continuation state; use resume "
+              "or a new isolated directory");
+        return;
       }
       if (!writeTextAtomically(bindingPath, binding, error) ||
-          !writeTextAtomically(journalPath, "", error)) { fatal(error); return; }
+          !writeTextAtomically(journalPath, "", error)) {
+        fatal(error);
+        return;
+      }
     }
     std::vector<ArchiveRecord> archive;
     rankedArchivePrefix.clear();
     std::set<std::string> seenKeys;
     std::vector<SearchState> beam, generated;
     std::vector<PendingNeighbor> pending;
-    uint64_t pendingCursor = 0, nextSerial = 0, scoredCount = 0, rejectedCount = 0;
+    uint64_t pendingCursor = 0, nextSerial = 0, scoredCount = 0,
+             rejectedCount = 0;
     int64_t round = 0;
     std::string canonicalFactKey, stopReason;
     if (resume) {
-      if (!restoreCheckpoint(canonical, checkpointPath, binding, round, nextSerial,
-          scoredCount, rejectedCount, canonicalFactKey, archive, beam, generated,
-          pending, pendingCursor, seenKeys, error)) { fatal(error); return; }
+      if (!restoreCheckpoint(canonical, checkpointPath, binding, round,
+                             nextSerial, scoredCount, rejectedCount,
+                             canonicalFactKey, archive, beam, generated,
+                             pending, pendingCursor, seenKeys, error)) {
+        fatal(error);
+        return;
+      }
       // The prefix is derived from the exact restored archive. Rebuilding it
       // once avoids storing a second authoritative ranking in the checkpoint.
       for (size_t index = 0; index < archive.size(); ++index)
-        if (archive[index].valid) insertRankedArchiveIndex(index, archive);
+        if (archive[index].valid)
+          insertRankedArchiveIndex(index, archive);
       if (!writeFamilyFunnelSidecars(outputDir, checkpointPath, round, archive,
-                                     beam, pending, pendingCursor, "",
-                                     error)) {
+                                     beam, pending, pendingCursor, "", error)) {
         fatal(error);
         return;
       }
     } else {
       SearchState identity;
       identity.id = "neighborhood-" + std::to_string(nextSerial++);
-      identity.module = canonical.clone(); identity.shapes = canonicalIdentityShapes;
-      identity.control = true; identity.controlRoles.push_back("identity");
-      if (!prepareInitialActiveTransferFacts(identity.module.get(), functionName,
-                                             error)) {
+      identity.module = canonical.clone();
+      identity.shapes = canonicalIdentityShapes;
+      identity.control = true;
+      identity.controlRoles.push_back("identity");
+      if (!prepareInitialActiveTransferFacts(identity.module.get(),
+                                             functionName, error)) {
         fatal(error);
         return;
       }
-      if (!prepareCandidateKey(identity, functionName, outputDir, nextSerial, error) ||
+      if (!prepareCandidateKey(identity, functionName, outputDir, nextSerial,
+                               error) ||
           identity.key.empty()) {
         fatal(error.empty()
-                  ? "canonical identity facts unknown: " +
-                        identity.rejectReason
+                  ? "canonical identity facts unknown: " + identity.rejectReason
                   : error);
         return;
       }
@@ -2899,25 +3119,38 @@ public:
       identity.actionHistory.known = true;
       identity.actionHistory.canonicalFactKey = canonicalFactKey;
       identity.actionHistory.initialShapes = canonicalIdentityShapes;
-      seenKeys.insert(identity.key); identity.keyReserved = true;
-      if (!evaluateCandidate(identity, canonical, functionName, stage, outputDir,
-          candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
-          scoredCount, /*chargeRoundQuota=*/false, nextSerial, error) ||
+      seenKeys.insert(identity.key);
+      identity.keyReserved = true;
+      if (!evaluateCandidate(identity, canonical, functionName, stage,
+                             outputDir, candidatesDir, canonicalFactKey,
+                             costCacheLoaded, costCache, 0, scoredCount,
+                             /*chargeRoundQuota=*/false, nextSerial, error) ||
           !identity.scored) {
-        fatal(error.empty() ? "canonical identity cost/schedule unknown: " + identity.rejectReason : error); return;
+        fatal(error.empty() ? "canonical identity cost/schedule unknown: " +
+                                  identity.rejectReason
+                            : error);
+        return;
       }
       if (!registerCandidate(identity, archive, seenKeys, rejectedCount,
-          candidatesDir, error)) { fatal(error); return; }
+                             candidatesDir, error)) {
+        fatal(error);
+        return;
+      }
       beam.push_back(std::move(identity));
-      auto ingest = [&](StringRef path, StringRef controlRole, bool required) -> bool {
-        if (path.empty()) return !required;
+      auto ingest = [&](StringRef path, StringRef controlRole,
+                        bool required) -> bool {
+        if (path.empty())
+          return !required;
         const bool strictHistoricalSelection =
             controlRole == "historical_measured_winner";
         std::string text;
         if (strictHistoricalSelection) {
           text = historicalNativeWinnerBoundBytes;
         } else if (!readFileBytes(path, text, error)) {
-          if (!required) { error.clear(); return true; }
+          if (!required) {
+            error.clear();
+            return true;
+          }
           return false;
         }
         if (strictHistoricalSelection) {
@@ -2929,7 +3162,8 @@ public:
             if (line.trim().empty())
               continue;
             if (++nonemptyLines != 1) {
-              error = "historical native winner must contain exactly one selection record";
+              error = "historical native winner must contain exactly one "
+                      "selection record";
               return false;
             }
             auto parsed = json::parse(line);
@@ -2939,9 +3173,8 @@ public:
               return false;
             }
             const json::Object *object = parsed->getAsObject();
-            auto recordType = object
-                                  ? object->getString("record_type")
-                                  : std::optional<StringRef>();
+            auto recordType = object ? object->getString("record_type")
+                                     : std::optional<StringRef>();
             auto schema = object ? object->getString("schema")
                                  : std::optional<StringRef>();
             auto candidateId = object ? object->getString("candidate_id")
@@ -2952,9 +3185,9 @@ public:
                 object ? object->getString("source_repository")
                        : std::optional<StringRef>();
             auto declaredCommit = object ? object->getString("source_commit")
-                                        : std::optional<StringRef>();
-            bool bestFound = object &&
-                             object->getBoolean("best_found").value_or(false);
+                                         : std::optional<StringRef>();
+            bool bestFound =
+                object && object->getBoolean("best_found").value_or(false);
             bool valid = object && object->getBoolean("valid").value_or(false);
             auto candidatePath = object ? object->getString("candidate_path")
                                         : std::optional<StringRef>();
@@ -2967,7 +3200,8 @@ public:
                 !declaredCommit || *declaredCommit != sourceCommit.getValue() ||
                 !bestFound || !valid || !candidatePath ||
                 candidatePath->empty()) {
-              error = "historical native winner lacks a valid source-owned selection record";
+              error = "historical native winner lacks a valid source-owned "
+                      "selection record";
               return false;
             }
           }
@@ -2978,7 +3212,8 @@ public:
         }
         auto buffer = llvm::MemoryBuffer::getMemBuffer(text);
         unsigned imported = 0;
-        for (llvm::line_iterator lines(*buffer, true); !lines.is_at_end() && imported < 16; ++lines) {
+        for (llvm::line_iterator lines(*buffer, true);
+             !lines.is_at_end() && imported < 16; ++lines) {
           auto value = json::parse(*lines);
           if (!value) {
             llvm::consumeError(value.takeError());
@@ -3004,36 +3239,46 @@ public:
             }
             continue;
           }
-          std::string sourcePath = object->getString("candidate_path").value_or(
-              object->getString("mapper_replay_path").value_or(
-                  object->getString("mlir_path").value_or(""))).str();
+          std::string sourcePath =
+              object->getString("candidate_path")
+                  .value_or(
+                      object->getString("mapper_replay_path")
+                          .value_or(
+                              object->getString("mlir_path").value_or("")))
+                  .str();
           if (required && sourcePath.empty()) {
-            error = "previous measured winner selection lacks its complete source module";
+            error = "previous measured winner selection lacks its complete "
+                    "source module";
             return false;
           }
           SearchState seed;
           seed.id = "neighborhood-seed-" + std::to_string(nextSerial++);
-          seed.module = sourcePath.empty() ? canonical.clone() :
-              parseSourceFile<ModuleOp>(sourcePath, canonical.getContext());
+          seed.module = sourcePath.empty()
+                            ? canonical.clone()
+                            : parseSourceFile<ModuleOp>(sourcePath,
+                                                        canonical.getContext());
           if (!seed.module) {
             if (required) {
-              error = strictHistoricalSelection
-                          ? "historical native winner module missing: " + sourcePath
-                          : "previous winner module missing: " + sourcePath;
+              error =
+                  strictHistoricalSelection
+                      ? "historical native winner module missing: " + sourcePath
+                      : "previous winner module missing: " + sourcePath;
               return false;
             }
             continue;
           }
-          if (!validateStageSeed(seed.module.get(), stage,
-                                 sourceDomainEnabled, error)) {
-            if (required) return false;
-            const std::string reason =
-                "seed_stage_gate_rejected:" + error;
+          if (!validateStageSeed(seed.module.get(), stage, sourceDomainEnabled,
+                                 error)) {
+            if (required)
+              return false;
+            const std::string reason = "seed_stage_gate_rejected:" + error;
             appendRejected(archive, seed, reason, 0);
             ++rejectedCount;
-            error.clear(); continue;
+            error.clear();
+            continue;
           }
-          auto function = selectTaskFunction(seed.module.get(), functionName, error);
+          auto function =
+              selectTaskFunction(seed.module.get(), functionName, error);
           if (failed(function)) {
             if (required)
               return false;
@@ -3045,8 +3290,8 @@ public:
             error.clear();
             return true;
           }
-          if (!prepareInitialActiveTransferFacts(seed.module.get(), functionName,
-                                                 error)) {
+          if (!prepareInitialActiveTransferFacts(seed.module.get(),
+                                                 functionName, error)) {
             if (required)
               return false;
             const std::string reason =
@@ -3059,7 +3304,8 @@ public:
           }
           bool parsedShapes = parseShapeArrayFromObject(*object, seed.shapes);
           if (strictHistoricalSelection && !parsedShapes) {
-            error = "historical native winner selection lacks complete task shapes";
+            error =
+                "historical native winner selection lacks complete task shapes";
             return false;
           }
           const auto *score = object->getObject("score_record");
@@ -3067,28 +3313,29 @@ public:
                                     : object->getArray("task_costs");
           std::vector<NeighborhoodShape> costShapes;
           std::string invalidMapperShapeReason;
-          if (costs) for (const auto &entry : *costs) {
-            const auto *cost = entry.getAsObject();
-            if (!cost)
-              continue;
-            auto task = cost->getString("task");
-            auto rows = cost->getInteger("mapper_tile_rows");
-            auto cols = cost->getInteger("mapper_tile_cols");
-            if (!task || !rows || !cols)
-              continue;
-            if (*rows <= 0 || *cols <= 0 || *rows % perCgraRows != 0 ||
-                *cols % perCgraCols != 0) {
-              invalidMapperShapeReason =
-                  "seed_mapper_shape_not_aligned_to_architecture_cgra:" +
-                  task->str() + ":mapper=" + std::to_string(*rows) + "x" +
-                  std::to_string(*cols) + ":per-cgra=" +
-                  std::to_string(perCgraRows) + "x" +
-                  std::to_string(perCgraCols);
-              break;
+          if (costs)
+            for (const auto &entry : *costs) {
+              const auto *cost = entry.getAsObject();
+              if (!cost)
+                continue;
+              auto task = cost->getString("task");
+              auto rows = cost->getInteger("mapper_tile_rows");
+              auto cols = cost->getInteger("mapper_tile_cols");
+              if (!task || !rows || !cols)
+                continue;
+              if (*rows <= 0 || *cols <= 0 || *rows % perCgraRows != 0 ||
+                  *cols % perCgraCols != 0) {
+                invalidMapperShapeReason =
+                    "seed_mapper_shape_not_aligned_to_architecture_cgra:" +
+                    task->str() + ":mapper=" + std::to_string(*rows) + "x" +
+                    std::to_string(*cols) +
+                    ":per-cgra=" + std::to_string(perCgraRows) + "x" +
+                    std::to_string(perCgraCols);
+                break;
+              }
+              costShapes.push_back(
+                  {task->str(), *rows / perCgraRows, *cols / perCgraCols});
             }
-            costShapes.push_back(
-                {task->str(), *rows / perCgraRows, *cols / perCgraCols});
-          }
           if (!invalidMapperShapeReason.empty()) {
             if (required) {
               error = invalidMapperShapeReason;
@@ -3113,8 +3360,8 @@ public:
           importTypedActionHistory(*object, seed.actionHistory);
           if (stageNumber(stage) != 6 &&
               !seed.actionHistory.fissionActions.empty()) {
-            const std::string reason =
-                "seed_stage_gate_rejected:fission_actions_require_full-joint-fission";
+            const std::string reason = "seed_stage_gate_rejected:fission_"
+                                       "actions_require_full-joint-fission";
             if (required) {
               error = reason;
               return false;
@@ -3125,8 +3372,11 @@ public:
             return true;
           }
           seed.control = !controlRole.empty();
-          if (seed.control) seed.controlRoles.push_back(controlRole.str());
-          if (!prepareCandidateKey(seed, functionName, outputDir, nextSerial, error) || seed.key.empty()) {
+          if (seed.control)
+            seed.controlRoles.push_back(controlRole.str());
+          if (!prepareCandidateKey(seed, functionName, outputDir, nextSerial,
+                                   error) ||
+              seed.key.empty()) {
             if (required) {
               if (error.empty())
                 error = "previous winner canonical facts unknown: " +
@@ -3138,7 +3388,8 @@ public:
                 (seed.rejectReason.empty() ? error : seed.rejectReason);
             appendRejected(archive, seed, reason, 0);
             ++rejectedCount;
-            error.clear(); continue;
+            error.clear();
+            continue;
           }
           if (!authenticateTypedActionHistory(seed, canonical, functionName,
                                               outputDir, nextSerial, error))
@@ -3147,24 +3398,28 @@ public:
             if (!mergeDuplicate(seed, canonical, functionName, archive,
                                 outputDir, candidatesDir, nextSerial, error))
               return false;
-            ++imported; continue;
+            ++imported;
+            continue;
           }
           seed.keyReserved = true;
           if (strictHistoricalSelection &&
               scoredCount >= static_cast<uint64_t>(maxCandidates)) {
-            error = "distinct historical native winner exceeds max-candidates budget";
+            error = "distinct historical native winner exceeds max-candidates "
+                    "budget";
             return false;
           }
           const uint64_t reservedControlScores =
               (!previousWinner.empty() ? 1 : 0) +
               (!historicalNativeWinner.empty() ? 1 : 0);
-          if (!required && scoredCount + reservedControlScores >=
-                               uint64_t(maxCandidates)) {
-            seenKeys.erase(seed.key); break;
+          if (!required &&
+              scoredCount + reservedControlScores >= uint64_t(maxCandidates)) {
+            seenKeys.erase(seed.key);
+            break;
           }
-          if (!evaluateCandidate(seed, canonical, functionName, stage, outputDir,
-              candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
-              scoredCount, /*chargeRoundQuota=*/false, nextSerial, error))
+          if (!evaluateCandidate(seed, canonical, functionName, stage,
+                                 outputDir, candidatesDir, canonicalFactKey,
+                                 costCacheLoaded, costCache, 0, scoredCount,
+                                 /*chargeRoundQuota=*/false, nextSerial, error))
             return false;
           if (required && !seed.scored) {
             error = (strictHistoricalSelection
@@ -3173,90 +3428,158 @@ public:
                     seed.rejectReason;
             return false;
           }
-          if (!registerCandidate(seed, archive, seenKeys, rejectedCount, candidatesDir, error)) return false;
+          if (!registerCandidate(seed, archive, seenKeys, rejectedCount,
+                                 candidatesDir, error))
+            return false;
           if (seed.scored &&
               !persistBestFamilyWitnesses(seed, archive, outputDir, error))
             return false;
-          if (seed.scored) beam.push_back(std::move(seed));
+          if (seed.scored)
+            beam.push_back(std::move(seed));
           ++imported;
-          if (required) break;
+          if (required)
+            break;
         }
-        if (required && !imported) { error = "previous winner file contains no legal complete selection"; return false; }
+        if (required && !imported) {
+          error = "previous winner file contains no legal complete selection";
+          return false;
+        }
         return true;
       };
       if (!ingest(seedManifest, "", false) ||
-          !ingest(previousWinner, "previous_stage_measured_winner", !previousWinner.empty()) ||
+          !ingest(previousWinner, "previous_stage_measured_winner",
+                  !previousWinner.empty()) ||
           !ingest(historicalNativeWinner, "historical_measured_winner",
                   !historicalNativeWinner.empty())) {
-        fatal(error.empty() ? "seed import failed" : error); return;
+        fatal(error.empty() ? "seed import failed" : error);
+        return;
       }
       beam = selectBeam(std::move(beam), beamWidth, diversitySlots);
-      if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
+      if (!retainCanonicalBeam(beam, archive, error)) {
+        fatal(error);
+        return;
+      }
       roundScoredCount = 0;
-      roundScoreLimit = perRoundScoreQuota(
-          scoredCount, phaseLimit,
-          maxRounds.getValue() - (round - phaseStartRound), roundQuotaScale.getValue());
-      if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-          canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
+      roundScoreLimit =
+          perRoundScoreQuota(scoredCount, phaseLimit,
+                             maxRounds.getValue() - (round - phaseStartRound),
+                             roundQuotaScale.getValue());
+      if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount,
+                          rejectedCount, canonicalFactKey, archive, beam,
+                          generated, pending, pendingCursor, "", error)) {
+        fatal(error);
+        return;
+      }
     }
     // Replay the recorded typed prefix, one generated action at a time. This
     // diagnostic is oracle-assisted and never used by the deployed controller.
     if (!diagnosticPath.empty()) {
       std::string pathText;
-      if (!readFileBytes(diagnosticPath, pathText, error)) { fatal(error); return; }
+      if (!readFileBytes(diagnosticPath, pathText, error)) {
+        fatal(error);
+        return;
+      }
       auto parsed = json::parse(pathText);
       auto *steps = parsed ? parsed->getAsArray() : nullptr;
-      if (!steps) { fatal("diagnostic-path needs an array of typed actions"); return; }
+      if (!steps) {
+        fatal("diagnostic-path needs an array of typed actions");
+        return;
+      }
       unsigned diagnosticDepth = 0;
       for (const auto &entry : *steps) {
         NeighborhoodAction action;
         auto *object = entry.getAsObject();
-        if (!object || !parseTypedAction(*object, action)) { fatal("bad diagnostic typed action"); return; }
+        if (!object || !parseTypedAction(*object, action)) {
+          fatal("bad diagnostic typed action");
+          return;
+        }
         std::string menuError;
-        auto menu = enumerateBalancedPendingNeighbors(beam, functionName, stage, diagnosticDepth++,
-            maxPartitionFactor, preparedTaskflowSource.get(), maxFissionActionsPerTask,
+        auto menu = enumerateBalancedPendingNeighbors(
+            beam, functionName, stage, diagnosticDepth++, maxPartitionFactor,
+            preparedTaskflowSource.get(), maxFissionActionsPerTask,
             canonicalFissionActions, familyFunnelByRound[0], false,
             [&](const SearchState &parent, NeighborhoodAction &candidate) {
               return filterSearchAction(parent, candidate);
-            }, menuError);
-        if (!menuError.empty()) { fatal(menuError); return; }
+            },
+            menuError);
+        if (!menuError.empty()) {
+          fatal(menuError);
+          return;
+        }
         bool admitted = llvm::any_of(menu, [&](const PendingNeighbor &n) {
-          return n.parent == 0 && actionSignature(n.action) == actionSignature(action);
+          return n.parent == 0 &&
+                 actionSignature(n.action) == actionSignature(action);
         });
-        if (!admitted) { fatal("diagnostic action is absent from the Joint menu: " + actionSignature(action)); return; }
-        if (scoredCount >= static_cast<uint64_t>(maxCandidates)) { fatal("diagnostic prefix exceeds total budget"); return; }
+        if (!admitted) {
+          fatal("diagnostic action is absent from the Joint menu: " +
+                actionSignature(action));
+          return;
+        }
+        if (scoredCount >= static_cast<uint64_t>(maxCandidates)) {
+          fatal("diagnostic prefix exceeds total budget");
+          return;
+        }
         SearchState &parent = beam[0];
         SearchState child;
         child.id = "neighborhood-" + std::to_string(nextSerial++);
-        child.parentId = parent.id; child.path = parent.path;
+        child.parentId = parent.id;
+        child.path = parent.path;
         child.path.push_back(actionSignature(action));
-        child.shapes = parent.shapes; child.module = parent.module->clone();
+        child.shapes = parent.shapes;
+        child.module = parent.module->clone();
         std::string reason, diagnostic;
-        auto outcome = materializeNeighbor(child, parent, canonical, functionName,
-            outputDir, action, canonicalFactKey, nextSerial, reason, diagnostic, error);
+        auto outcome = materializeNeighbor(
+            child, parent, canonical, functionName, outputDir, action,
+            canonicalFactKey, nextSerial, reason, diagnostic, error);
         if (outcome != NeighborMaterialization::Applied) {
-          fatal("diagnostic materialization failed: " + reason + ":" + diagnostic + ":" + error); return;
+          fatal("diagnostic materialization failed: " + reason + ":" +
+                diagnostic + ":" + error);
+          return;
         }
-        if (!seenKeys.insert(child.key).second) { fatal("diagnostic repeated state"); return; }
+        if (!seenKeys.insert(child.key).second) {
+          fatal("diagnostic repeated state");
+          return;
+        }
         child.keyReserved = true;
         if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
-            candidatesDir, canonicalFactKey, costCacheLoaded, costCache, 0,
-            scoredCount, false, nextSerial, error) ||
-            !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error) || !child.scored) {
-          fatal("diagnostic evaluation failed: " + error + child.rejectReason); return;
+                               candidatesDir, canonicalFactKey, costCacheLoaded,
+                               costCache, 0, scoredCount, false, nextSerial,
+                               error) ||
+            !registerCandidate(child, archive, seenKeys, rejectedCount,
+                               candidatesDir, error) ||
+            !child.scored) {
+          fatal("diagnostic evaluation failed: " + error + child.rejectReason);
+          return;
         }
-        if (!persistBestFamilyWitnesses(child, archive, outputDir, error)) { fatal(error); return; }
+        if (!persistBestFamilyWitnesses(child, archive, outputDir, error)) {
+          fatal(error);
+          return;
+        }
         // Preserve each prefix for independent source/key checks and resumable
         // one-prefix intervention; final winners are never algorithm seeds.
-        if (!writeTextAtomically(outputDir.getValue() + "/" + child.id + "-prefix.mlir",
-                           neighborhoodReplaySourceText(child.module.get()), error)) { fatal(error); return; }
-        beam.clear(); beam.push_back(std::move(child));
+        if (!writeTextAtomically(
+                outputDir.getValue() + "/" + child.id + "-prefix.mlir",
+                neighborhoodReplaySourceText(child.module.get()), error)) {
+          fatal(error);
+          return;
+        }
+        beam.clear();
+        beam.push_back(std::move(child));
       }
-      pending.clear(); pendingCursor = 0; generated.clear();
-      if (diagnosticContinue) { round = diagnosticDepth; phaseStartRound = round; }
+      pending.clear();
+      pendingCursor = 0;
+      generated.clear();
+      if (diagnosticContinue) {
+        round = diagnosticDepth;
+        phaseStartRound = round;
+      }
       roundScoredCount = 0;
-      roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds, roundQuotaScale);
-      if (!diagnosticContinue) { phaseLimit = scoredCount; stopReason = "diagnostic-path-complete"; }
+      roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds,
+                                           roundQuotaScale);
+      if (!diagnosticContinue) {
+        phaseLimit = scoredCount;
+        stopReason = "diagnostic-path-complete";
+      }
     }
     std::set<std::string> attemptedEdges;
     for (const auto &eventText : familyFunnelEvents) {
@@ -3264,12 +3587,16 @@ public:
       auto *object = value ? value->getAsObject() : nullptr;
       NeighborhoodAction action;
       auto *typed = object ? object->getObject("action") : nullptr;
-      if (object && object->getString("record_type").value_or("") == "candidate_attempt" &&
+      if (object &&
+          object->getString("record_type").value_or("") ==
+              "candidate_attempt" &&
           typed && parseTypedAction(*typed, action))
-        attemptedEdges.insert(object->getString("parent_id").value_or("").str() +
-                              "\n" + actionSignature(action));
+        attemptedEdges.insert(
+            object->getString("parent_id").value_or("").str() + "\n" +
+            actionSignature(action));
     }
-    auto edgeKey = [&](const SearchState &parent, const NeighborhoodAction &action) {
+    auto edgeKey = [&](const SearchState &parent,
+                       const NeighborhoodAction &action) {
       return parent.id + "\n" + actionSignature(action);
     };
     std::map<std::string, uint64_t> successfulFamilyScores =
@@ -3279,343 +3606,84 @@ public:
     const int64_t previousElapsed = elapsedMilliseconds;
     uint64_t actionsSinceCheckpoint = 0;
     do {
-    while (round - phaseStartRound < maxRounds && scoredCount < phaseLimit) {
-      if (beam.empty()) { stopReason = "no-new-legal-candidates"; break; }
-      if (pending.empty()) {
-        generated.clear(); pendingCursor = 0;
-        std::string actionEnumerationError;
-        pending = enumerateBalancedPendingNeighbors(
-            beam, functionName, stage, static_cast<unsigned>(round),
-            static_cast<unsigned>(maxPartitionFactor.getValue()),
-            preparedTaskflowSource.get(),
-            static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
-            canonicalFissionActions, familyFunnelByRound[round], shapeEnumerationOrder == "descending",
-            [&](const SearchState &parent, NeighborhoodAction &action) {
-              if (parentProgress && parentProgressAttemptedEdges.count(
-                      parentProgressEdgeKey(parent.key, action)))
-                return std::string("edge_already_attempted");
-              if (refreshFrontier && attemptedEdges.count(edgeKey(parent, action)))
-                return std::string("edge_already_attempted");
-              return filterSearchAction(parent, action);
-            }, actionEnumerationError);
-        if (!actionEnumerationError.empty()) {
-          fatal(actionEnumerationError);
-          return;
+      while (round - phaseStartRound < maxRounds && scoredCount < phaseLimit) {
+        if (beam.empty()) {
+          stopReason = "no-new-legal-candidates";
+          break;
         }
-        if (parentProgress && !mergeParentProgressQueues(
-                beam, round, pending, familyFunnelByRound[round], error)) {
-          fatal(error); return;
-        }
-        if (directionalSearch)
-          prepareDirectionalRound(beam, pending, round, scoredCount, phaseLimit);
-        if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-            canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
-      }
-      if (refreshFrontier && pending.empty()) { stopReason = "frontier-exhausted"; break; }
-      std::map<std::string, uint64_t> remainingPendingFamilies =
-          pendingActionFamilyCounts(pending, pendingCursor);
-      if (scoringWorkers <= 1) {
-      while (pendingCursor < pending.size() &&
-             scoredCount < phaseLimit &&
-             roundScoredCount < roundScoreLimit) {
-        prioritizeNextPendingActionFamily(pending, pendingCursor,
-                                          successfulFamilyScores,
-                                          noReservedFamilyScores,
-                                          remainingPendingFamilies);
-        DirectionalSelection directionalSelection;
-        if (directionalSearch && !selectDirectionalPending(
-                beam, pending, pendingCursor, round, directionalSelection, error)) {
-          fatal(error); return;
-        }
-        const auto &neighbor = pending[pendingCursor];
-        const std::string actionFamily = neighbor.action.family;
-        if (neighbor.parent >= beam.size()) { fatal("checkpoint pending parent outside beam"); return; }
-        SearchState &parent = beam[neighbor.parent];
-        const uint64_t objectiveEvaluationsBefore = scoredCount;
-        if (refreshFrontier) attemptedEdges.insert(edgeKey(parent, neighbor.action));
-        FamilyFunnelCounters &funnel =
-            familyFunnelByRound[round][actionFamily];
-        SearchState child;
-        child.id = "neighborhood-" + std::to_string(nextSerial++);
-        child.parentId = parent.id; child.path = parent.path;
-        child.path.push_back(actionSignature(neighbor.action));
-        child.shapes = parent.shapes; child.module = parent.module->clone();
-        std::string reason, diagnostic, materializeError;
-        ++funnel.attempted;
-        bool materialized = false;
-        bool unique = false;
-        bool duplicate = false;
-        bool freshCostPrepared = false;
-        bool cacheReused = false;
-        bool freshCostScored = false;
-        bool schedulerCalled = false;
-        bool schedulerPassed = false;
-        bool schedulerRejected = false;
-        bool archived = false;
-        bool expandCandidate = false;
-        uint64_t costShapeCacheHits = 0;
-        uint64_t costShapeCacheMisses = 0;
-        std::string outcomeReason;
-        NeighborMaterialization materialization = materializeNeighbor(
-            child, parent, canonical, functionName, outputDir,
-            neighbor.action, canonicalFactKey, nextSerial, reason, diagnostic,
-            materializeError);
-        if (materialization == NeighborMaterialization::Fatal) {
-          fatal(materializeError);
-          return;
-        }
-        if (materialization == NeighborMaterialization::Rejected) {
-          outcomeReason =
-              (reason.empty() ? "unsupported_or_unknown_action" : reason) +
-              ":" + diagnostic;
-          ++funnel.reject;
-          ++funnel.rejectReasons["materialize:" +
-                                 StringRef(outcomeReason)
-                                     .take_front(StringRef(outcomeReason).find(':'))
-                                     .str()];
-          ++rejectedCount; appendRejected(archive, child,
-                                           outcomeReason, round);
-          archived = true;
-        } else {
-          materialized = true;
-          ++funnel.materialized;
-          if (!child.key.empty() && child.rejectReason.empty() &&
-              !claimFiniteConfiguration(child)) {
-            duplicate = true; ++funnel.duplicate; ++duplicateCandidates;
-            ++rejectedCount;
-            outcomeReason = "authenticated_configuration_duplicate";
-            appendRejected(archive, child, outcomeReason, round);
-            archived = true;
-          } else if (!child.key.empty() && child.rejectReason.empty()) {
-            if (!seenKeys.insert(child.key).second) {
-              duplicate = true;
-              ++funnel.duplicate;
-              ++rejectedCount;
-              if (!mergeDuplicate(child, canonical, functionName, archive,
-                                  outputDir, candidatesDir, nextSerial, error)) {
-                fatal(error);
-                return;
-              }
-              archived = true;
-            } else {
-              unique = true;
-              ++funnel.unique;
-              child.keyReserved = true;
-              CandidateCostCacheObservation cacheObservation =
-                  observeCandidateCostCache(child, functionName,
-                                            canonicalFactKey,
-                                            costCacheLoaded);
-              cacheReused = cacheObservation.known &&
-                            cacheObservation.reused;
-              ++funnel.costPreparationAttempted;
-              if (cacheReused)
-                ++funnel.cacheReused;
-              const uint64_t oldCostHits = costCacheHits;
-              const uint64_t oldCostMisses = costCacheMisses;
-              const uint64_t oldSchedulerCalls = productionSchedulerCalls;
-              if (!evaluateCandidate(child, canonical, functionName, stage, outputDir,
-                  candidatesDir, canonicalFactKey, costCacheLoaded, costCache,
-                  round, scoredCount, /*chargeRoundQuota=*/true, nextSerial,
-                  error) ||
-                  !registerCandidate(child, archive, seenKeys, rejectedCount, candidatesDir, error)) { fatal(error); return; }
-              if (child.scored &&
-                  !persistBestFamilyWitnesses(child, archive, outputDir,
-                                              error)) {
-                fatal(error);
-                return;
-              }
-              archived = true;
-              costShapeCacheHits = costCacheHits - oldCostHits;
-              costShapeCacheMisses = costCacheMisses - oldCostMisses;
-              funnel.costShapeCacheHits += costShapeCacheHits;
-              funnel.costShapeCacheMisses += costShapeCacheMisses;
-              const bool generatedFreshCatalogue =
-                  cacheObservation.known && !cacheObservation.reused &&
-                  !cacheObservation.graphCostKey.empty() &&
-                  graphCostPaths.count(cacheObservation.graphCostKey);
-              if (generatedFreshCatalogue) {
-                freshCostPrepared = true;
-                ++funnel.freshCostPrepared;
-              }
-              schedulerCalled = productionSchedulerCalls > oldSchedulerCalls;
-              schedulerPassed = schedulerCalled && child.scored;
-              schedulerRejected = schedulerCalled && !child.scored;
-              if (schedulerCalled)
-                ++funnel.schedulerCalls;
-              if (schedulerPassed)
-                ++funnel.schedulerPass;
-              if (schedulerRejected) {
-                ++funnel.schedulerReject;
-                outcomeReason = child.rejectReason;
-                ++funnel.reject;
-                ++funnel.rejectReasons[
-                    "scheduler:" +
-                    StringRef(outcomeReason)
-                        .take_front(StringRef(outcomeReason).find(':'))
-                        .str()];
-              } else if (!child.scored) {
-                outcomeReason = child.rejectReason;
-                if (outcomeReason.empty())
-                  outcomeReason = "candidate_not_scored";
-                ++funnel.reject;
-                ++funnel.rejectReasons[
-                    "candidate:" +
-                    StringRef(outcomeReason)
-                        .take_front(StringRef(outcomeReason).find(':'))
-                        .str()];
-              }
-              freshCostScored = freshCostPrepared && schedulerCalled;
-              if (freshCostScored)
-                ++funnel.freshCostScored;
-              archive.back().round = round;
-              if (child.scored) {
-                ++successfulFamilyScores[neighbor.action.family];
-                expandCandidate = true;
-              }
-            }
-          } else if (child.key.empty() && child.rejectReason.empty()) {
-            outcomeReason =
-                "active_transfer_proof_unsupported:proof preparation returned no candidate key";
-            ++funnel.reject;
-            ++funnel.rejectReasons["candidate:active_transfer_proof_unsupported"];
-            ++rejectedCount;
-            appendRejected(archive, child, outcomeReason, round);
-            archived = true;
-          } else if (child.key.empty()) {
-            outcomeReason = child.rejectReason;
-            ++funnel.reject;
-            ++funnel.rejectReasons[
-                "candidate:" +
-                StringRef(outcomeReason)
-                    .take_front(StringRef(outcomeReason).find(':'))
-                    .str()];
-            ++rejectedCount;
-            appendRejected(archive, child, outcomeReason, round);
-            archived = true;
+        if (pending.empty()) {
+          generated.clear();
+          pendingCursor = 0;
+          std::string actionEnumerationError;
+          pending = enumerateBalancedPendingNeighbors(
+              beam, functionName, stage, static_cast<unsigned>(round),
+              static_cast<unsigned>(maxPartitionFactor.getValue()),
+              preparedTaskflowSource.get(),
+              static_cast<uint64_t>(maxFissionActionsPerTask.getValue()),
+              canonicalFissionActions, familyFunnelByRound[round],
+              shapeEnumerationOrder == "descending",
+              [&](const SearchState &parent, NeighborhoodAction &action) {
+                if (parentProgress &&
+                    parentProgressAttemptedEdges.count(
+                        parentProgressEdgeKey(parent.key, action)))
+                  return std::string("edge_already_attempted");
+                if (refreshFrontier &&
+                    attemptedEdges.count(edgeKey(parent, action)))
+                  return std::string("edge_already_attempted");
+                return filterSearchAction(parent, action);
+              },
+              actionEnumerationError);
+          if (!actionEnumerationError.empty()) {
+            fatal(actionEnumerationError);
+            return;
           }
-        }
-        if (archived)
-          ++funnel.archive;
-        json::Object eventResult{
-            {"attempted", true}, {"materialized", materialized},
-            {"reject_reason", outcomeReason}, {"unique", unique},
-            {"duplicate", duplicate},
-            {"fresh_cost_prepared", freshCostPrepared},
-            {"fresh_cost_scored", freshCostScored},
-            {"cache_reused", cacheReused},
-            {"cost_shape_cache_hits",
-             static_cast<int64_t>(costShapeCacheHits)},
-            {"cost_shape_cache_misses",
-             static_cast<int64_t>(costShapeCacheMisses)},
-            {"scheduler_calls", schedulerCalled ? 1 : 0},
-            {"scheduler_pass", schedulerPassed},
-            {"scheduler_reject", schedulerRejected},
-            {"archive", archived}};
-        json::Object progressEvent;
-        if (parentProgress && !commitParentProgress(
-                parent, neighbor.action, objectiveEvaluationsBefore,
-                scoredCount, progressEvent, error)) {
-          fatal(error); return;
-        }
-        if (directionalSearch)
-          commitDirectionalSelection(parent, neighbor.action, child.id, round,
-              objectiveEvaluationsBefore, scoredCount, directionalSelection);
-        appendFamilyFunnelCandidateEvent(
-            round, actionFamily, child.id, child.parentId, neighbor.action,
-            child.actionHistory, std::move(eventResult), std::move(progressEvent));
-        if (expandCandidate) {
-          generated.push_back(std::move(child));
-          std::map<std::string, int64_t> directionalBeforePruning;
+          if (parentProgress &&
+              !mergeParentProgressQueues(beam, round, pending,
+                                         familyFunnelByRound[round], error)) {
+            fatal(error);
+            return;
+          }
           if (directionalSearch)
-            for (const auto &state : generated) directionalBeforePruning[state.id] = state.score;
-          // Keep the expansion frontier bounded rather than serializing every
-          // evaluated program in a round. Four diverse slots remain available
-          // independently of the twelve cost-selected slots.
-          generated = selectBeam(std::move(generated), beamWidth,
-                                 diversitySlots);
-          if (directionalSearch) {
-            json::Array kept, pruned;
-            std::set<std::string> ids;
-            for (const auto &state : generated) { ids.insert(state.id); kept.push_back(state.id); }
-            for (const auto &[id, cost] : directionalBeforePruning)
-              if (!ids.count(id)) pruned.push_back(json::Object{{"id", id}, {"cost", cost}});
-            appendDirectionalEvent(json::Object{{"record_type", "generated_frontier"},
-                {"round", round}, {"evaluations", int64_t(scoredCount)},
-                {"candidate_id", archive.back().id}, {"retained", std::move(kept)},
-                {"pruned", std::move(pruned)}, {"reason", "unchanged cost/diversity generated beam"}});
+            prepareDirectionalRound(beam, pending, round, scoredCount,
+                                    phaseLimit);
+          if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount,
+                              rejectedCount, canonicalFactKey, archive, beam,
+                              generated, pending, pendingCursor, "", error)) {
+            fatal(error);
+            return;
           }
         }
-        if (directionalSearch && directionalSelection.mode == "guided" &&
-            neighbor.action.family == "shape" &&
-            ((expandCandidate && scoredCount > objectiveEvaluationsBefore) ||
-             outcomeReason == "authenticated_configuration_duplicate"))
-          openSelectedShapeWindow(parent, neighbor.action, round,
-              outcomeReason == "authenticated_configuration_duplicate");
-        ++pendingCursor; ++actionsSinceCheckpoint;
-        consumePendingActionFamily(remainingPendingFamilies, actionFamily);
-        bool pause = pauseAfterCandidates > 0 && scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
-        if (actionsSinceCheckpoint >= static_cast<uint64_t>(checkpointActions) || pause) {
-          if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-              canonicalFactKey, archive, beam, generated, pending, pendingCursor,
-              pause ? "explicit-pause" : "", error)) { fatal(error); return; }
-          actionsSinceCheckpoint = 0;
+        if (refreshFrontier && pending.empty()) {
+          stopReason = "frontier-exhausted";
+          break;
         }
-        if (pause) { stopReason = "explicit-pause"; break; }
-      }
-      } else {
-        // The worker path below keeps all action application, graph-fact and
-        // catalogue work in this owner thread.  Only the already-prepared
-        // production scheduler calls cross the context boundary.
-        const unsigned requestedWorkers =
-            static_cast<unsigned>(scoringWorkers.getValue());
-        const DialectRegistry &workerRegistry =
-            canonical.getContext()->getDialectRegistry();
-        while (pendingCursor < pending.size() &&
-               scoredCount < phaseLimit &&
-               roundScoredCount < roundScoreLimit) {
-          const uint64_t scoreBudget =
-              phaseLimit - scoredCount;
-          const uint64_t roundScoreBudget =
-              roundScoreLimit - roundScoredCount;
-          const uint64_t pauseBudget =
-              pauseAfterCandidates > 0 &&
-                      scoredCount < static_cast<uint64_t>(pauseAfterCandidates)
-                  ? static_cast<uint64_t>(pauseAfterCandidates) - scoredCount
-                  : scoreBudget;
-          const uint64_t batchScoreLimit =
-              std::min({scoreBudget, roundScoreBudget, pauseBudget});
-          if (batchScoreLimit == 0)
-            break;
-          const uint64_t checkpointBudget =
-              static_cast<uint64_t>(checkpointActions) -
-              std::min<uint64_t>(actionsSinceCheckpoint,
-                                 static_cast<uint64_t>(checkpointActions));
-          const size_t batchItemLimit = std::max<size_t>(
-              1, std::min<uint64_t>(requestedWorkers * 4ULL,
-                                    std::max<uint64_t>(1, checkpointBudget)));
-
-          std::vector<ParallelBatchItem> items;
-          std::vector<ParallelScoreJob> jobs;
-          std::map<std::string, uint64_t> reservedFamilyScores;
-          items.reserve(batchItemLimit);
-          jobs.reserve(std::min<uint64_t>(batchScoreLimit, batchItemLimit));
-          uint64_t cursor = pendingCursor;
-          const auto preparationBegan = std::chrono::steady_clock::now();
-          while (cursor < pending.size() && jobs.size() < batchScoreLimit &&
-                 items.size() < batchItemLimit) {
-            prioritizeNextPendingActionFamily(pending, cursor,
-                                              successfulFamilyScores,
-                                              reservedFamilyScores,
-                                              remainingPendingFamilies);
-            const PendingNeighbor &neighbor = pending[cursor];
+        std::map<std::string, uint64_t> remainingPendingFamilies =
+            pendingActionFamilyCounts(pending, pendingCursor);
+        if (scoringWorkers <= 1) {
+          while (pendingCursor < pending.size() && scoredCount < phaseLimit &&
+                 roundScoredCount < roundScoreLimit) {
+            prioritizeNextPendingActionFamily(
+                pending, pendingCursor, successfulFamilyScores,
+                noReservedFamilyScores, remainingPendingFamilies);
+            DirectionalSelection directionalSelection;
+            if (directionalSearch &&
+                !selectDirectionalPending(beam, pending, pendingCursor, round,
+                                          directionalSelection, error)) {
+              fatal(error);
+              return;
+            }
+            const auto &neighbor = pending[pendingCursor];
+            const std::string actionFamily = neighbor.action.family;
             if (neighbor.parent >= beam.size()) {
               fatal("checkpoint pending parent outside beam");
               return;
             }
             SearchState &parent = beam[neighbor.parent];
+            const uint64_t objectiveEvaluationsBefore = scoredCount;
+            if (refreshFrontier)
+              attemptedEdges.insert(edgeKey(parent, neighbor.action));
             FamilyFunnelCounters &funnel =
-                familyFunnelByRound[round][neighbor.action.family];
-            ++funnel.attempted;
+                familyFunnelByRound[round][actionFamily];
             SearchState child;
             child.id = "neighborhood-" + std::to_string(nextSerial++);
             child.parentId = parent.id;
@@ -3623,13 +3691,24 @@ public:
             child.path.push_back(actionSignature(neighbor.action));
             child.shapes = parent.shapes;
             child.module = parent.module->clone();
-            ParallelBatchItem item;
-            item.pendingIndex = cursor;
-            item.actionFamily = neighbor.action.family;
-            item.state = std::move(child);
             std::string reason, diagnostic, materializeError;
+            ++funnel.attempted;
+            bool materialized = false;
+            bool unique = false;
+            bool duplicate = false;
+            bool freshCostPrepared = false;
+            bool cacheReused = false;
+            bool freshCostScored = false;
+            bool schedulerCalled = false;
+            bool schedulerPassed = false;
+            bool schedulerRejected = false;
+            bool archived = false;
+            bool expandCandidate = false;
+            uint64_t costShapeCacheHits = 0;
+            uint64_t costShapeCacheMisses = 0;
+            std::string outcomeReason;
             NeighborMaterialization materialization = materializeNeighbor(
-                item.state, parent, canonical, functionName, outputDir,
+                child, parent, canonical, functionName, outputDir,
                 neighbor.action, canonicalFactKey, nextSerial, reason,
                 diagnostic, materializeError);
             if (materialization == NeighborMaterialization::Fatal) {
@@ -3637,423 +3716,822 @@ public:
               return;
             }
             if (materialization == NeighborMaterialization::Rejected) {
-              item.kind = ParallelBatchItemKind::Rejected;
-              item.materializationRejected = true;
-              item.state.rejectReason =
+              outcomeReason =
                   (reason.empty() ? "unsupported_or_unknown_action" : reason) +
                   ":" + diagnostic;
-            } else {
-              item.materialized = true;
-              ++funnel.materialized;
-              if (item.state.key.empty()) {
-                item.kind = ParallelBatchItemKind::Rejected;
-                item.state.rejectReason = "graph_facts_unknown";
-              } else if (!claimFiniteConfiguration(item.state)) {
-                item.kind = ParallelBatchItemKind::Rejected;
-                item.duplicate = true; ++funnel.duplicate; ++duplicateCandidates;
-                item.state.rejectReason = "authenticated_configuration_duplicate";
-              } else if (!seenKeys.insert(item.state.key).second) {
-                // A duplicate whose key was reserved by an earlier item in
-                // this batch is committed in order below, after that earlier
-                // archive record exists.  Duplicates from an older batch can
-                // be merged immediately at the same ordered commit point.
-                item.kind = ParallelBatchItemKind::Duplicate;
-                item.duplicate = true;
-                ++funnel.duplicate;
-              } else {
-                item.state.keyReserved = true;
-                item.unique = true;
-                ++funnel.unique;
-                CandidateCostCacheObservation cacheObservation =
-                    observeCandidateCostCache(item.state, functionName,
-                                              canonicalFactKey,
-                                              costCacheLoaded);
-                item.cacheReused = cacheObservation.known &&
-                                   cacheObservation.reused;
-                ++funnel.costPreparationAttempted;
-                if (item.cacheReused)
-                  ++funnel.cacheReused;
-                const uint64_t oldCostHits = costCacheHits;
-                const uint64_t oldCostMisses = costCacheMisses;
-                if (!prepareParallelCandidate(
-                        item.state, canonical, functionName, stage, outputDir,
-                        canonicalFactKey, costCacheLoaded, costCache,
-                        nextSerial, error)) {
-                  fatal(error);
-                  return;
-                }
-                funnel.costShapeCacheHits += costCacheHits - oldCostHits;
-                funnel.costShapeCacheMisses += costCacheMisses - oldCostMisses;
-                item.costShapeCacheHits = costCacheHits - oldCostHits;
-                item.costShapeCacheMisses =
-                    costCacheMisses - oldCostMisses;
-                item.freshCostPrepared =
-                    cacheObservation.known && !cacheObservation.reused &&
-                    !cacheObservation.graphCostKey.empty() &&
-                    graphCostPaths.count(cacheObservation.graphCostKey);
-                if (item.freshCostPrepared)
-                  ++funnel.freshCostPrepared;
-                if (item.state.rejectReason.empty() &&
-                    !item.state.choices.empty()) {
-                  item.kind = ParallelBatchItemKind::Score;
-                  ParallelScoreJob job;
-                  job.moduleIR = neighborhoodReplaySourceText(
-                      item.state.module.get());
-                  job.functionName = functionName.getValue();
-                  job.candidateID = item.state.id;
-                  job.choices = item.state.choices;
-                  job.durations = item.state.durations;
-                  job.fixedDispatch = parseStageFixed(stage);
-                  item.jobIndex = jobs.size();
-                  jobs.push_back(std::move(job));
-                  ++reservedFamilyScores[item.actionFamily];
-                } else {
-                  item.kind = ParallelBatchItemKind::Rejected;
-                }
-              }
-            }
-            items.push_back(std::move(item));
-            consumePendingActionFamily(remainingPendingFamilies,
-                                       neighbor.action.family);
-            ++cursor;
-          }
-          parallelPreparationMilliseconds +=
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - preparationBegan)
-                  .count();
-          if (items.empty())
-            break;
-          parallelBatchItemSizes.push_back(items.size());
-          parallelBatchScoreJobSizes.push_back(jobs.size());
-          parallelScoredJobs += jobs.size();
-
-          std::vector<ParallelScoreResult> results;
-          std::string workerError;
-          const auto scoringBegan = std::chrono::steady_clock::now();
-          if (!runPrivateProductionScores(jobs, workerRegistry,
-                                          requestedWorkers, parallelWorkerPool,
-                                          results, parallelModuleCacheHits,
-                                          parallelModuleCacheMisses,
-                                          workerError)) {
-            // No archive, ranking, budget, or frontier state has been
-            // committed for this batch.  The last durable checkpoint remains
-            // a safe replay cursor if the pass is resumed after this failure.
-            fatal(workerError);
-            return;
-          }
-          parallelScoringMilliseconds +=
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - scoringBegan)
-                  .count();
-
-          bool batchFailed = false;
-          for (const ParallelBatchItem &item : items)
-            if (item.kind == ParallelBatchItemKind::Score &&
-                (item.jobIndex >= results.size() ||
-                 !results[item.jobIndex].finished ||
-                 results[item.jobIndex].fatal)) {
-              batchFailed = true;
-              workerError = item.jobIndex < results.size()
-                                ? results[item.jobIndex].error
-                                : "parallel scoring result index is invalid";
-              break;
-            }
-          if (batchFailed) {
-            fatal(workerError.empty() ? "parallel scoring worker failed"
-                                      : workerError);
-            return;
-          }
-
-          const auto commitBegan = std::chrono::steady_clock::now();
-          for (ParallelBatchItem &item : items) {
-            SearchState &child = item.state;
-            FamilyFunnelCounters &funnel =
-                familyFunnelByRound[round][item.actionFamily];
-            bool schedulerPassed = false;
-            bool schedulerRejected = false;
-            bool retainInGeneratedBeam = false;
-            if (item.kind == ParallelBatchItemKind::Rejected) {
-              ++rejectedCount;
-              const std::string rejectReason =
-                  child.rejectReason.empty() ? "unsupported_or_unknown_action"
-                                             : child.rejectReason;
               ++funnel.reject;
-              ++funnel.rejectReasons[
-                  (item.materializationRejected ? "materialize:" :
-                                                   "candidate:") +
-                  StringRef(rejectReason)
-                      .take_front(StringRef(rejectReason).find(':'))
-                      .str()];
-              appendRejected(archive, child,
-                             rejectReason,
-                             round);
-              ++funnel.archive;
-            } else if (item.kind == ParallelBatchItemKind::Duplicate) {
+              ++funnel.rejectReasons["materialize:" +
+                                     StringRef(outcomeReason)
+                                         .take_front(
+                                             StringRef(outcomeReason).find(':'))
+                                         .str()];
               ++rejectedCount;
-              if (!mergeDuplicate(child, canonical, functionName, archive,
-                                  outputDir, candidatesDir, nextSerial, error)) {
-                fatal(error);
-                return;
-              }
-              ++funnel.archive;
+              appendRejected(archive, child, outcomeReason, round);
+              archived = true;
             } else {
-              ParallelScoreResult &result = results[item.jobIndex];
-              // Every production invocation consumes one budget unit, even
-              // when the unchanged scheduler rejects the candidate.
-              ++scoredCount;
-              recordObjectiveDebit(child, scoredCount);
-              ++productionSchedulerCalls;
-              ++roundScoredCount;
-              ++funnel.schedulerCalls;
-              if (item.freshCostPrepared) {
-                ++funnel.freshCostScored;
-                item.freshCostScored = true;
-              }
-              if (result.scored) {
-                child.schedule = std::move(result.schedule);
-                child.score = child.schedule.makespan;
-                child.scored = true;
-                child.rejectReason.clear();
-                schedulerPassed = true;
-                ++funnel.schedulerPass;
-                ++successfulFamilyScores[item.actionFamily];
-              } else {
-                child.rejectReason = "production_scheduler_rejected";
-                if (!result.error.empty())
-                  child.rejectReason += ":" + result.error;
-                child.scored = false;
-                schedulerRejected = true;
-                ++funnel.schedulerReject;
+              materialized = true;
+              ++funnel.materialized;
+              if (!child.key.empty() && child.rejectReason.empty() &&
+                  !claimFiniteConfiguration(child)) {
+                duplicate = true;
+                ++funnel.duplicate;
+                ++duplicateCandidates;
+                ++rejectedCount;
+                outcomeReason = "authenticated_configuration_duplicate";
+                appendRejected(archive, child, outcomeReason, round);
+                archived = true;
+              } else if (!child.key.empty() && child.rejectReason.empty()) {
+                if (!seenKeys.insert(child.key).second) {
+                  duplicate = true;
+                  ++funnel.duplicate;
+                  ++rejectedCount;
+                  if (!mergeDuplicate(child, canonical, functionName, archive,
+                                      outputDir, candidatesDir, nextSerial,
+                                      error)) {
+                    fatal(error);
+                    return;
+                  }
+                  archived = true;
+                } else {
+                  unique = true;
+                  ++funnel.unique;
+                  child.keyReserved = true;
+                  CandidateCostCacheObservation cacheObservation =
+                      observeCandidateCostCache(child, functionName,
+                                                canonicalFactKey,
+                                                costCacheLoaded);
+                  cacheReused =
+                      cacheObservation.known && cacheObservation.reused;
+                  ++funnel.costPreparationAttempted;
+                  if (cacheReused)
+                    ++funnel.cacheReused;
+                  const uint64_t oldCostHits = costCacheHits;
+                  const uint64_t oldCostMisses = costCacheMisses;
+                  const uint64_t oldSchedulerCalls = productionSchedulerCalls;
+                  if (!evaluateCandidate(
+                          child, canonical, functionName, stage, outputDir,
+                          candidatesDir, canonicalFactKey, costCacheLoaded,
+                          costCache, round, scoredCount,
+                          /*chargeRoundQuota=*/true, nextSerial, error) ||
+                      !registerCandidate(child, archive, seenKeys,
+                                         rejectedCount, candidatesDir, error)) {
+                    fatal(error);
+                    return;
+                  }
+                  if (child.scored && !persistBestFamilyWitnesses(
+                                          child, archive, outputDir, error)) {
+                    fatal(error);
+                    return;
+                  }
+                  archived = true;
+                  costShapeCacheHits = costCacheHits - oldCostHits;
+                  costShapeCacheMisses = costCacheMisses - oldCostMisses;
+                  funnel.costShapeCacheHits += costShapeCacheHits;
+                  funnel.costShapeCacheMisses += costShapeCacheMisses;
+                  const bool generatedFreshCatalogue =
+                      cacheObservation.known && !cacheObservation.reused &&
+                      !cacheObservation.graphCostKey.empty() &&
+                      graphCostPaths.count(cacheObservation.graphCostKey);
+                  if (generatedFreshCatalogue) {
+                    freshCostPrepared = true;
+                    ++funnel.freshCostPrepared;
+                  }
+                  schedulerCalled =
+                      productionSchedulerCalls > oldSchedulerCalls;
+                  schedulerPassed = schedulerCalled && child.scored;
+                  schedulerRejected = schedulerCalled && !child.scored;
+                  if (schedulerCalled)
+                    ++funnel.schedulerCalls;
+                  if (schedulerPassed)
+                    ++funnel.schedulerPass;
+                  if (schedulerRejected) {
+                    ++funnel.schedulerReject;
+                    outcomeReason = child.rejectReason;
+                    ++funnel.reject;
+                    ++funnel.rejectReasons
+                          ["scheduler:" +
+                           StringRef(outcomeReason)
+                               .take_front(StringRef(outcomeReason).find(':'))
+                               .str()];
+                  } else if (!child.scored) {
+                    outcomeReason = child.rejectReason;
+                    if (outcomeReason.empty())
+                      outcomeReason = "candidate_not_scored";
+                    ++funnel.reject;
+                    ++funnel.rejectReasons
+                          ["candidate:" +
+                           StringRef(outcomeReason)
+                               .take_front(StringRef(outcomeReason).find(':'))
+                               .str()];
+                  }
+                  freshCostScored = freshCostPrepared && schedulerCalled;
+                  if (freshCostScored)
+                    ++funnel.freshCostScored;
+                  archive.back().round = round;
+                  if (child.scored) {
+                    ++successfulFamilyScores[neighbor.action.family];
+                    expandCandidate = true;
+                  }
+                }
+              } else if (child.key.empty() && child.rejectReason.empty()) {
+                outcomeReason = "active_transfer_proof_unsupported:proof "
+                                "preparation returned no candidate key";
                 ++funnel.reject;
-                ++funnel.rejectReasons[
-                    "scheduler:production_scheduler_rejected"];
+                ++funnel.rejectReasons
+                      ["candidate:active_transfer_proof_unsupported"];
+                ++rejectedCount;
+                appendRejected(archive, child, outcomeReason, round);
+                archived = true;
+              } else if (child.key.empty()) {
+                outcomeReason = child.rejectReason;
+                ++funnel.reject;
+                ++funnel.rejectReasons["candidate:" +
+                                       StringRef(outcomeReason)
+                                           .take_front(StringRef(outcomeReason)
+                                                           .find(':'))
+                                           .str()];
+                ++rejectedCount;
+                appendRejected(archive, child, outcomeReason, round);
+                archived = true;
               }
-              if (!registerCandidate(child, archive, seenKeys, rejectedCount,
-                                     candidatesDir, error)) {
-                fatal(error);
-                return;
-              }
-              if (child.scored &&
-                  !persistBestFamilyWitnesses(child, archive, outputDir,
-                                              error)) {
-                fatal(error);
-                return;
-              }
-              archive.back().round = round;
-              ++funnel.archive;
-              retainInGeneratedBeam = child.scored;
             }
-            const PendingNeighbor &attempt =
-                pending[item.pendingIndex];
+            if (archived)
+              ++funnel.archive;
             json::Object eventResult{
                 {"attempted", true},
-                {"materialized", item.materialized},
-                {"reject_reason", child.rejectReason},
-                {"unique", item.unique}, {"duplicate", item.duplicate},
-                {"fresh_cost_prepared", item.freshCostPrepared},
-                {"fresh_cost_scored", item.freshCostScored},
-                {"cache_reused", item.cacheReused},
+                {"materialized", materialized},
+                {"reject_reason", outcomeReason},
+                {"unique", unique},
+                {"duplicate", duplicate},
+                {"fresh_cost_prepared", freshCostPrepared},
+                {"fresh_cost_scored", freshCostScored},
+                {"cache_reused", cacheReused},
                 {"cost_shape_cache_hits",
-                 static_cast<int64_t>(item.costShapeCacheHits)},
+                 static_cast<int64_t>(costShapeCacheHits)},
                 {"cost_shape_cache_misses",
-                 static_cast<int64_t>(item.costShapeCacheMisses)},
-                {"scheduler_calls",
-                 item.kind == ParallelBatchItemKind::Score ? 1 : 0},
+                 static_cast<int64_t>(costShapeCacheMisses)},
+                {"scheduler_calls", schedulerCalled ? 1 : 0},
                 {"scheduler_pass", schedulerPassed},
                 {"scheduler_reject", schedulerRejected},
-                {"archive", true}};
-            appendFamilyFunnelCandidateEvent(
-                round, item.actionFamily, child.id, child.parentId,
-                attempt.action, child.actionHistory, std::move(eventResult));
-            if (retainInGeneratedBeam) {
-              generated.push_back(std::move(child));
-              generated = selectBeam(std::move(generated), beamWidth,
-                                     diversitySlots);
-            }
-            ++actionsSinceCheckpoint;
-          }
-          parallelCommitMilliseconds +=
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - commitBegan)
-                  .count();
-          pendingCursor = cursor;
-          const bool pause =
-              pauseAfterCandidates > 0 &&
-              scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
-          if (actionsSinceCheckpoint >=
-                  static_cast<uint64_t>(checkpointActions) ||
-              pause) {
-            if (!saveCheckpoint(
-                    checkpointPath, round, nextSerial, scoredCount,
-                    rejectedCount, canonicalFactKey, archive, beam, generated,
-                    pending, pendingCursor, pause ? "explicit-pause" : "",
-                    error)) {
+                {"archive", archived}};
+            json::Object progressEvent;
+            if (parentProgress &&
+                !commitParentProgress(parent, neighbor.action,
+                                      objectiveEvaluationsBefore, scoredCount,
+                                      progressEvent, error)) {
               fatal(error);
               return;
             }
-            actionsSinceCheckpoint = 0;
+            if (directionalSearch)
+              commitDirectionalSelection(parent, neighbor.action, child.id,
+                                         round, objectiveEvaluationsBefore,
+                                         scoredCount, directionalSelection);
+            appendFamilyFunnelCandidateEvent(
+                round, actionFamily, child.id, child.parentId, neighbor.action,
+                child.actionHistory, std::move(eventResult),
+                std::move(progressEvent));
+            if (expandCandidate) {
+              generated.push_back(std::move(child));
+              std::map<std::string, int64_t> directionalBeforePruning;
+              if (directionalSearch)
+                for (const auto &state : generated)
+                  directionalBeforePruning[state.id] = state.score;
+              // Keep the expansion frontier bounded rather than serializing
+              // every evaluated program in a round. Four diverse slots remain
+              // available independently of the twelve cost-selected slots.
+              generated =
+                  selectBeam(std::move(generated), beamWidth, diversitySlots);
+              if (directionalSearch) {
+                json::Array kept, pruned;
+                std::set<std::string> ids;
+                for (const auto &state : generated) {
+                  ids.insert(state.id);
+                  kept.push_back(state.id);
+                }
+                for (const auto &[id, cost] : directionalBeforePruning)
+                  if (!ids.count(id))
+                    pruned.push_back(json::Object{{"id", id}, {"cost", cost}});
+                appendDirectionalEvent(json::Object{
+                    {"record_type", "generated_frontier"},
+                    {"round", round},
+                    {"evaluations", int64_t(scoredCount)},
+                    {"candidate_id", archive.back().id},
+                    {"retained", std::move(kept)},
+                    {"pruned", std::move(pruned)},
+                    {"reason", "unchanged cost/diversity generated beam"}});
+              }
+            }
+            if (directionalSearch && directionalSelection.mode == "guided" &&
+                neighbor.action.family == "shape" &&
+                ((expandCandidate &&
+                  scoredCount > objectiveEvaluationsBefore) ||
+                 outcomeReason == "authenticated_configuration_duplicate"))
+              openSelectedShapeWindow(
+                  parent, neighbor.action, round,
+                  outcomeReason == "authenticated_configuration_duplicate");
+            ++pendingCursor;
+            ++actionsSinceCheckpoint;
+            consumePendingActionFamily(remainingPendingFamilies, actionFamily);
+            bool pause =
+                pauseAfterCandidates > 0 &&
+                scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
+            if (actionsSinceCheckpoint >=
+                    static_cast<uint64_t>(checkpointActions) ||
+                pause) {
+              if (!saveCheckpoint(checkpointPath, round, nextSerial,
+                                  scoredCount, rejectedCount, canonicalFactKey,
+                                  archive, beam, generated, pending,
+                                  pendingCursor, pause ? "explicit-pause" : "",
+                                  error)) {
+                fatal(error);
+                return;
+              }
+              actionsSinceCheckpoint = 0;
+            }
+            if (pause) {
+              stopReason = "explicit-pause";
+              break;
+            }
           }
-          if (pause) {
-            stopReason = "explicit-pause";
-            break;
+        } else {
+          // The worker path below keeps all action application, graph-fact and
+          // catalogue work in this owner thread.  Only the already-prepared
+          // production scheduler calls cross the context boundary.
+          const unsigned requestedWorkers =
+              static_cast<unsigned>(scoringWorkers.getValue());
+          const DialectRegistry &workerRegistry =
+              canonical.getContext()->getDialectRegistry();
+          while (pendingCursor < pending.size() && scoredCount < phaseLimit &&
+                 roundScoredCount < roundScoreLimit) {
+            const uint64_t scoreBudget = phaseLimit - scoredCount;
+            const uint64_t roundScoreBudget =
+                roundScoreLimit - roundScoredCount;
+            const uint64_t pauseBudget =
+                pauseAfterCandidates > 0 &&
+                        scoredCount <
+                            static_cast<uint64_t>(pauseAfterCandidates)
+                    ? static_cast<uint64_t>(pauseAfterCandidates) - scoredCount
+                    : scoreBudget;
+            const uint64_t batchScoreLimit =
+                std::min({scoreBudget, roundScoreBudget, pauseBudget});
+            if (batchScoreLimit == 0)
+              break;
+            const uint64_t checkpointBudget =
+                static_cast<uint64_t>(checkpointActions) -
+                std::min<uint64_t>(actionsSinceCheckpoint,
+                                   static_cast<uint64_t>(checkpointActions));
+            const size_t batchItemLimit = std::max<size_t>(
+                1, std::min<uint64_t>(requestedWorkers * 4ULL,
+                                      std::max<uint64_t>(1, checkpointBudget)));
+
+            std::vector<ParallelBatchItem> items;
+            std::vector<ParallelScoreJob> jobs;
+            std::map<std::string, uint64_t> reservedFamilyScores;
+            items.reserve(batchItemLimit);
+            jobs.reserve(std::min<uint64_t>(batchScoreLimit, batchItemLimit));
+            uint64_t cursor = pendingCursor;
+            const auto preparationBegan = std::chrono::steady_clock::now();
+            while (cursor < pending.size() && jobs.size() < batchScoreLimit &&
+                   items.size() < batchItemLimit) {
+              prioritizeNextPendingActionFamily(
+                  pending, cursor, successfulFamilyScores, reservedFamilyScores,
+                  remainingPendingFamilies);
+              const PendingNeighbor &neighbor = pending[cursor];
+              if (neighbor.parent >= beam.size()) {
+                fatal("checkpoint pending parent outside beam");
+                return;
+              }
+              SearchState &parent = beam[neighbor.parent];
+              FamilyFunnelCounters &funnel =
+                  familyFunnelByRound[round][neighbor.action.family];
+              ++funnel.attempted;
+              SearchState child;
+              child.id = "neighborhood-" + std::to_string(nextSerial++);
+              child.parentId = parent.id;
+              child.path = parent.path;
+              child.path.push_back(actionSignature(neighbor.action));
+              child.shapes = parent.shapes;
+              child.module = parent.module->clone();
+              ParallelBatchItem item;
+              item.pendingIndex = cursor;
+              item.actionFamily = neighbor.action.family;
+              item.state = std::move(child);
+              std::string reason, diagnostic, materializeError;
+              NeighborMaterialization materialization = materializeNeighbor(
+                  item.state, parent, canonical, functionName, outputDir,
+                  neighbor.action, canonicalFactKey, nextSerial, reason,
+                  diagnostic, materializeError);
+              if (materialization == NeighborMaterialization::Fatal) {
+                fatal(materializeError);
+                return;
+              }
+              if (materialization == NeighborMaterialization::Rejected) {
+                item.kind = ParallelBatchItemKind::Rejected;
+                item.materializationRejected = true;
+                item.state.rejectReason =
+                    (reason.empty() ? "unsupported_or_unknown_action"
+                                    : reason) +
+                    ":" + diagnostic;
+              } else {
+                item.materialized = true;
+                ++funnel.materialized;
+                if (item.state.key.empty()) {
+                  item.kind = ParallelBatchItemKind::Rejected;
+                  item.state.rejectReason = "graph_facts_unknown";
+                } else if (!claimFiniteConfiguration(item.state)) {
+                  item.kind = ParallelBatchItemKind::Rejected;
+                  item.duplicate = true;
+                  ++funnel.duplicate;
+                  ++duplicateCandidates;
+                  item.state.rejectReason =
+                      "authenticated_configuration_duplicate";
+                } else if (!seenKeys.insert(item.state.key).second) {
+                  // A duplicate whose key was reserved by an earlier item in
+                  // this batch is committed in order below, after that earlier
+                  // archive record exists.  Duplicates from an older batch can
+                  // be merged immediately at the same ordered commit point.
+                  item.kind = ParallelBatchItemKind::Duplicate;
+                  item.duplicate = true;
+                  ++funnel.duplicate;
+                } else {
+                  item.state.keyReserved = true;
+                  item.unique = true;
+                  ++funnel.unique;
+                  CandidateCostCacheObservation cacheObservation =
+                      observeCandidateCostCache(item.state, functionName,
+                                                canonicalFactKey,
+                                                costCacheLoaded);
+                  item.cacheReused =
+                      cacheObservation.known && cacheObservation.reused;
+                  ++funnel.costPreparationAttempted;
+                  if (item.cacheReused)
+                    ++funnel.cacheReused;
+                  const uint64_t oldCostHits = costCacheHits;
+                  const uint64_t oldCostMisses = costCacheMisses;
+                  if (!prepareParallelCandidate(
+                          item.state, canonical, functionName, stage, outputDir,
+                          canonicalFactKey, costCacheLoaded, costCache,
+                          nextSerial, error)) {
+                    fatal(error);
+                    return;
+                  }
+                  funnel.costShapeCacheHits += costCacheHits - oldCostHits;
+                  funnel.costShapeCacheMisses +=
+                      costCacheMisses - oldCostMisses;
+                  item.costShapeCacheHits = costCacheHits - oldCostHits;
+                  item.costShapeCacheMisses = costCacheMisses - oldCostMisses;
+                  item.freshCostPrepared =
+                      cacheObservation.known && !cacheObservation.reused &&
+                      !cacheObservation.graphCostKey.empty() &&
+                      graphCostPaths.count(cacheObservation.graphCostKey);
+                  if (item.freshCostPrepared)
+                    ++funnel.freshCostPrepared;
+                  if (item.state.rejectReason.empty() &&
+                      !item.state.choices.empty()) {
+                    item.kind = ParallelBatchItemKind::Score;
+                    ParallelScoreJob job;
+                    job.moduleIR =
+                        neighborhoodReplaySourceText(item.state.module.get());
+                    job.functionName = functionName.getValue();
+                    job.candidateID = item.state.id;
+                    job.choices = item.state.choices;
+                    job.durations = item.state.durations;
+                    job.fixedDispatch = parseStageFixed(stage);
+                    item.jobIndex = jobs.size();
+                    jobs.push_back(std::move(job));
+                    ++reservedFamilyScores[item.actionFamily];
+                  } else {
+                    item.kind = ParallelBatchItemKind::Rejected;
+                  }
+                }
+              }
+              items.push_back(std::move(item));
+              consumePendingActionFamily(remainingPendingFamilies,
+                                         neighbor.action.family);
+              ++cursor;
+            }
+            parallelPreparationMilliseconds +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - preparationBegan)
+                    .count();
+            if (items.empty())
+              break;
+            parallelBatchItemSizes.push_back(items.size());
+            parallelBatchScoreJobSizes.push_back(jobs.size());
+            parallelScoredJobs += jobs.size();
+
+            std::vector<ParallelScoreResult> results;
+            std::string workerError;
+            const auto scoringBegan = std::chrono::steady_clock::now();
+            if (!runPrivateProductionScores(
+                    jobs, workerRegistry, requestedWorkers, parallelWorkerPool,
+                    results, parallelModuleCacheHits, parallelModuleCacheMisses,
+                    workerError)) {
+              // No archive, ranking, budget, or frontier state has been
+              // committed for this batch.  The last durable checkpoint remains
+              // a safe replay cursor if the pass is resumed after this failure.
+              fatal(workerError);
+              return;
+            }
+            parallelScoringMilliseconds +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - scoringBegan)
+                    .count();
+
+            bool batchFailed = false;
+            for (const ParallelBatchItem &item : items)
+              if (item.kind == ParallelBatchItemKind::Score &&
+                  (item.jobIndex >= results.size() ||
+                   !results[item.jobIndex].finished ||
+                   results[item.jobIndex].fatal)) {
+                batchFailed = true;
+                workerError = item.jobIndex < results.size()
+                                  ? results[item.jobIndex].error
+                                  : "parallel scoring result index is invalid";
+                break;
+              }
+            if (batchFailed) {
+              fatal(workerError.empty() ? "parallel scoring worker failed"
+                                        : workerError);
+              return;
+            }
+
+            const auto commitBegan = std::chrono::steady_clock::now();
+            for (ParallelBatchItem &item : items) {
+              SearchState &child = item.state;
+              FamilyFunnelCounters &funnel =
+                  familyFunnelByRound[round][item.actionFamily];
+              bool schedulerPassed = false;
+              bool schedulerRejected = false;
+              bool retainInGeneratedBeam = false;
+              if (item.kind == ParallelBatchItemKind::Rejected) {
+                ++rejectedCount;
+                const std::string rejectReason =
+                    child.rejectReason.empty() ? "unsupported_or_unknown_action"
+                                               : child.rejectReason;
+                ++funnel.reject;
+                ++funnel.rejectReasons
+                      [(item.materializationRejected ? "materialize:"
+                                                     : "candidate:") +
+                       StringRef(rejectReason)
+                           .take_front(StringRef(rejectReason).find(':'))
+                           .str()];
+                appendRejected(archive, child, rejectReason, round);
+                ++funnel.archive;
+              } else if (item.kind == ParallelBatchItemKind::Duplicate) {
+                ++rejectedCount;
+                if (!mergeDuplicate(child, canonical, functionName, archive,
+                                    outputDir, candidatesDir, nextSerial,
+                                    error)) {
+                  fatal(error);
+                  return;
+                }
+                ++funnel.archive;
+              } else {
+                ParallelScoreResult &result = results[item.jobIndex];
+                // Every production invocation consumes one budget unit, even
+                // when the unchanged scheduler rejects the candidate.
+                ++scoredCount;
+                recordObjectiveDebit(child, scoredCount);
+                ++productionSchedulerCalls;
+                ++roundScoredCount;
+                ++funnel.schedulerCalls;
+                if (item.freshCostPrepared) {
+                  ++funnel.freshCostScored;
+                  item.freshCostScored = true;
+                }
+                if (result.scored) {
+                  child.schedule = std::move(result.schedule);
+                  child.score = child.schedule.makespan;
+                  child.scored = true;
+                  child.rejectReason.clear();
+                  schedulerPassed = true;
+                  ++funnel.schedulerPass;
+                  ++successfulFamilyScores[item.actionFamily];
+                } else {
+                  child.rejectReason = "production_scheduler_rejected";
+                  if (!result.error.empty())
+                    child.rejectReason += ":" + result.error;
+                  child.scored = false;
+                  schedulerRejected = true;
+                  ++funnel.schedulerReject;
+                  ++funnel.reject;
+                  ++funnel.rejectReasons
+                        ["scheduler:production_scheduler_rejected"];
+                }
+                if (!registerCandidate(child, archive, seenKeys, rejectedCount,
+                                       candidatesDir, error)) {
+                  fatal(error);
+                  return;
+                }
+                if (child.scored && !persistBestFamilyWitnesses(
+                                        child, archive, outputDir, error)) {
+                  fatal(error);
+                  return;
+                }
+                archive.back().round = round;
+                ++funnel.archive;
+                retainInGeneratedBeam = child.scored;
+              }
+              const PendingNeighbor &attempt = pending[item.pendingIndex];
+              json::Object eventResult{
+                  {"attempted", true},
+                  {"materialized", item.materialized},
+                  {"reject_reason", child.rejectReason},
+                  {"unique", item.unique},
+                  {"duplicate", item.duplicate},
+                  {"fresh_cost_prepared", item.freshCostPrepared},
+                  {"fresh_cost_scored", item.freshCostScored},
+                  {"cache_reused", item.cacheReused},
+                  {"cost_shape_cache_hits",
+                   static_cast<int64_t>(item.costShapeCacheHits)},
+                  {"cost_shape_cache_misses",
+                   static_cast<int64_t>(item.costShapeCacheMisses)},
+                  {"scheduler_calls",
+                   item.kind == ParallelBatchItemKind::Score ? 1 : 0},
+                  {"scheduler_pass", schedulerPassed},
+                  {"scheduler_reject", schedulerRejected},
+                  {"archive", true}};
+              appendFamilyFunnelCandidateEvent(
+                  round, item.actionFamily, child.id, child.parentId,
+                  attempt.action, child.actionHistory, std::move(eventResult));
+              if (retainInGeneratedBeam) {
+                generated.push_back(std::move(child));
+                generated =
+                    selectBeam(std::move(generated), beamWidth, diversitySlots);
+              }
+              ++actionsSinceCheckpoint;
+            }
+            parallelCommitMilliseconds +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - commitBegan)
+                    .count();
+            pendingCursor = cursor;
+            const bool pause =
+                pauseAfterCandidates > 0 &&
+                scoredCount >= static_cast<uint64_t>(pauseAfterCandidates);
+            if (actionsSinceCheckpoint >=
+                    static_cast<uint64_t>(checkpointActions) ||
+                pause) {
+              if (!saveCheckpoint(checkpointPath, round, nextSerial,
+                                  scoredCount, rejectedCount, canonicalFactKey,
+                                  archive, beam, generated, pending,
+                                  pendingCursor, pause ? "explicit-pause" : "",
+                                  error)) {
+                fatal(error);
+                return;
+              }
+              actionsSinceCheckpoint = 0;
+            }
+            if (pause) {
+              stopReason = "explicit-pause";
+              break;
+            }
           }
         }
-      }
-      if (stopReason == "explicit-pause" ||
-          scoredCount >= phaseLimit)
-        break;
-      if (refreshFrontier) {
-        // Rebuild queues by stable parent ID and typed signature. Every still
-        // eligible unattempted edge is regenerated; attempted edges are removed.
-        // New children become eligible after one quota block, without waiting
-        // for thousands of sibling actions on the old frozen parents.
+        if (stopReason == "explicit-pause" || scoredCount >= phaseLimit)
+          break;
+        if (refreshFrontier) {
+          // Rebuild queues by stable parent ID and typed signature. Every still
+          // eligible unattempted edge is regenerated; attempted edges are
+          // removed. New children become eligible after one quota block,
+          // without waiting for thousands of sibling actions on the old frozen
+          // parents.
+          ++round;
+          json::Array oldParents, newParents;
+          for (const auto &state : beam)
+            oldParents.push_back(state.id);
+          const uint64_t remaining = pending.size() - pendingCursor;
+          std::set<std::string> directionalNewKeys;
+          if (directionalSearch) {
+            std::set<std::string> oldKeys;
+            for (const auto &state : beam)
+              oldKeys.insert(state.key);
+            for (const auto &state : generated)
+              if (!oldKeys.count(state.key))
+                directionalNewKeys.insert(state.key);
+          }
+          for (auto &state : beam)
+            generated.push_back(std::move(state));
+          beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
+          std::set<std::string> directionalCostKeys;
+          if (directionalSearch) {
+            const size_t costSlots =
+                static_cast<size_t>(beamWidth - diversitySlots);
+            for (size_t i = 0; i < std::min(costSlots, beam.size()); ++i)
+              directionalCostKeys.insert(beam[i].key);
+          }
+          if (!retainCanonicalBeam(beam, archive, error)) {
+            fatal(error);
+            return;
+          }
+          if (parentProgress)
+            retireParentProgressQueues(beam, round);
+          if (directionalSearch)
+            openDirectionalWindow(beam, archive, directionalNewKeys,
+                                  directionalCostKeys, round, scoredCount);
+          for (const auto &state : beam)
+            newParents.push_back(json::Object{
+                {"id", state.id},
+                {"key", state.key},
+                {"cost", state.score},
+                {"depth", static_cast<int64_t>(state.path.size())}});
+          std::error_code ec;
+          llvm::raw_fd_ostream journal(outputDir.getValue() +
+                                           "/frontier-refresh.jsonl",
+                                       ec, llvm::sys::fs::OF_Append);
+          if (ec) {
+            fatal("cannot write refresh journal");
+            return;
+          }
+          journal << json::Value(json::Object{
+                         {"round", round},
+                         {"evaluations", static_cast<int64_t>(scoredCount)},
+                         {"old_parents", std::move(oldParents)},
+                         {"beam", std::move(newParents)},
+                         {"pending_before", static_cast<int64_t>(remaining)}})
+                  << "\n";
+          pending.clear();
+          pendingCursor = 0;
+          generated.clear();
+          successfulFamilyScores.clear();
+          roundScoredCount = 0;
+          roundScoreLimit =
+              perRoundScoreQuota(scoredCount, phaseLimit,
+                                 maxRounds.getValue() - round, roundQuotaScale);
+          if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount,
+                              rejectedCount, canonicalFactKey, archive, beam,
+                              generated, pending, pendingCursor, "", error)) {
+            fatal(error);
+            return;
+          }
+          // Stop only if the eligible frontier has no remaining actions, rather
+          // than mistaking a lack of newly scored children for domain
+          // exhaustion.
+          continue;
+        }
+        if (fairPendingRetention && pendingCursor < pending.size()) {
+          ++retainedPendingFrontiers;
+          ++round;
+          roundScoredCount = 0;
+          roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
+                                               maxRounds.getValue() -
+                                                   (round - phaseStartRound),
+                                               roundQuotaScale.getValue());
+          continue;
+        }
+        for (size_t index = static_cast<size_t>(pendingCursor);
+             index < pending.size(); ++index) {
+          const PendingNeighbor &unattempted = pending[index];
+          FamilyFunnelCounters &funnel =
+              familyFunnelByRound[round][unattempted.action.family];
+          ++funnel.pendingUnattempted;
+          ++funnel.pendingUnattemptedReasons["round_score_quota"];
+          funnel.pendingUnattemptedActionSignatures.push_back(
+              actionSignature(unattempted.action));
+          if (unattempted.parent >= beam.size()) {
+            fatal("pending neighbor parent outside beam while recording funnel "
+                  "frontier");
+            return;
+          }
+          appendPendingFamilyFunnelEvent(round, unattempted,
+                                         beam[unattempted.parent],
+                                         "round_score_quota");
+        }
         ++round;
-        json::Array oldParents, newParents;
-        for (const auto &state : beam) oldParents.push_back(state.id);
-        const uint64_t remaining = pending.size() - pendingCursor;
-        std::set<std::string> directionalNewKeys;
-        if (directionalSearch) {
-          std::set<std::string> oldKeys;
-          for (const auto &state : beam) oldKeys.insert(state.key);
-          for (const auto &state : generated)
-            if (!oldKeys.count(state.key)) directionalNewKeys.insert(state.key);
-        }
-        for (auto &state : beam) generated.push_back(std::move(state));
-        beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
-        std::set<std::string> directionalCostKeys;
-        if (directionalSearch) {
-          const size_t costSlots = static_cast<size_t>(beamWidth - diversitySlots);
-          for (size_t i = 0; i < std::min(costSlots, beam.size()); ++i)
-            directionalCostKeys.insert(beam[i].key);
-        }
-        if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
-        if (parentProgress) retireParentProgressQueues(beam, round);
-        if (directionalSearch)
-          openDirectionalWindow(beam, archive, directionalNewKeys,
-                                directionalCostKeys, round, scoredCount);
-        for (const auto &state : beam) newParents.push_back(json::Object{
-            {"id", state.id}, {"key", state.key}, {"cost", state.score},
-            {"depth", static_cast<int64_t>(state.path.size())}});
-        std::error_code ec;
-        llvm::raw_fd_ostream journal(outputDir.getValue() + "/frontier-refresh.jsonl", ec,
-                                     llvm::sys::fs::OF_Append);
-        if (ec) { fatal("cannot write refresh journal"); return; }
-        journal << json::Value(json::Object{{"round", round},
-            {"evaluations", static_cast<int64_t>(scoredCount)},
-            {"old_parents", std::move(oldParents)}, {"beam", std::move(newParents)},
-            {"pending_before", static_cast<int64_t>(remaining)}}) << "\n";
-        pending.clear(); pendingCursor = 0; generated.clear();
+        pending.clear();
+        pendingCursor = 0;
+        remainingPendingFamilies.clear();
         successfulFamilyScores.clear();
         roundScoredCount = 0;
-        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
-            maxRounds.getValue() - round, roundQuotaScale);
-        if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-            canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
-        // Stop only if the eligible frontier has no remaining actions, rather
-        // than mistaking a lack of newly scored children for domain exhaustion.
-        continue;
-      }
-      if (fairPendingRetention && pendingCursor < pending.size()) {
-        ++retainedPendingFrontiers;
-        ++round;
-        roundScoredCount = 0;
-        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
-                                            maxRounds.getValue() - (round - phaseStartRound), roundQuotaScale.getValue());
-        continue;
-      }
-      for (size_t index = static_cast<size_t>(pendingCursor);
-           index < pending.size(); ++index) {
-        const PendingNeighbor &unattempted = pending[index];
-        FamilyFunnelCounters &funnel =
-            familyFunnelByRound[round][unattempted.action.family];
-        ++funnel.pendingUnattempted;
-        ++funnel.pendingUnattemptedReasons["round_score_quota"];
-        funnel.pendingUnattemptedActionSignatures.push_back(
-            actionSignature(unattempted.action));
-        if (unattempted.parent >= beam.size()) {
-          fatal("pending neighbor parent outside beam while recording funnel frontier");
+        roundScoreLimit =
+            perRoundScoreQuota(scoredCount, phaseLimit,
+                               maxRounds.getValue() - (round - phaseStartRound),
+                               roundQuotaScale.getValue());
+        if (generated.empty()) {
+          stopReason = "no-new-legal-candidates";
+          break;
+        }
+        beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
+        if (!retainCanonicalBeam(beam, archive, error)) {
+          fatal(error);
           return;
         }
-        appendPendingFamilyFunnelEvent(round, unattempted,
-                                       beam[unattempted.parent],
-                                       "round_score_quota");
+        generated.clear();
+        if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount,
+                            rejectedCount, canonicalFactKey, archive, beam,
+                            generated, pending, pendingCursor, "", error)) {
+          fatal(error);
+          return;
+        }
       }
-      ++round; pending.clear(); pendingCursor = 0;
-      remainingPendingFamilies.clear();
-      successfulFamilyScores.clear();
-      roundScoredCount = 0;
-      roundScoreLimit = perRoundScoreQuota(
-          scoredCount, phaseLimit,
-          maxRounds.getValue() - (round - phaseStartRound), roundQuotaScale.getValue());
-      if (generated.empty()) { stopReason = "no-new-legal-candidates"; break; }
-      beam = selectBeam(std::move(generated), beamWidth, diversitySlots);
-      if (!retainCanonicalBeam(beam, archive, error)) { fatal(error); return; }
-      generated.clear();
-      if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-          canonicalFactKey, archive, beam, generated, pending, pendingCursor, "", error)) { fatal(error); return; }
-    }
-    if (decisionFlow == "alternating") {
-      alternatingBlocks.push_back(json::Object{
-          {"block", static_cast<int64_t>(alternatingBlock)}, {"phase", activePhase},
-          {"requested_cumulative_limit", static_cast<int64_t>(phaseLimit)},
-          {"charged", static_cast<int64_t>(scoredCount - blockStartEvaluations)},
-          {"stop", stopReason.empty() ? (scoredCount >= phaseLimit ? "block-budget" : "max-rounds") : stopReason}});
-      ++alternatingBlock;
-      if (alternatingBlock < 4 && scoredCount < static_cast<uint64_t>(maxCandidates)) {
-        if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) { fatal(error); return; }
-        activePhase = alternatingBlock % 2 ? "B" : "A";
-        phaseLimit = static_cast<uint64_t>(maxCandidates.getValue() * (alternatingBlock + 1) / 4);
-        blockStartEvaluations = scoredCount;
-        phaseStartRound = round + 1; round = phaseStartRound;
-        generated.clear(); pending.clear(); pendingCursor = 0;
-        successfulFamilyScores.clear(); stopReason.clear(); roundScoredCount = 0;
-        roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit, maxRounds, roundQuotaScale);
+      if (decisionFlow == "alternating") {
+        alternatingBlocks.push_back(json::Object{
+            {"block", static_cast<int64_t>(alternatingBlock)},
+            {"phase", activePhase},
+            {"requested_cumulative_limit", static_cast<int64_t>(phaseLimit)},
+            {"charged",
+             static_cast<int64_t>(scoredCount - blockStartEvaluations)},
+            {"stop",
+             stopReason.empty()
+                 ? (scoredCount >= phaseLimit ? "block-budget" : "max-rounds")
+                 : stopReason}});
+        ++alternatingBlock;
+        if (alternatingBlock < 4 &&
+            scoredCount < static_cast<uint64_t>(maxCandidates)) {
+          if (!startResourcePhase(canonical, archive, beam, nextSerial,
+                                  error)) {
+            fatal(error);
+            return;
+          }
+          activePhase = alternatingBlock % 2 ? "B" : "A";
+          phaseLimit = static_cast<uint64_t>(maxCandidates.getValue() *
+                                             (alternatingBlock + 1) / 4);
+          blockStartEvaluations = scoredCount;
+          phaseStartRound = round + 1;
+          round = phaseStartRound;
+          generated.clear();
+          pending.clear();
+          pendingCursor = 0;
+          successfulFamilyScores.clear();
+          stopReason.clear();
+          roundScoredCount = 0;
+          roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
+                                               maxRounds, roundQuotaScale);
+          continue;
+        }
+        break;
+      }
+      if (decisionFlow == "sequential" && activePhase == "A") {
+        phaseAEvaluations = scoredCount;
+        phaseAStopReason =
+            stopReason.empty()
+                ? (round - phaseStartRound >= maxRounds ? "max-rounds"
+                                                        : "phase-budget")
+                : stopReason;
+        if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) {
+          fatal(error);
+          return;
+        }
+        phaseLimit =
+            scoredCount + phaseBBudget; // unused A budget is never reassigned.
+        const int64_t nextPhaseRound =
+            round + ((!pending.empty() || roundScoredCount > 0) ? 1 : 0);
+        generated.clear();
+        pending.clear();
+        pendingCursor = 0;
+        roundScoredCount = 0;
+        successfulFamilyScores.clear();
+        stopReason.clear();
+        // Each stage has its own round allowance; A cannot consume B's
+        // expansion opportunity. Objective allowances remain fixed and unused A
+        // is discarded. A fresh global round ID keeps funnel events from the
+        // two stages separate.
+        phaseStartRound = nextPhaseRound;
+        round = phaseStartRound;
+        roundScoreLimit =
+            perRoundScoreQuota(scoredCount, phaseLimit,
+                               maxRounds.getValue() - (round - phaseStartRound),
+                               roundQuotaScale.getValue());
+        if (round - phaseStartRound >= maxRounds)
+          break;
         continue;
       }
       break;
-    }
-    if (decisionFlow == "sequential" && activePhase == "A") {
-      phaseAEvaluations = scoredCount;
-      phaseAStopReason = stopReason.empty() ?
-          (round - phaseStartRound >= maxRounds ? "max-rounds" : "phase-budget") : stopReason;
-      if (!startResourcePhase(canonical, archive, beam, nextSerial, error)) {
-        fatal(error); return;
-      }
-      phaseLimit = scoredCount + phaseBBudget; // unused A budget is never reassigned.
-      const int64_t nextPhaseRound = round +
-          ((!pending.empty() || roundScoredCount > 0) ? 1 : 0);
-      generated.clear(); pending.clear(); pendingCursor = 0;
-      roundScoredCount = 0; successfulFamilyScores.clear(); stopReason.clear();
-      // Each stage has its own round allowance; A cannot consume B's expansion
-      // opportunity. Objective allowances remain fixed and unused A is discarded.
-      // A fresh global round ID keeps funnel events from the two stages separate.
-      phaseStartRound = nextPhaseRound;
-      round = phaseStartRound;
-      roundScoreLimit = perRoundScoreQuota(scoredCount, phaseLimit,
-                                          maxRounds.getValue() - (round - phaseStartRound), roundQuotaScale.getValue());
-      if (round - phaseStartRound >= maxRounds) break;
-      continue;
-    }
-    break;
     } while (true);
-    if (stopReason.empty()) stopReason = round - phaseStartRound >= maxRounds ? "max-rounds" : "max-unique-candidates";
+    if (stopReason.empty())
+      stopReason = round - phaseStartRound >= maxRounds
+                       ? "max-rounds"
+                       : "max-unique-candidates";
     if (directionalSearch) {
       closeDirectionalWindow(round, "search finished; unused quota returned");
-      appendDirectionalEvent(json::Object{{"record_type", "search_finished"}, {"round", round},
-          {"evaluations", int64_t(scoredCount)}, {"stop_reason", stopReason},
+      appendDirectionalEvent(json::Object{
+          {"record_type", "search_finished"},
+          {"round", round},
+          {"evaluations", int64_t(scoredCount)},
+          {"stop_reason", stopReason},
           {"original_charged", int64_t(directionalOriginalCharged)},
           {"guided_charged", int64_t(directionalGuidedCharged)}});
     }
-    elapsedMilliseconds = previousElapsed + std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - began).count();
-    if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount, rejectedCount,
-        canonicalFactKey, archive, beam, generated, pending, pendingCursor, stopReason, error)) { fatal(error); return; }
-    if (!writeOutputs(outputDir, checkpointPath, functionName, stage,
-        sourceRepository, sourceCommit, architecturePath, protocolFile,
-        maxRounds, maxCandidates, beamWidth, diversitySlots, round,
-        scoredCount, rejectedCount, costCacheLoaded, !previousWinner.empty(),
-        !historicalNativeWinner.empty(),
-        archive, stopReason, error)) { fatal(error); return; }
+    elapsedMilliseconds =
+        previousElapsed + std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - began)
+                              .count();
+    if (!saveCheckpoint(checkpointPath, round, nextSerial, scoredCount,
+                        rejectedCount, canonicalFactKey, archive, beam,
+                        generated, pending, pendingCursor, stopReason, error)) {
+      fatal(error);
+      return;
+    }
+    if (!writeOutputs(
+            outputDir, checkpointPath, functionName, stage, sourceRepository,
+            sourceCommit, architecturePath, protocolFile, maxRounds,
+            maxCandidates, beamWidth, diversitySlots, round, scoredCount,
+            rejectedCount, costCacheLoaded, !previousWinner.empty(),
+            !historicalNativeWinner.empty(), archive, stopReason, error)) {
+      fatal(error);
+      return;
+    }
   }
 
 private:
@@ -4065,31 +4543,42 @@ private:
   std::set<std::string> finiteClaimedConfigurations;
   bool claimFiniteConfiguration(const SearchState &state) {
     if (!finiteDomainFile.empty())
-      return finiteClaimedConfigurations.insert(graphHistorySignature(state.actionHistory) +
-                                                "shapes:" + shapeSignature(state.shapes)).second;
-    if (decisionFlow == "legacy" || !state.actionHistory.known) return true;
+      return finiteClaimedConfigurations
+          .insert(graphHistorySignature(state.actionHistory) +
+                  "shapes:" + shapeSignature(state.shapes))
+          .second;
+    if (decisionFlow == "legacy" || !state.actionHistory.known)
+      return true;
     // Authenticated replay fixes the canonical source, source cut interface,
     // initial bindings, and every non-shape primitive in exact order. A shape
     // assignment changes only final resources; repeated assignments must not
     // create another objective debit because stale schedule annotations differ.
     std::string key = state.actionHistory.canonicalFactKey + "|initial:" +
                       shapeSignature(state.actionHistory.initialShapes);
-    for (const auto &action : state.actionHistory.fissionActions) key += actionSignature(action) + "\n";
+    for (const auto &action : state.actionHistory.fissionActions)
+      key += actionSignature(action) + "\n";
     for (const auto &action : state.actionHistory.actions)
-      if (action.family != "shape") key += actionSignature(action) + "\n";
+      if (action.family != "shape")
+        key += actionSignature(action) + "\n";
     key += "|final:" + shapeSignature(state.shapes);
     return finiteClaimedConfigurations.insert(key).second;
   }
   std::string objectiveTrace;
   void recordObjectiveDebit(const SearchState &state, uint64_t count) {
-    (void)claimFiniteConfiguration(state); // includes the canonical identity debit
+    (void)claimFiniteConfiguration(
+        state); // includes the canonical identity debit
     json::Array shapes;
-    for (const auto &shape : state.shapes) shapes.push_back(shapeObject(shape));
-    objectiveTrace += jsonText(json::Value(json::Object{
-        {"candidate_id",state.id}, {"phase",activePhase},
-        {"cumulative_evaluations",int64_t(count)}, {"key",state.key},
-        {"action_history",typedActionHistoryObject(state.actionHistory)},
-        {"shapes",std::move(shapes)}})) + "\n";
+    for (const auto &shape : state.shapes)
+      shapes.push_back(shapeObject(shape));
+    objectiveTrace +=
+        jsonText(json::Value(json::Object{
+            {"candidate_id", state.id},
+            {"phase", activePhase},
+            {"cumulative_evaluations", int64_t(count)},
+            {"key", state.key},
+            {"action_history", typedActionHistoryObject(state.actionHistory)},
+            {"shapes", std::move(shapes)}})) +
+        "\n";
   }
   uint64_t phaseABudget = 0, phaseBBudget = 0, phaseLimit = 0;
   uint64_t phaseAEvaluations = 0, retainedPendingFrontiers = 0;
@@ -4102,94 +4591,128 @@ private:
   static bool resourceAction(const NeighborhoodAction &action) {
     return action.family == "shape" || action.family == "replica";
   }
-  static std::string graphHistorySignature(const SearchState::TypedActionHistory &history) {
+  static std::string
+  graphHistorySignature(const SearchState::TypedActionHistory &history) {
     std::string result;
     for (const auto &action : history.fissionActions)
       result += actionSignature(action) + "\n";
     for (const auto &action : history.actions)
-      if (!resourceAction(action)) result += actionSignature(action) + "\n";
+      if (!resourceAction(action))
+        result += actionSignature(action) + "\n";
     return result;
   }
   bool readFiniteDomain(std::string &error) {
-    if (finiteDomainFile.empty()) return true;
+    if (finiteDomainFile.empty())
+      return true;
     if (resume || !seedManifest.empty() || !previousWinner.empty() ||
         !historicalNativeWinner.empty()) {
-      error = "finite domain requires fresh identity-only search"; return false;
+      error = "finite domain requires fresh identity-only search";
+      return false;
     }
     std::string text;
-    if (!readFileBytes(finiteDomainFile, text, error)) return false;
+    if (!readFileBytes(finiteDomainFile, text, error))
+      return false;
     auto parsed = json::parse(text);
-    if (!parsed) { llvm::consumeError(parsed.takeError()); error = "malformed finite-domain JSON"; return false; }
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      error = "malformed finite-domain JSON";
+      return false;
+    }
     auto *object = parsed->getAsObject();
     auto *actions = object ? object->getArray("graph_actions") : nullptr;
     auto *roots = object ? object->getArray("variable_tasks") : nullptr;
     auto *shapes = object ? object->getArray("shapes") : nullptr;
     auto *fixed = object ? object->getObject("fixed_shapes") : nullptr;
     if (!actions || !roots || !shapes || !fixed) {
-      error = "finite domain needs graph_actions,variable_tasks,shapes,fixed_shapes"; return false;
+      error = "finite domain needs "
+              "graph_actions,variable_tasks,shapes,fixed_shapes";
+      return false;
     }
     for (const auto &value : *actions) {
       NeighborhoodAction action;
       auto *entry = value.getAsObject();
-      if (!entry || !parseTypedAction(*entry, action) || resourceAction(action) ||
-          action.canonicalReset || !action.shapeTask.empty() || action.primitives.size()!=1 ||
+      if (!entry || !parseTypedAction(*entry, action) ||
+          resourceAction(action) || action.canonicalReset ||
+          !action.shapeTask.empty() || action.primitives.size() != 1 ||
           !finiteGraphActions.insert(actionSignature(action)).second) {
-        error = "finite graph actions must be unique single graph rewrites"; return false;
+        error = "finite graph actions must be unique single graph rewrites";
+        return false;
       }
     }
     for (const auto &value : *roots) {
       auto name = value.getAsString();
-      if (!name || name->empty() || !finiteVariableRoots.insert(name->str()).second) {
-        error = "finite variable tasks must be unique names"; return false;
+      if (!name || name->empty() ||
+          !finiteVariableRoots.insert(name->str()).second) {
+        error = "finite variable tasks must be unique names";
+        return false;
       }
     }
-    auto parseShape = [&](const json::Value &value, std::pair<int64_t,int64_t> &shape) {
+    auto parseShape = [&](const json::Value &value,
+                          std::pair<int64_t, int64_t> &shape) {
       auto *array = value.getAsArray();
-      if (!array || array->size()!=2 || !(*array)[0].getAsInteger() || !(*array)[1].getAsInteger()) return false;
+      if (!array || array->size() != 2 || !(*array)[0].getAsInteger() ||
+          !(*array)[1].getAsInteger())
+        return false;
       shape = {*(*array)[0].getAsInteger(), *(*array)[1].getAsInteger()};
-      return shape.first>0 && shape.second>0;
+      return shape.first > 0 && shape.second > 0;
     };
     for (const auto &value : *shapes) {
-      std::pair<int64_t,int64_t> shape;
+      std::pair<int64_t, int64_t> shape;
       if (!parseShape(value, shape) || !finiteShapes.insert(shape).second) {
-        error = "finite shapes must be unique positive pairs"; return false;
+        error = "finite shapes must be unique positive pairs";
+        return false;
       }
     }
-    if (!finiteShapes.count({1,1})) { error = "finite domain must retain identity1x1"; return false; }
+    if (!finiteShapes.count({1, 1})) {
+      error = "finite domain must retain identity1x1";
+      return false;
+    }
     for (const auto &entry : *fixed) {
-      std::pair<int64_t,int64_t> shape;
-      if (!parseShape(entry.second, shape) || shape != std::make_pair(int64_t(1),int64_t(1)) || finiteVariableRoots.count(entry.first.str())) {
-        error = "fixed unaffected tasks must be disjoint from variable roots and1x1"; return false;
+      std::pair<int64_t, int64_t> shape;
+      if (!parseShape(entry.second, shape) ||
+          shape != std::make_pair(int64_t(1), int64_t(1)) ||
+          finiteVariableRoots.count(entry.first.str())) {
+        error = "fixed unaffected tasks must be disjoint from variable roots "
+                "and1x1";
+        return false;
       }
       finiteFixedShapes[entry.first.str()] = shape;
     }
     return true;
   }
-  std::string filterSearchAction(const SearchState &parent, NeighborhoodAction &action) const {
+  std::string filterSearchAction(const SearchState &parent,
+                                 NeighborhoodAction &action) const {
     // Cumulative paper ablations share the full source-owned task protocol,
     // critical-path scheduler and Joint refresh controller. Only the enabled
     // dimensions change. Composites are accepted only when every primitive
     // and their shape attachment are enabled by this stage.
     if (StringRef(featurePolicy.getValue()).starts_with("cumulative-")) {
-      const unsigned level = featurePolicy == "cumulative-fixed" ? 0 :
-          featurePolicy == "cumulative-shape" ? 1 :
-          featurePolicy == "cumulative-replica" ? 2 :
-          featurePolicy == "cumulative-tiling" ? 3 : 4;
-      if (level == 0) return "feature_policy_fixed_1x1";
+      const unsigned level = featurePolicy == "cumulative-fixed"     ? 0
+                             : featurePolicy == "cumulative-shape"   ? 1
+                             : featurePolicy == "cumulative-replica" ? 2
+                             : featurePolicy == "cumulative-tiling"  ? 3
+                                                                     : 4;
+      if (level == 0)
+        return "feature_policy_fixed_1x1";
       if (!parent.actionHistory.fissionActions.empty())
         return "feature_policy_cumulative_parent_fission";
-      if (action.family == "fission") return "feature_policy_cumulative_fission";
+      if (action.family == "fission")
+        return "feature_policy_cumulative_fission";
       for (const auto &primitive : action.primitives) {
         const StringRef kind = primitive.kind;
         const unsigned required =
-            (action.family == "lineage-replacement" && kind == "lineage-reset") ? 1 :
-            kind == "replica" ? 2 :
-            (kind == "tile" || kind == "k-tile") ? 3 :
-            (kind == "fusion" || kind == "sibling-fusion") ? 4 : 5;
-        if (required > level) return "feature_policy_cumulative_primitive";
+            (action.family == "lineage-replacement" && kind == "lineage-reset")
+                ? 1
+            : kind == "replica"                              ? 2
+            : (kind == "tile" || kind == "k-tile")           ? 3
+            : (kind == "fusion" || kind == "sibling-fusion") ? 4
+                                                             : 5;
+        if (required > level)
+          return "feature_policy_cumulative_primitive";
       }
     }
-    if (featurePolicy == "shape-only" && action.family != "shape") return "feature_policy_shape_only";
+    if (featurePolicy == "shape-only" && action.family != "shape")
+      return "feature_policy_shape_only";
     // The joint ablation disables fusion and source fission only. Keep
     // tiling, K-tiling, co-tiling, replica, shape and withdrawal actions.
     // Reject atomic composites containing a disabled primitive as a whole.
@@ -4199,56 +4722,107 @@ private:
            return StringRef(p.kind).contains("fusion") || p.kind == "fission";
          })))
       return "feature_policy_structural_off";
-    if (featurePolicy == "fusion-off" && llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
-          return StringRef(p.kind).contains("fusion"); })) return "feature_policy_fusion_off";
-    if (featurePolicy == "fission-off" && (action.family == "fission" ||
-        llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) { return p.kind == "fission"; }))) return "feature_policy_fission_off";
-    if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "A") {
-      if (resourceAction(action) || action.family=="lineage-replacement") return "sequential_graph_phase_resource_action";
-      action.primitives.erase(std::remove_if(action.primitives.begin(), action.primitives.end(),
-          [](const NeighborhoodPrimitive &p) { return p.kind=="replica" || p.kind=="replication"; }), action.primitives.end());
+    if (featurePolicy == "fusion-off" &&
+        llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
+          return StringRef(p.kind).contains("fusion");
+        }))
+      return "feature_policy_fusion_off";
+    if (featurePolicy == "fission-off" &&
+        (action.family == "fission" ||
+         llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) {
+           return p.kind == "fission";
+         })))
+      return "feature_policy_fission_off";
+    if ((decisionFlow == "sequential" || decisionFlow == "alternating") &&
+        activePhase == "A") {
+      if (resourceAction(action) || action.family == "lineage-replacement")
+        return "sequential_graph_phase_resource_action";
+      action.primitives.erase(
+          std::remove_if(action.primitives.begin(), action.primitives.end(),
+                         [](const NeighborhoodPrimitive &p) {
+                           return p.kind == "replica" ||
+                                  p.kind == "replication";
+                         }),
+          action.primitives.end());
       const bool projected = !action.shapeTask.empty();
-      action.shapeTask.clear(); action.shapeRows=0; action.shapeCols=0;
-      if (action.primitives.empty()) return "sequential_graph_phase_empty_projection";
-      if (projected) action.label = "projected:" + action.label;
-    } else if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "B") {
-      if (!resourceAction(action) || action.canonicalReset) return "sequential_resource_phase_frozen_graph";
-      if (graphHistorySignature(parent.actionHistory)!=frozenGraphHistory) return "sequential_frozen_graph_mismatch";
+      action.shapeTask.clear();
+      action.shapeRows = 0;
+      action.shapeCols = 0;
+      if (action.primitives.empty())
+        return "sequential_graph_phase_empty_projection";
+      if (projected)
+        action.label = "projected:" + action.label;
+    } else if ((decisionFlow == "sequential" ||
+                decisionFlow == "alternating") &&
+               activePhase == "B") {
+      if (!resourceAction(action) || action.canonicalReset)
+        return "sequential_resource_phase_frozen_graph";
+      if (graphHistorySignature(parent.actionHistory) != frozenGraphHistory)
+        return "sequential_frozen_graph_mismatch";
     }
-    if (finiteDomainFile.empty()) return {};
-    if (action.family=="shape") {
+    if (finiteDomainFile.empty())
+      return {};
+    if (action.family == "shape") {
       if (action.canonicalReset || !action.primitives.empty() ||
-          !finiteShapes.count({action.shapeRows,action.shapeCols})) return "finite_domain_shape";
-      bool variable=false;
+          !finiteShapes.count({action.shapeRows, action.shapeCols}))
+        return "finite_domain_shape";
+      bool variable = false;
       for (const auto &root : finiteVariableRoots)
-        variable |= action.shapeTask==root || StringRef(action.shapeTask).starts_with(root+".");
-      if (!variable || finiteFixedShapes.count(action.shapeTask)) return "finite_domain_fixed_task";
+        variable |= action.shapeTask == root ||
+                    StringRef(action.shapeTask).starts_with(root + ".");
+      if (!variable || finiteFixedShapes.count(action.shapeTask))
+        return "finite_domain_fixed_task";
       return {};
     }
-    if (!graphHistorySignature(parent.actionHistory).empty()) return "finite_domain_one_graph_action";
-    if (!finiteGraphActions.count(actionSignature(action))) return "finite_domain_graph_action";
+    if (!graphHistorySignature(parent.actionHistory).empty())
+      return "finite_domain_one_graph_action";
+    if (!finiteGraphActions.count(actionSignature(action)))
+      return "finite_domain_graph_action";
     return {};
   }
-  bool startResourcePhase(ModuleOp canonical, std::vector<ArchiveRecord> &archive,
+  bool startResourcePhase(ModuleOp canonical,
+                          std::vector<ArchiveRecord> &archive,
                           std::vector<SearchState> &beam, uint64_t &serial,
                           std::string &error) {
-    const ArchiveRecord *best=nullptr;
+    const ArchiveRecord *best = nullptr;
     for (const auto &record : archive)
-      if (record.valid && (!best || archiveLess(record,*best))) best=&record;
-    if (!best || best->candidatePath.empty()) { error="phase A has no retained legal anchor"; return false; }
+      if (record.valid && (!best || archiveLess(record, *best)))
+        best = &record;
+    if (!best || best->candidatePath.empty()) {
+      error = "phase A has no retained legal anchor";
+      return false;
+    }
     SearchState anchor;
-    anchor.module=parseSourceFile<ModuleOp>(best->candidatePath,&getContext());
-    if (!anchor.module) { error="phase A anchor snapshot cannot parse"; return false; }
-    anchor.id=best->id; anchor.parentId=best->parentId; anchor.key=best->key;
-    anchor.factKey=best->factKey; anchor.path=best->path; anchor.shapes=best->shapes;
-    anchor.actionHistory=portableActionHistory(best->actionHistory);
-    anchor.choices=best->choices; anchor.durations=best->durations; anchor.costs=best->costs;
-    anchor.schedule=best->schedule; anchor.costPath=best->costPath; anchor.score=best->score;
-    anchor.scored=true; anchor.keyReserved=true;
-    if (!authenticateTypedActionHistory(anchor,canonical,functionName,outputDir,serial,error) || !anchor.actionHistory.known) return false;
-    frozenGraphHistory=graphHistorySignature(anchor.actionHistory);
-    phaseAAnchor=anchor.id; activePhase="B";
-    beam.clear(); beam.push_back(std::move(anchor));
+    anchor.module =
+        parseSourceFile<ModuleOp>(best->candidatePath, &getContext());
+    if (!anchor.module) {
+      error = "phase A anchor snapshot cannot parse";
+      return false;
+    }
+    anchor.id = best->id;
+    anchor.parentId = best->parentId;
+    anchor.key = best->key;
+    anchor.factKey = best->factKey;
+    anchor.path = best->path;
+    anchor.shapes = best->shapes;
+    anchor.actionHistory = portableActionHistory(best->actionHistory);
+    anchor.choices = best->choices;
+    anchor.durations = best->durations;
+    anchor.costs = best->costs;
+    anchor.schedule = best->schedule;
+    anchor.costPath = best->costPath;
+    anchor.score = best->score;
+    anchor.scored = true;
+    anchor.keyReserved = true;
+    if (!authenticateTypedActionHistory(anchor, canonical, functionName,
+                                        outputDir, serial, error) ||
+        !anchor.actionHistory.known)
+      return false;
+    frozenGraphHistory = graphHistorySignature(anchor.actionHistory);
+    phaseAAnchor = anchor.id;
+    activePhase = "B";
+    beam.clear();
+    beam.push_back(std::move(anchor));
     return true;
   }
   int64_t perCgraRows = 0;
@@ -4268,7 +4842,8 @@ private:
     ArchiveRecord record;
     record.id = state.id;
     record.parentId = state.parentId;
-    record.key = state.key; record.factKey = state.factKey;
+    record.key = state.key;
+    record.factKey = state.factKey;
     record.path = state.path;
     record.actionHistory = portableActionHistory(state.actionHistory);
     markActionHistoryUnknown(record.actionHistory,
@@ -4359,9 +4934,10 @@ private:
     }
     auto cached = effectiveFissionCanonicalText.find(actionKey);
     if (cached != effectiveFissionCanonicalText.end()) {
-      effectiveCanonical = parseSourceString<ModuleOp>(
-          cached->second, canonical.getContext());
-      if (!effectiveCanonical || failed(verify(effectiveCanonical->getOperation()))) {
+      effectiveCanonical =
+          parseSourceString<ModuleOp>(cached->second, canonical.getContext());
+      if (!effectiveCanonical ||
+          failed(verify(effectiveCanonical->getOperation()))) {
         reason = "cached_fission_canonical_does_not_parse";
         return false;
       }
@@ -4392,8 +4968,8 @@ private:
       error.clear();
       return false;
     }
-    if (failed(lowerPreparedTaskflowFissionSource(
-            sourceCandidate.get(), effectiveCanonical, error))) {
+    if (failed(lowerPreparedTaskflowFissionSource(sourceCandidate.get(),
+                                                  effectiveCanonical, error))) {
       reason = "typed_fission_canonical_lowering_failed:" + error;
       error.clear();
       return false;
@@ -4437,11 +5013,10 @@ private:
                                  effectiveCanonical, reason, error);
   }
 
-  static void recordTypedAction(
-      SearchState::TypedActionHistory &history,
-      const NeighborhoodAction &action,
-      ArrayRef<std::string> beforeNames,
-      ArrayRef<std::string> afterNames) {
+  static void recordTypedAction(SearchState::TypedActionHistory &history,
+                                const NeighborhoodAction &action,
+                                ArrayRef<std::string> beforeNames,
+                                ArrayRef<std::string> afterNames) {
     if (action.canonicalReset) {
       history.actions.clear();
       history.dependencies.clear();
@@ -4496,11 +5071,11 @@ private:
     }
   }
 
-  bool replayTypedActionHistory(
-      const SearchState::TypedActionHistory &history, ModuleOp canonical,
-      StringRef functionName, StringRef outputDirectory, uint64_t serial,
-      SearchState &replayed, std::string &reason,
-      std::string &fatalError) {
+  bool replayTypedActionHistory(const SearchState::TypedActionHistory &history,
+                                ModuleOp canonical, StringRef functionName,
+                                StringRef outputDirectory, uint64_t serial,
+                                SearchState &replayed, std::string &reason,
+                                std::string &fatalError) {
     reason.clear();
     fatalError.clear();
     if (!history.known || history.canonicalFactKey.empty() ||
@@ -4517,12 +5092,13 @@ private:
     }
     for (const NeighborhoodAction &fission : history.fissionActions) {
       if (stageNumber(stage) != 6 ||
-          !llvm::any_of(canonicalFissionActions,
-                        [&](const NeighborhoodAction &allowed) {
-            return actionSignature(allowed) == actionSignature(fission);
-          })) {
-        reason = "typed_action_history_fission_action_not_in_complete_cut_set:" +
-                 fission.label;
+          !llvm::any_of(
+              canonicalFissionActions, [&](const NeighborhoodAction &allowed) {
+                return actionSignature(allowed) == actionSignature(fission);
+              })) {
+        reason =
+            "typed_action_history_fission_action_not_in_complete_cut_set:" +
+            fission.label;
         return false;
       }
     }
@@ -4555,7 +5131,8 @@ private:
                                  taskError) ||
         failed(canonicalMetadata) ||
         !sameTaskSet(*canonicalMetadata, replayed.shapes)) {
-      reason = "typed_action_history_initial_shapes_do_not_cover_canonical_tasks";
+      reason =
+          "typed_action_history_initial_shapes_do_not_cover_canonical_tasks";
       if (!taskError.empty())
         reason += ":" + taskError;
       return false;
@@ -4563,8 +5140,8 @@ private:
     if (!prepareCandidateKey(replayed, functionName, outputDirectory, serial,
                              fatalError)) {
       if (!fatalStorageError(fatalError)) {
-        reason = "typed_action_history_canonical_facts_unavailable:" +
-                 fatalError;
+        reason =
+            "typed_action_history_canonical_facts_unavailable:" + fatalError;
         fatalError.clear();
       }
       return false;
@@ -4591,7 +5168,8 @@ private:
     for (const NeighborhoodAction &action : history.actions) {
       if (action.family == "lineage-replacement" ||
           action.family == "fission") {
-        reason = "typed_action_history_contains_nonreplayable_lineage_replacement";
+        reason =
+            "typed_action_history_contains_nonreplayable_lineage_replacement";
         return false;
       }
       std::vector<std::string> beforeNames;
@@ -4602,8 +5180,8 @@ private:
       }
       std::string applyReason, diagnostic;
       if (!applyTrustedNeighborhoodAction(
-              replayed.module.get(), effectiveCanonical.get(), functionName, action,
-              replayed.shapes, applyReason, diagnostic,
+              replayed.module.get(), effectiveCanonical.get(), functionName,
+              action, replayed.shapes, applyReason, diagnostic,
               static_cast<unsigned>(maxPartitionFactor.getValue()))) {
         reason = "typed_action_history_replay_unsupported:";
         if (applyReason.empty())
@@ -4624,7 +5202,8 @@ private:
         reason = "typed_action_history_replay_function_missing:" + taskError;
         return false;
       }
-      if (!refreshActiveTransferFactsAfterTrustedRewrite(*function, taskError)) {
+      if (!refreshActiveTransferFactsAfterTrustedRewrite(*function,
+                                                         taskError)) {
         reason = "typed_action_history_replay_proof_unsupported:" + taskError;
         return false;
       }
@@ -4636,8 +5215,8 @@ private:
       if (!prepareCandidateKey(replayed, functionName, outputDirectory, serial,
                                fatalError)) {
         if (!fatalStorageError(fatalError)) {
-          reason = "typed_action_history_replay_facts_unavailable:" +
-                   fatalError;
+          reason =
+              "typed_action_history_replay_facts_unavailable:" + fatalError;
           fatalError.clear();
         }
         return false;
@@ -4659,12 +5238,9 @@ private:
     return true;
   }
 
-  bool authenticateTypedActionHistory(SearchState &candidate,
-                                      ModuleOp canonical,
-                                      StringRef functionName,
-                                      StringRef outputDirectory,
-                                      uint64_t serial,
-                                      std::string &fatalError) {
+  bool authenticateTypedActionHistory(
+      SearchState &candidate, ModuleOp canonical, StringRef functionName,
+      StringRef outputDirectory, uint64_t serial, std::string &fatalError) {
     if (!candidate.actionHistory.known)
       return true;
     SearchState replayed;
@@ -4683,19 +5259,21 @@ private:
         shapeSignature(replayed.shapes) != shapeSignature(candidate.shapes) ||
         neighborhoodReplaySourceText(replayed.module.get()) !=
             neighborhoodReplaySourceText(candidate.module.get())) {
-      markActionHistoryUnknown(candidate.actionHistory,
-                               "typed_action_history_canonical_replay_mismatch");
+      markActionHistoryUnknown(
+          candidate.actionHistory,
+          "typed_action_history_canonical_replay_mismatch");
       return true;
     }
     candidate.actionHistory = std::move(replayed.actionHistory);
     return true;
   }
 
-  bool replayLineageReplacement(
-      SearchState &child, const SearchState &parent, ModuleOp canonical,
-      StringRef functionName, StringRef outputDirectory,
-      const NeighborhoodAction &action, uint64_t serial,
-      std::string &reason, std::string &fatalError) {
+  bool replayLineageReplacement(SearchState &child, const SearchState &parent,
+                                ModuleOp canonical, StringRef functionName,
+                                StringRef outputDirectory,
+                                const NeighborhoodAction &action,
+                                uint64_t serial, std::string &reason,
+                                std::string &fatalError) {
     if (!parent.actionHistory.known) {
       reason = "lineage_replacement_requires_authenticated_path_replay";
       return false;
@@ -4711,20 +5289,19 @@ private:
         producer->second >= parent.actionHistory.actions.size() ||
         parent.actionHistory.dependencies.size() !=
             parent.actionHistory.actions.size()) {
-      reason = "lineage_replacement_target_has_no_authenticated_producer:" +
-               target;
+      reason =
+          "lineage_replacement_target_has_no_authenticated_producer:" + target;
       return false;
     }
     std::set<uint64_t> removed{producer->second};
     bool changed = true;
     while (changed) {
       changed = false;
-      for (uint64_t index = 0;
-           index < parent.actionHistory.dependencies.size(); ++index) {
+      for (uint64_t index = 0; index < parent.actionHistory.dependencies.size();
+           ++index) {
         if (removed.count(index))
           continue;
-        for (uint64_t dependency :
-             parent.actionHistory.dependencies[index]) {
+        for (uint64_t dependency : parent.actionHistory.dependencies[index]) {
           if (removed.count(dependency)) {
             removed.insert(index);
             changed = true;
@@ -4746,8 +5323,8 @@ private:
                                   outputDirectory, serial, replayed,
                                   replayReason, fatalError)) {
       if (fatalError.empty())
-        reason = "lineage_replacement_canonical_replay_unsupported:" +
-                 replayReason;
+        reason =
+            "lineage_replacement_canonical_replay_unsupported:" + replayReason;
       return false;
     }
     child.module = std::move(replayed.module);
@@ -4770,12 +5347,11 @@ private:
     child.actionHistory = parent.actionHistory;
     if (action.family == "fission") {
       if (stageNumber(stage) != 6 || !preparedTaskflowSource ||
-          !parent.actionHistory.known ||
-          action.primitives.size() != 1 ||
-          !llvm::any_of(canonicalFissionActions,
-                        [&](const NeighborhoodAction &allowed) {
-            return actionSignature(allowed) == actionSignature(action);
-          })) {
+          !parent.actionHistory.known || action.primitives.size() != 1 ||
+          !llvm::any_of(
+              canonicalFissionActions, [&](const NeighborhoodAction &allowed) {
+                return actionSignature(allowed) == actionSignature(action);
+              })) {
         reason = "fission_requires_authenticated_source_history";
         return NeighborMaterialization::Rejected;
       }
@@ -4789,22 +5365,20 @@ private:
         if (prior.primitives.size() == 1 &&
             prior.primitives.front().firstTask ==
                 action.primitives.front().firstTask) {
-            reason = "fission_target_was_already_split";
-            return NeighborMaterialization::Rejected;
+          reason = "fission_target_was_already_split";
+          return NeighborMaterialization::Rejected;
         }
       child.actionHistory.fissionActions.push_back(action);
       child.actionHistory.canonicalFactKey = "source-replay-pending";
       OwningOpRef<ModuleOp> effectiveCanonical;
-      if (!buildFissionCanonical(canonical,
-                                 child.actionHistory.fissionActions,
+      if (!buildFissionCanonical(canonical, child.actionHistory.fissionActions,
                                  effectiveCanonical, reason, fatalError)) {
         if (!fatalError.empty())
           return NeighborMaterialization::Fatal;
         return NeighborMaterialization::Rejected;
       }
       OwningOpRef<ModuleOp> priorCanonical;
-      if (!buildFissionCanonical(canonical,
-                                 parent.actionHistory.fissionActions,
+      if (!buildFissionCanonical(canonical, parent.actionHistory.fissionActions,
                                  priorCanonical, reason, fatalError)) {
         if (!fatalError.empty())
           return NeighborMaterialization::Fatal;
@@ -4826,9 +5400,8 @@ private:
           reason += ":" + diagnostic;
         return NeighborMaterialization::Rejected;
       }
-      FailureOr<func::FuncOp> splitFunction =
-          selectTaskFunction(effectiveCanonical.get(), functionName,
-                             diagnostic);
+      FailureOr<func::FuncOp> splitFunction = selectTaskFunction(
+          effectiveCanonical.get(), functionName, diagnostic);
       if (failed(splitFunction)) {
         reason = "fission_lowered_task_function_missing";
         return NeighborMaterialization::Rejected;
@@ -4840,8 +5413,7 @@ private:
         return NeighborMaterialization::Rejected;
       }
       std::map<std::string, NeighborhoodShape> priorInitialShapes;
-      for (const NeighborhoodShape &shape :
-           parent.actionHistory.initialShapes)
+      for (const NeighborhoodShape &shape : parent.actionHistory.initialShapes)
         if (!priorInitialShapes.emplace(shape.task, shape).second) {
           reason = "fission_parent_initial_shapes_repeat_task";
           return NeighborMaterialization::Rejected;
@@ -4940,9 +5512,8 @@ private:
                              fatalError))
       return NeighborMaterialization::Fatal;
     if (child.key.empty()) {
-      reason = child.rejectReason.empty()
-                   ? "graph_facts_unknown"
-                   : child.rejectReason;
+      reason = child.rejectReason.empty() ? "graph_facts_unknown"
+                                          : child.rejectReason;
       return NeighborMaterialization::Rejected;
     }
 
@@ -4954,9 +5525,8 @@ private:
           parent.actionHistory.canonicalFactKey.empty()
               ? canonicalFactKey.str()
               : parent.actionHistory.canonicalFactKey;
-      FailureOr<func::FuncOp> baselineFunction =
-          selectTaskFunction(effectiveCanonical.get(), functionName,
-                             diagnostic);
+      FailureOr<func::FuncOp> baselineFunction = selectTaskFunction(
+          effectiveCanonical.get(), functionName, diagnostic);
       if (failed(baselineFunction)) {
         reason = "action_reset_effective_canonical_function_missing";
         return NeighborMaterialization::Rejected;
@@ -4968,11 +5538,11 @@ private:
       std::vector<std::string> afterNames;
       if (!collectHistoryTaskNames(child.module.get(), functionName, afterNames,
                                    diagnostic)) {
-        markActionHistoryUnknown(child.actionHistory,
-                                 "typed_action_history_result_task_set_unknown");
+        markActionHistoryUnknown(
+            child.actionHistory,
+            "typed_action_history_result_task_set_unknown");
       } else {
-        recordTypedAction(child.actionHistory, action, beforeNames,
-                          afterNames);
+        recordTypedAction(child.actionHistory, action, beforeNames, afterNames);
       }
     }
     return NeighborMaterialization::Applied;
@@ -5045,16 +5615,18 @@ private:
                                       std::string &diagnostic,
                                       unsigned maxPartitionFactor) const {
     if (!sourceDomainEnabled)
-      return applyActiveTransferNeighborhoodAction(cloned, canonical,
-          selectedFunction, action, shapes, reason, diagnostic, maxPartitionFactor);
+      return applyActiveTransferNeighborhoodAction(
+          cloned, canonical, selectedFunction, action, shapes, reason,
+          diagnostic, maxPartitionFactor);
     std::string error;
     FailureOr<func::FuncOp> domainCanonical =
         selectTaskFunction(canonical, selectedFunction, error);
     auto child = selectTaskFunction(cloned, selectedFunction, error);
     if (failed(domainCanonical) || failed(child) ||
-        failed(verifySourceIterationDomainPartition(
-            *domainCanonical, *child, error))) {
-      reason = "source_iteration_domain_seed_unproven"; diagnostic = error;
+        failed(verifySourceIterationDomainPartition(*domainCanonical, *child,
+                                                    error))) {
+      reason = "source_iteration_domain_seed_unproven";
+      diagnostic = error;
       return false;
     }
     auto suspend = [](ModuleOp module) {
@@ -5069,26 +5641,27 @@ private:
     // Nested materializers see only current counters during the atomic edit;
     // no stale predecessor proof can authorize a half-built shard group.
     OwningOpRef<ModuleOp> actionCanonical = canonical.clone();
-    suspend(cloned); suspend(*actionCanonical);
-    if (!applyActiveTransferNeighborhoodAction(cloned, *actionCanonical,
-          selectedFunction, action, shapes, reason, diagnostic, maxPartitionFactor))
+    suspend(cloned);
+    suspend(*actionCanonical);
+    if (!applyActiveTransferNeighborhoodAction(
+            cloned, *actionCanonical, selectedFunction, action, shapes, reason,
+            diagnostic, maxPartitionFactor))
       return false;
     child = selectTaskFunction(cloned, selectedFunction, error);
     if (failed(child) || failed(proveAndRefreshSourceIterationDomainPartition(
-            *domainCanonical, *child, error))) {
-      reason = "source_iteration_domain_rewrite_unproven"; diagnostic = error;
+                             *domainCanonical, *child, error))) {
+      reason = "source_iteration_domain_rewrite_unproven";
+      diagnostic = error;
       return false;
     }
     return true;
   }
 
-  bool applyActiveTransferNeighborhoodAction(ModuleOp cloned, ModuleOp canonical,
-                                      StringRef selectedFunction,
-                                      const NeighborhoodAction &action,
-                                      std::vector<NeighborhoodShape> &shapes,
-                                      std::string &reason,
-                                      std::string &diagnostic,
-                                      unsigned maxPartitionFactor) const {
+  bool applyActiveTransferNeighborhoodAction(
+      ModuleOp cloned, ModuleOp canonical, StringRef selectedFunction,
+      const NeighborhoodAction &action, std::vector<NeighborhoodShape> &shapes,
+      std::string &reason, std::string &diagnostic,
+      unsigned maxPartitionFactor) const {
     if (activeTransferArguments.empty())
       return applyNeighborhoodAction(cloned, canonical, selectedFunction,
                                      action, shapes, reason, diagnostic,
@@ -5326,12 +5899,11 @@ private:
         ModuleOp originalCanonical =
             sourceDomainCanonical->getParentOfType<ModuleOp>();
         std::string replayReason;
-        if (!effectiveCanonicalForHistory(originalCanonical,
-                                          state.actionHistory,
-                                          effectiveCanonical, stage,
-                                          replayReason, error)) {
-          state.rejectReason = "fission_canonical_replay_unproven:" +
-                               replayReason;
+        if (!effectiveCanonicalForHistory(
+                originalCanonical, state.actionHistory, effectiveCanonical,
+                stage, replayReason, error)) {
+          state.rejectReason =
+              "fission_canonical_replay_unproven:" + replayReason;
           error.clear();
           return true;
         }
@@ -5344,10 +5916,11 @@ private:
         }
         domainCanonical = *selectedBaseline;
       }
-      if (failed(verifySourceIterationDomainPartition(
-              domainCanonical, *selected, error))) {
+      if (failed(verifySourceIterationDomainPartition(domainCanonical,
+                                                      *selected, error))) {
         state.rejectReason = "source_iteration_domain_unproven:" + error;
-        error.clear(); return true;
+        error.clear();
+        return true;
       }
     }
     FailureOr<SmallVector<TaskMetadata>> metadata =
@@ -5367,9 +5940,8 @@ private:
       return true;
     }
     std::string activeTransferSignature;
-    if (!collectVerifiedActiveTransferSignature(*selected,
-                                                activeTransferSignature,
-                                                error)) {
+    if (!collectVerifiedActiveTransferSignature(
+            *selected, activeTransferSignature, error)) {
       state.rejectReason = "active_transfer_proof_unsupported:" + error;
       error.clear();
       return true;
@@ -5394,27 +5966,40 @@ private:
     // keys refer to exact dictionary IDs, never repeated multi-KB IR strings.
     json::Array bodies, lineages;
     (*selected).walk([&](taskflow::TaskflowTaskOp task) {
-      std::string ledger; llvm::raw_string_ostream ledgerStream(ledger);
-      if (auto attr = task->getAttr("amoeba.neighborhood.partition_lineage.v1")) attr.print(ledgerStream);
-      ledgerStream.flush(); lineages.push_back(ledger);
+      std::string ledger;
+      llvm::raw_string_ostream ledgerStream(ledger);
+      if (auto attr = task->getAttr("amoeba.neighborhood.partition_lineage.v1"))
+        attr.print(ledgerStream);
+      ledgerStream.flush();
+      lineages.push_back(ledger);
     });
     bool bodyFailure = false;
     (*selected).walk([&](::mlir::neura::KernelOp kernel) {
-      if (bodyFailure) return;
-      std::string body; llvm::raw_string_ostream stream(body);
+      if (bodyFailure)
+        return;
+      std::string body;
+      llvm::raw_string_ostream stream(body);
       Operation *bodyClone = kernel->clone();
-      bodyClone->removeAttr("kernel_symname"); bodyClone->removeAttr("sym_name");
-      bodyClone->print(stream, OpPrintingFlags().printGenericOpForm()); stream.flush();
+      bodyClone->removeAttr("kernel_symname");
+      bodyClone->removeAttr("sym_name");
+      bodyClone->print(stream, OpPrintingFlags().printGenericOpForm());
+      stream.flush();
       bodyClone->destroy();
       std::string id;
-      if (!internWitness(body, true, id, error)) { bodyFailure = true; return; }
+      if (!internWitness(body, true, id, error)) {
+        bodyFailure = true;
+        return;
+      }
       bodies.push_back(id);
     });
-    if (bodyFailure) return false;
-    std::string graphWitness = jsonText(json::Value(json::Object{
-        {"canonical_structural_facts", state.factKey}, {"typed_kernel_body_ids", std::move(bodies)},
-        {"partition_lineages", std::move(lineages)}}));
-    if (!internWitness(graphWitness, false, state.factKey, error)) return false;
+    if (bodyFailure)
+      return false;
+    std::string graphWitness = jsonText(
+        json::Value(json::Object{{"canonical_structural_facts", state.factKey},
+                                 {"typed_kernel_body_ids", std::move(bodies)},
+                                 {"partition_lineages", std::move(lineages)}}));
+    if (!internWitness(graphWitness, false, state.factKey, error))
+      return false;
     std::string activeTransferWitnessID;
     if (!activeTransferSignature.empty()) {
       const std::string activeTransferWitness =
@@ -5426,14 +6011,16 @@ private:
     state.key = state.factKey + "|" + shapeSignature(state.shapes);
     if (!activeTransferWitnessID.empty())
       state.key += "|active-transfer-proof:" + activeTransferWitnessID;
-    (*selected)->setAttr("amoeba.graph_variant_id",
-                        StringAttr::get(state.module->getContext(), state.factKey));
+    (*selected)->setAttr(
+        "amoeba.graph_variant_id",
+        StringAttr::get(state.module->getContext(), state.factKey));
     return true;
   }
 
-  CandidateCostCacheObservation observeCandidateCostCache(
-      const SearchState &state, StringRef function,
-      StringRef canonicalFactKey, bool costCacheLoaded) const {
+  CandidateCostCacheObservation
+  observeCandidateCostCache(const SearchState &state, StringRef function,
+                            StringRef canonicalFactKey,
+                            bool costCacheLoaded) const {
     CandidateCostCacheObservation observation;
     if (state.factKey.empty())
       return observation;
@@ -5468,11 +6055,13 @@ private:
   // counters, and graph catalogue creation may publish files, so this helper
   // intentionally runs only on the owner thread.  It stops immediately before
   // the production scheduler call made by evaluateCandidate.
-  bool prepareParallelCandidate(
-      SearchState &state, ModuleOp canonical, StringRef function,
-      StringRef stageName, StringRef outputDirectory,
-      StringRef canonicalFactKey, bool costCacheLoaded,
-      TaskShapeCostCache &costCache, uint64_t serial, std::string &error) {
+  bool prepareParallelCandidate(SearchState &state, ModuleOp canonical,
+                                StringRef function, StringRef stageName,
+                                StringRef outputDirectory,
+                                StringRef canonicalFactKey,
+                                bool costCacheLoaded,
+                                TaskShapeCostCache &costCache, uint64_t serial,
+                                std::string &error) {
     FailureOr<func::FuncOp> selected =
         selectTaskFunction(state.module.get(), function, error);
     if (failed(selected))
@@ -5530,13 +6119,11 @@ private:
           if (!runCurrentCostPredictor(
                   *predictorModule, *predictorFunction, function, catalogueId,
                   outputDirectory, modelPath, cachePath,
-                  checkpointDirectoryForModel(),
-                  effectiveArchitectureContract, architecturePath,
-                  perCgraRows, perCgraCols, sourceRepository, sourceCommit,
-                  architectureTransferCatalog, modelNamespace,
-                  diagnosticIICeiling,
-                  bootstrapSupportedShapes, state.costPath, error,
-                  fatalPredictorFailure)) {
+                  checkpointDirectoryForModel(), effectiveArchitectureContract,
+                  architecturePath, perCgraRows, perCgraCols, sourceRepository,
+                  sourceCommit, architectureTransferCatalog, modelNamespace,
+                  diagnosticIICeiling, bootstrapSupportedShapes, state.costPath,
+                  error, fatalPredictorFailure)) {
             if (fatalPredictorFailure || fatalStorageError(error))
               return false;
             state.rejectReason = "current_graph_cost_unknown:" + error;
@@ -5549,11 +6136,10 @@ private:
         auto oracle = std::make_unique<TaskShapeCostCache>();
         std::string expectedWitness =
             neighborhoodReplaySourceText(state.module.get());
-        if (!graphId || !oracle->load(state.costPath, function, *metadata,
-                                      sourceRepository, sourceCommit,
-                                      architecturePath, *graphId, error,
-                                      bootstrapSupportedShapes,
-                                      expectedWitness)) {
+        if (!graphId ||
+            !oracle->load(state.costPath, function, *metadata, sourceRepository,
+                          sourceCommit, architecturePath, *graphId, error,
+                          bootstrapSupportedShapes, expectedWitness)) {
           if (error.empty())
             error = "generated cost catalogue has no bound graph ID";
           error = "generated_cost_catalogue_binding_failed:" + error;
@@ -5588,10 +6174,10 @@ private:
       TaskShapeChoice choice{task.name, task.tripCount, rectangle};
       std::string costError;
       const uint64_t oldHits = activeCostCache ? activeCostCache->hits() : 0;
-      const uint64_t oldMisses = activeCostCache ? activeCostCache->misses() : 0;
-      const TaskShapeCost *cost = activeCostCache
-                                      ? activeCostCache->get(choice, costError)
-                                      : nullptr;
+      const uint64_t oldMisses =
+          activeCostCache ? activeCostCache->misses() : 0;
+      const TaskShapeCost *cost =
+          activeCostCache ? activeCostCache->get(choice, costError) : nullptr;
       if (activeCostCache) {
         costCacheHits += activeCostCache->hits() - oldHits;
         costCacheMisses += activeCostCache->misses() - oldMisses;
@@ -5600,8 +6186,8 @@ private:
         return false;
       if (!cost || !cost->supported) {
         if (cost && cost->modelDomainUnsupported)
-          state.rejectReason = "unsupported_model_domain_shape:" +
-                               cost->unsupportedReason;
+          state.rejectReason =
+              "unsupported_model_domain_shape:" + cost->unsupportedReason;
         else
           state.rejectReason = costError.empty()
                                    ? "unsupported_task_shape_cost"
@@ -5631,14 +6217,14 @@ private:
 
   bool evaluateCandidate(SearchState &state, ModuleOp canonical,
                          StringRef function, StringRef stageName,
-                         StringRef outputDirectory, StringRef candidatesDirectory,
+                         StringRef outputDirectory,
+                         StringRef candidatesDirectory,
                          StringRef canonicalFactKey, bool costCacheLoaded,
-                         TaskShapeCostCache &costCache,
-                         int64_t round, uint64_t &scoredCount,
-                         bool chargeRoundQuota,
+                         TaskShapeCostCache &costCache, int64_t round,
+                         uint64_t &scoredCount, bool chargeRoundQuota,
                          uint64_t serial, std::string &error) {
-    FailureOr<func::FuncOp> selected = selectTaskFunction(
-        state.module.get(), function, error);
+    FailureOr<func::FuncOp> selected =
+        selectTaskFunction(state.module.get(), function, error);
     if (failed(selected))
       return false;
     FailureOr<SmallVector<TaskMetadata>> metadata =
@@ -5668,36 +6254,45 @@ private:
     state.schedule = {};
     TaskShapeCostCache *activeCostCache = nullptr;
     if (state.factKey == canonicalFactKey && costCacheLoaded) {
-      activeCostCache = &costCache; state.costPath = canonicalCostPath;
+      activeCostCache = &costCache;
+      state.costPath = canonicalCostPath;
     } else {
       // Catalogues bind source task names, while candidate dedup uses ordered
       // graph facts. Names can differ across equivalent rewrite paths, so bind
       // the memoization key to the current catalogue task vocabulary as well.
       std::string graphCostKey = state.factKey;
-      for (const auto &task : *metadata) graphCostKey += "|" + task.name;
+      for (const auto &task : *metadata)
+        graphCostKey += "|" + task.name;
       auto cached = graphCostCaches.find(graphCostKey);
       if (cached == graphCostCaches.end()) {
         auto knownPath = graphCostPaths.find(graphCostKey);
-        if (knownPath != graphCostPaths.end()) state.costPath = knownPath->second;
+        if (knownPath != graphCostPaths.end())
+          state.costPath = knownPath->second;
         else {
-          if (!diskGuard(error)) return false;
+          if (!diskGuard(error))
+            return false;
           OwningOpRef<ModuleOp> predictorModule = state.module->clone();
-          auto predictorFunction = selectTaskFunction(*predictorModule, function, error);
-          if (failed(predictorFunction)) return false;
-          const std::string catalogueId = "graph-catalogue-" + std::to_string(graphCostPaths.size());
+          auto predictorFunction =
+              selectTaskFunction(*predictorModule, function, error);
+          if (failed(predictorFunction))
+            return false;
+          const std::string catalogueId =
+              "graph-catalogue-" + std::to_string(graphCostPaths.size());
           bool fatalPredictorFailure = false;
-          if (!runCurrentCostPredictor(*predictorModule, *predictorFunction,
-                  function, catalogueId, outputDirectory, modelPath, cachePath,
-                  checkpointDirectoryForModel(),
-                  effectiveArchitectureContract, architecturePath,
-                  perCgraRows, perCgraCols, sourceRepository, sourceCommit,
-                  architectureTransferCatalog, modelNamespace,
-                  diagnosticIICeiling,
-                  bootstrapSupportedShapes, state.costPath, error,
-                  fatalPredictorFailure)) {
-            if (fatalPredictorFailure || fatalStorageError(error)) return false;
+          if (!runCurrentCostPredictor(
+                  *predictorModule, *predictorFunction, function, catalogueId,
+                  outputDirectory, modelPath, cachePath,
+                  checkpointDirectoryForModel(), effectiveArchitectureContract,
+                  architecturePath, perCgraRows, perCgraCols, sourceRepository,
+                  sourceCommit, architectureTransferCatalog, modelNamespace,
+                  diagnosticIICeiling, bootstrapSupportedShapes, state.costPath,
+                  error, fatalPredictorFailure)) {
+            if (fatalPredictorFailure || fatalStorageError(error))
+              return false;
             state.rejectReason = "current_graph_cost_unknown:" + error;
-            state.scored = false; error.clear(); return true;
+            state.scored = false;
+            error.clear();
+            return true;
           }
           graphCostPaths[graphCostKey] = state.costPath;
         }
@@ -5705,16 +6300,20 @@ private:
         auto oracle = std::make_unique<TaskShapeCostCache>();
         std::string expectedWitness =
             neighborhoodReplaySourceText(state.module.get());
-        if (!graphId || !oracle->load(state.costPath, function, *metadata,
-            sourceRepository, sourceCommit, architecturePath, *graphId, error,
-            bootstrapSupportedShapes, expectedWitness)) {
-          if (error.empty()) error = "generated cost catalogue has no bound graph ID";
+        if (!graphId ||
+            !oracle->load(state.costPath, function, *metadata, sourceRepository,
+                          sourceCommit, architecturePath, *graphId, error,
+                          bootstrapSupportedShapes, expectedWitness)) {
+          if (error.empty())
+            error = "generated cost catalogue has no bound graph ID";
           error = "generated_cost_catalogue_binding_failed:" + error;
-          state.scored = false; return false;
+          state.scored = false;
+          return false;
         }
         cached = graphCostCaches.emplace(graphCostKey, std::move(oracle)).first;
       }
-      state.costPath = graphCostPaths[graphCostKey]; activeCostCache = cached->second.get();
+      state.costPath = graphCostPaths[graphCostKey];
+      activeCostCache = cached->second.get();
     }
 
     std::map<std::string, const NeighborhoodShape *> shapeMap;
@@ -5742,10 +6341,10 @@ private:
       TaskShapeChoice choice{task.name, task.tripCount, rectangle};
       std::string costError;
       const uint64_t oldHits = activeCostCache ? activeCostCache->hits() : 0;
-      const uint64_t oldMisses = activeCostCache ? activeCostCache->misses() : 0;
-      const TaskShapeCost *cost = activeCostCache
-                                      ? activeCostCache->get(choice, costError)
-                                      : nullptr;
+      const uint64_t oldMisses =
+          activeCostCache ? activeCostCache->misses() : 0;
+      const TaskShapeCost *cost =
+          activeCostCache ? activeCostCache->get(choice, costError) : nullptr;
       if (activeCostCache) {
         costCacheHits += activeCostCache->hits() - oldHits;
         costCacheMisses += activeCostCache->misses() - oldMisses;
@@ -5754,8 +6353,8 @@ private:
         return false;
       if (!cost || !cost->supported) {
         if (cost && cost->modelDomainUnsupported)
-          state.rejectReason = "unsupported_model_domain_shape:" +
-                               cost->unsupportedReason;
+          state.rejectReason =
+              "unsupported_model_domain_shape:" + cost->unsupportedReason;
         else
           state.rejectReason = costError.empty()
                                    ? "unsupported_task_shape_cost"
@@ -5807,11 +6406,10 @@ private:
   }
 
   bool registerCandidate(SearchState &state,
-                                std::vector<ArchiveRecord> &archive,
-                                std::set<std::string> &seenKeys,
-                                uint64_t &rejectedCount,
-                                StringRef candidatesDirectory,
-                                std::string &error) {
+                         std::vector<ArchiveRecord> &archive,
+                         std::set<std::string> &seenKeys,
+                         uint64_t &rejectedCount, StringRef candidatesDirectory,
+                         std::string &error) {
     if (!state.scored || state.key.empty()) {
       ++rejectedCount;
       appendRejected(archive, state,
@@ -5848,13 +6446,16 @@ private:
       std::set<std::string> uniqueRoles;
       for (const std::string &role : record.controlRoles)
         if (role.empty() || !uniqueRoles.insert(role).second) {
-          error = "stage control candidate has an empty or duplicate control role";
+          error =
+              "stage control candidate has an empty or duplicate control role";
           return false;
         }
     }
     auto function = selectTaskFunction(state.module.get(), "", error);
-    if (failed(function)) return false;
-    auto graph = (*function)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
+    if (failed(function))
+      return false;
+    auto graph =
+        (*function)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     record.graphId = graph ? graph.getValue().str() : state.id;
     record.score = state.score;
     record.valid = true;
@@ -5871,7 +6472,8 @@ private:
     if (keepModule) {
       std::string candidatePath =
           candidatesDirectory.str() + "/" + state.id + ".mlir";
-      if (!diskGuard(error) || !writeModule(state.module.get(), candidatePath, error))
+      if (!diskGuard(error) ||
+          !writeModule(state.module.get(), candidatePath, error))
         return false;
       record.candidatePath = candidatePath;
     }
@@ -5879,8 +6481,7 @@ private:
       ControlRoleProvenance provenance;
       provenance.candidatePath = record.candidatePath;
       provenance.path = state.path;
-      provenance.actionHistory =
-          portableActionHistory(state.actionHistory);
+      provenance.actionHistory = portableActionHistory(state.actionHistory);
       record.controlRoleProvenance.emplace(role, std::move(provenance));
     }
     const std::vector<size_t> previousPrefix = rankedArchivePrefix;
@@ -5891,32 +6492,37 @@ private:
     for (size_t index : previousPrefix) {
       auto &old = archive[index];
       if (old.control || old.candidatePath.empty() ||
-          llvm::is_contained(rankedArchivePrefix, index)) continue;
-      obsoleteCandidatePaths.push_back(old.candidatePath); old.candidatePath.clear();
+          llvm::is_contained(rankedArchivePrefix, index))
+        continue;
+      obsoleteCandidatePaths.push_back(old.candidatePath);
+      old.candidatePath.clear();
       dirtyJournalIndices.insert(index);
     }
     return true;
   }
 
   void insertRankedArchiveIndex(size_t index,
-                               const std::vector<ArchiveRecord> &archive) {
-    auto position = std::lower_bound(
-        rankedArchivePrefix.begin(), rankedArchivePrefix.end(), index,
-        [&](size_t left, size_t right) {
-          return archiveLess(archive[left], archive[right]);
-        });
+                                const std::vector<ArchiveRecord> &archive) {
+    auto position =
+        std::lower_bound(rankedArchivePrefix.begin(), rankedArchivePrefix.end(),
+                         index, [&](size_t left, size_t right) {
+                           return archiveLess(archive[left], archive[right]);
+                         });
     rankedArchivePrefix.insert(position, index);
-    if (rankedArchivePrefix.size() > 5) rankedArchivePrefix.pop_back();
+    if (rankedArchivePrefix.size() > 5)
+      rankedArchivePrefix.pop_back();
   }
 
   bool retainCanonicalBeam(std::vector<SearchState> &beam,
                            ArrayRef<ArchiveRecord> archive,
                            std::string &error) {
-    if ((decisionFlow == "sequential" || decisionFlow == "alternating") && activePhase == "B") return true;
+    if ((decisionFlow == "sequential" || decisionFlow == "alternating") &&
+        activePhase == "B")
+      return true;
     const ArchiveRecord *identity = nullptr;
     for (const auto &record : archive)
-      if (record.valid && llvm::is_contained(record.controlRoles,
-                                            std::string("identity"))) {
+      if (record.valid &&
+          llvm::is_contained(record.controlRoles, std::string("identity"))) {
         identity = &record;
         break;
       }
@@ -5925,37 +6531,49 @@ private:
       return false;
     }
     for (const auto &state : beam)
-      if (state.key == identity->key) return true;
+      if (state.key == identity->key)
+        return true;
     SearchState state;
-    state.module = parseSourceFile<ModuleOp>(identity->candidatePath, &getContext());
+    state.module =
+        parseSourceFile<ModuleOp>(identity->candidatePath, &getContext());
     if (!state.module) {
       error = "canonical identity source snapshot no longer parses";
       return false;
     }
-    state.id = identity->id; state.key = identity->key;
-    state.factKey = identity->factKey; state.parentId = identity->parentId;
-    state.path = identity->path; state.shapes = identity->shapes;
+    state.id = identity->id;
+    state.key = identity->key;
+    state.factKey = identity->factKey;
+    state.parentId = identity->parentId;
+    state.path = identity->path;
+    state.shapes = identity->shapes;
     state.actionHistory = portableActionHistory(identity->actionHistory);
-    state.choices = identity->choices; state.durations = identity->durations;
-    state.costs = identity->costs; state.schedule = identity->schedule;
-    state.costPath = identity->costPath; state.score = identity->score;
-    state.control = identity->control; state.controlRoles = identity->controlRoles;
-    state.keyReserved = true; state.scored = true;
+    state.choices = identity->choices;
+    state.durations = identity->durations;
+    state.costs = identity->costs;
+    state.schedule = identity->schedule;
+    state.costPath = identity->costPath;
+    state.score = identity->score;
+    state.control = identity->control;
+    state.controlRoles = identity->controlRoles;
+    state.keyReserved = true;
+    state.scored = true;
     // The cost-selected prefix has width-diversity entries. When the beam is
     // full its last entry belongs to the diversity suffix, so reserving this
     // slot never evicts one of the twelve cost-selected candidates. The
     // identity is cloned from its archive witness without another score or
     // budget debit, and can replace or withdraw every historical decision.
-    if (beam.size() >= static_cast<size_t>(beamWidth.getValue())) beam.pop_back();
+    if (beam.size() >= static_cast<size_t>(beamWidth.getValue()))
+      beam.pop_back();
     beam.push_back(std::move(state));
     return true;
   }
 
-  static std::vector<SearchState> selectBeam(std::vector<SearchState> candidates,
-                                             int64_t width,
-                                             int64_t diversity) {
-    return orbit::taskflow::selectSearchBeam(std::move(candidates), width, diversity,
-        stateLess, [](const SearchState &s) { return s.scored; },
+  static std::vector<SearchState>
+  selectBeam(std::vector<SearchState> candidates, int64_t width,
+             int64_t diversity) {
+    return orbit::taskflow::selectSearchBeam(
+        std::move(candidates), width, diversity, stateLess,
+        [](const SearchState &s) { return s.scored; },
         [](const SearchState &s) { return s.key; },
         [](const SearchState &s) {
           return (s.path.empty() ? std::string("identity") : s.path.back()) +
@@ -5964,39 +6582,44 @@ private:
   }
 
   static int stageNumber(StringRef value) {
-    if (value == "S1" || value == "s1" || value == "shape-only" || value == "shape") return 1;
-    if (value == "S2" || value == "s2" || value == "shape-temporal") return 2;
-    if (value == "S3" || value == "s3" || value == "shape-temporal-replica") return 3;
-    if (value == "S4" || value == "s4" || value == "shape-temporal-replica-tiling") return 4;
-    if (value == "S5" || value == "s5" || value == "full-joint") return 5;
+    if (value == "S1" || value == "s1" || value == "shape-only" ||
+        value == "shape")
+      return 1;
+    if (value == "S2" || value == "s2" || value == "shape-temporal")
+      return 2;
+    if (value == "S3" || value == "s3" || value == "shape-temporal-replica")
+      return 3;
+    if (value == "S4" || value == "s4" ||
+        value == "shape-temporal-replica-tiling")
+      return 4;
+    if (value == "S5" || value == "s5" || value == "full-joint")
+      return 5;
     if (value == "S6" || value == "s6" || value == "full-joint-fission" ||
-        value == "shape-temporal-replica-tiling-fusion-fission") return 6;
+        value == "shape-temporal-replica-tiling-fusion-fission")
+      return 6;
     return 0;
   }
 
-  static bool hasCompleteSharedReplicaOutputRegion(
-      Operation *operation) {
+  static bool hasCompleteSharedReplicaOutputRegion(Operation *operation) {
     auto task = dyn_cast<taskflow::TaskflowTaskOp>(operation);
     if (!task)
       return false;
-    auto parent = task->getAttrOfType<StringAttr>(
-        "amoeba.replica.parent_task");
+    auto parent = task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
     auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
     auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
-    auto lowers = task->getAttrOfType<ArrayAttr>(
-        "amoeba.tiling.output_region_lowers");
-    auto uppers = task->getAttrOfType<ArrayAttr>(
-        "amoeba.tiling.output_region_uppers");
+    auto lowers =
+        task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_lowers");
+    auto uppers =
+        task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_uppers");
     return parent && !parent.getValue().empty() && id && count &&
            id.getInt() >= 0 && count.getInt() > 1 &&
            id.getInt() < count.getInt() && lowers && uppers &&
            !lowers.empty() && lowers.size() == uppers.size();
   }
 
-  static bool validateStageSeed(
-      ModuleOp module, StringRef stageName,
-      bool sourceDomainWillAuthenticateReplicaRegions,
-      std::string &error) {
+  static bool validateStageSeed(ModuleOp module, StringRef stageName,
+                                bool sourceDomainWillAuthenticateReplicaRegions,
+                                std::string &error) {
     const int number = stageNumber(stageName);
     bool valid = number != 0;
     module.walk([&](Operation *operation) {
@@ -6011,12 +6634,12 @@ private:
             (number < 6 && name.starts_with("amoeba.fission.")) ||
             (number < 3 && name.starts_with("amoeba.replica.")) ||
             (number < 4 && (name.starts_with("amoeba.neura.tiling.") ||
-                           (name.starts_with("amoeba.tiling.") &&
-                            !sharedReplicaOutputRegion) ||
-                           name.starts_with("amoeba.semantic.k_block") ||
-                           name == "amoeba.semantic.K_range")) ||
+                            (name.starts_with("amoeba.tiling.") &&
+                             !sharedReplicaOutputRegion) ||
+                            name.starts_with("amoeba.semantic.k_block") ||
+                            name == "amoeba.semantic.K_range")) ||
             (number < 5 && (name.starts_with("amoeba.neura.fusion.") ||
-                           name.starts_with("amoeba.fusion.")));
+                            name.starts_with("amoeba.fusion.")));
         if (outsideStage) {
           valid = false;
           if (error.empty()) {
@@ -6024,11 +6647,11 @@ private:
                 (name == "amoeba.tiling.output_region_lowers" ||
                  name == "amoeba.tiling.output_region_uppers") &&
                 !hasCompleteSharedReplicaOutputRegion(operation))
-              error = "replica output-region annotation lacks complete parent/id/count metadata";
+              error = "replica output-region annotation lacks complete "
+                      "parent/id/count metadata";
             else
               error = "seed contains forbidden rewrite annotation " +
-                      name.str() + " for cumulative stage " +
-                      stageName.str();
+                      name.str() + " for cumulative stage " + stageName.str();
           }
         }
       }
@@ -6043,30 +6666,38 @@ private:
     auto bind = [&](StringRef role, StringRef path, bool optional = false,
                     std::string *boundBytes = nullptr) {
       std::string bytes;
-      if (!readFileBytes(path, bytes, error, optional)) return false;
+      if (!readFileBytes(path, bytes, error, optional))
+        return false;
       if (boundBytes)
         *boundBytes = bytes;
-      files[role] = json::Object{{"path", path}, {"exact_bytes", std::move(bytes)}};
+      files[role] =
+          json::Object{{"path", path}, {"exact_bytes", std::move(bytes)}};
       return true;
     };
-    if (!bind("finite_domain", finiteDomainFile, true)) return false;
-    if (!bind("protocol", protocolFile) || !bind("source_and_model_contract", sourceContractFile) ||
-        !bind("architecture", architecturePath) || !bind("ensemble", modelPath, true) ||
+    if (!bind("finite_domain", finiteDomainFile, true))
+      return false;
+    if (!bind("protocol", protocolFile) ||
+        !bind("source_and_model_contract", sourceContractFile) ||
+        !bind("architecture", architecturePath) ||
+        !bind("ensemble", modelPath, true) ||
         !bind("parent_costs", parentCostFile, true) ||
         !bind("architecture_transfer", architectureTransferCatalog, true) ||
-        !bind("seed_manifest", seedManifest, true) || !bind("previous_winner", previousWinner, true)) return false;
+        !bind("seed_manifest", seedManifest, true) ||
+        !bind("previous_winner", previousWinner, true))
+      return false;
     if (stageNumber(stage) == 6) {
       std::string currentPreparedSourceBytes;
       if (!readFileBytes(preparedSourceFile, currentPreparedSourceBytes,
                          error) ||
           currentPreparedSourceBytes != preparedTaskflowSourceBytes) {
         if (error.empty())
-          error = "prepared source bytes changed after canonical authentication";
+          error =
+              "prepared source bytes changed after canonical authentication";
         return false;
       }
-      files["prepared_taskflow_source"] = json::Object{
-          {"path", preparedSourceFile.getValue()},
-          {"exact_bytes", preparedTaskflowSourceBytes}};
+      files["prepared_taskflow_source"] =
+          json::Object{{"path", preparedSourceFile.getValue()},
+                       {"exact_bytes", preparedTaskflowSourceBytes}};
     }
     if (!historicalNativeWinner.empty() &&
         !bind("historical_native_winner", historicalNativeWinner,
@@ -6074,19 +6705,26 @@ private:
       return false;
     auto protocolBytes = files.getObject("protocol")->getString("exact_bytes");
     auto value = json::parse(*protocolBytes);
-    if (!value) { llvm::consumeError(value.takeError()); error = "bound protocol is not JSON"; return false; }
+    if (!value) {
+      llvm::consumeError(value.takeError());
+      error = "bound protocol is not JSON";
+      return false;
+    }
     auto object = value->getAsObject();
     auto search = object ? object->getObject("search") : nullptr;
     std::optional<StringRef> supportedShapeBootstrapPolicy =
         search ? search->getString("supported_shape_bootstrap_policy")
                : std::nullopt;
     if (!search || search->getInteger("max_rounds") != maxRounds.getValue() ||
-        search->getInteger("max_unique_complete_candidates_scored") != maxCandidates.getValue() ||
+        search->getInteger("max_unique_complete_candidates_scored") !=
+            maxCandidates.getValue() ||
         search->getInteger("beam_width") != beamWidth.getValue() ||
-        search->getInteger("diversity_min_slots") != diversitySlots.getValue() ||
+        search->getInteger("diversity_min_slots") !=
+            diversitySlots.getValue() ||
         search->getInteger("max_partition_factor").value_or(4) !=
             maxPartitionFactor.getValue()) {
-      error = "search budgets do not match the bound common protocol"; return false;
+      error = "search budgets do not match the bound common protocol";
+      return false;
     }
     std::optional<int64_t> protocolDiagnosticIICeiling =
         search->getInteger("diagnostic_ii_ceiling");
@@ -6117,47 +6755,62 @@ private:
               "policy";
       return false;
     }
-    if (search->getInteger("round_quota_scale").value_or(1) != roundQuotaScale.getValue() ||
-        search->getString("feature_policy").value_or("all") != featurePolicy.getValue() ||
-        search->getString("shape_enumeration_order").value_or("ascending") != shapeEnumerationOrder.getValue()) {
-      error = "search feature/order/quota options differ from bound protocol"; return false;
+    if (search->getInteger("round_quota_scale").value_or(1) !=
+            roundQuotaScale.getValue() ||
+        search->getString("feature_policy").value_or("all") !=
+            featurePolicy.getValue() ||
+        search->getString("shape_enumeration_order").value_or("ascending") !=
+            shapeEnumerationOrder.getValue()) {
+      error = "search feature/order/quota options differ from bound protocol";
+      return false;
     }
     const auto protocolParentProgress = search->getBoolean("parent_progress");
     if (search->get("parent_progress") && !protocolParentProgress) {
-      error = "bound parent_progress must be a boolean"; return false;
+      error = "bound parent_progress must be a boolean";
+      return false;
     }
-    for (const auto &mode : {
-             std::pair<StringRef, StringRef>{"target_coverage", "target_coverage_policy"},
-             std::pair<StringRef, StringRef>{"diagnostic_incumbent", "diagnostic_incumbent_policy"}}) {
+    for (const auto &mode :
+         {std::pair<StringRef, StringRef>{"target_coverage",
+                                          "target_coverage_policy"},
+          std::pair<StringRef, StringRef>{"diagnostic_incumbent",
+                                          "diagnostic_incumbent_policy"}}) {
       const auto enabled = search->getBoolean(mode.first);
       if ((search->get(mode.first) && (!enabled || *enabled)) ||
           search->get(mode.second)) {
-        error = "parent progress source cannot enable or bind coverage/incumbent policies";
+        error = "parent progress source cannot enable or bind "
+                "coverage/incumbent policies";
         return false;
       }
     }
-    if ((parentProgress &&
-         (search->getBoolean("parent_progress") != true ||
-          search->getString("parent_progress_policy") != kParentProgressPolicy)) ||
-        (!parentProgress &&
-         (protocolParentProgress.value_or(false) ||
-          search->get("parent_progress_policy")))) {
-      error = "parent progress differs from the bound protocol"; return false;
+    if ((parentProgress && (search->getBoolean("parent_progress") != true ||
+                            search->getString("parent_progress_policy") !=
+                                kParentProgressPolicy)) ||
+        (!parentProgress && (protocolParentProgress.value_or(false) ||
+                             search->get("parent_progress_policy")))) {
+      error = "parent progress differs from the bound protocol";
+      return false;
     }
     json::Object objectBinding{
         {"schema", "orbit-neighborhood-exact-binding-v1"},
-        {"decision_flow",decisionFlow.getValue()}, {"graph_budget_percent",graphBudgetPercent.getValue()},
-        {"fair_pending_retention",fairPendingRetention.getValue()},
-        {"round_quota_scale",roundQuotaScale.getValue()}, {"feature_policy",featurePolicy.getValue()},
-        {"shape_enumeration_order",shapeEnumerationOrder.getValue()},
+        {"decision_flow", decisionFlow.getValue()},
+        {"graph_budget_percent", graphBudgetPercent.getValue()},
+        {"fair_pending_retention", fairPendingRetention.getValue()},
+        {"round_quota_scale", roundQuotaScale.getValue()},
+        {"feature_policy", featurePolicy.getValue()},
+        {"shape_enumeration_order", shapeEnumerationOrder.getValue()},
         {"canonical_ir", neighborhoodReplaySourceText(canonical)},
-        {"files", std::move(files)}, {"function", functionName.getValue()},
-        {"stage", stage.getValue()}, {"source_repository", sourceRepository.getValue()},
-        {"source_commit", sourceCommit.getValue()}, {"model_namespace", modelNamespace.getValue()},
+        {"files", std::move(files)},
+        {"function", functionName.getValue()},
+        {"stage", stage.getValue()},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"model_namespace", modelNamespace.getValue()},
         {"cache_path", cachePath.getValue()},
         {"architecture_contract", effectiveArchitectureContract},
-        {"max_rounds", maxRounds.getValue()}, {"max_candidates", maxCandidates.getValue()},
-        {"beam_width", beamWidth.getValue()}, {"diversity_slots", diversitySlots.getValue()},
+        {"max_rounds", maxRounds.getValue()},
+        {"max_candidates", maxCandidates.getValue()},
+        {"beam_width", beamWidth.getValue()},
+        {"diversity_slots", diversitySlots.getValue()},
         {"scoring_workers", scoringWorkers.getValue()},
         {"max_partition_factor", maxPartitionFactor.getValue()},
         {"tie_key_policy", "cost-numeric-shape-schedule-graph-key-v1"},
@@ -6192,8 +6845,8 @@ private:
     // without its path so identical network documents share the same search
     // continuation identity even when staged at different locations.
     if (interTaskNetworkSpecOverrideBytes)
-      objectBinding["inter_task_network_spec_override"] = json::Object{
-          {"exact_bytes", *interTaskNetworkSpecOverrideBytes}};
+      objectBinding["inter_task_network_spec_override"] =
+          json::Object{{"exact_bytes", *interTaskNetworkSpecOverrideBytes}};
     if (bootstrapSupportedShapes) {
       objectBinding["bootstrap_supported_shapes"] = true;
       objectBinding["supported_shape_bootstrap_policy"] =
@@ -6218,18 +6871,20 @@ private:
       requiredControlRoles.push_back("historical_measured_winner");
       objectBinding["historical_native_winner_option"] =
           historicalNativeWinner.getValue();
-      objectBinding["required_control_roles"] =
-          std::move(requiredControlRoles);
+      objectBinding["required_control_roles"] = std::move(requiredControlRoles);
     }
     text = jsonText(json::Value(std::move(objectBinding))) + "\n";
     return true;
   }
 
   static json::Object directionalConstants() {
-    return json::Object{{"directions_per_parent", int64_t(kDirectionalCount)},
+    return json::Object{
+        {"directions_per_parent", int64_t(kDirectionalCount)},
         {"parameters_per_direction", int64_t(kDirectionalParameters)},
-        {"cost_tier_width", 4}, {"preferred_numerator", 3},
-        {"preferred_denominator", 4}, {"occupancy_zero_streak_cap", 2},
+        {"cost_tier_width", 4},
+        {"preferred_numerator", 3},
+        {"preferred_denominator", 4},
+        {"occupancy_zero_streak_cap", 2},
         {"communication_zero_streak_cap", 2},
         {"critical_predecessor_band_denominator", 8},
         {"guided_duplicate_shape_window", 1},
@@ -6243,7 +6898,8 @@ private:
 
   bool validateDirectionalProtocol(std::string &error) {
     std::string bytes;
-    if (!readFileBytes(protocolFile, bytes, error)) return false;
+    if (!readFileBytes(protocolFile, bytes, error))
+      return false;
     auto value = json::parse(bytes);
     if (!value) {
       error = "directional protocol JSON: " + llvm::toString(value.takeError());
@@ -6253,15 +6909,17 @@ private:
     const auto *search = root ? root->getObject("search") : nullptr;
     const auto *flag = search ? search->get("directional_search") : nullptr;
     if ((flag && !flag->getAsBoolean()) ||
-        (directionalSearch && (!search || search->getBoolean("directional_search") != true ||
+        (directionalSearch &&
+         (!search || search->getBoolean("directional_search") != true ||
           search->getString("directional_policy") != kDirectionalPolicy ||
           root->getBoolean("paper_admission") != false ||
           search->getBoolean("paper_admission") != false ||
           search->getBoolean("parent_progress") != true)) ||
         (!directionalSearch && search &&
-          (search->getBoolean("directional_search") == true ||
-           search->get("directional_policy")))) {
-      error = "directional-search option/protocol mismatch or diagnostic paper exclusion absent";
+         (search->getBoolean("directional_search") == true ||
+          search->get("directional_policy")))) {
+      error = "directional-search option/protocol mismatch or diagnostic paper "
+              "exclusion absent";
       return false;
     }
     return true;
@@ -6273,12 +6931,16 @@ private:
     directionalEvents.push_back(jsonText(json::Value(std::move(event))));
   }
 
-  static std::set<std::string> directionalFootprint(const NeighborhoodAction &action) {
+  static std::set<std::string>
+  directionalFootprint(const NeighborhoodAction &action) {
     std::set<std::string> names;
-    if (!action.shapeTask.empty()) names.insert(action.shapeTask);
+    if (!action.shapeTask.empty())
+      names.insert(action.shapeTask);
     for (const auto &primitive : action.primitives) {
-      if (!primitive.firstTask.empty()) names.insert(primitive.firstTask);
-      if (!primitive.secondTask.empty()) names.insert(primitive.secondTask);
+      if (!primitive.firstTask.empty())
+        names.insert(primitive.firstTask);
+      if (!primitive.secondTask.empty())
+        names.insert(primitive.secondTask);
     }
     return names;
   }
@@ -6289,7 +6951,8 @@ private:
   }
 
   std::map<std::string, DirectionalTaskObservation> observeDirectionalState(
-      const SearchState &parent, std::map<std::pair<std::string, std::string>, uint64_t> &payloads,
+      const SearchState &parent,
+      std::map<std::pair<std::string, std::string>, uint64_t> &payloads,
       bool &graphKnown, std::string &failure) {
     std::map<std::string, DirectionalTaskObservation> tasks;
     graphKnown = false;
@@ -6297,21 +6960,31 @@ private:
       const auto &choice = parent.choices[i];
       auto &task = tasks[choice.task];
       task.task = choice.task;
-      task.rows = choice.shape.rows; task.cols = choice.shape.cols;
-      if (i < parent.durations.size()) task.duration = parent.durations[i];
+      task.rows = choice.shape.rows;
+      task.cols = choice.shape.cols;
+      if (i < parent.durations.size())
+        task.duration = parent.durations[i];
     }
     for (const auto &placement : parent.schedule.placements) {
-      if (placement.task >= parent.choices.size()) { failure = "placement_index_unknown"; return tasks; }
+      if (placement.task >= parent.choices.size()) {
+        failure = "placement_index_unknown";
+        return tasks;
+      }
       auto &task = tasks[parent.choices[placement.task].task];
-      task.row = placement.row; task.col = placement.col;
-      task.start = placement.start; task.end = placement.end;
+      task.row = placement.row;
+      task.col = placement.col;
+      task.start = placement.start;
+      task.end = placement.end;
       task.terminal = placement.end == parent.schedule.makespan;
     }
-    auto function = selectTaskFunction(parent.module.get(), functionName, failure);
-    if (failed(function)) return tasks;
+    auto function =
+        selectTaskFunction(parent.module.get(), functionName, failure);
+    if (failed(function))
+      return tasks;
     TaskEdgeGraphOptions options;
     auto graph = buildTaskEdgeGraph(*function, options, failure);
-    if (failed(graph)) return tasks;
+    if (failed(graph))
+      return tasks;
     std::map<std::string, std::set<std::string>> predecessors;
     for (const TaskEdge &edge : graph->getEdges()) {
       auto producerOp = edge.producer;
@@ -6319,66 +6992,98 @@ private:
       const std::string producer = producerOp.getTaskName().str();
       const std::string consumer = consumerOp.getTaskName().str();
       if (!tasks.count(producer) || !tasks.count(consumer)) {
-        failure = "typed_edge_task_not_in_scored_choices"; return tasks;
+        failure = "typed_edge_task_not_in_scored_choices";
+        return tasks;
       }
       predecessors[consumer].insert(producer);
-      auto &source = tasks[producer]; auto &dest = tasks[consumer];
+      auto &source = tasks[producer];
+      auto &dest = tasks[consumer];
       dest.predecessorFinish = std::max(dest.predecessorFinish, source.end);
       if (edge.origin != TaskEdgeOrigin::Taskflow ||
-          (edge.kind != TaskEdgeKind::Value && edge.kind != TaskEdgeKind::Raw)) continue;
-      if (!edge.payload_bits) { ++source.unknownPayloads; ++dest.unknownPayloads; continue; }
+          (edge.kind != TaskEdgeKind::Value && edge.kind != TaskEdgeKind::Raw))
+        continue;
+      if (!edge.payload_bits) {
+        ++source.unknownPayloads;
+        ++dest.unknownPayloads;
+        continue;
+      }
       const uint64_t bits = *edge.payload_bits;
       auto saturate = [](uint64_t a, uint64_t b) {
         return b > std::numeric_limits<uint64_t>::max() - a
-            ? std::numeric_limits<uint64_t>::max() : a + b;
+                   ? std::numeric_limits<uint64_t>::max()
+                   : a + b;
       };
       source.payloadBits = saturate(source.payloadBits, bits);
       dest.payloadBits = saturate(dest.payloadBits, bits);
-      auto &pair = payloads[{producer, consumer}]; pair = saturate(pair, bits);
+      auto &pair = payloads[{producer, consumer}];
+      pair = saturate(pair, bits);
     }
     // Include nearby parallel predecessors in the observed critical-chain
     // proxy. A one-eighth-duration band limits exploration to branches that
     // can become critical after a modest resource or communication change.
     // Network reservations remain absent; these flags are heuristic only.
-    for (const auto &[name, observation] : tasks) if (observation.terminal) {
-      std::vector<std::string> worklist{name}; std::set<std::string> visited;
-      while (!worklist.empty()) {
-        std::string current = worklist.back(); worklist.pop_back();
-        if (!visited.insert(current).second) continue;
-        tasks[current].criticalChainProxy = true;
-        std::string latestName; int64_t latest = -1;
-        for (const std::string &candidate : predecessors[current])
-          if (tasks[candidate].end > latest ||
-              (tasks[candidate].end == latest && (latestName.empty() || candidate < latestName))) {
-            latestName = candidate; latest = tasks[candidate].end;
-          }
-        if (latestName.empty()) continue;
-        const int64_t band = std::max<int64_t>(1, tasks[latestName].duration / 8);
-        for (const std::string &candidate : predecessors[current])
-          if (latest - tasks[candidate].end <= band) worklist.push_back(candidate);
+    for (const auto &[name, observation] : tasks)
+      if (observation.terminal) {
+        std::vector<std::string> worklist{name};
+        std::set<std::string> visited;
+        while (!worklist.empty()) {
+          std::string current = worklist.back();
+          worklist.pop_back();
+          if (!visited.insert(current).second)
+            continue;
+          tasks[current].criticalChainProxy = true;
+          std::string latestName;
+          int64_t latest = -1;
+          for (const std::string &candidate : predecessors[current])
+            if (tasks[candidate].end > latest ||
+                (tasks[candidate].end == latest &&
+                 (latestName.empty() || candidate < latestName))) {
+              latestName = candidate;
+              latest = tasks[candidate].end;
+            }
+          if (latestName.empty())
+            continue;
+          const int64_t band =
+              std::max<int64_t>(1, tasks[latestName].duration / 8);
+          for (const std::string &candidate : predecessors[current])
+            if (latest - tasks[candidate].end <= band)
+              worklist.push_back(candidate);
+        }
       }
-    }
     for (auto &[name, task] : tasks) {
-      task.readinessGapProxy = std::max<int64_t>(0, task.start - task.predecessorFinish);
+      task.readinessGapProxy =
+          std::max<int64_t>(0, task.start - task.predecessorFinish);
       for (const auto &[otherName, other] : tasks) {
         if (name == otherName || task.row >= other.row + other.rows ||
-            other.row >= task.row + task.rows || task.col >= other.col + other.cols ||
-            other.col >= task.col + task.cols) continue;
+            other.row >= task.row + task.rows ||
+            task.col >= other.col + other.cols ||
+            other.col >= task.col + task.cols)
+          continue;
         // An observed rectangle was occupied during part of this gap. This is
         // not proof that its occupation caused the production start time.
-        task.occupiedGapProxy = std::max(task.occupiedGapProxy,
-            std::max<int64_t>(0, std::min(task.start, other.end) -
-                                  std::max(task.predecessorFinish, other.start)));
+        task.occupiedGapProxy =
+            std::max(task.occupiedGapProxy,
+                     std::max<int64_t>(
+                         0, std::min(task.start, other.end) -
+                                std::max(task.predecessorFinish, other.start)));
       }
     }
     graphKnown = true;
     return tasks;
   }
 
-  static json::Object directionalObservationObject(const DirectionalTaskObservation &task) {
-    return json::Object{{"task", task.task}, {"duration_cycles", task.duration},
-        {"rows", task.rows}, {"cols", task.cols}, {"row", task.row}, {"col", task.col},
-        {"start", task.start}, {"end", task.end}, {"terminal_critical", task.terminal},
+  static json::Object
+  directionalObservationObject(const DirectionalTaskObservation &task) {
+    return json::Object{
+        {"task", task.task},
+        {"duration_cycles", task.duration},
+        {"rows", task.rows},
+        {"cols", task.cols},
+        {"row", task.row},
+        {"col", task.col},
+        {"start", task.start},
+        {"end", task.end},
+        {"terminal_critical", task.terminal},
         {"critical_chain_proxy", task.criticalChainProxy},
         {"predecessor_finish", task.predecessorFinish},
         {"readiness_gap_proxy", task.readinessGapProxy},
@@ -6392,12 +7097,15 @@ private:
       const std::map<std::string, DirectionalTaskObservation> &tasks) {
     if (action.family == "shape") {
       auto found = tasks.find(action.shapeTask);
-      if (found == tasks.end()) return 1e9;
+      if (found == tasks.end())
+        return 1e9;
       const auto &task = found->second;
-      const int64_t delta = action.shapeRows * action.shapeCols - task.rows * task.cols;
+      const int64_t delta =
+          action.shapeRows * action.shapeCols - task.rows * task.cols;
       const int64_t distance = std::abs(action.shapeRows - task.rows) +
                                std::abs(action.shapeCols - task.cols);
-      if (distance == 0) return 1e8; // Leave identity in the ordinary suffix.
+      if (distance == 0)
+        return 1e8; // Leave identity in the ordinary suffix.
       // Adjacent rectangle edges first; area reductions remain available.
       return (delta < 0 ? 100.0 : 0.0) + distance;
     }
@@ -6407,53 +7115,82 @@ private:
     return penalty;
   }
 
-  std::map<std::string, int64_t> remainingShapeComputeOpportunity(
-      const SearchState &parent, ArrayRef<PendingNeighbor> pending,
-      uint64_t parentIndex, bool &known) {
+  std::map<std::string, int64_t>
+  remainingShapeComputeOpportunity(const SearchState &parent,
+                                   ArrayRef<PendingNeighbor> pending,
+                                   uint64_t parentIndex, bool &known) {
     // Only inspect the complete, already generated catalogue. This neither
     // invokes the predictor nor scores a whole-program candidate.
     std::map<std::string, int64_t> gains;
     known = false;
     auto buffer = llvm::MemoryBuffer::getFile(parent.costPath);
-    if (!buffer) return gains;
+    if (!buffer)
+      return gains;
     auto parsed = json::parse((*buffer)->getBuffer());
-    if (!parsed) { llvm::consumeError(parsed.takeError()); return gains; }
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return gains;
+    }
     const auto *root = parsed->getAsObject();
     const auto *entries = root ? root->getArray("entries") : nullptr;
-    if (!entries) return gains;
+    if (!entries)
+      return gains;
     std::map<CostQueryKey, TaskShapeCost> catalogue;
     for (const auto &value : *entries) {
-      const auto *entry = value.getAsObject(); if (!entry) continue;
+      const auto *entry = value.getAsObject();
+      if (!entry)
+        continue;
       auto name = entry->getString("task");
-      auto rows = entry->getInteger("mapper_tile_rows"), cols = entry->getInteger("mapper_tile_cols");
-      auto ii = entry->getNumber("predicted_ii"), startup = entry->getNumber("startup_cycles");
+      auto rows = entry->getInteger("mapper_tile_rows"),
+           cols = entry->getInteger("mapper_tile_cols");
+      auto ii = entry->getNumber("predicted_ii"),
+           startup = entry->getNumber("startup_cycles");
       if (!name || !rows || !cols || !ii || !startup ||
-          entry->getString("support_status") != "supported" || !std::isfinite(*ii) ||
-          !std::isfinite(*startup) || *ii <= 0 || *ii > diagnosticIICeiling || *startup < 0) continue;
-      TaskShapeCost cost; cost.supported = true; cost.predictedII = *ii; cost.startupCycles = *startup;
+          entry->getString("support_status") != "supported" ||
+          !std::isfinite(*ii) || !std::isfinite(*startup) || *ii <= 0 ||
+          *ii > diagnosticIICeiling || *startup < 0)
+        continue;
+      TaskShapeCost cost;
+      cost.supported = true;
+      cost.predictedII = *ii;
+      cost.startupCycles = *startup;
       catalogue[{name->str(), *rows, *cols}] = cost;
     }
     known = true;
-    for (const auto &choice : parent.choices) gains[choice.task] = 0;
+    for (const auto &choice : parent.choices)
+      gains[choice.task] = 0;
     for (const auto &neighbor : pending) {
-      if (neighbor.parent != parentIndex || neighbor.action.family != "shape") continue;
+      if (neighbor.parent != parentIndex || neighbor.action.family != "shape")
+        continue;
       const auto &action = neighbor.action;
-      auto choice = llvm::find_if(parent.choices, [&](const TaskShapeChoice &c) { return c.task == action.shapeTask; });
-      if (choice == parent.choices.end()) continue;
+      auto choice =
+          llvm::find_if(parent.choices, [&](const TaskShapeChoice &c) {
+            return c.task == action.shapeTask;
+          });
+      if (choice == parent.choices.end())
+        continue;
       int64_t rows = 0, cols = 0;
-      if (!cgraShapeToMapperTileShape(action.shapeRows, action.shapeCols, perCgraRows, perCgraCols, rows, cols)) continue;
-      auto cost = catalogue.find({choice->task, rows, cols}); if (cost == catalogue.end()) continue;
-      std::string error; auto duration = durationFromCost(cost->second, choice->tripCount, error);
+      if (!cgraShapeToMapperTileShape(action.shapeRows, action.shapeCols,
+                                      perCgraRows, perCgraCols, rows, cols))
+        continue;
+      auto cost = catalogue.find({choice->task, rows, cols});
+      if (cost == catalogue.end())
+        continue;
+      std::string error;
+      auto duration = durationFromCost(cost->second, choice->tripCount, error);
       auto index = std::distance(parent.choices.begin(), choice);
-      if (!duration || static_cast<size_t>(index) >= parent.durations.size()) continue;
-      gains[choice->task] = std::max(gains[choice->task], std::max<int64_t>(0, parent.durations[index] - *duration));
+      if (!duration || static_cast<size_t>(index) >= parent.durations.size())
+        continue;
+      gains[choice->task] =
+          std::max(gains[choice->task],
+                   std::max<int64_t>(0, parent.durations[index] - *duration));
     }
     return gains;
   }
 
   void prepareDirectionalRound(ArrayRef<SearchState> beam,
-      ArrayRef<PendingNeighbor> pending, int64_t round,
-      uint64_t scoredCount, uint64_t limit) {
+                               ArrayRef<PendingNeighbor> pending, int64_t round,
+                               uint64_t scoredCount, uint64_t limit) {
     parentDirections.clear();
     directionalRoundOriginal = directionalRoundPreferred = 0;
     // Streak/cap fallback persists across refresh until an actual original
@@ -6463,10 +7200,13 @@ private:
     for (auto indexed : llvm::enumerate(beam)) {
       const SearchState &parent = indexed.value();
       std::map<std::pair<std::string, std::string>, uint64_t> payloads;
-      bool graphKnown; std::string failure;
-      auto tasks = observeDirectionalState(parent, payloads, graphKnown, failure);
+      bool graphKnown;
+      std::string failure;
+      auto tasks =
+          observeDirectionalState(parent, payloads, graphKnown, failure);
       bool shapeCatalogueKnown;
-      auto shapeGains = remainingShapeComputeOpportunity(parent, pending, indexed.index(), shapeCatalogueKnown);
+      auto shapeGains = remainingShapeComputeOpportunity(
+          parent, pending, indexed.index(), shapeCatalogueKnown);
       // Separate categories have separate units. Their scores are compared
       // only within the category, never by adding payload bits to cycles.
       struct Group {
@@ -6477,155 +7217,263 @@ private:
       };
       std::map<std::tuple<std::string, std::string, std::string>, Group> groups;
       for (const PendingNeighbor &neighbor : pending) {
-        if (neighbor.parent != indexed.index()) continue;
+        if (neighbor.parent != indexed.index())
+          continue;
         const NeighborhoodAction &action = neighbor.action;
         auto footprint = directionalFootprint(action);
-        double compute = 0, occupancy = 0, payload = 0, criticalIncidentPayload = 0;
+        double compute = 0, occupancy = 0, payload = 0,
+               criticalIncidentPayload = 0;
         uint64_t criticalTaskIncidentPayloadBits = 0;
         bool criticalEndpoint = false;
         int64_t maxArea = 1;
         for (const auto &name : footprint) {
-          auto found = tasks.find(name); if (found == tasks.end()) continue;
+          auto found = tasks.find(name);
+          if (found == tasks.end())
+            continue;
           const auto &task = found->second;
-          compute = std::max(compute, static_cast<double>(action.family == "shape" && shapeCatalogueKnown ? shapeGains[name] : task.duration) *
-              (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
+          compute = std::max(
+              compute,
+              static_cast<double>(action.family == "shape" &&
+                                          shapeCatalogueKnown
+                                      ? shapeGains[name]
+                                      : task.duration) *
+                  (task.criticalChainProxy || task.terminal ? 2.0 : 1.0));
           criticalEndpoint |= task.criticalChainProxy || task.terminal;
           if (task.criticalChainProxy || task.terminal) {
-            criticalTaskIncidentPayloadBits = std::max(criticalTaskIncidentPayloadBits,
-                                                       task.payloadBits);
+            criticalTaskIncidentPayloadBits =
+                std::max(criticalTaskIncidentPayloadBits, task.payloadBits);
             for (const auto &[edge, bits] : payloads)
               if (edge.first == name || edge.second == name)
                 criticalIncidentPayload = std::max(criticalIncidentPayload,
-                    static_cast<double>(bits));
+                                                   static_cast<double>(bits));
           }
           const int64_t area = task.rows * task.cols;
           maxArea = std::max(maxArea, area);
-          occupancy = std::max(occupancy,
-              static_cast<double>(area) * (task.duration + task.occupiedGapProxy));
+          occupancy =
+              std::max(occupancy, static_cast<double>(area) *
+                                      (task.duration + task.occupiedGapProxy));
         }
         for (const auto &[pair, bits] : payloads)
-          if (footprint.count(pair.first) && footprint.count(pair.second)) payload += bits;
-        std::string category, reason; double priority = 0;
+          if (footprint.count(pair.first) && footprint.count(pair.second))
+            payload += bits;
+        std::string category, reason;
+        double priority = 0;
         if (action.family == "shape") {
-          category = "compute"; priority = compute;
-          reason = "remaining cached shape compute gain proxy; critical-chain weighting";
-        } else if ((action.family == "fusion" || action.family == "fusion-plus-shape" ||
-                    action.family == "producer-consumer-co-tiling") && graphKnown &&
-                   payload > 0 && criticalEndpoint) {
-          category = "communication"; priority = payload;
-          reason = "known typed producer-consumer payload proxy; mapping benefit unproved";
+          category = "compute";
+          priority = compute;
+          reason = "remaining cached shape compute gain proxy; critical-chain "
+                   "weighting";
+        } else if ((action.family == "fusion" ||
+                    action.family == "fusion-plus-shape" ||
+                    action.family == "producer-consumer-co-tiling") &&
+                   graphKnown && payload > 0 && criticalEndpoint) {
+          category = "communication";
+          priority = payload;
+          reason = "known typed producer-consumer payload proxy; mapping "
+                   "benefit unproved";
         } else if (action.family == "replica" || action.family == "tiling" ||
                    action.family == "k-tiling" || action.family == "fission") {
-          category = "occupancy"; priority = occupancy;
+          category = "occupancy";
+          priority = occupancy;
           // Replica explores parallel work on small rectangles; partitioning
           // explores long large rectangles. This is a structural heuristic.
           if ((maxArea == 1 && action.family == "replica") ||
-              (maxArea > 1 && action.family == "tiling")) priority *= 1.25;
-          if (action.family == "fission") priority *= 0.5;
-          reason = "area-duration proxy; try other targets after two local zero-debit occupancy attempts; original queue intact";
+              (maxArea > 1 && action.family == "tiling"))
+            priority *= 1.25;
+          if (action.family == "fission")
+            priority *= 0.5;
+          reason = "area-duration proxy; try other targets after two local "
+                   "zero-debit occupancy attempts; original queue intact";
         }
-        if (category.empty()) continue;
+        if (category.empty())
+          continue;
         const std::string target = actionTargetKey(action);
-        if (category == "communication" && directionalFeedback[directionFeedbackKey(
-                parent.key, "__communication_zero_streak:" + action.family, target)].attempts >= 2)
+        if (category == "communication" &&
+            directionalFeedback[directionFeedbackKey(
+                                    parent.key,
+                                    "__communication_zero_streak:" +
+                                        action.family,
+                                    target)]
+                    .attempts >= 2)
           continue;
         // Exact parent-local observations apply only to preferred occupancy
         // ranking. Every action remains in the ordinary pending queue.
-        if (category == "occupancy" && directionalFeedback[
-                directionFeedbackKey(parent.key, "__occupancy_zero_streak", target)].attempts >= 2)
+        if (category == "occupancy" &&
+            directionalFeedback[directionFeedbackKey(parent.key,
+                                                     "__occupancy_zero_streak",
+                                                     target)]
+                    .attempts >= 2)
           continue;
-        auto addGroup = [&](StringRef groupCategory, StringRef groupReason, double groupPriority) {
+        auto addGroup = [&](StringRef groupCategory, StringRef groupReason,
+                            double groupPriority) {
           auto &group = groups[{groupCategory.str(), action.family, target}];
-          group.category = groupCategory.str(); group.family = action.family; group.target = target;
-          group.reason = groupReason.str(); group.priority = groupPriority;
-          group.criticalTaskIncidentPayloadBits = groupCategory == "communication"
-              ? criticalTaskIncidentPayloadBits : 0;
+          group.category = groupCategory.str();
+          group.family = action.family;
+          group.target = target;
+          group.reason = groupReason.str();
+          group.priority = groupPriority;
+          group.criticalTaskIncidentPayloadBits =
+              groupCategory == "communication" ? criticalTaskIncidentPayloadBits
+                                               : 0;
           group.actions.push_back(&action);
         };
-        if (priority > 0 && std::isfinite(priority)) addGroup(category, reason, priority);
-        if (action.family == "shape" && graphKnown && criticalIncidentPayload > 0 &&
-            directionalFeedback[directionFeedbackKey(parent.key, "__communication_zero_streak:shape", target)].attempts < 2)
-          addGroup("communication", "largest known incident pair payload on critical endpoint; shape layout benefit unproved",
+        if (priority > 0 && std::isfinite(priority))
+          addGroup(category, reason, priority);
+        if (action.family == "shape" && graphKnown &&
+            criticalIncidentPayload > 0 &&
+            directionalFeedback[directionFeedbackKey(
+                                    parent.key,
+                                    "__communication_zero_streak:shape",
+                                    target)]
+                    .attempts < 2)
+          addGroup("communication",
+                   "largest known incident pair payload on critical endpoint; "
+                   "shape layout benefit unproved",
                    criticalIncidentPayload);
       }
       json::Array directions, observations, opportunities;
       for (const auto &[name, gain] : shapeGains)
-        opportunities.push_back(json::Object{{"task", name}, {"remaining_compute_gain_cycles", gain}});
+        opportunities.push_back(json::Object{
+            {"task", name}, {"remaining_compute_gain_cycles", gain}});
       auto &selected = parentDirections[parent.key];
-      for (StringRef category : {StringRef("compute"), StringRef("communication"), StringRef("occupancy")}) {
+      for (StringRef category :
+           {StringRef("compute"), StringRef("communication"),
+            StringRef("occupancy")}) {
         Group *best = nullptr;
         for (auto &[key, group] : groups)
           if (group.category == category &&
-              !llvm::any_of(selected, [&](const DirectionalChoice &choice) {
-                return choice.family == group.family && choice.target == group.target;
-              }) && (!best || group.priority > best->priority ||
-              (group.priority == best->priority &&
-               ((category == "communication" && group.criticalTaskIncidentPayloadBits > best->criticalTaskIncidentPayloadBits) ||
-                ((category != "communication" || group.criticalTaskIncidentPayloadBits == best->criticalTaskIncidentPayloadBits) &&
-                 std::make_pair(group.family, group.target) < std::make_pair(best->family, best->target)))))) best = &group;
-        if (!best) continue;
-        llvm::stable_sort(best->actions, [&](const NeighborhoodAction *left, const NeighborhoodAction *right) {
-          const double a = directionalParameterPenalty(*left, tasks), b = directionalParameterPenalty(*right, tasks);
-          return a != b ? a < b : actionSignature(*left) < actionSignature(*right);
+              !llvm::any_of(selected,
+                            [&](const DirectionalChoice &choice) {
+                              return choice.family == group.family &&
+                                     choice.target == group.target;
+                            }) &&
+              (!best || group.priority > best->priority ||
+               (group.priority == best->priority &&
+                ((category == "communication" &&
+                  group.criticalTaskIncidentPayloadBits >
+                      best->criticalTaskIncidentPayloadBits) ||
+                 ((category != "communication" ||
+                   group.criticalTaskIncidentPayloadBits ==
+                       best->criticalTaskIncidentPayloadBits) &&
+                  std::make_pair(group.family, group.target) <
+                      std::make_pair(best->family, best->target))))))
+            best = &group;
+        if (!best)
+          continue;
+        llvm::stable_sort(best->actions, [&](const NeighborhoodAction *left,
+                                             const NeighborhoodAction *right) {
+          const double a = directionalParameterPenalty(*left, tasks),
+                       b = directionalParameterPenalty(*right, tasks);
+          return a != b ? a < b
+                        : actionSignature(*left) < actionSignature(*right);
         });
-        DirectionalChoice choice{best->family, best->target, best->reason, best->priority, {}};
-        for (size_t i = 0; i < std::min<size_t>(kDirectionalParameters, best->actions.size()); ++i)
+        DirectionalChoice choice{
+            best->family, best->target, best->reason, best->priority, {}};
+        for (size_t i = 0;
+             i < std::min<size_t>(kDirectionalParameters, best->actions.size());
+             ++i)
           choice.signatures.push_back(actionSignature(*best->actions[i]));
-        const std::string feedbackKey = directionFeedbackKey(parent.key, choice.family, choice.target);
+        const std::string feedbackKey =
+            directionFeedbackKey(parent.key, choice.family, choice.target);
         const auto &feedback = directionalFeedback[feedbackKey];
-        directions.push_back(json::Object{{"category", best->category}, {"family", choice.family},
-            {"target", choice.target}, {"reason", choice.reason},
+        directions.push_back(json::Object{
+            {"category", best->category},
+            {"family", choice.family},
+            {"target", choice.target},
+            {"reason", choice.reason},
             {"priority_proxy", choice.priorityProxy},
-            {"communication_secondary_known_incident_bits", std::to_string(best->criticalTaskIncidentPayloadBits)},
-            {"proxy_units", category == "communication" ? "bits" : category == "compute" ? "cycles" : "CGRA-cycles"},
+            {"communication_secondary_known_incident_bits",
+             std::to_string(best->criticalTaskIncidentPayloadBits)},
+            {"proxy_units", category == "communication" ? "bits"
+                            : category == "compute"     ? "cycles"
+                                                        : "CGRA-cycles"},
             {"action_signatures", stringArray(choice.signatures)},
-            {"feedback_attempts", int64_t(feedback.attempts)}, {"feedback_charged", int64_t(feedback.charged)}});
+            {"feedback_attempts", int64_t(feedback.attempts)},
+            {"feedback_charged", int64_t(feedback.charged)}});
         selected.push_back(std::move(choice));
       }
-      for (const auto &[name, task] : tasks) observations.push_back(directionalObservationObject(task));
-      appendDirectionalEvent(json::Object{{"record_type", "parent_directions"},
-          {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key},
-          {"makespan", parent.schedule.makespan}, {"actual_wait_causes_known", false},
-          {"typed_graph_known", graphKnown}, {"fallback_reason", failure},
-          {"task_observations", std::move(observations)}, {"shape_catalogue_known", shapeCatalogueKnown},
-          {"shape_compute_opportunities", std::move(opportunities)}, {"directions", std::move(directions)}});
+      for (const auto &[name, task] : tasks)
+        observations.push_back(directionalObservationObject(task));
+      appendDirectionalEvent(json::Object{
+          {"record_type", "parent_directions"},
+          {"round", round},
+          {"parent_id", parent.id},
+          {"parent_key", parent.key},
+          {"makespan", parent.schedule.makespan},
+          {"actual_wait_causes_known", false},
+          {"typed_graph_known", graphKnown},
+          {"fallback_reason", failure},
+          {"task_observations", std::move(observations)},
+          {"shape_catalogue_known", shapeCatalogueKnown},
+          {"shape_compute_opportunities", std::move(opportunities)},
+          {"directions", std::move(directions)}});
     }
-    appendDirectionalEvent(json::Object{{"record_type", "round_allowance"}, {"round", round},
-        {"evaluations", int64_t(scoredCount)}, {"round_charge_allowance", int64_t(directionalRoundAllowance)},
+    appendDirectionalEvent(json::Object{
+        {"record_type", "round_allowance"},
+        {"round", round},
+        {"evaluations", int64_t(scoredCount)},
+        {"round_charge_allowance", int64_t(directionalRoundAllowance)},
         {"round_original_reserve", int64_t(directionalRoundReserve)}});
   }
 
   bool reorderDirectionalPending(ArrayRef<SearchState> beam,
-      std::vector<PendingNeighbor> &pending, size_t cursor, size_t selected,
-      int64_t round, const DirectionalSelection &selection, std::string &error) {
+                                 std::vector<PendingNeighbor> &pending,
+                                 size_t cursor, size_t selected, int64_t round,
+                                 const DirectionalSelection &selection,
+                                 std::string &error) {
     const auto &neighbor = pending[selected];
     const auto &parent = beam[neighbor.parent];
     auto foundParent = parentProgressQueues.find(parent.key);
-    if (foundParent == parentProgressQueues.end()) { error = "directional parent queue absent"; return false; }
-    auto foundFamily = foundParent->second.families.find(neighbor.action.family);
-    if (foundFamily == foundParent->second.families.end()) { error = "directional family queue absent"; return false; }
+    if (foundParent == parentProgressQueues.end()) {
+      error = "directional parent queue absent";
+      return false;
+    }
+    auto foundFamily =
+        foundParent->second.families.find(neighbor.action.family);
+    if (foundFamily == foundParent->second.families.end()) {
+      error = "directional family queue absent";
+      return false;
+    }
     auto &stream = foundFamily->second;
     const std::string signature = actionSignature(neighbor.action);
     size_t position = stream.cursor;
-    while (position < stream.actions.size() && actionSignature(stream.actions[position]) != signature) ++position;
-    if (position == stream.actions.size()) { error = "directional action not in legal remaining suffix"; return false; }
+    while (position < stream.actions.size() &&
+           actionSignature(stream.actions[position]) != signature)
+      ++position;
+    if (position == stream.actions.size()) {
+      error = "directional action not in legal remaining suffix";
+      return false;
+    }
     if (position != stream.cursor) {
       std::vector<std::string> before, after;
-      for (size_t i = stream.cursor; i < stream.actions.size(); ++i) before.push_back(actionSignature(stream.actions[i]));
-      std::rotate(stream.actions.begin() + stream.cursor, stream.actions.begin() + position,
+      for (size_t i = stream.cursor; i < stream.actions.size(); ++i)
+        before.push_back(actionSignature(stream.actions[i]));
+      std::rotate(stream.actions.begin() + stream.cursor,
+                  stream.actions.begin() + position,
                   stream.actions.begin() + position + 1);
-      for (size_t i = stream.cursor; i < stream.actions.size(); ++i) after.push_back(actionSignature(stream.actions[i]));
-      parentProgressEvents.push_back(jsonText(json::Value(json::Object{
-          {"record_type", "directional_reorder"}, {"policy", kParentProgressPolicy},
-          {"directional_policy", kDirectionalPolicy}, {"round", round},
-          {"parent_id", parent.id}, {"parent_key", parent.key}, {"family", neighbor.action.family},
-          {"cursor", int64_t(stream.cursor)}, {"selected_offset", int64_t(position - stream.cursor)},
-          {"action_signature", signature}, {"mode", selection.mode}, {"reason", selection.reason},
-          {"attempt_global_index", int64_t(parentProgressAttemptedEdges.size() + 1)},
-          {"before_remaining", stringArray(before)}, {"after_remaining", stringArray(after)}})));
+      for (size_t i = stream.cursor; i < stream.actions.size(); ++i)
+        after.push_back(actionSignature(stream.actions[i]));
+      parentProgressEvents.push_back(jsonText(json::Value(
+          json::Object{{"record_type", "directional_reorder"},
+                       {"policy", kParentProgressPolicy},
+                       {"directional_policy", kDirectionalPolicy},
+                       {"round", round},
+                       {"parent_id", parent.id},
+                       {"parent_key", parent.key},
+                       {"family", neighbor.action.family},
+                       {"cursor", int64_t(stream.cursor)},
+                       {"selected_offset", int64_t(position - stream.cursor)},
+                       {"action_signature", signature},
+                       {"mode", selection.mode},
+                       {"reason", selection.reason},
+                       {"attempt_global_index",
+                        int64_t(parentProgressAttemptedEdges.size() + 1)},
+                       {"before_remaining", stringArray(before)},
+                       {"after_remaining", stringArray(after)}})));
     }
     if (selected != cursor)
-      std::rotate(pending.begin() + cursor, pending.begin() + selected, pending.begin() + selected + 1);
+      std::rotate(pending.begin() + cursor, pending.begin() + selected,
+                  pending.begin() + selected + 1);
     return true;
   }
 
@@ -6635,67 +7483,109 @@ private:
         action.primitives.size() != 2 ||
         !llvm::all_of(action.primitives, [](const auto &primitive) {
           return primitive.kind == "tile";
-        })) return std::nullopt;
+        }))
+      return std::nullopt;
     std::vector<int64_t> axes;
-    for (const auto &primitive : action.primitives) axes.push_back(primitive.axis);
+    for (const auto &primitive : action.primitives)
+      axes.push_back(primitive.axis);
     return axes;
   }
 
   json::Array directionalWindowAxisAttemptsObject() const {
     json::Array records;
-    for (const auto &[axes, attempts] : directionalWindow.coTilingAxisAttempts) {
+    for (const auto &[axes, attempts] :
+         directionalWindow.coTilingAxisAttempts) {
       json::Array vector;
-      for (int64_t axis : axes) vector.push_back(axis);
+      for (int64_t axis : axes)
+        vector.push_back(axis);
       records.push_back(json::Object{{"axis_vector", std::move(vector)},
-                                    {"attempts", int64_t(attempts)}});
+                                     {"attempts", int64_t(attempts)}});
     }
     return records;
   }
 
   bool selectDirectionalPending(ArrayRef<SearchState> beam,
-      std::vector<PendingNeighbor> &pending, size_t cursor, int64_t round,
-      DirectionalSelection &selection, std::string &error) {
+                                std::vector<PendingNeighbor> &pending,
+                                size_t cursor, int64_t round,
+                                DirectionalSelection &selection,
+                                std::string &error) {
     // The caller already put the original B choice at cursor. Preferred
     // selection is independent of that choice's family and parent.
-    if (pending[cursor].parent >= beam.size()) { error = "directional baseline parent outside beam"; return false; }
+    if (pending[cursor].parent >= beam.size()) {
+      error = "directional baseline parent outside beam";
+      return false;
+    }
     selection.baselineSignature = actionSignature(pending[cursor].action);
     selection.baselineParentID = beam[pending[cursor].parent].id;
     selection.baselineParentKey = beam[pending[cursor].parent].key;
-    const uint64_t charged = directionalRoundOriginal + directionalRoundPreferred;
-    const uint64_t remaining = directionalRoundAllowance > charged ? directionalRoundAllowance - charged : 0;
-    const uint64_t reserve = directionalRoundReserve > directionalRoundOriginal ?
-        directionalRoundReserve - directionalRoundOriginal : 0;
-    const bool original = directionalForceOriginal || directionalPreferredStreak >= 3 || remaining <= reserve;
+    const uint64_t charged =
+        directionalRoundOriginal + directionalRoundPreferred;
+    const uint64_t remaining = directionalRoundAllowance > charged
+                                   ? directionalRoundAllowance - charged
+                                   : 0;
+    const uint64_t reserve =
+        directionalRoundReserve > directionalRoundOriginal
+            ? directionalRoundReserve - directionalRoundOriginal
+            : 0;
+    const bool original = directionalForceOriginal ||
+                          directionalPreferredStreak >= 3 ||
+                          remaining <= reserve;
     if (original) {
-      selection.reason = directionalForceOriginal ? "zero-debit-cap fallback" :
-          remaining <= reserve ? "remaining original charge reserve" : "three preferred charges then original";
-      if (directionalForceOriginal) selection.mode = "fallback";
+      selection.reason = directionalForceOriginal ? "zero-debit-cap fallback"
+                         : remaining <= reserve
+                             ? "remaining original charge reserve"
+                             : "three preferred charges then original";
+      if (directionalForceOriginal)
+        selection.mode = "fallback";
       return true;
     }
     std::vector<size_t> ranked;
-    for (size_t i = 0; i < beam.size(); ++i) ranked.push_back(i);
-    llvm::stable_sort(ranked, [&](size_t a, size_t b) { return stateLess(beam[a], beam[b]); });
+    for (size_t i = 0; i < beam.size(); ++i)
+      ranked.push_back(i);
+    llvm::stable_sort(ranked, [&](size_t a, size_t b) {
+      return stateLess(beam[a], beam[b]);
+    });
     std::vector<size_t> rank(beam.size());
-    for (size_t i = 0; i < ranked.size(); ++i) rank[ranked[i]] = i;
+    for (size_t i = 0; i < ranked.size(); ++i)
+      rank[ranked[i]] = i;
     size_t selected = pending.size();
     // A window consumes ordinary preferred slots and never changes the beam.
     if (directionalWindow.active) {
       double bestPenalty = std::numeric_limits<double>::infinity();
       for (size_t i = cursor; i < pending.size(); ++i) {
-        const auto &neighbor = pending[i]; const auto &parent = beam[neighbor.parent];
-        if (parent.key != directionalWindow.parentKey || !directionalWindow.families.count(neighbor.action.family)) continue;
+        const auto &neighbor = pending[i];
+        const auto &parent = beam[neighbor.parent];
+        if (parent.key != directionalWindow.parentKey ||
+            !directionalWindow.families.count(neighbor.action.family))
+          continue;
         auto footprint = directionalFootprint(neighbor.action);
-        if (!llvm::any_of(footprint, [&](const std::string &name) { return directionalWindow.targets.count(name); })) continue;
+        if (!llvm::any_of(footprint, [&](const std::string &name) {
+              return directionalWindow.targets.count(name);
+            }))
+          continue;
         double penalty = 0;
         if (neighbor.action.family == "shape") {
-          auto found = llvm::find_if(parent.choices, [&](const TaskShapeChoice &choice) { return choice.task == neighbor.action.shapeTask; });
+          auto found =
+              llvm::find_if(parent.choices, [&](const TaskShapeChoice &choice) {
+                return choice.task == neighbor.action.shapeTask;
+              });
           if (found != parent.choices.end()) {
-            const int64_t delta = neighbor.action.shapeRows * neighbor.action.shapeCols - found->shape.cgraCount();
-            const int64_t distance = std::abs(neighbor.action.shapeRows - found->shape.rows) + std::abs(neighbor.action.shapeCols - found->shape.cols);
-            penalty = distance == 0 ? 1e8 : (delta < 0 ? 100.0 : 0.0) + distance;
+            const int64_t delta =
+                neighbor.action.shapeRows * neighbor.action.shapeCols -
+                found->shape.cgraCount();
+            const int64_t distance =
+                std::abs(neighbor.action.shapeRows - found->shape.rows) +
+                std::abs(neighbor.action.shapeCols - found->shape.cols);
+            penalty =
+                distance == 0 ? 1e8 : (delta < 0 ? 100.0 : 0.0) + distance;
           }
-        } else for (const auto &primitive : neighbor.action.primitives) penalty += std::max<int64_t>(0, primitive.factor - 2);
-        if (selected == pending.size() || penalty < bestPenalty) { selected = i; bestPenalty = penalty; }
+        } else
+          for (const auto &primitive : neighbor.action.primitives)
+            penalty += std::max<int64_t>(0, primitive.factor - 2);
+        if (selected == pending.size() || penalty < bestPenalty) {
+          selected = i;
+          bestPenalty = penalty;
+        }
       }
       // Preserve the legacy minimum penalty and selected action family.
       // Only typed co-tiling ties within this exact active window compare
@@ -6705,85 +7595,120 @@ private:
         const std::string legacyFamily = pending[selected].action.family;
         auto axes = directionalCoTilingAxisVector(pending[selected].action);
         auto found = directionalWindow.coTilingAxisAttempts.find(*axes);
-        uint64_t bestAttempts = found == directionalWindow.coTilingAxisAttempts.end()
-            ? 0 : found->second;
+        uint64_t bestAttempts =
+            found == directionalWindow.coTilingAxisAttempts.end()
+                ? 0
+                : found->second;
         for (size_t i = cursor; i < pending.size(); ++i) {
           const auto &neighbor = pending[i];
           const auto &parent = beam[neighbor.parent];
           if (parent.key != directionalWindow.parentKey ||
-              neighbor.action.family != legacyFamily) continue;
+              neighbor.action.family != legacyFamily)
+            continue;
           auto footprint = directionalFootprint(neighbor.action);
           if (!llvm::any_of(footprint, [&](const std::string &name) {
                 return directionalWindow.targets.count(name);
-              })) continue;
+              }))
+            continue;
           auto vector = directionalCoTilingAxisVector(neighbor.action);
-          if (!vector) continue;
+          if (!vector)
+            continue;
           double penalty = 0;
           for (const auto &primitive : neighbor.action.primitives)
             penalty += std::max<int64_t>(0, primitive.factor - 2);
-          if (penalty != bestPenalty) continue;
+          if (penalty != bestPenalty)
+            continue;
           auto count = directionalWindow.coTilingAxisAttempts.find(*vector);
-          const uint64_t attempts = count == directionalWindow.coTilingAxisAttempts.end()
-              ? 0 : count->second;
-          if (attempts < bestAttempts || (attempts == bestAttempts && i < selected)) {
-            selected = i; bestAttempts = attempts;
+          const uint64_t attempts =
+              count == directionalWindow.coTilingAxisAttempts.end()
+                  ? 0
+                  : count->second;
+          if (attempts < bestAttempts ||
+              (attempts == bestAttempts && i < selected)) {
+            selected = i;
+            bestAttempts = attempts;
           }
         }
       }
       if (selected != pending.size()) {
-        selection.mode = "window"; selection.window = selection.preferred = true;
-        selection.reason = "related successor of best retained new cost-block parent";
-      } else closeDirectionalWindow(round, "related legal suffix exhausted");
+        selection.mode = "window";
+        selection.window = selection.preferred = true;
+        selection.reason =
+            "related successor of best retained new cost-block parent";
+      } else
+        closeDirectionalWindow(round, "related legal suffix exhausted");
     }
     if (selected == pending.size()) {
-      std::optional<std::tuple<size_t, uint64_t, uint64_t, size_t, size_t, size_t>> best;
+      std::optional<
+          std::tuple<size_t, uint64_t, uint64_t, size_t, size_t, size_t>>
+          best;
       for (size_t i = cursor; i < pending.size(); ++i) {
-        const auto &neighbor = pending[i]; const auto &parent = beam[neighbor.parent];
-        auto found = parentDirections.find(parent.key); if (found == parentDirections.end()) continue;
+        const auto &neighbor = pending[i];
+        const auto &parent = beam[neighbor.parent];
+        auto found = parentDirections.find(parent.key);
+        if (found == parentDirections.end())
+          continue;
         for (size_t ordinal = 0; ordinal < found->second.size(); ++ordinal) {
           const auto &direction = found->second[ordinal];
-          if (neighbor.action.family != direction.family || actionTargetKey(neighbor.action) != direction.target) continue;
-          auto parameter = llvm::find(direction.signatures, actionSignature(neighbor.action));
-          if (parameter == direction.signatures.end()) continue;
-          const auto &feedback = directionalFeedback[directionFeedbackKey(parent.key, direction.family, direction.target)];
+          if (neighbor.action.family != direction.family ||
+              actionTargetKey(neighbor.action) != direction.target)
+            continue;
+          auto parameter = llvm::find(direction.signatures,
+                                      actionSignature(neighbor.action));
+          if (parameter == direction.signatures.end())
+            continue;
+          const auto &feedback = directionalFeedback[directionFeedbackKey(
+              parent.key, direction.family, direction.target)];
           // Cost tier is primary. Feedback operates only among <=4 current
           // parents in that tier and is retired with its parent.
-          auto key = std::make_tuple(rank[neighbor.parent] / 4, feedback.charged,
-              feedback.attempts, rank[neighbor.parent], ordinal,
+          auto key = std::make_tuple(
+              rank[neighbor.parent] / 4, feedback.charged, feedback.attempts,
+              rank[neighbor.parent], ordinal,
               static_cast<size_t>(parameter - direction.signatures.begin()));
           if (!best || key < *best) {
-            best = key; selected = i; selection.mode = "guided";
-            selection.preferred = true; selection.reason = direction.reason;
+            best = key;
+            selected = i;
+            selection.mode = "guided";
+            selection.preferred = true;
+            selection.reason = direction.reason;
           }
         }
       }
     }
     if (selected == pending.size()) {
-      selection.mode = "fallback"; selection.reason = "no remaining preferred parameter; original B order";
+      selection.mode = "fallback";
+      selection.reason = "no remaining preferred parameter; original B order";
       return true;
     }
     const auto &chosen = pending[selected];
     selection.selectedPendingOffset = selected - cursor;
-    selection.directionKey = directionFeedbackKey(beam[chosen.parent].key,
-                                                  chosen.action.family, actionTargetKey(chosen.action));
-    return reorderDirectionalPending(beam, pending, cursor, selected, round, selection, error);
+    selection.directionKey =
+        directionFeedbackKey(beam[chosen.parent].key, chosen.action.family,
+                             actionTargetKey(chosen.action));
+    return reorderDirectionalPending(beam, pending, cursor, selected, round,
+                                     selection, error);
   }
 
   void commitDirectionalSelection(const SearchState &parent,
-      const NeighborhoodAction &action, StringRef candidateID, int64_t round,
-      uint64_t before, uint64_t after, const DirectionalSelection &selection) {
+                                  const NeighborhoodAction &action,
+                                  StringRef candidateID, int64_t round,
+                                  uint64_t before, uint64_t after,
+                                  const DirectionalSelection &selection) {
     const uint64_t debit = after - before;
-    const auto windowAxes = selection.window
-        ? directionalCoTilingAxisVector(action) : std::nullopt;
+    const auto windowAxes =
+        selection.window ? directionalCoTilingAxisVector(action) : std::nullopt;
     uint64_t axisAttemptsBefore = 0;
     if (windowAxes) {
       auto &attempts = directionalWindow.coTilingAxisAttempts[*windowAxes];
-      axisAttemptsBefore = attempts; ++attempts;
+      axisAttemptsBefore = attempts;
+      ++attempts;
     }
     if (action.family == "shape" || action.family == "fusion" ||
-        action.family == "fusion-plus-shape" || action.family == "producer-consumer-co-tiling") {
-      auto &localZero = directionalFeedback[directionFeedbackKey(parent.key,
-          "__communication_zero_streak:" + action.family, actionTargetKey(action))];
+        action.family == "fusion-plus-shape" ||
+        action.family == "producer-consumer-co-tiling") {
+      auto &localZero = directionalFeedback[directionFeedbackKey(
+          parent.key, "__communication_zero_streak:" + action.family,
+          actionTargetKey(action))];
       localZero.attempts = debit ? 0 : localZero.attempts + 1;
     }
     if (action.family == "replica" || action.family == "tiling" ||
@@ -6794,132 +7719,230 @@ private:
     }
     if (selection.preferred) {
       auto &feedback = directionalFeedback[selection.directionKey];
-      ++feedback.attempts; feedback.charged += debit;
-      if (debit) { ++directionalGuidedCharged; ++directionalRoundPreferred; ++directionalPreferredStreak; directionalConsecutiveZero = 0; }
-      else { ++directionalGuidedZero; if (++directionalConsecutiveZero >= kDirectionalZeroDebitCap) directionalForceOriginal = true; }
+      ++feedback.attempts;
+      feedback.charged += debit;
+      if (debit) {
+        ++directionalGuidedCharged;
+        ++directionalRoundPreferred;
+        ++directionalPreferredStreak;
+        directionalConsecutiveZero = 0;
+      } else {
+        ++directionalGuidedZero;
+        if (++directionalConsecutiveZero >= kDirectionalZeroDebitCap)
+          directionalForceOriginal = true;
+      }
       if (selection.window) {
-        if (debit) { ++directionalWindowCharged; ++directionalWindow.charged; }
-        else { ++directionalWindowZero; ++directionalWindow.zeroDebit; }
+        if (debit) {
+          ++directionalWindowCharged;
+          ++directionalWindow.charged;
+        } else {
+          ++directionalWindowZero;
+          ++directionalWindow.zeroDebit;
+        }
       }
     } else {
       if (debit) {
-        ++directionalOriginalCharged; ++directionalRoundOriginal;
-        directionalPreferredStreak = directionalConsecutiveZero = 0; directionalForceOriginal = false;
-        if (selection.mode == "fallback") ++directionalFallbackCharged;
+        ++directionalOriginalCharged;
+        ++directionalRoundOriginal;
+        directionalPreferredStreak = directionalConsecutiveZero = 0;
+        directionalForceOriginal = false;
+        if (selection.mode == "fallback")
+          ++directionalFallbackCharged;
       } else {
         ++directionalOriginalZero;
-        if (selection.mode == "fallback") ++directionalFallbackZero;
+        if (selection.mode == "fallback")
+          ++directionalFallbackZero;
       }
     }
-    json::Object event{{"record_type", "candidate_selection"}, {"round", round},
-        {"parent_id", parent.id}, {"parent_key", parent.key}, {"candidate_id", candidateID},
-        {"family", action.family}, {"target", actionTargetKey(action)},
-        {"action", typedActionObject(action)}, {"action_signature", actionSignature(action)},
+    json::Object event{
+        {"record_type", "candidate_selection"},
+        {"round", round},
+        {"parent_id", parent.id},
+        {"parent_key", parent.key},
+        {"candidate_id", candidateID},
+        {"family", action.family},
+        {"target", actionTargetKey(action)},
+        {"action", typedActionObject(action)},
+        {"action_signature", actionSignature(action)},
         {"baseline_action_signature", selection.baselineSignature},
-        {"baseline_parent_id", selection.baselineParentID}, {"baseline_parent_key", selection.baselineParentKey},
-        {"selected_pending_offset_before_rotation", int64_t(selection.selectedPendingOffset)}, {"mode", selection.mode},
-        {"reason", selection.reason}, {"direction_key", selection.directionKey},
+        {"baseline_parent_id", selection.baselineParentID},
+        {"baseline_parent_key", selection.baselineParentKey},
+        {"selected_pending_offset_before_rotation",
+         int64_t(selection.selectedPendingOffset)},
+        {"mode", selection.mode},
+        {"reason", selection.reason},
+        {"direction_key", selection.directionKey},
         {"attempt_global_index", int64_t(parentProgressAttemptedEdges.size())},
-        {"objective_evaluations_before", int64_t(before)}, {"objective_evaluations_after", int64_t(after)},
-        {"debit", int64_t(debit)}, {"round_original_charged", int64_t(directionalRoundOriginal)},
+        {"objective_evaluations_before", int64_t(before)},
+        {"objective_evaluations_after", int64_t(after)},
+        {"debit", int64_t(debit)},
+        {"round_original_charged", int64_t(directionalRoundOriginal)},
         {"round_preferred_charged", int64_t(directionalRoundPreferred)},
         {"round_charge_allowance", int64_t(directionalRoundAllowance)},
         {"round_original_reserve", int64_t(directionalRoundReserve)},
-        {"window_remaining", int64_t(directionalWindow.active ? kDirectionalWindowCharges - directionalWindow.charged : 0)},
+        {"window_remaining",
+         int64_t(directionalWindow.active
+                     ? kDirectionalWindowCharges - directionalWindow.charged
+                     : 0)},
         {"window_zero_debit", int64_t(directionalWindow.zeroDebit)}};
     if (windowAxes) {
       json::Array axes;
-      for (int64_t axis : *windowAxes) axes.push_back(axis);
+      for (int64_t axis : *windowAxes)
+        axes.push_back(axis);
       event["co_tiling_axis_vector"] = std::move(axes);
       event["co_tiling_axis_attempts_before"] = int64_t(axisAttemptsBefore);
       event["co_tiling_axis_attempts_after"] = int64_t(axisAttemptsBefore + 1);
     }
     appendDirectionalEvent(std::move(event));
-    if (directionalWindow.active && (directionalWindow.charged >= kDirectionalWindowCharges ||
-        directionalWindow.zeroDebit >= kDirectionalZeroDebitCap))
-      closeDirectionalWindow(round, directionalWindow.charged >= kDirectionalWindowCharges ? "charged allowance used" : "window zero-debit cap");
+    if (directionalWindow.active &&
+        (directionalWindow.charged >= kDirectionalWindowCharges ||
+         directionalWindow.zeroDebit >= kDirectionalZeroDebitCap))
+      closeDirectionalWindow(round, directionalWindow.charged >=
+                                            kDirectionalWindowCharges
+                                        ? "charged allowance used"
+                                        : "window zero-debit cap");
   }
 
   void openSelectedShapeWindow(const SearchState &parent,
-      const NeighborhoodAction &action, int64_t round, bool duplicateShape = false) {
-    if (directionalWindow.active || action.shapeTask.empty()) return;
+                               const NeighborhoodAction &action, int64_t round,
+                               bool duplicateShape = false) {
+    if (directionalWindow.active || action.shapeTask.empty())
+      return;
     std::set<std::string> families{"shape"};
-    if (duplicateShape) families.insert("tiling");
-    else families.insert("producer-consumer-co-tiling");
+    if (duplicateShape)
+      families.insert("tiling");
+    else
+      families.insert("producer-consumer-co-tiling");
     const uint64_t initialCharged = duplicateShape ? 0 : 1;
-    directionalWindow = DirectionalWindow{parent.key, parent.id,
-        "shape-direction", {action.shapeTask}, families, initialCharged, 0, true};
-    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
-        {"round", round}, {"parent_id", parent.id}, {"parent_key", parent.key}, {"cost", parent.score},
-        {"source_parent_id", parent.parentId}, {"trigger_family", "shape-direction"},
-        {"related_targets", stringArray(std::vector<std::string>{action.shapeTask})},
-        {"allowed_families", stringArray(std::vector<std::string>(families.begin(), families.end()))},
-        {"parent_selection", duplicateShape ? "selected authenticated duplicate shape direction" : "selected scored shape direction"},
+    directionalWindow = DirectionalWindow{parent.key,
+                                          parent.id,
+                                          "shape-direction",
+                                          {action.shapeTask},
+                                          families,
+                                          initialCharged,
+                                          0,
+                                          true};
+    appendDirectionalEvent(json::Object{
+        {"record_type", "followup_window"},
+        {"event", "open"},
+        {"round", round},
+        {"parent_id", parent.id},
+        {"parent_key", parent.key},
+        {"cost", parent.score},
+        {"source_parent_id", parent.parentId},
+        {"trigger_family", "shape-direction"},
+        {"related_targets",
+         stringArray(std::vector<std::string>{action.shapeTask})},
+        {"allowed_families", stringArray(std::vector<std::string>(
+                                 families.begin(), families.end()))},
+        {"parent_selection",
+         duplicateShape ? "selected authenticated duplicate shape direction"
+                        : "selected scored shape direction"},
         {"target_relation", "same semantic parent and selected shape target"},
-        {"initial_charged", int64_t(initialCharged)}, {"charged_allowance", int64_t(kDirectionalWindowCharges)},
-        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
+        {"initial_charged", int64_t(initialCharged)},
+        {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)},
+        {"extra_budget", 0}});
   }
 
   void closeDirectionalWindow(int64_t round, StringRef reason) {
-    if (!directionalWindow.active) return;
-    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "close"},
-        {"round", round}, {"parent_id", directionalWindow.parentID}, {"parent_key", directionalWindow.parentKey},
-        {"reason", reason}, {"charged", int64_t(directionalWindow.charged)},
+    if (!directionalWindow.active)
+      return;
+    appendDirectionalEvent(json::Object{
+        {"record_type", "followup_window"},
+        {"event", "close"},
+        {"round", round},
+        {"parent_id", directionalWindow.parentID},
+        {"parent_key", directionalWindow.parentKey},
+        {"reason", reason},
+        {"charged", int64_t(directionalWindow.charged)},
         {"zero_debit", int64_t(directionalWindow.zeroDebit)},
-        {"unused_returned", int64_t(kDirectionalWindowCharges - directionalWindow.charged)},
+        {"unused_returned",
+         int64_t(kDirectionalWindowCharges - directionalWindow.charged)},
         {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}});
     directionalWindow.active = false;
     directionalWindow.coTilingAxisAttempts.clear();
   }
 
-  void openDirectionalWindow(ArrayRef<SearchState> beam, ArrayRef<ArchiveRecord> archive,
-      const std::set<std::string> &newKeys, const std::set<std::string> &costKeys,
-      int64_t round, uint64_t scoredCount) {
-    closeDirectionalWindow(round, "original refresh boundary; unused quota returned");
+  void openDirectionalWindow(ArrayRef<SearchState> beam,
+                             ArrayRef<ArchiveRecord> archive,
+                             const std::set<std::string> &newKeys,
+                             const std::set<std::string> &costKeys,
+                             int64_t round, uint64_t scoredCount) {
+    closeDirectionalWindow(round,
+                           "original refresh boundary; unused quota returned");
     // Eligibility uses only known typed history and actual parent/current task
     // names. Actual next-round menu admission remains the ordinary enumerator;
     // an empty related suffix closes the window without scoring anything.
-    auto relatedFor = [&](const SearchState &parent, std::set<std::string> &related,
-                          std::set<std::string> &families, std::string &trigger) {
-      if (parent.path.empty() || !parent.actionHistory.known) return false;
+    auto relatedFor = [&](const SearchState &parent,
+                          std::set<std::string> &related,
+                          std::set<std::string> &families,
+                          std::string &trigger) {
+      if (parent.path.empty() || !parent.actionHistory.known)
+        return false;
       const StringRef signature(parent.path.back());
       trigger = signature.take_front(signature.find(':')).str();
       if (trigger == "replica") {
         std::set<std::string> partitionFootprint, roots;
         for (const auto &action : parent.actionHistory.actions)
           if (StringRef(action.family).contains("tiling") &&
-              llvm::any_of(action.primitives, [](const NeighborhoodPrimitive &p) { return p.kind == "tile"; }))
-            for (const auto &name : directionalFootprint(action)) partitionFootprint.insert(name);
+              llvm::any_of(action.primitives,
+                           [](const NeighborhoodPrimitive &p) {
+                             return p.kind == "tile";
+                           }))
+            for (const auto &name : directionalFootprint(action))
+              partitionFootprint.insert(name);
         for (const auto &initial : parent.actionHistory.initialShapes)
           if (llvm::any_of(partitionFootprint, [&](const std::string &name) {
-                return name == initial.task || StringRef(name).starts_with(initial.task + ".");
-              })) roots.insert(initial.task);
+                return name == initial.task ||
+                       StringRef(name).starts_with(initial.task + ".");
+              }))
+            roots.insert(initial.task);
         for (const auto &choice : parent.choices)
           if (llvm::any_of(roots, [&](const std::string &root) {
-                return choice.task == root || StringRef(choice.task).starts_with(root + ".");
-              })) related.insert(choice.task);
+                return choice.task == root ||
+                       StringRef(choice.task).starts_with(root + ".");
+              }))
+            related.insert(choice.task);
         families.insert("producer-consumer-co-tiling");
         return !related.empty();
       }
-      if (StringRef(trigger).contains("fusion") || trigger == "fission") families.insert("shape");
-      else if (StringRef(trigger).contains("tiling")) { families.insert("shape"); families.insert("replica"); families.insert("tiling"); }
-      else return false;
+      if (StringRef(trigger).contains("fusion") || trigger == "fission")
+        families.insert("shape");
+      else if (StringRef(trigger).contains("tiling")) {
+        families.insert("shape");
+        families.insert("replica");
+        families.insert("tiling");
+      } else
+        return false;
       const ArchiveRecord *before = nullptr;
-      for (const auto &record : archive) if (record.id == parent.parentId) { before = &record; break; }
-      if (!before) return false;
+      for (const auto &record : archive)
+        if (record.id == parent.parentId) {
+          before = &record;
+          break;
+        }
+      if (!before)
+        return false;
       std::set<std::string> oldNames, names;
-      for (const auto &choice : before->choices) oldNames.insert(choice.task);
+      for (const auto &choice : before->choices)
+        oldNames.insert(choice.task);
       for (const auto &choice : parent.choices) {
-        names.insert(choice.task); if (!oldNames.count(choice.task)) related.insert(choice.task);
+        names.insert(choice.task);
+        if (!oldNames.count(choice.task))
+          related.insert(choice.task);
       }
       if (!parent.actionHistory.actions.empty()) {
         const auto &last = parent.actionHistory.actions.back();
         if (last.family == trigger)
-          for (const auto &name : directionalFootprint(last)) if (names.count(name)) related.insert(name);
+          for (const auto &name : directionalFootprint(last))
+            if (names.count(name))
+              related.insert(name);
       }
       if (trigger == "fission" && !parent.actionHistory.fissionActions.empty())
-        for (const auto &name : directionalFootprint(parent.actionHistory.fissionActions.back()))
-          if (names.count(name)) related.insert(name);
+        for (const auto &name :
+             directionalFootprint(parent.actionHistory.fissionActions.back()))
+          if (names.count(name))
+            related.insert(name);
       // Histories authenticate the initial task names. A later partition of
       // one branch may leave already partitioned siblings under the same
       // initial task; give their remaining resource actions the same bounded
@@ -6927,96 +7950,162 @@ private:
       std::set<std::string> roots;
       for (const auto &initial : parent.actionHistory.initialShapes)
         if (llvm::any_of(related, [&](const std::string &name) {
-              return name == initial.task || StringRef(name).starts_with(initial.task + ".");
-            })) roots.insert(initial.task);
+              return name == initial.task ||
+                     StringRef(name).starts_with(initial.task + ".");
+            }))
+          roots.insert(initial.task);
       for (const auto &choice : parent.choices)
         if (llvm::any_of(roots, [&](const std::string &root) {
-              return choice.task == root || StringRef(choice.task).starts_with(root + ".");
-            })) related.insert(choice.task);
+              return choice.task == root ||
+                     StringRef(choice.task).starts_with(root + ".");
+            }))
+          related.insert(choice.task);
       return !related.empty();
     };
-    const SearchState *best = nullptr; std::set<std::string> live, bestRelated, bestFamilies;
+    const SearchState *best = nullptr;
+    std::set<std::string> live, bestRelated, bestFamilies;
     std::string bestTrigger;
     json::Array retainedNew, prunedNew, costParents, eligibleNew;
     for (const auto &parent : beam) {
       live.insert(parent.key);
-      if (costKeys.count(parent.key)) costParents.push_back(parent.id);
+      if (costKeys.count(parent.key))
+        costParents.push_back(parent.id);
       if (newKeys.count(parent.key)) {
         retainedNew.push_back(parent.id);
-        std::set<std::string> related, families; std::string trigger;
-        if (costKeys.count(parent.key) && relatedFor(parent, related, families, trigger)) {
+        std::set<std::string> related, families;
+        std::string trigger;
+        if (costKeys.count(parent.key) &&
+            relatedFor(parent, related, families, trigger)) {
           eligibleNew.push_back(parent.id);
           if (!best || stateLess(parent, *best)) {
-            best = &parent; bestRelated = std::move(related);
-            bestFamilies = std::move(families); bestTrigger = std::move(trigger);
+            best = &parent;
+            bestRelated = std::move(related);
+            bestFamilies = std::move(families);
+            bestTrigger = std::move(trigger);
           }
         }
       }
     }
     for (const auto &record : archive)
-      if (newKeys.count(record.key) && !live.count(record.key)) prunedNew.push_back(record.id);
-    appendDirectionalEvent(json::Object{{"record_type", "frontier_decision"}, {"round", round},
-        {"evaluations", int64_t(scoredCount)}, {"retained_new", std::move(retainedNew)},
-        {"pruned_new", std::move(prunedNew)}, {"original_cost_parents", std::move(costParents)},
+      if (newKeys.count(record.key) && !live.count(record.key))
+        prunedNew.push_back(record.id);
+    appendDirectionalEvent(json::Object{
+        {"record_type", "frontier_decision"},
+        {"round", round},
+        {"evaluations", int64_t(scoredCount)},
+        {"retained_new", std::move(retainedNew)},
+        {"pruned_new", std::move(prunedNew)},
+        {"original_cost_parents", std::move(costParents)},
         {"window_eligible_new", std::move(eligibleNew)},
-        {"window_eligibility", "new retained cost-slot structural parent with known history and related current tasks/families; next menu not pre-enumerated"},
+        {"window_eligibility",
+         "new retained cost-slot structural parent with known history and "
+         "related current tasks/families; next menu not pre-enumerated"},
         {"beam_policy_changed", false}});
-    for (auto it = directionalFeedback.begin(); it != directionalFeedback.end();) {
-      auto key = json::parse(it->first); bool present = false;
-      if (key) if (const auto *parts = key->getAsArray())
-        if (!parts->empty()) if (auto parentKey = parts->front().getAsString()) present = live.count(parentKey->str());
-      if (!key) llvm::consumeError(key.takeError());
-      if (!present) it = directionalFeedback.erase(it); else ++it;
+    for (auto it = directionalFeedback.begin();
+         it != directionalFeedback.end();) {
+      auto key = json::parse(it->first);
+      bool present = false;
+      if (key)
+        if (const auto *parts = key->getAsArray())
+          if (!parts->empty())
+            if (auto parentKey = parts->front().getAsString())
+              present = live.count(parentKey->str());
+      if (!key)
+        llvm::consumeError(key.takeError());
+      if (!present)
+        it = directionalFeedback.erase(it);
+      else
+        ++it;
     }
-    if (!best) return;
-    directionalWindow = DirectionalWindow{best->key, best->id, bestTrigger, bestRelated, bestFamilies, 0, 0, true};
-    std::vector<std::string> targetNames(bestRelated.begin(), bestRelated.end()), familyNames(bestFamilies.begin(), bestFamilies.end());
-    appendDirectionalEvent(json::Object{{"record_type", "followup_window"}, {"event", "open"},
-        {"round", round}, {"parent_id", best->id}, {"parent_key", best->key}, {"cost", best->score},
-        {"source_parent_id", best->parentId}, {"trigger_family", bestTrigger},
-        {"related_targets", stringArray(targetNames)}, {"allowed_families", stringArray(familyNames)},
-        {"parent_selection", "best stateLess after structural-related eligibility filter within original new retained cost slots"},
-        {"target_relation", "new task names and surviving footprint plus their authenticated initial-task descendants"},
+    if (!best)
+      return;
+    directionalWindow =
+        DirectionalWindow{best->key,    best->id, bestTrigger, bestRelated,
+                          bestFamilies, 0,        0,           true};
+    std::vector<std::string> targetNames(bestRelated.begin(),
+                                         bestRelated.end()),
+        familyNames(bestFamilies.begin(), bestFamilies.end());
+    appendDirectionalEvent(json::Object{
+        {"record_type", "followup_window"},
+        {"event", "open"},
+        {"round", round},
+        {"parent_id", best->id},
+        {"parent_key", best->key},
+        {"cost", best->score},
+        {"source_parent_id", best->parentId},
+        {"trigger_family", bestTrigger},
+        {"related_targets", stringArray(targetNames)},
+        {"allowed_families", stringArray(familyNames)},
+        {"parent_selection",
+         "best stateLess after structural-related eligibility filter within "
+         "original new retained cost slots"},
+        {"target_relation", "new task names and surviving footprint plus their "
+                            "authenticated initial-task descendants"},
         {"charged_allowance", int64_t(kDirectionalWindowCharges)},
-        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)}, {"extra_budget", 0}});
+        {"zero_debit_cap", int64_t(kDirectionalZeroDebitCap)},
+        {"extra_budget", 0}});
   }
 
   json::Object directionalStateObject() const {
-    std::vector<std::string> windowTargets(directionalWindow.targets.begin(), directionalWindow.targets.end());
-    std::vector<std::string> windowFamilies(directionalWindow.families.begin(), directionalWindow.families.end());
+    std::vector<std::string> windowTargets(directionalWindow.targets.begin(),
+                                           directionalWindow.targets.end());
+    std::vector<std::string> windowFamilies(directionalWindow.families.begin(),
+                                            directionalWindow.families.end());
     json::Array feedback;
     for (const auto &[key, value] : directionalFeedback)
-      feedback.push_back(json::Object{{"direction_key", key}, {"attempts", int64_t(value.attempts)}, {"charged", int64_t(value.charged)}});
-    return json::Object{{"policy", kDirectionalPolicy}, {"constants", directionalConstants()},
-        {"guided_charged", int64_t(directionalGuidedCharged)}, {"original_charged", int64_t(directionalOriginalCharged)},
-        {"fallback_charged", int64_t(directionalFallbackCharged)}, {"window_charged", int64_t(directionalWindowCharged)},
-        {"guided_zero_debit", int64_t(directionalGuidedZero)}, {"original_zero_debit", int64_t(directionalOriginalZero)},
-        {"fallback_zero_debit", int64_t(directionalFallbackZero)}, {"window_zero_debit", int64_t(directionalWindowZero)},
-        {"round_original_charged", int64_t(directionalRoundOriginal)}, {"round_preferred_charged", int64_t(directionalRoundPreferred)},
-        {"round_charge_allowance", int64_t(directionalRoundAllowance)}, {"round_original_reserve", int64_t(directionalRoundReserve)},
-        {"preferred_streak", int64_t(directionalPreferredStreak)}, {"consecutive_preferred_zero_debit", int64_t(directionalConsecutiveZero)},
-        {"force_original_until_charge", directionalForceOriginal}, {"live_direction_feedback", std::move(feedback)},
-        {"window", json::Object{{"active", directionalWindow.active}, {"parent_id", directionalWindow.parentID},
-          {"parent_key", directionalWindow.parentKey}, {"trigger_family", directionalWindow.triggerFamily},
-          {"related_targets", stringArray(windowTargets)}, {"allowed_families", stringArray(windowFamilies)},
-          {"charged_allowance", int64_t(kDirectionalWindowCharges)}, {"charged", int64_t(directionalWindow.charged)},
-          {"zero_debit", int64_t(directionalWindow.zeroDebit)},
-          {"co_tiling_axis_attempts", directionalWindowAxisAttemptsObject()}}},
-        {"resume_supported", false}, {"paper_admission", false}};
+      feedback.push_back(json::Object{{"direction_key", key},
+                                      {"attempts", int64_t(value.attempts)},
+                                      {"charged", int64_t(value.charged)}});
+    return json::Object{
+        {"policy", kDirectionalPolicy},
+        {"constants", directionalConstants()},
+        {"guided_charged", int64_t(directionalGuidedCharged)},
+        {"original_charged", int64_t(directionalOriginalCharged)},
+        {"fallback_charged", int64_t(directionalFallbackCharged)},
+        {"window_charged", int64_t(directionalWindowCharged)},
+        {"guided_zero_debit", int64_t(directionalGuidedZero)},
+        {"original_zero_debit", int64_t(directionalOriginalZero)},
+        {"fallback_zero_debit", int64_t(directionalFallbackZero)},
+        {"window_zero_debit", int64_t(directionalWindowZero)},
+        {"round_original_charged", int64_t(directionalRoundOriginal)},
+        {"round_preferred_charged", int64_t(directionalRoundPreferred)},
+        {"round_charge_allowance", int64_t(directionalRoundAllowance)},
+        {"round_original_reserve", int64_t(directionalRoundReserve)},
+        {"preferred_streak", int64_t(directionalPreferredStreak)},
+        {"consecutive_preferred_zero_debit",
+         int64_t(directionalConsecutiveZero)},
+        {"force_original_until_charge", directionalForceOriginal},
+        {"live_direction_feedback", std::move(feedback)},
+        {"window",
+         json::Object{{"active", directionalWindow.active},
+                      {"parent_id", directionalWindow.parentID},
+                      {"parent_key", directionalWindow.parentKey},
+                      {"trigger_family", directionalWindow.triggerFamily},
+                      {"related_targets", stringArray(windowTargets)},
+                      {"allowed_families", stringArray(windowFamilies)},
+                      {"charged_allowance", int64_t(kDirectionalWindowCharges)},
+                      {"charged", int64_t(directionalWindow.charged)},
+                      {"zero_debit", int64_t(directionalWindow.zeroDebit)},
+                      {"co_tiling_axis_attempts",
+                       directionalWindowAxisAttemptsObject()}}},
+        {"resume_supported", false},
+        {"paper_admission", false}};
   }
 
-  bool mergeParentProgressQueues(
-      ArrayRef<SearchState> beam, int64_t round,
-      std::vector<PendingNeighbor> &pending, FamilyFunnelRound &funnel,
-      std::string &error) {
+  bool mergeParentProgressQueues(ArrayRef<SearchState> beam, int64_t round,
+                                 std::vector<PendingNeighbor> &pending,
+                                 FamilyFunnelRound &funnel,
+                                 std::string &error) {
     // Re-enumeration validates the current menu and opens post-seed actions.
     // It never reorders an existing legal suffix. New signatures are appended
     // in the unchanged cost-guided stream order produced by the old helper.
     std::map<std::string,
-             std::map<std::string, std::vector<NeighborhoodAction>>> admitted;
+             std::map<std::string, std::vector<NeighborhoodAction>>>
+        admitted;
     for (auto &neighbor : pending) {
       if (neighbor.parent >= beam.size()) {
-        error = "parent progress menu parent outside beam"; return false;
+        error = "parent progress menu parent outside beam";
+        return false;
       }
       --funnel[neighbor.action.family].generated;
       admitted[beam[neighbor.parent].key][neighbor.action.family].push_back(
@@ -7032,16 +8121,20 @@ private:
       saved.parentID = parent.id;
       auto &currentFamilies = admitted[parent.key];
       std::set<std::string> names;
-      for (const auto &[name, stream] : saved.families) names.insert(name);
-      for (const auto &[name, stream] : currentFamilies) names.insert(name);
+      for (const auto &[name, stream] : saved.families)
+        names.insert(name);
+      for (const auto &[name, stream] : currentFamilies)
+        names.insert(name);
       for (const std::string &family : names) {
         ParentFamilyProgress &stream = saved.families[family];
         if (stream.cursor > stream.actions.size()) {
-          error = "parent progress cursor exceeds stream"; return false;
+          error = "parent progress cursor exceeds stream";
+          return false;
         }
         auto &current = currentFamilies[family];
         std::set<std::string> legal, retained;
-        for (const auto &action : current) legal.insert(actionSignature(action));
+        for (const auto &action : current)
+          legal.insert(actionSignature(action));
         std::vector<std::string> previous, kept, added, removed;
         std::vector<NeighborhoodAction> updated;
         updated.reserve(stream.actions.size() + current.size());
@@ -7051,10 +8144,12 @@ private:
           NeighborhoodAction &action = stream.actions[i];
           const std::string signature = actionSignature(action);
           previous.push_back(signature);
-          if (legal.count(signature) && !parentProgressAttemptedEdges.count(
+          if (legal.count(signature) &&
+              !parentProgressAttemptedEdges.count(
                   parentProgressEdgeKey(parent.key, action))) {
             if (!retained.insert(signature).second) {
-              error = "duplicate retained parent progress signature"; return false;
+              error = "duplicate retained parent progress signature";
+              return false;
             }
             kept.push_back(signature);
             updated.push_back(std::move(action));
@@ -7074,9 +8169,12 @@ private:
         stream.actions = std::move(updated);
         if (!added.empty() || !removed.empty()) {
           parentProgressEvents.push_back(jsonText(json::Value(json::Object{
-              {"record_type", "queue_update"}, {"policy", kParentProgressPolicy},
-              {"round", round}, {"parent_id", parent.id},
-              {"parent_key", parent.key}, {"family", family},
+              {"record_type", "queue_update"},
+              {"policy", kParentProgressPolicy},
+              {"round", round},
+              {"parent_id", parent.id},
+              {"parent_key", parent.key},
+              {"family", family},
               {"cursor", static_cast<int64_t>(stream.cursor)},
               {"stream_attempts", static_cast<int64_t>(stream.attempts)},
               {"previous_remaining", stringArray(previous)},
@@ -7084,7 +8182,8 @@ private:
               {"appended_signatures", stringArray(added)},
               {"removed_signatures", stringArray(removed)}})));
         }
-        if (stream.cursor < stream.actions.size()) familyNames.insert(family);
+        if (stream.cursor < stream.actions.size())
+          familyNames.insert(family);
       }
     }
     pending.clear();
@@ -7096,11 +8195,13 @@ private:
         for (auto indexed : llvm::enumerate(beam)) {
           auto &families = parentProgressQueues[indexed.value().key].families;
           auto found = families.find(family);
-          if (found == families.end()) continue;
+          if (found == families.end())
+            continue;
           ParentFamilyProgress &stream = found->second;
           uint64_t &position = positions[{indexed.value().key, family}];
           const uint64_t index = stream.cursor + position;
-          if (index >= stream.actions.size()) continue;
+          if (index >= stream.actions.size())
+            continue;
           pending.push_back({indexed.index(), stream.actions[index]});
           ++position;
           ++funnel[family].generated;
@@ -7110,36 +8211,43 @@ private:
     return true;
   }
 
-  bool commitParentProgress(
-      const SearchState &parent, const NeighborhoodAction &action,
-      uint64_t before, uint64_t after, json::Object &event,
-      std::string &error) {
+  bool commitParentProgress(const SearchState &parent,
+                            const NeighborhoodAction &action, uint64_t before,
+                            uint64_t after, json::Object &event,
+                            std::string &error) {
     auto saved = parentProgressQueues.find(parent.key);
     if (saved == parentProgressQueues.end()) {
-      error = "committed parent has no progress queue"; return false;
+      error = "committed parent has no progress queue";
+      return false;
     }
     auto family = saved->second.families.find(action.family);
     if (family == saved->second.families.end() ||
         family->second.cursor >= family->second.actions.size()) {
-      error = "committed family has no remaining progress action"; return false;
+      error = "committed family has no remaining progress action";
+      return false;
     }
     ParentFamilyProgress &stream = family->second;
-    if (parentProgressEdgeKey(parent.key, action) != parentProgressEdgeKey(
-            parent.key, stream.actions[stream.cursor]) || after < before ||
-        after - before > 1 || !parentProgressAttemptedEdges.insert(
-            parentProgressEdgeKey(parent.key, action)).second) {
+    if (parentProgressEdgeKey(parent.key, action) !=
+            parentProgressEdgeKey(parent.key, stream.actions[stream.cursor]) ||
+        after < before || after - before > 1 ||
+        !parentProgressAttemptedEdges
+             .insert(parentProgressEdgeKey(parent.key, action))
+             .second) {
       error = "parent progress attempted edge repeated or out of stream order";
       return false;
     }
     event = json::Object{
-        {"policy", kParentProgressPolicy}, {"parent_key", parent.key},
-        {"family", action.family}, {"target", actionTargetKey(action)},
+        {"policy", kParentProgressPolicy},
+        {"parent_key", parent.key},
+        {"family", action.family},
+        {"target", actionTargetKey(action)},
         {"action_signature", actionSignature(action)},
         {"cursor_before", static_cast<int64_t>(stream.cursor)},
         {"cursor_after", static_cast<int64_t>(stream.cursor + 1)},
         {"stream_attempts", static_cast<int64_t>(stream.attempts + 1)},
         {"queue_size", static_cast<int64_t>(stream.actions.size())},
-        {"attempt_global_index", static_cast<int64_t>(parentProgressAttemptedEdges.size())},
+        {"attempt_global_index",
+         static_cast<int64_t>(parentProgressAttemptedEdges.size())},
         {"objective_evaluations_before", static_cast<int64_t>(before)},
         {"objective_evaluations_after", static_cast<int64_t>(after)}};
     ++stream.cursor;
@@ -7149,54 +8257,70 @@ private:
 
   void retireParentProgressQueues(ArrayRef<SearchState> beam, int64_t round) {
     std::set<std::string> keys;
-    for (const SearchState &parent : beam) keys.insert(parent.key);
-    for (auto it = parentProgressQueues.begin(); it != parentProgressQueues.end();) {
+    for (const SearchState &parent : beam)
+      keys.insert(parent.key);
+    for (auto it = parentProgressQueues.begin();
+         it != parentProgressQueues.end();) {
       if (keys.count(it->first)) {
         for (const SearchState &parent : beam)
-          if (parent.key == it->first) it->second.parentID = parent.id;
-        ++it; continue;
+          if (parent.key == it->first)
+            it->second.parentID = parent.id;
+        ++it;
+        continue;
       }
-      parentProgressEvents.push_back(jsonText(json::Value(json::Object{
-          {"record_type", "parent_retired"}, {"policy", kParentProgressPolicy},
-          {"round", round}, {"parent_id", it->second.parentID},
-          {"parent_key", it->first}})));
+      parentProgressEvents.push_back(
+          jsonText(json::Value(json::Object{{"record_type", "parent_retired"},
+                                            {"policy", kParentProgressPolicy},
+                                            {"round", round},
+                                            {"parent_id", it->second.parentID},
+                                            {"parent_key", it->first}})));
       it = parentProgressQueues.erase(it);
     }
   }
 
   json::Object parentProgressQueuesObject() const {
     json::Array parents, edges;
-    for (const std::string &edge : parentProgressAttemptedEdges) edges.push_back(edge);
+    for (const std::string &edge : parentProgressAttemptedEdges)
+      edges.push_back(edge);
     for (const auto &[key, saved] : parentProgressQueues) {
       json::Array families;
       for (const auto &[family, stream] : saved.families)
-        families.push_back(json::Object{
-            {"family", family}, {"cursor", static_cast<int64_t>(stream.cursor)},
-            {"attempts", static_cast<int64_t>(stream.attempts)},
-            {"actions", typedActionArray(stream.actions)}});
+        families.push_back(
+            json::Object{{"family", family},
+                         {"cursor", static_cast<int64_t>(stream.cursor)},
+                         {"attempts", static_cast<int64_t>(stream.attempts)},
+                         {"actions", typedActionArray(stream.actions)}});
       parents.push_back(json::Object{{"parent_key", key},
-          {"parent_id", saved.parentID}, {"families", std::move(families)}});
+                                     {"parent_id", saved.parentID},
+                                     {"families", std::move(families)}});
     }
     return json::Object{{"policy", kParentProgressPolicy},
-        {"attempted_edges", std::move(edges)}, {"parents", std::move(parents)}};
+                        {"attempted_edges", std::move(edges)},
+                        {"parents", std::move(parents)}};
   }
 
-  bool restoreParentProgress(
-      const json::Object &root, ArrayRef<ArchiveRecord> archive,
-      ArrayRef<SearchState> beam, std::string &error) {
+  bool restoreParentProgress(const json::Object &root,
+                             ArrayRef<ArchiveRecord> archive,
+                             ArrayRef<SearchState> beam, std::string &error) {
     auto fail = [&]() {
-      error = "checkpoint parent progress policy, queues, or committed edges differ";
+      error = "checkpoint parent progress policy, queues, or committed edges "
+              "differ";
       return false;
     };
     if (!parentProgress) {
       if (root.get("parent_progress") || root.get("parent_progress_policy") ||
-          root.get("parent_progress_queues") || root.get("parent_progress_events"))
+          root.get("parent_progress_queues") ||
+          root.get("parent_progress_events"))
         return fail();
       for (const std::string &text : familyFunnelEvents) {
         auto parsed = json::parse(text);
-        if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+        if (!parsed) {
+          llvm::consumeError(parsed.takeError());
+          return fail();
+        }
         auto *event = parsed->getAsObject();
-        if (event && event->get("parent_progress")) return fail();
+        if (event && event->get("parent_progress"))
+          return fail();
       }
       return true;
     }
@@ -7207,21 +8331,29 @@ private:
     if (root.getBoolean("parent_progress") != true ||
         root.getString("parent_progress_policy") != kParentProgressPolicy ||
         !queues || queues->getString("policy") != kParentProgressPolicy ||
-        !events || !parents || !edges) return fail();
+        !events || !parents || !edges)
+      return fail();
     std::map<std::string, std::string> archivedKeys, eligibleKeys;
     for (const auto &record : archive)
-      if (record.valid) archivedKeys[record.id] = record.key;
-    for (const auto &parent : beam) eligibleKeys[parent.id] = parent.key;
+      if (record.valid)
+        archivedKeys[record.id] = record.key;
+    for (const auto &parent : beam)
+      eligibleKeys[parent.id] = parent.key;
     std::set<std::string> committed, savedEdges;
     std::map<std::pair<std::string, std::string>, uint64_t> latestCursors;
     std::optional<uint64_t> previousEvaluations;
     for (const std::string &text : familyFunnelEvents) {
       auto parsed = json::parse(text);
-      if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+      if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        return fail();
+      }
       auto *event = parsed->getAsObject();
-      if (!event) return fail();
+      if (!event)
+        return fail();
       if (event->getString("record_type") != "candidate_attempt") {
-        if (event->get("parent_progress")) return fail();
+        if (event->get("parent_progress"))
+          return fail();
         continue;
       }
       const auto *progress = event->getObject("parent_progress");
@@ -7230,48 +8362,66 @@ private:
       NeighborhoodAction action;
       auto id = event->getString("parent_id");
       auto key = progress ? progress->getString("parent_key") : std::nullopt;
-      auto before = progress ? progress->getInteger("cursor_before") : std::nullopt;
-      auto after = progress ? progress->getInteger("cursor_after") : std::nullopt;
-      auto attempts = progress ? progress->getInteger("stream_attempts") : std::nullopt;
+      auto before =
+          progress ? progress->getInteger("cursor_before") : std::nullopt;
+      auto after =
+          progress ? progress->getInteger("cursor_after") : std::nullopt;
+      auto attempts =
+          progress ? progress->getInteger("stream_attempts") : std::nullopt;
       auto size = progress ? progress->getInteger("queue_size") : std::nullopt;
-      auto index = progress ? progress->getInteger("attempt_global_index") : std::nullopt;
-      auto evaluatedBefore = progress ? progress->getInteger("objective_evaluations_before") : std::nullopt;
-      auto evaluatedAfter = progress ? progress->getInteger("objective_evaluations_after") : std::nullopt;
+      auto index = progress ? progress->getInteger("attempt_global_index")
+                            : std::nullopt;
+      auto evaluatedBefore =
+          progress ? progress->getInteger("objective_evaluations_before")
+                   : std::nullopt;
+      auto evaluatedAfter =
+          progress ? progress->getInteger("objective_evaluations_after")
+                   : std::nullopt;
       if (!progress || !typed || !result || !parseTypedAction(*typed, action) ||
-          !id || !key || !archivedKeys.count(id->str()) || archivedKeys[id->str()] != *key ||
+          !id || !key || !archivedKeys.count(id->str()) ||
+          archivedKeys[id->str()] != *key ||
           progress->getString("policy") != kParentProgressPolicy ||
           progress->getString("family") != action.family ||
           progress->getString("target") != actionTargetKey(action) ||
           progress->getString("action_signature") != actionSignature(action) ||
-          result->getBoolean("attempted") != true ||
-          !before || !after || !attempts || !size || !index || *before < 0 ||
+          result->getBoolean("attempted") != true || !before || !after ||
+          !attempts || !size || !index || *before < 0 ||
           *before == std::numeric_limits<int64_t>::max() ||
           *after != *before + 1 || *attempts != *after || *size < *after ||
           !evaluatedBefore || !evaluatedAfter || *evaluatedBefore < 0 ||
-          *evaluatedAfter < *evaluatedBefore || *evaluatedAfter - *evaluatedBefore > 1 ||
+          *evaluatedAfter < *evaluatedBefore ||
+          *evaluatedAfter - *evaluatedBefore > 1 ||
           *evaluatedAfter > maxCandidates.getValue() ||
-          result->getInteger("scheduler_calls") != *evaluatedAfter - *evaluatedBefore ||
-          (previousEvaluations && *previousEvaluations != static_cast<uint64_t>(*evaluatedBefore)) ||
+          result->getInteger("scheduler_calls") !=
+              *evaluatedAfter - *evaluatedBefore ||
+          (previousEvaluations &&
+           *previousEvaluations != static_cast<uint64_t>(*evaluatedBefore)) ||
           !committed.insert(parentProgressEdgeKey(*key, action)).second ||
-          *index != static_cast<int64_t>(committed.size())) return fail();
+          *index != static_cast<int64_t>(committed.size()))
+        return fail();
       previousEvaluations = *evaluatedAfter;
       latestCursors[{key->str(), action.family}] = *after;
     }
     if (previousEvaluations && root.getInteger("scored_candidates") !=
-                                  static_cast<int64_t>(*previousEvaluations)) return fail();
+                                   static_cast<int64_t>(*previousEvaluations))
+      return fail();
     for (const auto &value : *edges) {
       auto edge = value.getAsString();
-      if (!edge || !savedEdges.insert(edge->str()).second) return fail();
+      if (!edge || !savedEdges.insert(edge->str()).second)
+        return fail();
     }
-    if (savedEdges != committed) return fail();
+    if (savedEdges != committed)
+      return fail();
     std::map<std::string, ParentPendingProgress> restored;
     for (const auto &value : *parents) {
       auto *parent = value.getAsObject();
       auto key = parent ? parent->getString("parent_key") : std::nullopt;
       auto id = parent ? parent->getString("parent_id") : std::nullopt;
       const auto *families = parent ? parent->getArray("families") : nullptr;
-      if (!key || key->empty() || !id || !families || !eligibleKeys.count(id->str()) ||
-          eligibleKeys[id->str()] != *key || restored.count(key->str())) return fail();
+      if (!key || key->empty() || !id || !families ||
+          !eligibleKeys.count(id->str()) || eligibleKeys[id->str()] != *key ||
+          restored.count(key->str()))
+        return fail();
       ParentPendingProgress saved;
       saved.parentID = id->str();
       for (const auto &entry : *families) {
@@ -7280,9 +8430,11 @@ private:
         auto cursor = family ? family->getInteger("cursor") : std::nullopt;
         auto attempts = family ? family->getInteger("attempts") : std::nullopt;
         const auto *actions = family ? family->getArray("actions") : nullptr;
-        if (!name || name->empty() || !cursor || !attempts || !actions || *cursor < 0 ||
-            *attempts != *cursor || static_cast<uint64_t>(*cursor) > actions->size() ||
-            saved.families.count(name->str())) return fail();
+        if (!name || name->empty() || !cursor || !attempts || !actions ||
+            *cursor < 0 || *attempts != *cursor ||
+            static_cast<uint64_t>(*cursor) > actions->size() ||
+            saved.families.count(name->str()))
+          return fail();
         ParentFamilyProgress stream;
         stream.cursor = *cursor;
         stream.attempts = *attempts;
@@ -7290,13 +8442,16 @@ private:
         for (auto indexed : llvm::enumerate(*actions)) {
           const auto *typed = indexed.value().getAsObject();
           NeighborhoodAction action;
-          if (!typed || !parseTypedAction(*typed, action) || action.family != *name ||
+          if (!typed || !parseTypedAction(*typed, action) ||
+              action.family != *name ||
               !signatures.insert(actionSignature(action)).second ||
               committed.count(parentProgressEdgeKey(*key, action)) !=
-                  static_cast<size_t>(indexed.index() < stream.cursor)) return fail();
+                  static_cast<size_t>(indexed.index() < stream.cursor))
+            return fail();
           stream.actions.push_back(std::move(action));
         }
-        if (stream.cursor > 0 && latestCursors[{key->str(), name->str()}] != stream.cursor)
+        if (stream.cursor > 0 &&
+            latestCursors[{key->str(), name->str()}] != stream.cursor)
           return fail();
         saved.families.emplace(name->str(), std::move(stream));
       }
@@ -7305,25 +8460,35 @@ private:
     std::vector<std::string> restoredEvents;
     for (const auto &value : *events) {
       auto text = value.getAsString();
-      if (!text) return fail();
+      if (!text)
+        return fail();
       auto parsed = json::parse(*text);
-      if (!parsed) { llvm::consumeError(parsed.takeError()); return fail(); }
+      if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        return fail();
+      }
       auto *event = parsed->getAsObject();
       auto type = event ? event->getString("record_type") : std::nullopt;
       auto id = event ? event->getString("parent_id") : std::nullopt;
       auto key = event ? event->getString("parent_key") : std::nullopt;
       auto round = event ? event->getInteger("round") : std::nullopt;
-      if (!event || !type || (*type != "queue_update" && *type != "parent_retired") ||
-          event->getString("policy") != kParentProgressPolicy || !id || !key || !round || *round < 0 ||
-          *round > root.getInteger("round").value_or(-1) || !archivedKeys.count(id->str()) ||
-          archivedKeys[id->str()] != *key) return fail();
+      if (!event || !type ||
+          (*type != "queue_update" && *type != "parent_retired") ||
+          event->getString("policy") != kParentProgressPolicy || !id || !key ||
+          !round || *round < 0 ||
+          *round > root.getInteger("round").value_or(-1) ||
+          !archivedKeys.count(id->str()) || archivedKeys[id->str()] != *key)
+        return fail();
       if (*type == "queue_update") {
         std::vector<std::string> signatures;
         for (StringRef name : {"previous_remaining", "retained_remaining",
-                              "appended_signatures", "removed_signatures"})
-          if (!parseStringArray(event->getArray(name), signatures)) return fail();
-        if (!event->getString("family") || event->getInteger("cursor").value_or(-1) < 0 ||
-            event->getInteger("stream_attempts") != event->getInteger("cursor")) return fail();
+                               "appended_signatures", "removed_signatures"})
+          if (!parseStringArray(event->getArray(name), signatures))
+            return fail();
+        if (!event->getString("family") ||
+            event->getInteger("cursor").value_or(-1) < 0 ||
+            event->getInteger("stream_attempts") != event->getInteger("cursor"))
+          return fail();
       }
       restoredEvents.push_back(text->str());
     }
@@ -7333,27 +8498,33 @@ private:
     return true;
   }
 
-  bool internWitnessInNamespace(
-      StringRef bytes, StringRef idPrefix,
-      std::map<std::string, std::string> &dictionary, std::string &id,
-      std::string &error) {
+  bool internWitnessInNamespace(StringRef bytes, StringRef idPrefix,
+                                std::map<std::string, std::string> &dictionary,
+                                std::string &id, std::string &error) {
     auto existing = dictionary.find(bytes.str());
-    if (existing != dictionary.end()) { id = existing->second; return true; }
+    if (existing != dictionary.end()) {
+      id = existing->second;
+      return true;
+    }
     id = idPrefix.str() + std::to_string(dictionary.size());
     const std::string directory = outputDir + "/witnesses";
     const std::string path = directory + "/" + id + ".txt";
-    if (!ensureDirectory(directory, error) || !diskGuard(error)) return false;
+    if (!ensureDirectory(directory, error) || !diskGuard(error))
+      return false;
     if (llvm::sys::fs::exists(path)) {
       std::string old;
-      if (!readFileBytes(path, old, error)) return false;
+      if (!readFileBytes(path, old, error))
+        return false;
       // A crash may leave an uncommitted immutable dictionary entry. It is
       // reusable only by direct byte equality, never by a numeric ID alone.
       if (old != bytes) {
         error = "immutable source witness file has different exact bytes";
         return false;
       }
-    } else if (!writeTextAtomically(path, bytes, error)) return false;
-    dictionary.emplace(bytes.str(), id); witnessPaths[id] = path;
+    } else if (!writeTextAtomically(path, bytes, error))
+      return false;
+    dictionary.emplace(bytes.str(), id);
+    witnessPaths[id] = path;
     return true;
   }
 
@@ -7374,8 +8545,9 @@ private:
     std::error_code ec;
     auto space = std::filesystem::space(outputDir.getValue(), ec);
     if (ec || space.available < uintmax_t(minimumFreeBytes.getValue())) {
-      error = ec ? "disk guard cannot query filesystem: " + ec.message() :
-                   "disk guard: insufficient free bytes for durable search output";
+      error =
+          ec ? "disk guard cannot query filesystem: " + ec.message()
+             : "disk guard: insufficient free bytes for durable search output";
       return false;
     }
     return true;
@@ -7384,9 +8556,8 @@ private:
   bool mergeDuplicate(SearchState &state, ModuleOp canonical,
                       StringRef functionName,
                       std::vector<ArchiveRecord> &archive,
-                      StringRef outputDirectory,
-                      StringRef candidatesDirectory, uint64_t &nextSerial,
-                      std::string &error) {
+                      StringRef outputDirectory, StringRef candidatesDirectory,
+                      uint64_t &nextSerial, std::string &error) {
     if (state.control != !state.controlRoles.empty()) {
       error = "stage control duplicate marker and named roles differ";
       return false;
@@ -7401,9 +8572,11 @@ private:
     }
     for (size_t index = 0; index < archive.size(); ++index) {
       ArchiveRecord &record = archive[index];
-      if (record.key != state.key || record.key.empty()) continue;
+      if (record.key != state.key || record.key.empty())
+        continue;
       if (state.control && !record.valid) {
-        error = "required stage control duplicates a candidate without a legal production score";
+        error = "required stage control duplicates a candidate without a legal "
+                "production score";
         return false;
       }
       if (state.control &&
@@ -7422,34 +8595,33 @@ private:
           error = "stage control duplicate has no named control role";
           return false;
         }
-        if (!diskGuard(error)) return false;
+        if (!diskGuard(error))
+          return false;
         for (;;) {
-          roleCandidatePath =
-              candidatesDirectory.str() + "/" + state.id + "-control-" +
-              std::to_string(nextSerial++) + ".mlir";
+          roleCandidatePath = candidatesDirectory.str() + "/" + state.id +
+                              "-control-" + std::to_string(nextSerial++) +
+                              ".mlir";
           if (!llvm::sys::fs::exists(roleCandidatePath)) {
             if (!writeModule(state.module.get(), roleCandidatePath, error))
               return false;
             break;
           }
-          OwningOpRef<ModuleOp> existing =
-              parseSourceFile<ModuleOp>(roleCandidatePath,
-                                        state.module.get().getContext());
+          OwningOpRef<ModuleOp> existing = parseSourceFile<ModuleOp>(
+              roleCandidatePath, state.module.get().getContext());
           if (existing && neighborhoodReplaySourceText(*existing) ==
-                              neighborhoodReplaySourceText(
-                                  state.module.get()))
+                              neighborhoodReplaySourceText(state.module.get()))
             break;
         }
       }
       for (const std::string &role : state.controlRoles) {
-        if (record.controlRoleProvenance.count(role)) continue;
+        if (record.controlRoleProvenance.count(role))
+          continue;
         if (!llvm::is_contained(record.controlRoles, role))
           record.controlRoles.push_back(role);
         ControlRoleProvenance provenance;
         provenance.candidatePath = roleCandidatePath;
         provenance.path = state.path;
-        provenance.actionHistory =
-            portableActionHistory(state.actionHistory);
+        provenance.actionHistory = portableActionHistory(state.actionHistory);
         record.controlRoleProvenance.emplace(role, std::move(provenance));
       }
       record.control |= state.control;
@@ -7460,12 +8632,10 @@ private:
       // snapshot is retained and byte-equal to this authenticated candidate.
       if (!record.actionHistory.known && state.actionHistory.known &&
           !record.candidatePath.empty()) {
-        OwningOpRef<ModuleOp> archived =
-            parseSourceFile<ModuleOp>(record.candidatePath,
-                                      state.module.get().getContext());
-        if (archived &&
-            neighborhoodReplaySourceText(*archived) ==
-                neighborhoodReplaySourceText(state.module.get())) {
+        OwningOpRef<ModuleOp> archived = parseSourceFile<ModuleOp>(
+            record.candidatePath, state.module.get().getContext());
+        if (archived && neighborhoodReplaySourceText(*archived) ==
+                            neighborhoodReplaySourceText(state.module.get())) {
           if (!authenticateTypedActionHistory(state, canonical, functionName,
                                               outputDirectory, nextSerial,
                                               error))
@@ -7485,9 +8655,10 @@ private:
     return false;
   }
 
-  bool persistBestFamilyWitnesses(
-      const SearchState &state, ArrayRef<ArchiveRecord> archive,
-      StringRef outputDirectory, std::string &error) {
+  bool persistBestFamilyWitnesses(const SearchState &state,
+                                  ArrayRef<ArchiveRecord> archive,
+                                  StringRef outputDirectory,
+                                  std::string &error) {
     if (!state.scored || !state.module)
       return true;
     std::set<std::string> candidateFamilies =
@@ -7570,24 +8741,23 @@ private:
          static_cast<int64_t>(costCatalogueJSON.size())},
         {"cost_catalogue_exact_json", std::move(costCatalogueJSON)},
         {"task_choices", choiceRecords(candidateRecord->choices)},
-        {"task_costs", costRecords(candidateRecord->choices,
-                                    candidateRecord->costs,
-                                    candidateRecord->durations)},
-        {"task_schedule", scheduleRecords(
-                               candidateRecord->choices,
-                               candidateRecord->schedule.placements)},
+        {"task_costs",
+         costRecords(candidateRecord->choices, candidateRecord->costs,
+                     candidateRecord->durations)},
+        {"task_schedule",
+         scheduleRecords(candidateRecord->choices,
+                         candidateRecord->schedule.placements)},
         {"action_path", stringArray(candidateRecord->path)},
         {"action_history",
          typedActionHistoryObject(candidateRecord->actionHistory)},
         {"binding", std::move(witnessBinding)}};
     const std::string diagnosticsDirectory =
         outputDirectory.str() + "/diagnostics";
-    if (!ensureDirectory(diagnosticsDirectory, error) ||
-        !diskGuard(error) ||
-        !writeTextAtomically(
-            diagnosticsDirectory + "/" +
-                familyWitnessFilename(candidateRecord->id),
-            jsonText(json::Value(std::move(witness))) + "\n", error))
+    if (!ensureDirectory(diagnosticsDirectory, error) || !diskGuard(error) ||
+        !writeTextAtomically(diagnosticsDirectory + "/" +
+                                 familyWitnessFilename(candidateRecord->id),
+                             jsonText(json::Value(std::move(witness))) + "\n",
+                             error))
       return false;
     return true;
   }
@@ -7595,8 +8765,8 @@ private:
   void appendFamilyFunnelCandidateEvent(
       int64_t round, StringRef family, StringRef candidateID,
       StringRef parentID, const NeighborhoodAction &action,
-      const SearchState::TypedActionHistory &history,
-      json::Object result, json::Object progress = {}) {
+      const SearchState::TypedActionHistory &history, json::Object result,
+      json::Object progress = {}) {
     std::set<std::string> primitiveKinds;
     for (const NeighborhoodPrimitive &primitive : action.primitives)
       primitiveKinds.insert(primitive.kind);
@@ -7629,25 +8799,27 @@ private:
     if (stageNumber(stage) == 6)
       binding["fission_source_replay"] =
           "orbit-taskflow-fission-source-replay-v2-ordinary-suffix-rebase";
-    json::Object event{
-        {"record_type", "candidate_attempt"},
-        {"schema", kFamilyFunnelSchema},
-        {"round", round},
-        {"action_family", family}, {"phase",activePhase},
-        {"candidate_id", candidateID},
-        {"parent_id", parentID},
-        {"action", typedActionObject(action)},
-        {"typed_primitive_kinds", std::move(primitiveKindArray)},
-        {"typed_action_history", std::move(typedHistory)},
-        {"binding", std::move(binding)},
-        {"result", std::move(result)}};
-    if (parentProgress) event["parent_progress"] = std::move(progress);
+    json::Object event{{"record_type", "candidate_attempt"},
+                       {"schema", kFamilyFunnelSchema},
+                       {"round", round},
+                       {"action_family", family},
+                       {"phase", activePhase},
+                       {"candidate_id", candidateID},
+                       {"parent_id", parentID},
+                       {"action", typedActionObject(action)},
+                       {"typed_primitive_kinds", std::move(primitiveKindArray)},
+                       {"typed_action_history", std::move(typedHistory)},
+                       {"binding", std::move(binding)},
+                       {"result", std::move(result)}};
+    if (parentProgress)
+      event["parent_progress"] = std::move(progress);
     familyFunnelEvents.push_back(jsonText(json::Value(std::move(event))));
   }
 
-  void appendPendingFamilyFunnelEvent(
-      int64_t round, const PendingNeighbor &neighbor,
-      const SearchState &parent, StringRef reason) {
+  void appendPendingFamilyFunnelEvent(int64_t round,
+                                      const PendingNeighbor &neighbor,
+                                      const SearchState &parent,
+                                      StringRef reason) {
     std::set<std::string> primitiveKinds;
     for (const NeighborhoodPrimitive &primitive : neighbor.action.primitives)
       primitiveKinds.insert(primitive.kind);
@@ -7665,19 +8837,18 @@ private:
         {"fissionActions",
          typedActionArray(parent.actionHistory.fissionActions)},
         {"actions", typedActionArray(parent.actionHistory.actions)}};
-    json::Object event{
-        {"record_type", "pending_unattempted"},
-        {"schema", kFamilyFunnelSchema},
-        {"round", round},
-        {"action_family", neighbor.action.family},
-        {"candidate_id", ""},
-        {"parent_id", parent.id},
-        {"action", typedActionObject(neighbor.action)},
-        {"typed_primitive_kinds", std::move(kinds)},
-        {"typed_action_history", std::move(history)},
-        {"status", "not_attempted_at_checkpoint"},
-        {"pending_reason", reason.str()},
-        {"source_binding_witness", bindingPath}};
+    json::Object event{{"record_type", "pending_unattempted"},
+                       {"schema", kFamilyFunnelSchema},
+                       {"round", round},
+                       {"action_family", neighbor.action.family},
+                       {"candidate_id", ""},
+                       {"parent_id", parent.id},
+                       {"action", typedActionObject(neighbor.action)},
+                       {"typed_primitive_kinds", std::move(kinds)},
+                       {"typed_action_history", std::move(history)},
+                       {"status", "not_attempted_at_checkpoint"},
+                       {"pending_reason", reason.str()},
+                       {"source_binding_witness", bindingPath}};
     familyFunnelEvents.push_back(jsonText(json::Value(std::move(event))));
   }
 
@@ -7687,8 +8858,8 @@ private:
       json::Object counts;
       for (const auto &[family, counters] : families)
         counts[family] = familyFunnelCountersObject(counters);
-      rounds.push_back(json::Object{{"round", round},
-                                    {"families", std::move(counts)}});
+      rounds.push_back(
+          json::Object{{"round", round}, {"families", std::move(counts)}});
     }
     return rounds;
   }
@@ -7703,8 +8874,8 @@ private:
     familyFunnelByRound.clear();
     for (const json::Value &value : *rounds) {
       const json::Object *roundObject = value.getAsObject();
-      auto round = roundObject ? roundObject->getInteger("round")
-                               : std::nullopt;
+      auto round =
+          roundObject ? roundObject->getInteger("round") : std::nullopt;
       const json::Object *families =
           roundObject ? roundObject->getObject("families") : nullptr;
       if (!round || *round < 0 || !families) {
@@ -7715,14 +8886,15 @@ private:
       for (const auto &[familyRef, familyValue] : *families) {
         const json::Object *counts = familyValue.getAsObject();
         FamilyFunnelCounters parsed;
-        if (!counts ||
-            !parseFamilyFunnelCounters(*counts, parsed) ||
-            !parsedFamilies.emplace(familyRef.str(), std::move(parsed)).second) {
+        if (!counts || !parseFamilyFunnelCounters(*counts, parsed) ||
+            !parsedFamilies.emplace(familyRef.str(), std::move(parsed))
+                 .second) {
           error = "checkpoint family funnel counters are malformed";
           return false;
         }
       }
-      if (!familyFunnelByRound.emplace(*round, std::move(parsedFamilies)).second) {
+      if (!familyFunnelByRound.emplace(*round, std::move(parsedFamilies))
+               .second) {
         error = "checkpoint family funnel repeats a round";
         return false;
       }
@@ -7737,10 +8909,10 @@ private:
       auto parsed = json::parse(*eventText);
       const json::Object *eventObject =
           parsed ? parsed->getAsObject() : nullptr;
-      auto schema = eventObject ? eventObject->getString("schema")
-                                : std::nullopt;
-      auto recordType = eventObject ? eventObject->getString("record_type")
-                                    : std::nullopt;
+      auto schema =
+          eventObject ? eventObject->getString("schema") : std::nullopt;
+      auto recordType =
+          eventObject ? eventObject->getString("record_type") : std::nullopt;
       if (!eventObject || !schema || *schema != kFamilyFunnelSchema ||
           !recordType) {
         if (!parsed)
@@ -7753,13 +8925,13 @@ private:
     return true;
   }
 
-  bool writeFamilyFunnelSidecars(
-      StringRef outputDirectory, StringRef checkpointPath,
-      int64_t currentRound,
-      ArrayRef<ArchiveRecord> archive, ArrayRef<SearchState> beam,
-      ArrayRef<PendingNeighbor> pending, uint64_t pendingCursor,
-      StringRef stopReason,
-      std::string &error) {
+  bool writeFamilyFunnelSidecars(StringRef outputDirectory,
+                                 StringRef checkpointPath, int64_t currentRound,
+                                 ArrayRef<ArchiveRecord> archive,
+                                 ArrayRef<SearchState> beam,
+                                 ArrayRef<PendingNeighbor> pending,
+                                 uint64_t pendingCursor, StringRef stopReason,
+                                 std::string &error) {
     const std::string diagnosticsDirectory =
         outputDirectory.str() + "/diagnostics";
     if (!ensureDirectory(diagnosticsDirectory, error))
@@ -7770,10 +8942,9 @@ private:
       if (record.valid)
         ranked.push_back(&record);
     std::stable_sort(ranked.begin(), ranked.end(),
-                     [](const ArchiveRecord *left,
-                        const ArchiveRecord *right) {
-      return archiveLess(*left, *right);
-    });
+                     [](const ArchiveRecord *left, const ArchiveRecord *right) {
+                       return archiveLess(*left, *right);
+                     });
     struct PathPresence {
       std::set<std::string> archiveIDs;
       std::set<std::string> scoredIDs;
@@ -7789,8 +8960,8 @@ private:
       for (const std::string &family : recordFamilies(record))
         pathPresence[family].archiveIDs.insert(record.id);
       const bool schedulerWasCalled =
-          record.valid || StringRef(record.rejectReason).starts_with(
-                              "production_scheduler_rejected");
+          record.valid || StringRef(record.rejectReason)
+                              .starts_with("production_scheduler_rejected");
       if (schedulerWasCalled)
         for (const std::string &family : recordFamilies(record))
           pathPresence[family].scoredIDs.insert(record.id);
@@ -7815,15 +8986,13 @@ private:
     }
 
     std::set<std::string> activeFamilyWitnessPaths;
-    auto candidateRankObject = [](uint64_t rank,
-                                  const ArchiveRecord &record,
+    auto candidateRankObject = [](uint64_t rank, const ArchiveRecord &record,
                                   StringRef witnessPath) {
-      json::Object candidate{
-          {"candidate_id", record.id},
-          {"score", record.score},
-          {"global_rank", static_cast<int64_t>(rank)},
-          {"candidate_path", record.candidatePath},
-          {"cost_catalogue_path", record.costPath}};
+      json::Object candidate{{"candidate_id", record.id},
+                             {"score", record.score},
+                             {"global_rank", static_cast<int64_t>(rank)},
+                             {"candidate_path", record.candidatePath},
+                             {"cost_catalogue_path", record.costPath}};
       if (!witnessPath.empty())
         candidate["family_witness_path"] = witnessPath.str();
       return candidate;
@@ -7846,26 +9015,25 @@ private:
         ranks.push_back(static_cast<int64_t>(rank));
         std::string witnessPath;
         if (!haveBest) {
-          witnessPath = diagnosticsDirectory + "/" +
-                        familyWitnessFilename(record->id);
+          witnessPath =
+              diagnosticsDirectory + "/" + familyWitnessFilename(record->id);
           std::string witnessBytes;
           if (!readFileBytes(witnessPath, witnessBytes, error))
             return false;
           auto parsedWitness = json::parse(witnessBytes);
           const json::Object *witnessObject =
               parsedWitness ? parsedWitness->getAsObject() : nullptr;
-          auto witnessSchema = witnessObject
-                                   ? witnessObject->getString("schema")
-                                   : std::nullopt;
-          auto witnessCandidateID = witnessObject
-                                        ? witnessObject->getString("candidate_id")
-                                        : std::nullopt;
+          auto witnessSchema =
+              witnessObject ? witnessObject->getString("schema") : std::nullopt;
+          auto witnessCandidateID =
+              witnessObject ? witnessObject->getString("candidate_id")
+                            : std::nullopt;
           const json::Array *witnessFamilies =
               witnessObject ? witnessObject->getArray("typed_path_families")
                             : nullptr;
-          const auto body = witnessObject
-                                ? witnessObject->getString("candidate_module_ir")
-                                : std::nullopt;
+          const auto body =
+              witnessObject ? witnessObject->getString("candidate_module_ir")
+                            : std::nullopt;
           if (!witnessObject || !witnessSchema ||
               *witnessSchema !=
                   "orbit-joint-neighborhood-family-best-witness-v1" ||
@@ -7877,7 +9045,8 @@ private:
               })) {
             if (!parsedWitness)
               llvm::consumeError(parsedWitness.takeError());
-            error = "family-best witness does not authenticate its ranked candidate";
+            error = "family-best witness does not authenticate its ranked "
+                    "candidate";
             return false;
           }
           activeFamilyWitnessPaths.insert(witnessPath);
@@ -7901,7 +9070,8 @@ private:
           {"archive_candidate_ids", std::move(archiveIDs)},
           {"top5", static_cast<int64_t>(top5Candidates.size())},
           {"top5_candidates", std::move(top5Candidates)},
-          {"global_ranks", std::move(ranks)}, {"best", std::move(best)}};
+          {"global_ranks", std::move(ranks)},
+          {"best", std::move(best)}};
     }
 
     std::map<std::string, FamilyFunnelCounters> totals;
@@ -7927,8 +9097,7 @@ private:
       to.pendingUnattempted += from.pendingUnattempted;
       for (const auto &[reason, count] : from.rejectReasons)
         to.rejectReasons[reason] += count;
-      for (const auto &[reason, count] :
-           from.pendingUnattemptedReasons)
+      for (const auto &[reason, count] : from.pendingUnattemptedReasons)
         to.pendingUnattemptedReasons[reason] += count;
       to.pendingUnattemptedActionSignatures.insert(
           to.pendingUnattemptedActionSignatures.end(),
@@ -7953,8 +9122,7 @@ private:
       const PendingNeighbor &neighbor = pending[index];
       if (neighbor.parent >= beam.size())
         continue;
-      FamilyFunnelCounters &counters =
-          current[neighbor.action.family];
+      FamilyFunnelCounters &counters = current[neighbor.action.family];
       ++counters.pendingUnattempted;
       const std::string pendingReason = stopReason.empty()
                                             ? "checkpoint_frontier_remaining"
@@ -7990,13 +9158,15 @@ private:
         funnelStream << json::Value(std::move(record)) << "\n";
       }
     for (const auto &[family, presenceValue] : pathPresenceRecords) {
-      funnelStream << json::Value(json::Object{
-          {"record_type", "typed_path_presence"},
-          {"schema", kFamilyFunnelSchema},
-          {"through_round", currentRound},
-          {"stage", stage.getValue()}, {"function", functionName.getValue()},
-          {"action_family", family.str()}, {"presence", presenceValue},
-          {"source_binding_witness", bindingPath}})
+      funnelStream << json::Value(
+                          json::Object{{"record_type", "typed_path_presence"},
+                                       {"schema", kFamilyFunnelSchema},
+                                       {"through_round", currentRound},
+                                       {"stage", stage.getValue()},
+                                       {"function", functionName.getValue()},
+                                       {"action_family", family.str()},
+                                       {"presence", presenceValue},
+                                       {"source_binding_witness", bindingPath}})
                    << "\n";
     }
     for (size_t index = static_cast<size_t>(pendingCursor);
@@ -8007,8 +9177,7 @@ private:
       const SearchState &parent = beam[neighbor.parent];
       json::Array kinds;
       std::set<std::string> primitiveKinds;
-      for (const NeighborhoodPrimitive &primitive :
-           neighbor.action.primitives)
+      for (const NeighborhoodPrimitive &primitive : neighbor.action.primitives)
         primitiveKinds.insert(primitive.kind);
       for (const std::string &kind : primitiveKinds)
         kinds.push_back(kind);
@@ -8018,19 +9187,20 @@ private:
            typedActionArray(parent.actionHistory.fissionActions)},
           {"actions", typedActionArray(parent.actionHistory.actions)}};
       funnelStream << json::Value(json::Object{
-          {"record_type", "pending_unattempted"},
-          {"schema", kFamilyFunnelSchema},
-          {"round", currentRound},
-          {"action_family", neighbor.action.family},
-          {"candidate_id", ""}, {"parent_id", parent.id},
-          {"action", typedActionObject(neighbor.action)},
-          {"typed_primitive_kinds", std::move(kinds)},
-          {"typed_action_history", std::move(history)},
-          {"status", "not_attempted_at_checkpoint"},
-          {"pending_reason", stopReason.empty()
-                                 ? "checkpoint_frontier_remaining"
-                                 : stopReason.str()},
-          {"source_binding_witness", bindingPath}})
+                          {"record_type", "pending_unattempted"},
+                          {"schema", kFamilyFunnelSchema},
+                          {"round", currentRound},
+                          {"action_family", neighbor.action.family},
+                          {"candidate_id", ""},
+                          {"parent_id", parent.id},
+                          {"action", typedActionObject(neighbor.action)},
+                          {"typed_primitive_kinds", std::move(kinds)},
+                          {"typed_action_history", std::move(history)},
+                          {"status", "not_attempted_at_checkpoint"},
+                          {"pending_reason",
+                           stopReason.empty() ? "checkpoint_frontier_remaining"
+                                              : stopReason.str()},
+                          {"source_binding_witness", bindingPath}})
                    << "\n";
     }
     funnelStream.flush();
@@ -8057,9 +9227,15 @@ private:
         {"checkpoint_stop_reason", stopReason},
         {"through_round", currentRound},
         {"current_edge_semantics",
-         "menu counts are syntactic source inventory; generated and later counters classify current edges by exact action family. A current edge belongs to one exact family, so current-edge counts are additive across families. Typed full-path presence overlaps."},
+         "menu counts are syntactic source inventory; generated and later "
+         "counters classify current edges by exact action family. A current "
+         "edge belongs to one exact family, so current-edge counts are "
+         "additive across families. Typed full-path presence overlaps."},
         {"path_presence_semantics",
-         "Only known histories contribute exact representative fissionActions and ordinary actions. Unknown histories and alternate paths are excluded. Candidate counts overlap across families and must not be summed."},
+         "Only known histories contribute exact representative fissionActions "
+         "and ordinary actions. Unknown histories and alternate paths are "
+         "excluded. Candidate counts overlap across families and must not be "
+         "summed."},
         {"current_edge_by_family", std::move(currentEdgeRecords)},
         {"typed_path_presence_by_family", std::move(pathPresenceRecords)}};
     if (stageNumber(stage) == 6)
@@ -8069,14 +9245,14 @@ private:
         jsonText(json::Value(std::move(summary))) + "\n";
     if (!writeTextAtomically(diagnosticsDirectory + "/family-funnel.jsonl",
                              jsonl, error) ||
-        !writeTextAtomically(
-            diagnosticsDirectory + "/family-funnel-summary.json",
-            summaryText, error))
+        !writeTextAtomically(diagnosticsDirectory +
+                                 "/family-funnel-summary.json",
+                             summaryText, error))
       return false;
     std::error_code cleanupError;
     const std::string witnessPrefix = "family-best-witness-";
-    for (std::filesystem::directory_iterator iterator(diagnosticsDirectory,
-                                                      cleanupError),
+    for (std::filesystem::directory_iterator
+             iterator(diagnosticsDirectory, cleanupError),
          end;
          !cleanupError && iterator != end; iterator.increment(cleanupError)) {
       const std::string path = iterator->path().string();
@@ -8090,8 +9266,8 @@ private:
         break;
     }
     if (cleanupError) {
-      error = "cannot retire stale family-best witness: " +
-              cleanupError.message();
+      error =
+          "cannot retire stale family-best witness: " + cleanupError.message();
       return false;
     }
     return true;
@@ -8099,11 +9275,14 @@ private:
 
   bool saveCheckpoint(StringRef path, int64_t round, uint64_t nextSerial,
                       uint64_t scoredCount, uint64_t rejectedCount,
-                      StringRef canonicalFactKey, const std::vector<ArchiveRecord> &archive,
-                      ArrayRef<SearchState> beam, ArrayRef<SearchState> generated,
+                      StringRef canonicalFactKey,
+                      const std::vector<ArchiveRecord> &archive,
+                      ArrayRef<SearchState> beam,
+                      ArrayRef<SearchState> generated,
                       ArrayRef<PendingNeighbor> pending, uint64_t pendingCursor,
                       StringRef stopReason, std::string &error) {
-    if (!diskGuard(error)) return false;
+    if (!diskGuard(error))
+      return false;
     // Archive is append-only with explicit indexed amendments. Checkpoints
     // reference one committed journal prefix instead of rewriting 20k rows
     // every 128 actions. A crash beyond that prefix is ignored on recovery.
@@ -8111,45 +9290,70 @@ private:
     llvm::raw_string_ostream stream(additions);
     for (size_t index : dirtyJournalIndices)
       if (index < journalArchiveCount)
-        stream << json::Value(json::Object{{"index", int64_t(index)},
-                {"candidate", archiveObject(archive[index])}}) << "\n";
+        stream << json::Value(json::Object{
+                      {"index", int64_t(index)},
+                      {"candidate", archiveObject(archive[index])}})
+               << "\n";
     for (size_t index = journalArchiveCount; index < archive.size(); ++index)
-      stream << json::Value(json::Object{{"index", int64_t(index)},
-              {"candidate", archiveObject(archive[index])}}) << "\n";
+      stream << json::Value(
+                    json::Object{{"index", int64_t(index)},
+                                 {"candidate", archiveObject(archive[index])}})
+             << "\n";
     stream.flush();
     if (!additions.empty()) {
       std::ofstream journal(journalPath, std::ios::binary | std::ios::app);
-      if (!journal) { error = "cannot open archive journal for append"; return false; }
-      journal.write(additions.data(), additions.size()); journal.flush();
-      if (!journal) { error = "archive journal write failure"; return false; }
+      if (!journal) {
+        error = "cannot open archive journal for append";
+        return false;
+      }
+      journal.write(additions.data(), additions.size());
+      journal.flush();
+      if (!journal) {
+        error = "archive journal write failure";
+        return false;
+      }
       journal.close();
-      if (journal.fail()) { error = "archive journal close/write failure"; return false; }
+      if (journal.fail()) {
+        error = "archive journal close/write failure";
+        return false;
+      }
     }
     const uint64_t newJournalBytes = journalBytes + additions.size();
     json::Array beams, generatedStates, neighbors, graphCosts, witnesses,
         funnelEvents;
-    for (const auto &state : beam) beams.push_back(stateObject(state));
-    for (const auto &state : generated) generatedStates.push_back(stateObject(state));
+    for (const auto &state : beam)
+      beams.push_back(stateObject(state));
+    for (const auto &state : generated)
+      generatedStates.push_back(stateObject(state));
     for (const std::string &event : familyFunnelEvents)
       funnelEvents.push_back(event);
     for (const auto &neighbor : pending)
-      neighbors.push_back(json::Object{{"parent", int64_t(neighbor.parent)},
-                                       {"action", actionObject(neighbor.action)}});
+      neighbors.push_back(
+          json::Object{{"parent", int64_t(neighbor.parent)},
+                       {"action", actionObject(neighbor.action)}});
     // Seen failed scoring keys survive restore too. Their canonical graph may
     // lack a score, so reconstructing seen solely from valid rows is unsafe.
     for (const auto &entry : graphCostPaths)
-      graphCosts.push_back(json::Object{{"graph_key", entry.first}, {"path", entry.second}});
+      graphCosts.push_back(
+          json::Object{{"graph_key", entry.first}, {"path", entry.second}});
     for (const auto &entry : witnessPaths)
-      witnesses.push_back(json::Object{{"id", entry.first}, {"path", entry.second}});
+      witnesses.push_back(
+          json::Object{{"id", entry.first}, {"path", entry.second}});
     json::Object root{
         {"schema", checkpointSchemaForCeiling(diagnosticIICeiling.getValue())},
         {"record_type", "checkpoint"},
-        {"function", functionName.getValue()}, {"stage", stage.getValue()},
-        {"source_repository", sourceRepository.getValue()}, {"source_commit", sourceCommit.getValue()},
-        {"architecture_path", architecturePath.getValue()}, {"protocol_path", protocolFile.getValue()},
-        {"binding_witness_path", bindingPath}, {"canonical_fact_key", canonicalFactKey},
-        {"round", round}, {"next_serial", int64_t(nextSerial)},
-        {"scored_candidates", int64_t(scoredCount)}, {"rejected_candidates", int64_t(rejectedCount)},
+        {"function", functionName.getValue()},
+        {"stage", stage.getValue()},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"architecture_path", architecturePath.getValue()},
+        {"protocol_path", protocolFile.getValue()},
+        {"binding_witness_path", bindingPath},
+        {"canonical_fact_key", canonicalFactKey},
+        {"round", round},
+        {"next_serial", int64_t(nextSerial)},
+        {"scored_candidates", int64_t(scoredCount)},
+        {"rejected_candidates", int64_t(rejectedCount)},
         {"round_scored_candidates", int64_t(roundScoredCount)},
         {"round_score_limit", int64_t(roundScoreLimit)},
         {"duplicate_candidates", int64_t(duplicateCandidates)},
@@ -8163,17 +9367,26 @@ private:
         {"parallel_module_cache_misses", int64_t(parallelModuleCacheMisses)},
         {"parallel_scored_jobs", int64_t(parallelScoredJobs)},
         {"parallel_batch_item_sizes", uint64Array(parallelBatchItemSizes)},
-        {"parallel_batch_score_job_sizes", uint64Array(parallelBatchScoreJobSizes)},
-        {"cost_cache_hits", int64_t(costCacheHits)}, {"cost_cache_misses", int64_t(costCacheMisses)},
+        {"parallel_batch_score_job_sizes",
+         uint64Array(parallelBatchScoreJobSizes)},
+        {"cost_cache_hits", int64_t(costCacheHits)},
+        {"cost_cache_misses", int64_t(costCacheMisses)},
         {"elapsed_milliseconds", elapsedMilliseconds},
-        {"pending_action_cursor", int64_t(pendingCursor)}, {"pending_neighbors", std::move(neighbors)},
-        {"beam", std::move(beams)}, {"generated", std::move(generatedStates)},
-        {"witness_dictionary", std::move(witnesses)}, {"graph_cost_catalogues", std::move(graphCosts)},
-        {"archive_journal_path", journalPath}, {"archive_journal_bytes", int64_t(newJournalBytes)},
-        {"archive_count", int64_t(archive.size())}, {"stop_reason", stopReason},
+        {"pending_action_cursor", int64_t(pendingCursor)},
+        {"pending_neighbors", std::move(neighbors)},
+        {"beam", std::move(beams)},
+        {"generated", std::move(generatedStates)},
+        {"witness_dictionary", std::move(witnesses)},
+        {"graph_cost_catalogues", std::move(graphCosts)},
+        {"archive_journal_path", journalPath},
+        {"archive_journal_bytes", int64_t(newJournalBytes)},
+        {"archive_count", int64_t(archive.size())},
+        {"stop_reason", stopReason},
         {"family_funnel_rounds", familyFunnelRoundsObject()},
         {"family_funnel_events", std::move(funnelEvents)},
-        {"search_scope", kSearchScope}, {"best_found", true}, {"exhaustive", false}};
+        {"search_scope", kSearchScope},
+        {"best_found", true},
+        {"exhaustive", false}};
     if (diagnosticIICeiling == 23)
       root["diagnostic_ii_ceiling"] = diagnosticIICeiling.getValue();
     if (parentProgress) {
@@ -8188,7 +9401,9 @@ private:
       root["directional_state"] = directionalStateObject();
       root["directional_events"] = stringArray(directionalEvents);
     }
-    if (!writeTextAtomically(path, jsonText(json::Value(std::move(root))) + "\n", error)) return false;
+    if (!writeTextAtomically(
+            path, jsonText(json::Value(std::move(root))) + "\n", error))
+      return false;
     if (!writeFamilyFunnelSidecars(outputDir, path, round, archive, beam,
                                    pending, pendingCursor, stopReason, error))
       return false;
@@ -8197,61 +9412,83 @@ private:
       for (const std::string &event : parentProgressEvents)
         progressText += event + "\n";
       if (!writeTextAtomically(outputDir.getValue() + "/parent-progress.jsonl",
-                               progressText, error)) return false;
+                               progressText, error))
+        return false;
     }
     if (directionalSearch) {
       std::string text;
-      for (const std::string &event : directionalEvents) text += event + "\n";
-      if (!writeTextAtomically(outputDir.getValue() + "/directions.jsonl", text, error))
+      for (const std::string &event : directionalEvents)
+        text += event + "\n";
+      if (!writeTextAtomically(outputDir.getValue() + "/directions.jsonl", text,
+                               error))
         return false;
     }
-    journalBytes = newJournalBytes; journalArchiveCount = archive.size(); dirtyJournalIndices.clear();
+    journalBytes = newJournalBytes;
+    journalArchiveCount = archive.size();
+    dirtyJournalIndices.clear();
     // Snapshot deletion happens only after a checkpoint binds the amended
     // archive. A failed checkpoint always leaves the previous replay inputs.
     for (const auto &obsolete : obsoleteCandidatePaths) {
       std::error_code ec = llvm::sys::fs::remove(obsolete);
       if (ec && ec != std::errc::no_such_file_or_directory) {
-        error = "cannot retire superseded candidate snapshot: " + ec.message(); return false;
+        error = "cannot retire superseded candidate snapshot: " + ec.message();
+        return false;
       }
     }
     obsoleteCandidatePaths.clear();
     return true;
   }
 
-  bool restoreCheckpoint(ModuleOp canonical, StringRef path, StringRef binding,
-      int64_t &round, uint64_t &nextSerial, uint64_t &scoredCount,
-      uint64_t &rejectedCount, std::string &canonicalFactKey,
-      std::vector<ArchiveRecord> &archive, std::vector<SearchState> &beam,
-      std::vector<SearchState> &generated, std::vector<PendingNeighbor> &pending,
-      uint64_t &pendingCursor, std::set<std::string> &seenKeys, std::string &error) {
+  bool restoreCheckpoint(
+      ModuleOp canonical, StringRef path, StringRef binding, int64_t &round,
+      uint64_t &nextSerial, uint64_t &scoredCount, uint64_t &rejectedCount,
+      std::string &canonicalFactKey, std::vector<ArchiveRecord> &archive,
+      std::vector<SearchState> &beam, std::vector<SearchState> &generated,
+      std::vector<PendingNeighbor> &pending, uint64_t &pendingCursor,
+      std::set<std::string> &seenKeys, std::string &error) {
     std::string bytes;
-    if (!readFileBytes(path, bytes, error)) return false;
+    if (!readFileBytes(path, bytes, error))
+      return false;
     auto parsed = json::parse(bytes);
-    if (!parsed) { llvm::consumeError(parsed.takeError()); error = "invalid neighborhood checkpoint JSON"; return false; }
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      error = "invalid neighborhood checkpoint JSON";
+      return false;
+    }
     const auto *root = parsed->getAsObject();
-    if (!root || !parseCheckpointHeader(*root, functionName, stage, sourceRepository,
-        sourceCommit, architecturePath, protocolFile, diagnosticIICeiling,
-        error)) return false;
+    if (!root ||
+        !parseCheckpointHeader(*root, functionName, stage, sourceRepository,
+                               sourceCommit, architecturePath, protocolFile,
+                               diagnosticIICeiling, error))
+      return false;
     if (!restoreFamilyFunnel(*root, error))
       return false;
-    auto savedRound = root->getInteger("round"), serial = root->getInteger("next_serial"),
-         count = root->getInteger("scored_candidates"), rejected = root->getInteger("rejected_candidates"),
+    auto savedRound = root->getInteger("round"),
+         serial = root->getInteger("next_serial"),
+         count = root->getInteger("scored_candidates"),
+         rejected = root->getInteger("rejected_candidates"),
          roundCount = root->getInteger("round_scored_candidates"),
          roundLimit = root->getInteger("round_score_limit"),
-         cursor = root->getInteger("pending_action_cursor"), prefix = root->getInteger("archive_journal_bytes"),
+         cursor = root->getInteger("pending_action_cursor"),
+         prefix = root->getInteger("archive_journal_bytes"),
          archiveCount = root->getInteger("archive_count");
-    auto beamRecords = root->getArray("beam"), generatedRecords = root->getArray("generated"),
+    auto beamRecords = root->getArray("beam"),
+         generatedRecords = root->getArray("generated"),
          neighbors = root->getArray("pending_neighbors");
-    auto facts = root->getString("canonical_fact_key"), witness = root->getString("binding_witness_path"),
+    auto facts = root->getString("canonical_fact_key"),
+         witness = root->getString("binding_witness_path"),
          savedJournal = root->getString("archive_journal_path");
     if (!savedRound || !serial || !count || !rejected || !roundCount ||
-        !roundLimit || !cursor || !prefix || !archiveCount ||
-        !beamRecords || !generatedRecords || !neighbors || !facts || !witness || !savedJournal ||
-        *witness != bindingPath || *savedJournal != journalPath || *savedRound < 0 || *serial < 0 ||
+        !roundLimit || !cursor || !prefix || !archiveCount || !beamRecords ||
+        !generatedRecords || !neighbors || !facts || !witness ||
+        !savedJournal || *witness != bindingPath ||
+        *savedJournal != journalPath || *savedRound < 0 || *serial < 0 ||
         *count < 0 || *rejected < 0 || *roundCount < 0 || *roundLimit < 0 ||
-        *roundCount > *roundLimit || *cursor < 0 || uint64_t(*cursor) > neighbors->size() ||
-        *prefix < 0 || *archiveCount < 0) {
-      error = "checkpoint lacks exact frontier/journal continuation state"; return false;
+        *roundCount > *roundLimit || *cursor < 0 ||
+        uint64_t(*cursor) > neighbors->size() || *prefix < 0 ||
+        *archiveCount < 0) {
+      error = "checkpoint lacks exact frontier/journal continuation state";
+      return false;
     }
     const uint64_t configuredMaxCandidates =
         static_cast<uint64_t>(maxCandidates.getValue());
@@ -8272,64 +9509,102 @@ private:
         static_cast<uint64_t>(*roundLimit) > remainingScoreBound ||
         (*savedRound == maxRounds.getValue() &&
          (*roundCount != 0 || *roundLimit != 0))) {
-      error = "checkpoint per-round score quota differs from protocol-derived budget";
+      error = "checkpoint per-round score quota differs from protocol-derived "
+              "budget";
       return false;
     }
-    if (!readFileBytes(journalPath, bytes, error) || bytes.size() < uint64_t(*prefix)) {
-      if (error.empty()) error = "checkpoint committed archive journal prefix is truncated";
+    if (!readFileBytes(journalPath, bytes, error) ||
+        bytes.size() < uint64_t(*prefix)) {
+      if (error.empty())
+        error = "checkpoint committed archive journal prefix is truncated";
       return false;
     }
     const std::string committed = bytes.substr(0, *prefix);
     auto journalBuffer = llvm::MemoryBuffer::getMemBuffer(committed);
-    for (llvm::line_iterator lines(*journalBuffer, true); !lines.is_at_end(); ++lines) {
+    for (llvm::line_iterator lines(*journalBuffer, true); !lines.is_at_end();
+         ++lines) {
       auto entry = json::parse(*lines);
-      if (!entry) { llvm::consumeError(entry.takeError()); error = "invalid committed archive journal JSON"; return false; }
+      if (!entry) {
+        llvm::consumeError(entry.takeError());
+        error = "invalid committed archive journal JSON";
+        return false;
+      }
       auto object = entry->getAsObject();
       auto index = object ? object->getInteger("index") : std::nullopt;
       auto candidate = object ? object->getObject("candidate") : nullptr;
-      if (!index || !candidate || *index < 0 || uint64_t(*index) > archive.size()) {
-        error = "archive journal index is not an append or existing amendment"; return false;
+      if (!index || !candidate || *index < 0 ||
+          uint64_t(*index) > archive.size()) {
+        error = "archive journal index is not an append or existing amendment";
+        return false;
       }
       ArchiveRecord record;
-      if (!parseArchiveObject(*candidate, record, error)) return false;
-      if (uint64_t(*index) == archive.size()) archive.push_back(std::move(record));
-      else archive[*index] = std::move(record);
+      if (!parseArchiveObject(*candidate, record, error))
+        return false;
+      if (uint64_t(*index) == archive.size())
+        archive.push_back(std::move(record));
+      else
+        archive[*index] = std::move(record);
     }
-    if (archive.size() != uint64_t(*archiveCount)) { error = "committed archive row count mismatch"; return false; }
+    if (archive.size() != uint64_t(*archiveCount)) {
+      error = "committed archive row count mismatch";
+      return false;
+    }
     // Discard only this search's uncommitted journal suffix, after exact byte
     // binding and all committed rows have validated. No candidate traversal.
-    if (bytes.size() != uint64_t(*prefix) && !writeTextAtomically(journalPath, committed, error)) return false;
-    auto states = [&](const json::Array &records, std::vector<SearchState> &out) {
+    if (bytes.size() != uint64_t(*prefix) &&
+        !writeTextAtomically(journalPath, committed, error))
+      return false;
+    auto states = [&](const json::Array &records,
+                      std::vector<SearchState> &out) {
       for (const auto &value : records) {
-        const auto *object = value.getAsObject(); SearchState state;
-        if (!object || !parseState(*object, canonical.getContext(), state, error)) return false;
-        if (!validateStageSeed(state.module.get(), stage,
-                               sourceDomainEnabled, error))
+        const auto *object = value.getAsObject();
+        SearchState state;
+        if (!object ||
+            !parseState(*object, canonical.getContext(), state, error))
+          return false;
+        if (!validateStageSeed(state.module.get(), stage, sourceDomainEnabled,
+                               error))
           return false;
         out.push_back(std::move(state));
       }
       return true;
     };
-    if (!states(*beamRecords, beam) || !states(*generatedRecords, generated)) return false;
+    if (!states(*beamRecords, beam) || !states(*generatedRecords, generated))
+      return false;
     for (const auto &value : *neighbors) {
       const auto *object = value.getAsObject();
       auto parent = object ? object->getInteger("parent") : std::nullopt;
       auto action = object ? object->getObject("action") : nullptr;
       PendingNeighbor neighbor;
-      if (!parent || *parent < 0 || uint64_t(*parent) >= beam.size() || !action ||
-          !parseAction(*action, neighbor.action)) { error = "malformed exact pending neighbor"; return false; }
-      neighbor.parent = *parent; pending.push_back(std::move(neighbor));
+      if (!parent || *parent < 0 || uint64_t(*parent) >= beam.size() ||
+          !action || !parseAction(*action, neighbor.action)) {
+        error = "malformed exact pending neighbor";
+        return false;
+      }
+      neighbor.parent = *parent;
+      pending.push_back(std::move(neighbor));
     }
-    for (const auto &record : archive) if (!record.key.empty()) seenKeys.insert(record.key);
+    for (const auto &record : archive)
+      if (!record.key.empty())
+        seenKeys.insert(record.key);
     const auto *witnesses = root->getArray("witness_dictionary");
-    if (!witnesses) { error = "checkpoint missing exact graph/body/active-transfer witness dictionary"; return false; }
+    if (!witnesses) {
+      error = "checkpoint missing exact graph/body/active-transfer witness "
+              "dictionary";
+      return false;
+    }
     for (const auto &value : *witnesses) {
       const auto *object = value.getAsObject();
       auto id = object ? object->getString("id") : std::nullopt;
       auto witnessPath = object ? object->getString("path") : std::nullopt;
       std::string witnessBytes;
-      if (!id || !witnessPath || !readFileBytes(*witnessPath, witnessBytes, error) ||
-          witnessPaths.count(id->str())) { if (error.empty()) error = "malformed witness dictionary"; return false; }
+      if (!id || !witnessPath ||
+          !readFileBytes(*witnessPath, witnessBytes, error) ||
+          witnessPaths.count(id->str())) {
+        if (error.empty())
+          error = "malformed witness dictionary";
+        return false;
+      }
       std::map<std::string, std::string> *dictionary = nullptr;
       if (id->starts_with("body-"))
         dictionary = &bodyWitnessIds;
@@ -8338,7 +9613,8 @@ private:
       else if (id->starts_with("graph-"))
         dictionary = &graphWitnessIds;
       if (!dictionary || !dictionary->emplace(witnessBytes, id->str()).second) {
-        error = "duplicate exact dictionary witness with distinct ID"; return false;
+        error = "duplicate exact dictionary witness with distinct ID";
+        return false;
       }
       witnessPaths[id->str()] = witnessPath->str();
     }
@@ -8368,22 +9644,24 @@ private:
       candidate.key.clear();
       candidate.factKey.clear();
       const size_t oldWitnessCount = witnessPaths.size();
-      if (!prepareCandidateKey(candidate, functionName, outputDir,
-                               nextSerial, error) ||
+      if (!prepareCandidateKey(candidate, functionName, outputDir, nextSerial,
+                               error) ||
           candidate.key != record.key || candidate.factKey != record.factKey ||
           witnessPaths.size() != oldWitnessCount) {
         if (error.empty())
-          error = "restored archive module differs from exact source-owned candidate key";
+          error = "restored archive module differs from exact source-owned "
+                  "candidate key";
         return false;
       }
       auto candidateFunction =
           selectTaskFunction(candidate.module.get(), functionName, error);
       if (failed(candidateFunction))
         return false;
-      auto graph = (*candidateFunction)->getAttrOfType<StringAttr>(
-          "amoeba.graph_variant_id");
+      auto graph = (*candidateFunction)
+                       ->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
       if (!graph || graph.getValue() != record.graphId) {
-        error = "restored archive graph label differs from its exact candidate record";
+        error = "restored archive graph label differs from its exact candidate "
+                "record";
         return false;
       }
       if (!authenticateTypedActionHistory(candidate, canonical, functionName,
@@ -8397,18 +9675,20 @@ private:
       if (record.controlRoleProvenance.empty())
         continue;
       if (!record.valid || !record.control) {
-        error = "checkpoint control-role provenance is attached to a non-control archive row";
+        error = "checkpoint control-role provenance is attached to a "
+                "non-control archive row";
         return false;
       }
       for (auto &[role, provenance] : record.controlRoleProvenance) {
         if (provenance.candidatePath.empty()) {
-          error = "checkpoint control role has no retained exact source module: " +
-                  role;
+          error =
+              "checkpoint control role has no retained exact source module: " +
+              role;
           return false;
         }
         SearchState candidate;
-        candidate.module = parseSourceFile<ModuleOp>(
-            provenance.candidatePath, canonical.getContext());
+        candidate.module = parseSourceFile<ModuleOp>(provenance.candidatePath,
+                                                     canonical.getContext());
         if (!candidate.module) {
           error = "checkpoint retained control-role module is missing: " +
                   provenance.candidatePath;
@@ -8421,37 +9701,36 @@ private:
         candidate.key.clear();
         candidate.factKey.clear();
         const size_t oldWitnessCount = witnessPaths.size();
-        if (!prepareCandidateKey(candidate, functionName, outputDir,
-                                 nextSerial, error) ||
+        if (!prepareCandidateKey(candidate, functionName, outputDir, nextSerial,
+                                 error) ||
             candidate.key != record.key ||
             candidate.factKey != record.factKey ||
             witnessPaths.size() != oldWitnessCount) {
           if (error.empty())
-            error = "restored control-role module differs from exact source-owned candidate key";
+            error = "restored control-role module differs from exact "
+                    "source-owned candidate key";
           return false;
         }
         auto candidateFunction =
             selectTaskFunction(candidate.module.get(), functionName, error);
         if (failed(candidateFunction))
           return false;
-        auto graph = (*candidateFunction)->getAttrOfType<StringAttr>(
-            "amoeba.graph_variant_id");
+        auto graph = (*candidateFunction)
+                         ->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
         if (!graph || graph.getValue() != record.graphId) {
-          error = "restored control-role graph label differs from its exact candidate record";
+          error = "restored control-role graph label differs from its exact "
+                  "candidate record";
           return false;
         }
-        const std::string previousHistory =
-            jsonText(json::Value(typedActionHistoryObject(
-                provenance.actionHistory)));
-        if (!authenticateTypedActionHistory(candidate, canonical,
-                                            functionName, outputDir,
-                                            nextSerial, error))
+        const std::string previousHistory = jsonText(
+            json::Value(typedActionHistoryObject(provenance.actionHistory)));
+        if (!authenticateTypedActionHistory(candidate, canonical, functionName,
+                                            outputDir, nextSerial, error))
           return false;
         provenance.actionHistory =
             portableActionHistory(candidate.actionHistory);
-        if (previousHistory !=
-            jsonText(json::Value(typedActionHistoryObject(
-                provenance.actionHistory))))
+        if (previousHistory != jsonText(json::Value(typedActionHistoryObject(
+                                   provenance.actionHistory))))
           dirtyJournalIndices.insert(index);
       }
     }
@@ -8459,18 +9738,24 @@ private:
       for (auto &state : states) {
         const std::string key = state.key, graphKey = state.factKey;
         const size_t oldWitnessCount = witnessPaths.size();
-        state.key.clear(); state.factKey.clear();
+        state.key.clear();
+        state.factKey.clear();
         if (!prepareCandidateKey(state, functionName, outputDir, nextSerial,
-                                 error) || state.key != key || state.factKey != graphKey ||
+                                 error) ||
+            state.key != key || state.factKey != graphKey ||
             witnessPaths.size() != oldWitnessCount) {
-          if (error.empty()) error = "restored module differs from exact canonical graph/body/active-transfer/lineage witnesses";
+          if (error.empty())
+            error = "restored module differs from exact canonical "
+                    "graph/body/active-transfer/lineage witnesses";
           return false;
         }
       }
       return true;
     };
-    if (!validateRestoredStates(beam) || !validateRestoredStates(generated)) return false;
-    if (!restoreParentProgress(*root, archive, beam, error)) return false;
+    if (!validateRestoredStates(beam) || !validateRestoredStates(generated))
+      return false;
+    if (!restoreParentProgress(*root, archive, beam, error))
+      return false;
     auto authenticateRestoredStates = [&](std::vector<SearchState> &states) {
       for (SearchState &state : states)
         if (!authenticateTypedActionHistory(state, canonical, functionName,
@@ -8486,15 +9771,25 @@ private:
         const auto *object = value.getAsObject();
         auto key = object ? object->getString("graph_key") : std::nullopt;
         auto costPath = object ? object->getString("path") : std::nullopt;
-        if (!key || !costPath) { error = "malformed cached graph catalogue continuation"; return false; }
+        if (!key || !costPath) {
+          error = "malformed cached graph catalogue continuation";
+          return false;
+        }
         graphCostPaths[key->str()] = costPath->str();
       }
-    round = *savedRound; nextSerial = *serial; scoredCount = *count; rejectedCount = *rejected;
-    roundScoredCount = *roundCount; roundScoreLimit = *roundLimit;
-    pendingCursor = *cursor; canonicalFactKey = facts->str();
-    journalBytes = *prefix; journalArchiveCount = archive.size();
+    round = *savedRound;
+    nextSerial = *serial;
+    scoredCount = *count;
+    rejectedCount = *rejected;
+    roundScoredCount = *roundCount;
+    roundScoreLimit = *roundLimit;
+    pendingCursor = *cursor;
+    canonicalFactKey = facts->str();
+    journalBytes = *prefix;
+    journalArchiveCount = archive.size();
     duplicateCandidates = root->getInteger("duplicate_candidates").value_or(0);
-    productionSchedulerCalls = root->getInteger("production_scheduler_calls").value_or(0);
+    productionSchedulerCalls =
+        root->getInteger("production_scheduler_calls").value_or(0);
     costCacheHits = root->getInteger("cost_cache_hits").value_or(0);
     costCacheMisses = root->getInteger("cost_cache_misses").value_or(0);
     parallelPreparationMilliseconds =
@@ -8525,93 +9820,137 @@ private:
     return true;
   }
 
-  static json::Object scoreRecord(const ArchiveRecord &record, StringRef shapeId) {
+  static json::Object scoreRecord(const ArchiveRecord &record,
+                                  StringRef shapeId) {
     return json::Object{
-        {"schema", "amoeba-exact-joint-task-scores-v1"}, {"record_type", "score"},
-        {"candidate_id", record.id}, {"shape_candidate_id", shapeId.str()},
-        {"graph_variant_id", record.graphId}, {"valid", true},
+        {"schema", "amoeba-exact-joint-task-scores-v1"},
+        {"record_type", "score"},
+        {"candidate_id", record.id},
+        {"shape_candidate_id", shapeId.str()},
+        {"graph_variant_id", record.graphId},
+        {"valid", true},
         {"predicted_whole_program_cycles", record.score},
-        {"score_source", "ML-task-cost-production-scheduler-explicit-communication"},
-        {"task_costs", costRecords(record.choices, record.costs, record.durations)},
-        {"task_schedule", scheduleRecords(record.choices, record.schedule.placements)},
-        {"dispatch_order", indexArray(record.schedule.dispatch, record.choices)},
-        {"replayed_communication_edges", int64_t(record.schedule.replayedEdges)},
+        {"score_source",
+         "ML-task-cost-production-scheduler-explicit-communication"},
+        {"task_costs",
+         costRecords(record.choices, record.costs, record.durations)},
+        {"task_schedule",
+         scheduleRecords(record.choices, record.schedule.placements)},
+        {"dispatch_order",
+         indexArray(record.schedule.dispatch, record.choices)},
+        {"replayed_communication_edges",
+         int64_t(record.schedule.replayedEdges)},
         {"communication_trace_known", record.schedule.replayedEdgesKnown},
-        {"best_found", true}, {"certified", false}, {"exhaustive", false}};
+        {"best_found", true},
+        {"certified", false},
+        {"exhaustive", false}};
   }
 
   bool replaySelection(const ArchiveRecord &record, StringRef function,
                        StringRef stageName, StringRef outputDirectory,
                        json::Object &selection, std::string &error) {
-    if (record.candidatePath.empty()) { error = "retained native candidate has no materialized source module"; return false; }
-    auto module = parseSourceFile<ModuleOp>(record.candidatePath, &getContext());
-    if (!module) { error = "retained native candidate module does not parse"; return false; }
+    if (record.candidatePath.empty()) {
+      error = "retained native candidate has no materialized source module";
+      return false;
+    }
+    auto module =
+        parseSourceFile<ModuleOp>(record.candidatePath, &getContext());
+    if (!module) {
+      error = "retained native candidate module does not parse";
+      return false;
+    }
     auto selected = selectTaskFunction(*module, function, error);
-    if (failed(selected)) return false;
+    if (failed(selected))
+      return false;
     std::string activeTransferSignature;
     if (!collectVerifiedActiveTransferSignature(*selected,
-                                                activeTransferSignature,
-                                                error))
+                                                activeTransferSignature, error))
       return false;
     if (!verifyActiveTransferWitnessInKey(activeTransferSignature, record.key,
                                           error))
       return false;
-    auto graph = (*selected)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
+    auto graph =
+        (*selected)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     if (!graph || graph.getValue() != record.graphId) {
-      error = "replay candidate graph label differs from saved C++ archive"; return false;
+      error = "replay candidate graph label differs from saved C++ archive";
+      return false;
     }
     const std::string shapeId = "shape-" + record.id;
     const std::string replayDirectory = outputDirectory.str() + "/replay";
-    if (!ensureDirectory(replayDirectory, error) || !diskGuard(error)) return false;
-    const std::string shapePath = replayDirectory + "/" + record.id + "-shape.json";
-    const std::string scorePath = replayDirectory + "/" + record.id + "-score.jsonl";
-    Candidate candidate; candidate.id = shapeId; candidate.choices = record.choices;
-    if (!writeNeighborhoodShapeSelection(*module, *selected, candidate, shapePath, error)) return false;
+    if (!ensureDirectory(replayDirectory, error) || !diskGuard(error))
+      return false;
+    const std::string shapePath =
+        replayDirectory + "/" + record.id + "-shape.json";
+    const std::string scorePath =
+        replayDirectory + "/" + record.id + "-score.jsonl";
+    Candidate candidate;
+    candidate.id = shapeId;
+    candidate.choices = record.choices;
+    if (!writeNeighborhoodShapeSelection(*module, *selected, candidate,
+                                         shapePath, error))
+      return false;
     int64_t iterations = 64;
-    if (auto configured = (*selected)->getAttrOfType<IntegerAttr>("joint_scheduling_fixed_point_max_iterations"))
+    if (auto configured = (*selected)->getAttrOfType<IntegerAttr>(
+            "joint_scheduling_fixed_point_max_iterations"))
       iterations = configured.getInt();
     json::Object header{
-        {"record_type", "header"}, {"schema", "amoeba-exact-joint-task-scores-v1"},
-        {"function", function}, {"schedule_space", "production-scheduler"},
+        {"record_type", "header"},
+        {"schema", "amoeba-exact-joint-task-scores-v1"},
+        {"function", function},
+        {"schedule_space", "production-scheduler"},
         {"temporal_model", "production-scheduler"},
-        {"dispatch_policy", parseStageFixed(stageName) ? "fixed" : "critical-path"},
+        {"dispatch_policy",
+         parseStageFixed(stageName) ? "fixed" : "critical-path"},
         {"start_policy", "production-spatial-temporal-scheduler"},
         {"temporal_search_scope", "production-task-scheduler-only"},
         {"production_fixed_point_max_iterations", iterations},
-        {"search_scope", kSearchScope}, {"best_found", true}, {"exhaustive", false},
-        {"source_repository", sourceRepository.getValue()}, {"source_commit", sourceCommit.getValue()},
-        {"architecture_path", architecturePath.getValue()}, {"source_binding_witness", bindingPath}};
-    json::Object footer{{"record_type", "footer"}, {"schema", "amoeba-exact-joint-task-scores-v1"},
-                        {"scored_count", 1}, {"status", "best-found"}, {"certified", false}};
+        {"search_scope", kSearchScope},
+        {"best_found", true},
+        {"exhaustive", false},
+        {"source_repository", sourceRepository.getValue()},
+        {"source_commit", sourceCommit.getValue()},
+        {"architecture_path", architecturePath.getValue()},
+        {"source_binding_witness", bindingPath}};
+    json::Object footer{{"record_type", "footer"},
+                        {"schema", "amoeba-exact-joint-task-scores-v1"},
+                        {"scored_count", 1},
+                        {"status", "best-found"},
+                        {"certified", false}};
     std::string text = jsonText(json::Value(std::move(header))) + "\n" +
-        jsonText(json::Value(scoreRecord(record, shapeId))) + "\n" +
-        jsonText(json::Value(std::move(footer))) + "\n";
-    if (!writeTextAtomically(scorePath, text, error)) return false;
+                       jsonText(json::Value(scoreRecord(record, shapeId))) +
+                       "\n" + jsonText(json::Value(std::move(footer))) + "\n";
+    if (!writeTextAtomically(scorePath, text, error))
+      return false;
     selection = archiveObject(record);
     selection["record_type"] = "selection";
     selection["shape_candidate_id"] = shapeId;
     selection["score_file"] = scorePath;
     selection["shape_manifest_file"] = shapePath;
     selection["score_record"] = scoreRecord(record, shapeId);
-    selection["certified"] = false; selection["best_found"] = true;
+    selection["certified"] = false;
+    selection["best_found"] = true;
     selection["source_binding_witness"] = bindingPath;
-    selection["transformations"] = json::Object{
-        {"shape", choiceRecords(record.choices)}, {"action_path", stringArray(record.path)},
-        {"lineage_source", record.candidatePath}};
+    selection["transformations"] =
+        json::Object{{"shape", choiceRecords(record.choices)},
+                     {"action_path", stringArray(record.path)},
+                     {"lineage_source", record.candidatePath}};
     return true;
   }
 
-  bool writeOutputs(
-      StringRef outputDirectory, StringRef checkpointPath, StringRef function,
-      StringRef stageName, StringRef repository, StringRef commit,
-      StringRef architecture, StringRef protocol, int64_t maxRoundsValue,
-      int64_t maxCandidatesValue, int64_t beamWidthValue,
-      int64_t diversityValue, int64_t round, uint64_t scoredCount,
-      uint64_t rejectedCount, bool costCacheLoaded,
-      bool previousWinnerRequested, bool historicalWinnerRequested,
-      ArrayRef<ArchiveRecord> archive,
-      StringRef stopReason, std::string &error) {
-    if (!writeTextAtomically(outputDirectory.str()+"/budget-trace.jsonl", objectiveTrace,error)) return false;
+  bool writeOutputs(StringRef outputDirectory, StringRef checkpointPath,
+                    StringRef function, StringRef stageName,
+                    StringRef repository, StringRef commit,
+                    StringRef architecture, StringRef protocol,
+                    int64_t maxRoundsValue, int64_t maxCandidatesValue,
+                    int64_t beamWidthValue, int64_t diversityValue,
+                    int64_t round, uint64_t scoredCount, uint64_t rejectedCount,
+                    bool costCacheLoaded, bool previousWinnerRequested,
+                    bool historicalWinnerRequested,
+                    ArrayRef<ArchiveRecord> archive, StringRef stopReason,
+                    std::string &error) {
+    if (!writeTextAtomically(outputDirectory.str() + "/budget-trace.jsonl",
+                             objectiveTrace, error))
+      return false;
     std::vector<const ArchiveRecord *> ranked;
     json::Object reasons;
     uint64_t validCount = 0;
@@ -8621,11 +9960,11 @@ private:
         if (decisionFlow != "sequential" || activePhase != "B" ||
             graphHistorySignature(record.actionHistory) == frozenGraphHistory)
           ranked.push_back(&record);
-      }
-      else {
+      } else {
         StringRef reason = record.rejectReason;
         std::string category = reason.take_front(reason.find(':')).str();
-        if (category.empty()) category = "unknown";
+        if (category.empty())
+          category = "unknown";
         reasons[category] = reasons.getInteger(category).value_or(0) + 1;
       }
     }
@@ -8633,12 +9972,17 @@ private:
     std::stable_sort(ranked.begin(), ranked.end(), [](auto *left, auto *right) {
       return archiveLess(*left, *right);
     });
-    if (ranked.size() > 5) ranked.resize(5);
+    if (ranked.size() > 5)
+      ranked.resize(5);
     std::string archiveText;
     llvm::raw_string_ostream archiveStream(archiveText);
-    for (const auto &record : archive) archiveStream << json::Value(archiveObject(record)) << "\n";
+    for (const auto &record : archive)
+      archiveStream << json::Value(archiveObject(record)) << "\n";
     archiveStream.flush();
-    if (!diskGuard(error) || !writeTextAtomically(outputDirectory.str() + "/archive.jsonl", archiveText, error)) return false;
+    if (!diskGuard(error) ||
+        !writeTextAtomically(outputDirectory.str() + "/archive.jsonl",
+                             archiveText, error))
+      return false;
     auto identityShapeRecords = [&]() {
       json::Array result;
       for (const NeighborhoodShape &shape : canonicalIdentityShapes)
@@ -8649,27 +9993,37 @@ private:
       json::Array result;
       for (const UnsupportedUnitQuery &query :
            canonicalAllUnitUnsupportedQueries) {
-        result.push_back(json::Object{
-            {"task", query.task},
-            {"mapper_tile_rows", query.mapperRows},
-            {"mapper_tile_cols", query.mapperCols},
-            {"status", kModelDomainUnsupportedStatus.str()},
-            {"unsupported_reason", query.reason},
-            {"analytical_lower_bound", query.lowerBound},
-            {"model_interval_max_ii", kFormalMax4ModelCeilingII}});
+        result.push_back(
+            json::Object{{"task", query.task},
+                         {"mapper_tile_rows", query.mapperRows},
+                         {"mapper_tile_cols", query.mapperCols},
+                         {"status", kModelDomainUnsupportedStatus.str()},
+                         {"unsupported_reason", query.reason},
+                         {"analytical_lower_bound", query.lowerBound},
+                         {"model_interval_max_ii", kFormalMax4ModelCeilingII}});
       }
       return result;
     };
     json::Object metadata{
-        {"schema", kSearchSchema}, {"search_scope", kSearchScope}, {"function", function},
-        {"stage", stageName}, {"source_repository", repository}, {"source_commit", commit},
+        {"schema", kSearchSchema},
+        {"search_scope", kSearchScope},
+        {"function", function},
+        {"stage", stageName},
+        {"source_repository", repository},
+        {"source_commit", commit},
         {"schedule_space", "production-scheduler"},
-        {"dispatch_policy", parseStageFixed(stageName) ? "fixed" : "critical-path"},
+        {"dispatch_policy",
+         parseStageFixed(stageName) ? "fixed" : "critical-path"},
         {"start_policy", "production-spatial-temporal-scheduler"},
-        {"architecture_path", architecture}, {"protocol_path", protocol},
-        {"source_binding_witness", bindingPath}, {"max_rounds", maxRoundsValue},
-        {"max_candidates", maxCandidatesValue}, {"beam_width", beamWidthValue},
-        {"diversity_slots", diversityValue}, {"rounds", round}, {"rounds_completed", round},
+        {"architecture_path", architecture},
+        {"protocol_path", protocol},
+        {"source_binding_witness", bindingPath},
+        {"max_rounds", maxRoundsValue},
+        {"max_candidates", maxCandidatesValue},
+        {"beam_width", beamWidthValue},
+        {"diversity_slots", diversityValue},
+        {"rounds", round},
+        {"rounds_completed", round},
         {"alternating_blocks", std::move(alternatingBlocks)},
         {"decision_flow", decisionFlow.getValue()},
         {"graph_budget_percent", graphBudgetPercent.getValue()},
@@ -8677,39 +10031,56 @@ private:
         {"refresh_frontier", refreshFrontier.getValue()},
         {"oracle_assisted_diagnostic", !diagnosticPath.empty()},
         {"fair_pending_retention", fairPendingRetention.getValue()},
-        {"round_quota_scale",roundQuotaScale.getValue()}, {"feature_policy",featurePolicy.getValue()},
-        {"shape_enumeration_order",shapeEnumerationOrder.getValue()},
-        {"phase_round_limits", decisionFlow == "sequential" ?
-            json::Object{{"A",maxRounds.getValue()},{"B",maxRounds.getValue()}} :
-            json::Object{{"joint",maxRounds.getValue()}}},
+        {"round_quota_scale", roundQuotaScale.getValue()},
+        {"feature_policy", featurePolicy.getValue()},
+        {"shape_enumeration_order", shapeEnumerationOrder.getValue()},
+        {"phase_round_limits",
+         decisionFlow == "sequential"
+             ? json::Object{{"A", maxRounds.getValue()},
+                            {"B", maxRounds.getValue()}}
+             : json::Object{{"joint", maxRounds.getValue()}}},
         {"retained_pending_frontiers", int64_t(retainedPendingFrontiers)},
-        {"phase_a_budget", int64_t(phaseABudget)}, {"phase_b_budget", int64_t(phaseBBudget)},
+        {"phase_a_budget", int64_t(phaseABudget)},
+        {"phase_b_budget", int64_t(phaseBBudget)},
         {"phase_a_evaluations", int64_t(phaseAEvaluations)},
         {"phase_b_evaluations", int64_t(scoredCount - phaseAEvaluations)},
-        {"phase_a_anchor", phaseAAnchor}, {"phase_a_stop_reason", phaseAStopReason},
-        {"initial_child_shape_policy", "source fission children 1x1; unaffected canonical shapes retained; later child shapes independently searchable"},
+        {"phase_a_anchor", phaseAAnchor},
+        {"phase_a_stop_reason", phaseAStopReason},
+        {"initial_child_shape_policy",
+         "source fission children 1x1; unaffected canonical shapes retained; "
+         "later child shapes independently searchable"},
         {"unique_complete_candidates_scored", int64_t(scoredCount)},
-        {"unique_scored_candidates", int64_t(scoredCount)}, {"unique_valid_candidates", int64_t(validCount)},
+        {"unique_scored_candidates", int64_t(scoredCount)},
+        {"unique_valid_candidates", int64_t(validCount)},
         {"rejected_or_duplicate_candidates", int64_t(rejectedCount)},
         {"scoring_workers", scoringWorkers.getValue()},
         {"max_partition_factor", maxPartitionFactor.getValue()},
         {"parallel_phase_elapsed_milliseconds",
-         json::Object{{"candidate_preparation", parallelPreparationMilliseconds},
-                      {"worker_scoring", parallelScoringMilliseconds},
-                      {"ordered_commit", parallelCommitMilliseconds}}},
+         json::Object{
+             {"candidate_preparation", parallelPreparationMilliseconds},
+             {"worker_scoring", parallelScoringMilliseconds},
+             {"ordered_commit", parallelCommitMilliseconds}}},
         {"parallel_module_cache_hits", int64_t(parallelModuleCacheHits)},
         {"parallel_module_cache_misses", int64_t(parallelModuleCacheMisses)},
         {"parallel_scored_jobs", int64_t(parallelScoredJobs)},
         {"parallel_batch_item_sizes", uint64Array(parallelBatchItemSizes)},
-        {"parallel_batch_score_job_sizes", uint64Array(parallelBatchScoreJobSizes)},
-        {"cache_hits", int64_t(costCacheHits)}, {"cache_misses", int64_t(costCacheMisses)},
-        {"reject_reasons", std::move(reasons)}, {"elapsed_seconds", elapsedMilliseconds / 1000.0},
+        {"parallel_batch_score_job_sizes",
+         uint64Array(parallelBatchScoreJobSizes)},
+        {"cache_hits", int64_t(costCacheHits)},
+        {"cache_misses", int64_t(costCacheMisses)},
+        {"reject_reasons", std::move(reasons)},
+        {"elapsed_seconds", elapsedMilliseconds / 1000.0},
         {"production_scheduler_calls", int64_t(productionSchedulerCalls)},
         {"graph_cost_catalogues", int64_t(graphCostPaths.size())},
-        {"cost_catalogue_loaded", costCacheLoaded}, {"best_found", true}, {"exhaustive", false},
-        {"stop_reason", stopReason}, {"checkpoint", checkpointPath},
-        {"identity_control_retained", true}, {"previous_winner_requested", previousWinnerRequested},
-        {"native_top5_required", true}, {"numeric_trace_sram_separate", true},
+        {"cost_catalogue_loaded", costCacheLoaded},
+        {"best_found", true},
+        {"exhaustive", false},
+        {"stop_reason", stopReason},
+        {"checkpoint", checkpointPath},
+        {"identity_control_retained", true},
+        {"previous_winner_requested", previousWinnerRequested},
+        {"native_top5_required", true},
+        {"numeric_trace_sram_separate", true},
         {"family_funnel_schema", kFamilyFunnelSchema},
         {"family_funnel_path",
          outputDirectory.str() + "/diagnostics/family-funnel.jsonl"},
@@ -8727,7 +10098,8 @@ private:
       metadata["directional_search"] = true;
       metadata["directional_policy"] = kDirectionalPolicy.str();
       metadata["directional_state"] = directionalStateObject();
-      metadata["directional_path"] = outputDirectory.str() + "/directions.jsonl";
+      metadata["directional_path"] =
+          outputDirectory.str() + "/directions.jsonl";
       metadata["paper_admission"] = false;
     }
     if (stageNumber(stageName) == 6) {
@@ -8736,8 +10108,7 @@ private:
         support.push_back(entry);
       metadata["fission_dimension"] = json::Object{
           {"prepared_source_file", preparedSourceFile.getValue()},
-          {"max_actions_per_task",
-           maxFissionActionsPerTask.getValue()},
+          {"max_actions_per_task", maxFissionActionsPerTask.getValue()},
           {"complete_cut_action_count",
            static_cast<int64_t>(canonicalFissionActions.size())},
           {"task_support", std::move(support)},
@@ -8748,8 +10119,7 @@ private:
       metadata["supported_shape_bootstrap_policy"] =
           kSupportedShapeBootstrapPolicy.str();
       metadata["canonical_bootstrap_applied"] = canonicalBootstrapApplied;
-      metadata["canonical_all_unit_cost_status"] =
-          canonicalAllUnitCostStatus;
+      metadata["canonical_all_unit_cost_status"] = canonicalAllUnitCostStatus;
       metadata["canonical_all_unit_control_scored"] =
           canonicalAllUnitControlScored;
       metadata["canonical_actual_identity_shapes"] = identityShapeRecords();
@@ -8775,26 +10145,36 @@ private:
       metadata["historical_native_winner_requested"] = true;
       metadata["required_control_roles"] = std::move(requiredControlRoles);
     }
-    json::Object header = metadata; header["record_type"] = "header";
+    json::Object header = metadata;
+    header["record_type"] = "header";
     std::string topText = jsonText(json::Value(std::move(header))) + "\n";
     for (size_t rank = 0; rank < ranked.size(); ++rank) {
       json::Object selection;
-      if (!replaySelection(*ranked[rank], function, stageName, outputDirectory, selection, error)) return false;
+      if (!replaySelection(*ranked[rank], function, stageName, outputDirectory,
+                           selection, error))
+        return false;
       selection["rank"] = int64_t(rank);
       topText += jsonText(json::Value(std::move(selection))) + "\n";
     }
-    json::Object footer = metadata; footer["record_type"] = "footer"; footer["status"] = "best-found";
+    json::Object footer = metadata;
+    footer["record_type"] = "footer";
+    footer["status"] = "best-found";
     topText += jsonText(json::Value(std::move(footer))) + "\n";
     std::string controlsText;
     std::set<std::string> roles;
     for (const auto &record : archive) {
-      if (!record.valid || !record.control) continue;
+      if (!record.valid || !record.control)
+        continue;
       for (const auto &role : record.controlRoles) {
-        if (!roles.insert(role).second) { error = "duplicate stage control role"; return false; }
+        if (!roles.insert(role).second) {
+          error = "duplicate stage control role";
+          return false;
+        }
         auto provenance = record.controlRoleProvenance.find(role);
         if (provenance == record.controlRoleProvenance.end() ||
             provenance->second.candidatePath.empty()) {
-          error = "stage control role lacks its retained exact candidate provenance: " +
+          error = "stage control role lacks its retained exact candidate "
+                  "provenance: " +
                   role;
           return false;
         }
@@ -8810,12 +10190,12 @@ private:
         if (!replaySelection(roleRecord, function, stageName, outputDirectory,
                              selection, error))
           return false;
-        selection["record_type"] = "control"; selection["control_role"] = role;
+        selection["record_type"] = "control";
+        selection["control_role"] = role;
         if (bootstrapSupportedShapes && role == "identity") {
           selection["supported_shape_bootstrap_policy"] =
               kSupportedShapeBootstrapPolicy.str();
-          selection["canonical_bootstrap_applied"] =
-              canonicalBootstrapApplied;
+          selection["canonical_bootstrap_applied"] = canonicalBootstrapApplied;
           selection["canonical_all_unit_cost_status"] =
               canonicalAllUnitCostStatus;
           selection["canonical_all_unit_control_scored"] =
@@ -8833,11 +10213,16 @@ private:
          !roles.count("previous_stage_measured_winner")) ||
         (historicalWinnerRequested &&
          !roles.count("historical_measured_winner"))) {
-      error = "required stage native controls missing from C++ archive"; return false;
+      error = "required stage native controls missing from C++ archive";
+      return false;
     }
-    return writeTextAtomically(outputDirectory.str() + "/top5.jsonl", topText, error) &&
-           writeTextAtomically(outputDirectory.str() + "/controls.jsonl", controlsText, error) &&
-           writeTextAtomically(outputDirectory.str() + "/search-summary.json", jsonText(json::Value(std::move(metadata))) + "\n", error);
+    return writeTextAtomically(outputDirectory.str() + "/top5.jsonl", topText,
+                               error) &&
+           writeTextAtomically(outputDirectory.str() + "/controls.jsonl",
+                               controlsText, error) &&
+           writeTextAtomically(
+               outputDirectory.str() + "/search-summary.json",
+               jsonText(json::Value(std::move(metadata))) + "\n", error);
   }
 
   std::string journalPath, bindingPath, historicalNativeWinnerBoundBytes;
@@ -8895,7 +10280,6 @@ private:
   uint64_t directionalRoundAllowance = 0, directionalRoundReserve = 0;
   uint64_t directionalPreferredStreak = 0, directionalConsecutiveZero = 0;
   bool directionalForceOriginal = false;
-
 };
 
 } // namespace
@@ -8907,29 +10291,50 @@ std::unique_ptr<Pass> createSearchJointNeighborhoodPass() {
 } // namespace mlir::amoeba::neura
 
 namespace mlir::amoeba::neura::joint_scheduling {
-bool predictProgramGraphTaskCosts(ModuleOp module,func::FuncOp function,
-    const ProgramGraphAmoebaOptions &options,StringRef graphId,StringRef output,
-    ArrayRef<::orbit::taskflow::AmoebaTaskShape> shapes,int64_t peRows,int64_t peColumns,
-    std::vector<TaskShapeChoice> &choices,std::vector<TaskShapeCost> &costs,
-    std::vector<int64_t> &durations,std::string &error) {
-  std::string catalogue;bool fatal=false;
-  if(!runCurrentCostPredictor(module,function,function.getName(),graphId,output,
-      options.model,options.cache,llvm::sys::path::parent_path(options.model),options.architectureContract,options.architecture,
-      peRows,peColumns,options.sourceRepository,options.sourceCommit,
-      options.architectureTransferCatalog,options.modelNamespace,20,false,catalogue,error,fatal))return false;
-  auto metadata=collectAnalyticalTaskMetadata(function,error);auto catalogGraph=readCatalogGraphId(catalogue);
+bool predictProgramGraphTaskCosts(
+    ModuleOp module, func::FuncOp function,
+    const ProgramGraphAmoebaOptions &options, StringRef graphId,
+    StringRef output, ArrayRef<::orbit::taskflow::AmoebaTaskShape> shapes,
+    int64_t peRows, int64_t peColumns, std::vector<TaskShapeChoice> &choices,
+    std::vector<TaskShapeCost> &costs, std::vector<int64_t> &durations,
+    std::string &error) {
+  std::string catalogue;
+  bool fatal = false;
+  if (!runCurrentCostPredictor(
+          module, function, function.getName(), graphId, output, options.model,
+          options.cache, llvm::sys::path::parent_path(options.model),
+          options.architectureContract, options.architecture, peRows, peColumns,
+          options.sourceRepository, options.sourceCommit,
+          options.architectureTransferCatalog, options.modelNamespace, 20,
+          false, catalogue, error, fatal))
+    return false;
+  auto metadata = collectAnalyticalTaskMetadata(function, error);
+  auto catalogGraph = readCatalogGraphId(catalogue);
   TaskShapeCostCache cache;
-  if(failed(metadata) || !catalogGraph || metadata->size()!=shapes.size() ||
-      !cache.load(catalogue,function.getName(),*metadata,options.sourceRepository,options.sourceCommit,
-          options.architecture,*catalogGraph,error,false,neighborhoodReplaySourceText(module)))return false;
-  for(size_t i=0;i<metadata->size();++i) {
-    TaskShapeChoice choice{(*metadata)[i].name,(*metadata)[i].tripCount,
-        RectShape{shapes[i].rows,shapes[i].columns,shapes[i].rows*peRows,shapes[i].columns*peColumns}};
-    auto cost=cache.get(choice,error);
-    if(!cost || !cost->supported) {if(error.empty())error="actual CGRA model does not support requested source/shape";return false;}
-    auto duration=durationFromCost(*cost,choice.tripCount,error);if(!duration)return false;
-    choices.push_back(choice);costs.push_back(*cost);durations.push_back(*duration);
+  if (failed(metadata) || !catalogGraph || metadata->size() != shapes.size() ||
+      !cache.load(catalogue, function.getName(), *metadata,
+                  options.sourceRepository, options.sourceCommit,
+                  options.architecture, *catalogGraph, error, false,
+                  neighborhoodReplaySourceText(module)))
+    return false;
+  for (size_t i = 0; i < metadata->size(); ++i) {
+    TaskShapeChoice choice{(*metadata)[i].name, (*metadata)[i].tripCount,
+                           RectShape{shapes[i].rows, shapes[i].columns,
+                                     shapes[i].rows * peRows,
+                                     shapes[i].columns * peColumns}};
+    auto cost = cache.get(choice, error);
+    if (!cost || !cost->supported) {
+      if (error.empty())
+        error = "actual CGRA model does not support requested source/shape";
+      return false;
+    }
+    auto duration = durationFromCost(*cost, choice.tripCount, error);
+    if (!duration)
+      return false;
+    choices.push_back(choice);
+    costs.push_back(*cost);
+    durations.push_back(*duration);
   }
   return true;
 }
-}
+} // namespace mlir::amoeba::neura::joint_scheduling

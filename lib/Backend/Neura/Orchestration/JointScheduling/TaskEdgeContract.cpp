@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -121,8 +121,8 @@ collectProducerResults(Value value,
   }
   if (auto cast = value.getDefiningOp<memref::CastOp>())
     return collectProducerResults(cast.getSource(), taskIds,
-                                  requireTaskProducer, crossedChannel,
-                                  results, visited, error);
+                                  requireTaskProducer, crossedChannel, results,
+                                  visited, error);
   if (auto channel = value.getDefiningOp<TaskflowChannelOp>()) {
     if (channel.getSource().getType() != value.getType()) {
       error = "taskflow.channel source and result types do not match";
@@ -143,7 +143,8 @@ collectProducerResults(Value value,
     }
     for (Value state : readJoin.getTileStates()) {
       if (state.getType() != value.getType()) {
-        error = "taskflow.read_completion_join state and result types do not match";
+        error =
+            "taskflow.read_completion_join state and result types do not match";
         return failure();
       }
       if (failed(collectProducerResults(state, taskIds, requireTaskProducer,
@@ -283,13 +284,13 @@ static FailureOr<Value> resolveOriginalMemrefRoot(Value value,
     if (result == results.end())
       return failure();
     unsigned index = result - results.begin();
-    ValueRange yielded = requireWrite ? yield.getDoneWrites()
-                                      : yield.getDoneReads();
+    ValueRange yielded =
+        requireWrite ? yield.getDoneWrites() : yield.getDoneReads();
     if (index >= yielded.size())
       return failure();
     auto argument = dyn_cast<BlockArgument>(yielded[index]);
-    unsigned stateInputCount = task.getWillReads().size() +
-                               task.getWillWrites().size();
+    unsigned stateInputCount =
+        task.getWillReads().size() + task.getWillWrites().size();
     if (!argument || argument.getOwner() != &task.getBody().front() ||
         argument.getArgNumber() >= stateInputCount)
       return failure();
@@ -544,9 +545,9 @@ struct CallerMemrefShapeContract {
   SmallVector<int64_t> extents;
 };
 
-CallerMemrefShapeContract
-getCallerMemrefShapeContract(func::FuncOp function, BlockArgument argument,
-                             std::string &error) {
+CallerMemrefShapeContract getCallerMemrefShapeContract(func::FuncOp function,
+                                                       BlockArgument argument,
+                                                       std::string &error) {
   CallerMemrefShapeContract contract;
   Attribute attribute =
       function.getArgAttr(argument.getArgNumber(), kLogicalTransferShapeAttr);
@@ -628,8 +629,7 @@ PayloadFact getCallerMemrefShapePayload(ProducerResult producer,
     return {};
 
   DenseSet<Value> visited;
-  FailureOr<Value> root =
-      resolveOriginalMemrefRoot(producer.value, visited);
+  FailureOr<Value> root = resolveOriginalMemrefRoot(producer.value, visited);
   if (failed(root))
     return {};
 
@@ -709,18 +709,18 @@ PayloadFact getCallerMemrefShapePayload(ProducerResult producer,
   // access before accepting fewer transferred elements. Unproved arguments
   // continue using their full caller capacity.
   unsigned argumentIndex = argument.getArgNumber();
-  Attribute active = function.getArgAttr(argumentIndex,
-                                          "amoeba.active_transfer_shape");
-  Attribute hasProof = function.getArgAttr(argumentIndex,
-                                           "amoeba.active_transfer_proof");
+  Attribute active =
+      function.getArgAttr(argumentIndex, "amoeba.active_transfer_shape");
+  Attribute hasProof =
+      function.getArgAttr(argumentIndex, "amoeba.active_transfer_proof");
   if (active || hasProof) {
     if (failed(verifyStaticActiveTransferShapeProof(function, argumentIndex,
-                                                   &error)))
+                                                    &error)))
       return {};
     if (active) {
       auto extents = dyn_cast<DenseI64ArrayAttr>(active);
-      if (!extents || static_cast<size_t>(extents.size()) !=
-                          contract.extents.size()) {
+      if (!extents ||
+          static_cast<size_t>(extents.size()) != contract.extents.size()) {
         error = "active transfer shape must match the caller capacity rank";
         return {};
       }
@@ -744,7 +744,8 @@ PayloadFact getCallerMemrefShapePayload(ProducerResult producer,
   return {elements * *elementBits, PayloadSource::CallerMemrefShape};
 }
 
-PayloadFact getProducerPayloadFact(ProducerResult producer, std::string &error) {
+PayloadFact getProducerPayloadFact(ProducerResult producer,
+                                   std::string &error) {
   auto shaped = dyn_cast<ShapedType>(producer.value.getType());
   if (!shaped || producer.segment != TaskResultSegment::DoneWrites) {
     std::optional<uint64_t> bits = getTypePayloadBits(producer.value.getType());
@@ -782,7 +783,8 @@ PayloadFact getProducerPayloadFact(ProducerResult producer, std::string &error) 
   FailureOr<Value> root = resolveOriginalMemrefRoot(producer.value, visited);
   if (succeeded(root)) {
     if (auto argument = dyn_cast<BlockArgument>(*root)) {
-      auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+      auto function =
+          dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
       if (function && !function.getBody().empty() &&
           argument.getOwner() == &function.getBody().front() &&
           (function.getArgAttr(argument.getArgNumber(),

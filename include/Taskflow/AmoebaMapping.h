@@ -23,10 +23,11 @@ llvm::json::Value serializeAmoebaTarget(const AmoebaTargetContract &);
 // storage accesses, one abstract data-availability endpoint per task. Shapes
 // are choices for the real backend mapper/scheduler, not placed coordinates.
 bool buildAmoebaProgramGraph(GenericAnalysis &, const AmoebaTargetContract &,
-                            const std::vector<AmoebaTaskShape> &,
-                            ProgramGraph &, std::string &error);
-bool checkAmoebaProgramGraph(const GenericAnalysis &, const AmoebaTargetContract &,
-                            const std::vector<AmoebaTaskShape> &,
-                            const ProgramGraph &, std::string &error);
+                             const std::vector<AmoebaTaskShape> &,
+                             ProgramGraph &, std::string &error);
+bool checkAmoebaProgramGraph(const GenericAnalysis &,
+                             const AmoebaTargetContract &,
+                             const std::vector<AmoebaTaskShape> &,
+                             const ProgramGraph &, std::string &error);
 } // namespace orbit::taskflow
 #endif

@@ -28,17 +28,14 @@ using namespace mlir;
 namespace {
 
 struct AnalyzeRecResMiiPass
-    : public PassWrapper<AnalyzeRecResMiiPass,
-                         OperationPass<ModuleOp>> {
+    : public PassWrapper<AnalyzeRecResMiiPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeRecResMiiPass)
 
   AnalyzeRecResMiiPass() = default;
   AnalyzeRecResMiiPass(const AnalyzeRecResMiiPass &other)
       : PassWrapper(other) {}
 
-  StringRef getArgument() const override {
-    return "analyze-rec-res-mii";
-  }
+  StringRef getArgument() const override { return "analyze-rec-res-mii"; }
   StringRef getDescription() const override {
     return "Computes the mapper-compatible analytical lower bound without "
            "mapping";
@@ -58,9 +55,8 @@ struct AnalyzeRecResMiiPass
     if (xTiles.getValue() <= 0 || yTiles.getValue() <= 0 ||
         xTiles.getValue() > std::numeric_limits<int>::max() ||
         yTiles.getValue() > std::numeric_limits<int>::max()) {
-      module.emitError()
-          << "analyze-rec-res-mii requires positive x-tiles and "
-             "y-tiles within the integer range";
+      module.emitError() << "analyze-rec-res-mii requires positive x-tiles and "
+                            "y-tiles within the integer range";
       return signalPassFailure();
     }
 
@@ -110,9 +106,8 @@ struct AnalyzeRecResMiiPass
       ++materializedOperations;
     });
     int64_t numTiles = std::max<int64_t>(1, shape->getNumTiles());
-    int resMii = static_cast<int>(
-        materializedOperations / numTiles +
-        (materializedOperations % numTiles != 0));
+    int resMii = static_cast<int>(materializedOperations / numTiles +
+                                  (materializedOperations % numTiles != 0));
 
     MLIRContext *context = module.getContext();
     module->setAttr("amoeba.rec_res_mii_info", UnitAttr::get(context));

@@ -14,8 +14,8 @@
 #include "AnalyticalTaskCostCatalog.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
 #include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/SourceIterationDomainPartitionProof.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "NeuraDialect/NeuraOps.h"
@@ -146,18 +146,16 @@ struct BodyProof {
   int64_t childCounters = 0;
 };
 
-static std::optional<StringRef> requiredString(const json::Object &object,
-                                               StringRef key,
-                                               std::string &error) {
+static std::optional<StringRef>
+requiredString(const json::Object &object, StringRef key, std::string &error) {
   std::optional<StringRef> value = object.getString(key);
   if (!value || value->empty())
     error = "missing or empty string field \"" + key.str() + "\"";
   return value;
 }
 
-static std::optional<int64_t> requiredInteger(const json::Object &object,
-                                              StringRef key,
-                                              std::string &error) {
+static std::optional<int64_t>
+requiredInteger(const json::Object &object, StringRef key, std::string &error) {
   std::optional<int64_t> value = object.getInteger(key);
   if (!value)
     error = "missing or invalid integer field \"" + key.str() + "\"";
@@ -165,8 +163,7 @@ static std::optional<int64_t> requiredInteger(const json::Object &object,
 }
 
 static std::optional<bool> requiredBoolean(const json::Object &object,
-                                           StringRef key,
-                                           std::string &error) {
+                                           StringRef key, std::string &error) {
   std::optional<bool> value = object.getBoolean(key);
   if (!value)
     error = "missing or invalid boolean field \"" + key.str() + "\"";
@@ -183,12 +180,10 @@ requiredDecimal(const json::Object &object, StringRef key, std::string &error) {
     return std::to_string(*numeric);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char value) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char value) {
         return value < '0' || value > '9';
       })) {
-    error = "missing or invalid positive decimal field \"" + key.str() +
-            "\"";
+    error = "missing or invalid positive decimal field \"" + key.str() + "\"";
     return std::nullopt;
   }
   StringRef normalized = text->ltrim('0');
@@ -206,8 +201,8 @@ static std::string multiplyDecimal(StringRef value, uint64_t factor) {
   uint64_t carry = 0;
   for (auto it = value.rbegin(); it != value.rend(); ++it) {
     uint64_t digit = static_cast<uint64_t>(*it - '0');
-    unsigned __int128 product = static_cast<unsigned __int128>(digit) * factor +
-                                 carry;
+    unsigned __int128 product =
+        static_cast<unsigned __int128>(digit) * factor + carry;
     result.push_back(static_cast<char>('0' + product % 10));
     carry = static_cast<uint64_t>(product / 10);
   }
@@ -237,8 +232,8 @@ static bool rejectSha256(const json::Value &value, StringRef where,
     for (const auto &item : *object) {
       StringRef key = item.first;
       if (key.contains_insensitive("sha256")) {
-        error = "SHA-256 identity is unsupported in " + where.str() +
-                ": " + key.str();
+        error = "SHA-256 identity is unsupported in " + where.str() + ": " +
+                key.str();
         return false;
       }
       if (!rejectSha256(item.second, where, error))
@@ -317,8 +312,7 @@ static bool parseFactoredSpace(StringRef path, StringRef expectedFunction,
     return false;
   }
   auto footerSchema = requiredString(*footer, "schema", error);
-  auto footerRepresentation =
-      requiredString(*footer, "representation", error);
+  auto footerRepresentation = requiredString(*footer, "representation", error);
   auto footerCount = requiredDecimal(*footer, "candidate_count", error);
   auto ranked = requiredBoolean(*footer, "ranked", error);
   if (!footerSchema || !footerRepresentation || !footerCount || !ranked)
@@ -362,8 +356,8 @@ static bool parseFactoredSpace(StringRef path, StringRef expectedFunction,
           *kind != "rect")
         return false;
       if (!shapeSet.insert({*rows, *cols}).second) {
-        error = "child factored manifest repeats task/mapper shape " +
-                task->str();
+        error =
+            "child factored manifest repeats task/mapper shape " + task->str();
         return false;
       }
       ShapeKey key{task->str(), *rows, *cols};
@@ -409,7 +403,8 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
     return std::nullopt;
   if (!kernel) {
     llvm::DenseSet<Value> active;
-    if (auto folded = sourceStaticIndex(value, task, active)) return folded;
+    if (auto folded = sourceStaticIndex(value, task, active))
+      return folded;
   }
   if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
     return constant.value();
@@ -428,8 +423,8 @@ compileTimeIndex(Value value, TaskflowTaskOp task,
       return compileTimeIndex(kernel.getInputs()[index], task);
     }
     if (argument.getOwner() == &task.getBody().front()) {
-      unsigned firstValueInput = task.getWillReads().size() +
-                                 task.getWillWrites().size();
+      unsigned firstValueInput =
+          task.getWillReads().size() + task.getWillWrites().size();
       if (argument.getArgNumber() < firstValueInput)
         return std::nullopt;
       unsigned index = argument.getArgNumber() - firstValueInput;
@@ -458,8 +453,8 @@ static bool readRange(TaskflowTaskOp task, StringRef attributeName,
                       int64_t &lower, int64_t &upper, std::string &error) {
   auto range = task->getAttrOfType<DenseI64ArrayAttr>(attributeName);
   if (!range || range.size() != 2 || range[0] >= range[1]) {
-    error = "sequential-K task " + task.getTaskName().str() +
-            " has no valid " + attributeName.str();
+    error = "sequential-K task " + task.getTaskName().str() + " has no valid " +
+            attributeName.str();
     return false;
   }
   lower = range[0];
@@ -467,9 +462,8 @@ static bool readRange(TaskflowTaskOp task, StringRef attributeName,
   return true;
 }
 
-static bool readCounterBounds(TaskflowCounterOp counter,
-                              TaskflowTaskOp task, CounterBounds &bounds,
-                              std::string &error) {
+static bool readCounterBounds(TaskflowCounterOp counter, TaskflowTaskOp task,
+                              CounterBounds &bounds, std::string &error) {
   auto lower = compileTimeIndex(counter.getLowerBound(), task);
   auto upper = compileTimeIndex(counter.getUpperBound(), task);
   auto step = compileTimeIndex(counter.getStep(), task);
@@ -517,8 +511,7 @@ static bool findSingleNeuraKernel(TaskflowTaskOp task, neura::KernelOp &kernel,
 }
 
 static bool findNeuraCounterBounds(TaskflowTaskOp task, int64_t id,
-                                   CounterBounds &bounds,
-                                   std::string &error) {
+                                   CounterBounds &bounds, std::string &error) {
   neura::KernelOp kernel;
   if (!findSingleNeuraKernel(task, kernel, error))
     return false;
@@ -549,8 +542,8 @@ static bool findNeuraCounterBounds(TaskflowTaskOp task, int64_t id,
         return false;
       }
     }
-    std::optional<int64_t> fromAttribute = compileTimeCounterAttribute(
-        found, attributeName, task, kernel);
+    std::optional<int64_t> fromAttribute =
+        compileTimeCounterAttribute(found, attributeName, task, kernel);
     if (fromOperand && fromAttribute && *fromOperand != *fromAttribute) {
       error = "Neura counter " + std::to_string(id) + " " +
               attributeName.str() + " operand/attribute drift in task " +
@@ -605,13 +598,13 @@ static bool checkedTripProduct(const CounterBounds &m, const CounterBounds &n,
 static bool isSequentialKTask(TaskflowTaskOp task) {
   auto source = task->getAttrOfType<StringAttr>("amoeba.semantic.k_source");
   auto policy = task->getAttrOfType<StringAttr>("amoeba.semantic.k_policy");
-  auto parallel = task->getAttrOfType<BoolAttr>(
-      "amoeba.semantic.k_parallel_legal");
-  auto topology = task->getAttrOfType<StringAttr>(
-      "amoeba.semantic.reduction_topology");
+  auto parallel =
+      task->getAttrOfType<BoolAttr>("amoeba.semantic.k_parallel_legal");
+  auto topology =
+      task->getAttrOfType<StringAttr>("amoeba.semantic.reduction_topology");
   return source && source.getValue() == "memory_feedback" && policy &&
-         policy.getValue() == "sequential" && parallel && !parallel.getValue() &&
-         topology && topology.getValue() == "none";
+         policy.getValue() == "sequential" && parallel &&
+         !parallel.getValue() && topology && topology.getValue() == "none";
 }
 
 static bool isSequentialKDerivedTaskAttr(StringRef name) {
@@ -659,10 +652,10 @@ static constexpr StringLiteral kOriginalAmoebaDecisionModeAttr =
 // child replicas.  These metadata checks are deliberately local and strict;
 // a task name that merely contains ".tile." is never sufficient lineage.
 static bool hasOutputRegionProof(TaskflowTaskOp task, std::string &error) {
-  auto lowers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_lowers");
-  auto uppers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_uppers");
+  auto lowers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_lowers");
+  auto uppers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_uppers");
   if (!lowers || !uppers || lowers.empty() || lowers.size() != uppers.size()) {
     error = "source-owned nested partition is missing output-region proof";
     return false;
@@ -670,8 +663,7 @@ static bool hasOutputRegionProof(TaskflowTaskOp task, std::string &error) {
   for (auto pair : llvm::zip(lowers, uppers)) {
     auto lower = dyn_cast<DenseI64ArrayAttr>(std::get<0>(pair));
     auto upper = dyn_cast<DenseI64ArrayAttr>(std::get<1>(pair));
-    if (!lower || !upper || lower.size() == 0 ||
-        lower.size() != upper.size()) {
+    if (!lower || !upper || lower.size() == 0 || lower.size() != upper.size()) {
       error = "source-owned nested partition has malformed output region";
       return false;
     }
@@ -686,8 +678,7 @@ static bool hasOutputRegionProof(TaskflowTaskOp task, std::string &error) {
   return true;
 }
 
-static bool collectCounterIds(TaskflowTaskOp task,
-                              SmallVector<int64_t> &ids,
+static bool collectCounterIds(TaskflowTaskOp task, SmallVector<int64_t> &ids,
                               std::string &error) {
   std::set<int64_t> unique;
   bool malformed = false;
@@ -729,14 +720,14 @@ static bool checkedCounterVolume(ArrayRef<CounterBounds> bounds,
   return true;
 }
 
-static bool validateOutputRegionAgainstProof(
-    TaskflowTaskOp task, unsigned writeIndex,
-    const ReplicaOutputCoordinateProof &proof, bool requireMetadata,
-    std::string &error) {
-  auto lowers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_lowers");
-  auto uppers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_uppers");
+static bool
+validateOutputRegionAgainstProof(TaskflowTaskOp task, unsigned writeIndex,
+                                 const ReplicaOutputCoordinateProof &proof,
+                                 bool requireMetadata, std::string &error) {
+  auto lowers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_lowers");
+  auto uppers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_uppers");
   if (!lowers && !uppers) {
     if (requireMetadata) {
       error = "ordinary dual-output replica " + task.getTaskName().str() +
@@ -786,8 +777,7 @@ static bool validateOutputRegionAgainstProof(
 
 static bool validateReplicaOutputShardMap(TaskflowTaskOp parentTask,
                                           TaskflowTaskOp childTask,
-                                          int64_t outputAxis,
-                                          int64_t shardAxis,
+                                          int64_t outputAxis, int64_t shardAxis,
                                           std::string &error) {
   if (outputAxis < 0 || shardAxis < 0 ||
       parentTask.getWillWrites().size() != childTask.getWillWrites().size() ||
@@ -799,8 +789,8 @@ static bool validateReplicaOutputShardMap(TaskflowTaskOp parentTask,
             " has incompatible output-axis or write metadata";
     return false;
   }
-  for (unsigned writeIndex = 0;
-       writeIndex < childTask.getWillWrites().size(); ++writeIndex) {
+  for (unsigned writeIndex = 0; writeIndex < childTask.getWillWrites().size();
+       ++writeIndex) {
     ReplicaOutputCoordinateProof parentProof =
         analyzeReplicaOutputCoordinates(parentTask, -1, writeIndex);
     ReplicaOutputCoordinateProof childProof =
@@ -812,8 +802,8 @@ static bool validateReplicaOutputShardMap(TaskflowTaskOp parentTask,
       return false;
     }
     if (parentProof.outputCounterAxes != childProof.outputCounterAxes ||
-        outputAxis >= static_cast<int64_t>(
-                          childProof.outputCounterAxes.size()) ||
+        outputAxis >=
+            static_cast<int64_t>(childProof.outputCounterAxes.size()) ||
         childProof.outputCounterAxes[outputAxis] ==
             ReplicaOutputCoordinateProof::kConstantAxis ||
         childProof.outputCounterAxes[outputAxis] !=
@@ -849,8 +839,8 @@ static bool validateOrdinaryReplicaOutputs(const TaskMetadata &parent,
             " is missing the authenticated output counter map";
     return false;
   }
-  for (unsigned writeIndex = 0;
-       writeIndex < childTask.getWillWrites().size(); ++writeIndex) {
+  for (unsigned writeIndex = 0; writeIndex < childTask.getWillWrites().size();
+       ++writeIndex) {
     ReplicaOutputCoordinateProof parentProof =
         analyzeReplicaOutputCoordinates(parentTask, -1, writeIndex);
     ReplicaOutputCoordinateProof childProof =
@@ -868,8 +858,8 @@ static bool validateOrdinaryReplicaOutputs(const TaskMetadata &parent,
               std::to_string(writeIndex);
       return false;
     }
-    if (outputAxis >= static_cast<int64_t>(
-                          childProof.outputCounterAxes.size()) ||
+    if (outputAxis >=
+            static_cast<int64_t>(childProof.outputCounterAxes.size()) ||
         childProof.outputCounterAxes[outputAxis] ==
             ReplicaOutputCoordinateProof::kConstantAxis ||
         childProof.outputCounterAxes[outputAxis] !=
@@ -878,20 +868,18 @@ static bool validateOrdinaryReplicaOutputs(const TaskMetadata &parent,
               " output shard axis does not map to its actual counter axis";
       return false;
     }
-    if (!validateOutputRegionAgainstProof(
-            parentTask, writeIndex, parentProof, /*requireMetadata=*/false,
-            error) ||
-        !validateOutputRegionAgainstProof(
-            childTask, writeIndex, childProof, /*requireMetadata=*/true,
-            error))
+    if (!validateOutputRegionAgainstProof(parentTask, writeIndex, parentProof,
+                                          /*requireMetadata=*/false, error) ||
+        !validateOutputRegionAgainstProof(childTask, writeIndex, childProof,
+                                          /*requireMetadata=*/true, error))
       return false;
   }
   return true;
 }
 
-static bool validateOrdinaryReplicaGroup(
-    const TaskMetadata &parent, ArrayRef<ReplicaRecord> records,
-    std::string &error) {
+static bool validateOrdinaryReplicaGroup(const TaskMetadata &parent,
+                                         ArrayRef<ReplicaRecord> records,
+                                         std::string &error) {
   if (records.empty())
     return false;
   SmallVector<int64_t> parentIds;
@@ -957,8 +945,7 @@ static bool validateOrdinaryReplicaGroup(
       error = "ordinary replica group changes shard axis";
       return false;
     }
-    for (int64_t id = 0; id < static_cast<int64_t>(parentBounds.size());
-         ++id) {
+    for (int64_t id = 0; id < static_cast<int64_t>(parentBounds.size()); ++id) {
       if (id == shardAxis) {
         if (childBounds[id].lower < parentBounds[id].lower ||
             childBounds[id].upper > parentBounds[id].upper) {
@@ -979,10 +966,10 @@ static bool validateOrdinaryReplicaGroup(
               " trip count does not match actual counter volume";
       return false;
     }
-    auto shardLower = child->getAttrOfType<IntegerAttr>(
-        "amoeba.replica.shard_lower");
-    auto shardUpper = child->getAttrOfType<IntegerAttr>(
-        "amoeba.replica.shard_upper");
+    auto shardLower =
+        child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
+    auto shardUpper =
+        child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
     if (!shardLower || shardLower.getInt() != childBounds[shardAxis].lower ||
         !shardUpper || shardUpper.getInt() != childBounds[shardAxis].upper) {
       error = "ordinary replica " + child.getTaskName().str() +
@@ -1005,8 +992,8 @@ static bool validateOrdinaryReplicaGroup(
     }
     intervals.push_back(
         {childBounds[shardAxis].lower, childBounds[shardAxis].upper});
-    auto childOutputAxis = child->getAttrOfType<IntegerAttr>(
-        "amoeba.replica.output_shard_axis");
+    auto childOutputAxis =
+        child->getAttrOfType<IntegerAttr>("amoeba.replica.output_shard_axis");
     if (child->hasAttr("amoeba.replica.output_shard_axis") &&
         !childOutputAxis) {
       error = "ordinary replica " + child.getTaskName().str() +
@@ -1021,9 +1008,8 @@ static bool validateOrdinaryReplicaGroup(
         return false;
       }
       if (child.getWillWrites().size() == 1 &&
-          !validateReplicaOutputShardMap(parent.op, child,
-                                         childOutputAxis.getInt(), shardAxis,
-                                         error))
+          !validateReplicaOutputShardMap(
+              parent.op, child, childOutputAxis.getInt(), shardAxis, error))
         return false;
     }
     if (child.getWillWrites().size() > 1) {
@@ -1057,19 +1043,17 @@ static bool validateOrdinaryReplicaGroup(
 
 static bool validateSourceOwnedTilingTask(TaskflowTaskOp task,
                                           std::string &error) {
-  auto parent = task->getAttrOfType<StringAttr>(
-      "amoeba.neura.tiling.parent_task");
+  auto parent =
+      task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
   auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
   auto part =
       task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
-  auto factor =
-      task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+  auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
   auto original = task->getAttrOfType<DenseI64ArrayAttr>(
       "amoeba.neura.tiling.original_range");
   auto derived = task->getAttrOfType<DenseI64ArrayAttr>(
       "amoeba.neura.tiling.derived_range");
-  auto rewrite = task->getAttrOfType<StringAttr>(
-      "amoeba.neura.joint_rewrite");
+  auto rewrite = task->getAttrOfType<StringAttr>("amoeba.neura.joint_rewrite");
   if (!parent || parent.getValue().empty() || !axis || !part || !factor ||
       !original || !derived || !rewrite ||
       rewrite.getValue() != "post-neura-mn-tiling" || axis.getInt() < 0 ||
@@ -1085,9 +1069,8 @@ static bool validateSourceOwnedTilingTask(TaskflowTaskOp task,
   int64_t extent = original[1] - original[0];
   int64_t baseWidth = extent / factor.getInt();
   int64_t remainder = extent % factor.getInt();
-  int64_t expectedLower =
-      original[0] + baseWidth * part.getInt() +
-      std::min<int64_t>(part.getInt(), remainder);
+  int64_t expectedLower = original[0] + baseWidth * part.getInt() +
+                          std::min<int64_t>(part.getInt(), remainder);
   int64_t expectedWidth =
       baseWidth + (part.getInt() < remainder ? int64_t(1) : int64_t(0));
   if (axis.getInt() > 1 || extent <= 0 || baseWidth <= 0 ||
@@ -1180,10 +1163,9 @@ static bool lineagePartitionMatches(StringRef family, int64_t axis,
 // current Taskflow/Neura bounds, task name, and tiling attributes.
 static bool sourceOwnedImmediateTilingBounds(
     TaskflowTaskOp task, StringRef canonicalName,
-    ArrayRef<CounterBounds> canonicalBounds,
-    ArrayRef<CounterBounds> current,
-    SmallVectorImpl<CounterBounds> &immediateBounds,
-    bool &finalStepIsTiling, std::string &error) {
+    ArrayRef<CounterBounds> canonicalBounds, ArrayRef<CounterBounds> current,
+    SmallVectorImpl<CounterBounds> &immediateBounds, bool &finalStepIsTiling,
+    std::string &error) {
   finalStepIsTiling = false;
   const size_t rank = canonicalBounds.size();
   if (rank < 2 || rank > 3 || current.size() != rank) {
@@ -1200,9 +1182,10 @@ static bool sourceOwnedImmediateTilingBounds(
     auto declaredParent =
         task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
     auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
-    auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
-    auto part = task->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.part_index");
+    auto factor =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto part =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
     if (!declaredParent || declaredParent.getValue() != canonicalName) {
       error = "nested source-owned tiling requires authenticated partition "
               "lineage";
@@ -1213,17 +1196,15 @@ static bool sourceOwnedImmediateTilingBounds(
     auto derivedRange = task->getAttrOfType<DenseI64ArrayAttr>(
         "amoeba.neura.tiling.derived_range");
     if (!axis || !factor || !part || axis.getInt() < 0 || axis.getInt() > 1 ||
-        !originalRange ||
-        !derivedRange || originalRange.size() != 2 ||
+        !originalRange || !derivedRange || originalRange.size() != 2 ||
         derivedRange.size() != 2 ||
         originalRange[0] != canonicalBounds[axis.getInt()].lower ||
         originalRange[1] != canonicalBounds[axis.getInt()].upper ||
         derivedRange[0] != current[axis.getInt()].lower ||
         derivedRange[1] != current[axis.getInt()].upper ||
         (rank == 3 && !equalBounds(current[2], canonicalBounds[2])) ||
-        !lineagePartitionMatches("tiling", axis.getInt(),
-                                 factor.getInt(), part.getInt(),
-                                 canonicalBounds, current)) {
+        !lineagePartitionMatches("tiling", axis.getInt(), factor.getInt(),
+                                 part.getInt(), canonicalBounds, current)) {
       error = "source-owned tiling range attributes disagree with canonical "
               "or current counter bounds";
       return false;
@@ -1286,9 +1267,8 @@ static bool sourceOwnedImmediateTilingBounds(
       return false;
     }
     immediateName = derivedName;
-    StepContract &familyContract = family.getValue() == "tiling"
-                                       ? latestTiling
-                                       : latestReplica;
+    StepContract &familyContract =
+        family.getValue() == "tiling" ? latestTiling : latestReplica;
     familyContract.present = true;
     familyContract.parent = derivedName;
     familyContract.axis = axis.getInt();
@@ -1319,12 +1299,13 @@ static bool sourceOwnedImmediateTilingBounds(
     return false;
   }
 
-  auto hasTilingMetadata = task->hasAttr("amoeba.neura.tiling.parent_task") ||
-                           task->hasAttr("amoeba.neura.tiling.axis") ||
-                           task->hasAttr("amoeba.neura.tiling.factor") ||
-                           task->hasAttr("amoeba.neura.tiling.part_index") ||
-                           task->hasAttr("amoeba.neura.tiling.original_range") ||
-                           task->hasAttr("amoeba.neura.tiling.derived_range");
+  auto hasTilingMetadata =
+      task->hasAttr("amoeba.neura.tiling.parent_task") ||
+      task->hasAttr("amoeba.neura.tiling.axis") ||
+      task->hasAttr("amoeba.neura.tiling.factor") ||
+      task->hasAttr("amoeba.neura.tiling.part_index") ||
+      task->hasAttr("amoeba.neura.tiling.original_range") ||
+      task->hasAttr("amoeba.neura.tiling.derived_range");
   // Replica materialization strips every amoeba.neura.tiling.* attribute
   // from its output tasks. When the authenticated ledger ends in a replica,
   // that complete absence is valid because the ledger and replica counters
@@ -1339,12 +1320,13 @@ static bool sourceOwnedImmediateTilingBounds(
     return false;
   }
   if (latestTiling.present && hasTilingMetadata) {
-    auto parent = task->getAttrOfType<StringAttr>(
-        "amoeba.neura.tiling.parent_task");
+    auto parent =
+        task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
     auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
-    auto factor = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
-    auto part = task->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.part_index");
+    auto factor =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
+    auto part =
+        task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.part_index");
     auto originalRange = task->getAttrOfType<DenseI64ArrayAttr>(
         "amoeba.neura.tiling.original_range");
     auto derivedRange = task->getAttrOfType<DenseI64ArrayAttr>(
@@ -1381,20 +1363,18 @@ static bool sourceOwnedImmediateTilingBounds(
     return false;
   }
   if (latestReplica.present) {
-    auto parent = task->getAttrOfType<StringAttr>(
-        "amoeba.replica.parent_task");
+    auto parent = task->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
     auto id = task->getAttrOfType<IntegerAttr>("amoeba.replica.id");
     auto count = task->getAttrOfType<IntegerAttr>("amoeba.replica.count");
     auto axis = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
     auto lower = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
     auto upper = task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
-    auto shardTripCount = task->getAttrOfType<IntegerAttr>(
-        "amoeba.replica.shard_trip_count");
+    auto shardTripCount =
+        task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_trip_count");
     int64_t axisIndex = latestReplica.axis;
     if (!parent || parent.getValue() != latestReplica.parent || !id || !count ||
         !axis || !lower || !upper || id.getInt() != latestReplica.part ||
-        count.getInt() != latestReplica.factor ||
-        axis.getInt() != axisIndex ||
+        count.getInt() != latestReplica.factor || axis.getInt() != axisIndex ||
         lower.getInt() != latestReplica.after[axisIndex].lower ||
         upper.getInt() != latestReplica.after[axisIndex].upper) {
       error = "source-owned replica attributes do not match their latest "
@@ -1460,10 +1440,11 @@ sourceOwnedOutputCounterAxis(Value value, ArrayRef<neura::CounterOp> counters,
   return std::nullopt;
 }
 
-static bool validateSourceOwnedTaskBox(
-    const TaskMetadata &parent, const ReplicaRecord &record,
-    ArrayRef<CounterBounds> parentBounds, SourceOwnedPartitionBox &box,
-    std::string &error) {
+static bool validateSourceOwnedTaskBox(const TaskMetadata &parent,
+                                       const ReplicaRecord &record,
+                                       ArrayRef<CounterBounds> parentBounds,
+                                       SourceOwnedPartitionBox &box,
+                                       std::string &error) {
   TaskflowTaskOp task = record.child;
   const size_t rank = parentBounds.size();
   if (rank < 2 || rank > 3) {
@@ -1472,7 +1453,8 @@ static bool validateSourceOwnedTaskBox(
   }
   box.bounds.assign(rank, CounterBounds{});
   SmallVector<TaskflowCounterOp> taskCounters;
-  task.walk([&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
+  task.walk(
+      [&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
   if (taskCounters.size() != rank) {
     error = "source-owned nested task " + task.getTaskName().str() +
             " must retain exactly its canonical M/N[/K] counters";
@@ -1551,10 +1533,10 @@ static bool validateSourceOwnedTaskBox(
     return false;
   }
 
-  auto lowers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_lowers");
-  auto uppers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_uppers");
+  auto lowers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_lowers");
+  auto uppers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_uppers");
   if (!lowers || !uppers || lowers.size() != task.getWillWrites().size() ||
       uppers.size() != lowers.size() || lowers.empty()) {
     error = "source-owned nested task " + task.getTaskName().str() +
@@ -1578,7 +1560,8 @@ static bool validateSourceOwnedTaskBox(
       return false;
     }
     Value outputArgument = body.getArgument(firstWrite + writeIndex);
-    for (auto [inputIndex, input] : llvm::enumerate(kernels.front().getInputs()))
+    for (auto [inputIndex, input] :
+         llvm::enumerate(kernels.front().getInputs()))
       if (input == outputArgument) {
         outputKernelInputs.insert(inputIndex);
         outputKernelInputByWrite.push_back(inputIndex);
@@ -1599,8 +1582,8 @@ static bool validateSourceOwnedTaskBox(
         mlir::amoeba::neura::joint_scheduling::detail::accessInput(
             store, store.getBase(), kernels.front());
     auto outputIt = outputInput
-                       ? llvm::find(outputKernelInputByWrite, *outputInput)
-                       : outputKernelInputByWrite.end();
+                        ? llvm::find(outputKernelInputByWrite, *outputInput)
+                        : outputKernelInputByWrite.end();
     if (!outputInput || !outputKernelInputs.contains(*outputInput)) {
       error = "source-owned nested task " + task.getTaskName().str() +
               " has an indexed store outside its authenticated task outputs";
@@ -1616,8 +1599,8 @@ static bool validateSourceOwnedTaskBox(
     unsigned outputIndex = outputIt - outputKernelInputByWrite.begin();
     SmallVector<unsigned> route;
     for (Value index : store.getIndices()) {
-      std::optional<unsigned> axis = sourceOwnedOutputCounterAxis(
-          index, neuraCounters);
+      std::optional<unsigned> axis =
+          sourceOwnedOutputCounterAxis(index, neuraCounters);
       if (!axis || llvm::is_contained(route, *axis)) {
         error = "source-owned nested task " + task.getTaskName().str() +
                 " has an indexed output coordinate that is not a unique "
@@ -1647,7 +1630,8 @@ static bool validateSourceOwnedTaskBox(
   if (!error.empty())
     return false;
   if (outputCounterAxes.size() != 2 ||
-      llvm::any_of(outputStoreCounts, [](unsigned count) { return count == 0; })) {
+      llvm::any_of(outputStoreCounts,
+                   [](unsigned count) { return count == 0; })) {
     error = "source-owned nested task " + task.getTaskName().str() +
             " does not cover every output with an authenticated indexed "
             "store";
@@ -1679,20 +1663,18 @@ static bool validateSourceOwnedTaskBox(
   // describe that intermediate tile even when the final task is a later
   // replica, so they are checked against their own ledger step rather than
   // against the final task box.
-  bool hasPartitionLineage =
-      task->hasAttr(kNeighborhoodPartitionLineageAttr) ||
-      task->hasAttr("amoeba.neura.tiling.axis") ||
-      task->hasAttr("amoeba.replica.parent_task");
+  bool hasPartitionLineage = task->hasAttr(kNeighborhoodPartitionLineageAttr) ||
+                             task->hasAttr("amoeba.neura.tiling.axis") ||
+                             task->hasAttr("amoeba.replica.parent_task");
   if (hasPartitionLineage) {
     SmallVector<CounterBounds, 3> latestTilingParentBounds;
     bool finalStepIsTiling = false;
-    if (!sourceOwnedImmediateTilingBounds(
-            task, parent.name, parentBounds, box.bounds,
-            latestTilingParentBounds, finalStepIsTiling, error))
+    if (!sourceOwnedImmediateTilingBounds(task, parent.name, parentBounds,
+                                          box.bounds, latestTilingParentBounds,
+                                          finalStepIsTiling, error))
       return false;
     if (finalStepIsTiling) {
-      auto axis = task->getAttrOfType<IntegerAttr>(
-          "amoeba.neura.tiling.axis");
+      auto axis = task->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
       if (!axis || axis.getInt() < 0 || axis.getInt() > 1) {
         error = "source-owned nested task " + task.getTaskName().str() +
                 " has no valid final tiling axis";
@@ -1733,18 +1715,18 @@ struct SourceOwnedLineageStep {
   SmallVector<CounterBounds, 3> after;
 };
 
-static bool decodeSourceOwnedLineageSteps(
-    TaskflowTaskOp task, StringRef canonicalName,
-    ArrayRef<CounterBounds> canonicalBounds,
-    SmallVectorImpl<SourceOwnedLineageStep> &steps, std::string &error) {
+static bool
+decodeSourceOwnedLineageSteps(TaskflowTaskOp task, StringRef canonicalName,
+                              ArrayRef<CounterBounds> canonicalBounds,
+                              SmallVectorImpl<SourceOwnedLineageStep> &steps,
+                              std::string &error) {
   auto roots = dyn_cast_or_null<ArrayAttr>(
       task->getAttr(kNeighborhoodPartitionLineageAttr));
-  auto root = roots && roots.size() == 1
-                  ? dyn_cast<DictionaryAttr>(roots[0])
-                  : DictionaryAttr{};
+  auto root = roots && roots.size() == 1 ? dyn_cast<DictionaryAttr>(roots[0])
+                                         : DictionaryAttr{};
   auto rootName = root ? root.getAs<StringAttr>("root") : StringAttr{};
-  auto original = root ? root.getAs<DenseI64ArrayAttr>("original")
-                       : DenseI64ArrayAttr{};
+  auto original =
+      root ? root.getAs<DenseI64ArrayAttr>("original") : DenseI64ArrayAttr{};
   auto encodedSteps = root ? root.getAs<ArrayAttr>("steps") : ArrayAttr{};
   SmallVector<CounterBounds, 3> originalBounds(canonicalBounds.size());
   if (!rootName || rootName.getValue() != canonicalName || !original ||
@@ -1763,8 +1745,8 @@ static bool decodeSourceOwnedLineageSteps(
     auto encoded = dyn_cast<DictionaryAttr>(attribute);
     auto family = encoded ? encoded.getAs<StringAttr>("family") : StringAttr{};
     auto axis = encoded ? encoded.getAs<IntegerAttr>("axis") : IntegerAttr{};
-    auto factor = encoded ? encoded.getAs<IntegerAttr>("factor")
-                          : IntegerAttr{};
+    auto factor =
+        encoded ? encoded.getAs<IntegerAttr>("factor") : IntegerAttr{};
     auto part = encoded ? encoded.getAs<IntegerAttr>("part") : IntegerAttr{};
     SourceOwnedLineageStep step;
     step.before.resize(canonicalBounds.size());
@@ -1785,9 +1767,8 @@ static bool decodeSourceOwnedLineageSteps(
     step.factor = factor.getInt();
     step.part = part.getInt();
     if (step.family == "tiling")
-      derivedName += (Twine(".tile.") + Twine(step.axis) + "." +
-                      Twine(step.part))
-                         .str();
+      derivedName +=
+          (Twine(".tile.") + Twine(step.axis) + "." + Twine(step.part)).str();
     else
       derivedName += (Twine(".replica.") + Twine(step.part)).str();
     current.assign(step.after.begin(), step.after.end());
@@ -1801,9 +1782,10 @@ static bool decodeSourceOwnedLineageSteps(
   return true;
 }
 
-static bool collectSourceOwnedJoinLeaves(
-    Value state, SmallVectorImpl<TaskflowTaskOp> &leaves,
-    DenseSet<Operation *> &activeJoins) {
+static bool
+collectSourceOwnedJoinLeaves(Value state,
+                             SmallVectorImpl<TaskflowTaskOp> &leaves,
+                             DenseSet<Operation *> &activeJoins) {
   state = stripSourceOwnedMemrefCasts(state);
   if (TaskflowTaskOp task = state.getDefiningOp<TaskflowTaskOp>()) {
     leaves.push_back(task);
@@ -1834,9 +1816,10 @@ static bool sameSourceOwnedLineageStep(const SourceOwnedLineageStep &lhs,
          llvm::equal(lhs.after, rhs.after, equalBounds);
 }
 
-static bool sourceOwnedBoxesCoverRegion(
-    ArrayRef<unsigned> indices, ArrayRef<SourceOwnedPartitionBox> boxes,
-    ArrayRef<CounterBounds> region, std::string &error) {
+static bool sourceOwnedBoxesCoverRegion(ArrayRef<unsigned> indices,
+                                        ArrayRef<SourceOwnedPartitionBox> boxes,
+                                        ArrayRef<CounterBounds> region,
+                                        std::string &error) {
   if (region.size() < 2 || region.size() > 3) {
     error = "source-owned completion-join branch has an unsupported typed "
             "region rank";
@@ -1851,8 +1834,7 @@ static bool sourceOwnedBoxesCoverRegion(
               "typed output region";
       return false;
     }
-    if (region.size() == 3 &&
-        !equalBounds(box[2], region[2])) {
+    if (region.size() == 3 && !equalBounds(box[2], region[2])) {
       error = "source-owned completion-join branch changes its retained K "
               "reduction bounds";
       return false;
@@ -1892,9 +1874,8 @@ static bool sourceOwnedBoxesCoverRegion(
 // coordinates before this structural check runs.
 static bool validateSourceOwnedMixedJoinTree(
     StringRef canonicalName, ArrayRef<CounterBounds> canonicalBounds,
-    ArrayRef<ReplicaRecord> records,
-    ArrayRef<SourceOwnedPartitionBox> boxes, size_t canonicalDoneReadCount,
-    std::string &error) {
+    ArrayRef<ReplicaRecord> records, ArrayRef<SourceOwnedPartitionBox> boxes,
+    size_t canonicalDoneReadCount, std::string &error) {
   if (canonicalDoneReadCount != 0) {
     error = "source-owned mixed partition with sparse done-read outputs is "
             "unsupported";
@@ -1912,9 +1893,8 @@ static bool validateSourceOwnedMixedJoinTree(
   for (auto [index, record] : llvm::enumerate(records)) {
     TaskflowTaskOp child = record.child;
     if (!recordByTask.emplace(child.getOperation(), index).second ||
-        !decodeSourceOwnedLineageSteps(child, canonicalName,
-                                       canonicalBounds, lineages[index],
-                                       error))
+        !decodeSourceOwnedLineageSteps(child, canonicalName, canonicalBounds,
+                                       lineages[index], error))
       return false;
     if (child.getWillWrites().size() != 1 ||
         child.getDoneWrites().size() != 1 ||
@@ -1941,7 +1921,8 @@ static bool validateSourceOwnedMixedJoinTree(
   };
 
   std::function<bool(TaskflowJoinOp, ArrayRef<unsigned>,
-                     DenseSet<Operation *> &)> validateNode;
+                     DenseSet<Operation *> &)>
+      validateNode;
   validateNode = [&](TaskflowJoinOp join, ArrayRef<unsigned> indices,
                      DenseSet<Operation *> &active) {
     if (!join || indices.size() < 2 ||
@@ -1964,17 +1945,15 @@ static bool validateSourceOwnedMixedJoinTree(
         return false;
       }
       bool common = llvm::all_of(indices.drop_front(), [&](unsigned index) {
-        return sameSourceOwnedLineageStep(
-            lineages[indices.front()][split], lineages[index][split]);
+        return sameSourceOwnedLineageStep(lineages[indices.front()][split],
+                                          lineages[index][split]);
       });
       if (!common)
         break;
     }
-    const SourceOwnedLineageStep &splitStep =
-        lineages[indices.front()][split];
+    const SourceOwnedLineageStep &splitStep = lineages[indices.front()][split];
     for (unsigned index : indices)
-      if (!sameSourceOwnedLineageStepKey(splitStep,
-                                         lineages[index][split])) {
+      if (!sameSourceOwnedLineageStepKey(splitStep, lineages[index][split])) {
         error = "source-owned mixed completion join does not correspond to "
                 "one typed partition step";
         leaveActive();
@@ -2014,8 +1993,8 @@ static bool validateSourceOwnedMixedJoinTree(
         return false;
       }
     } else {
-      auto rewrite = join->getAttrOfType<StringAttr>(
-          "amoeba.neura.joint_rewrite");
+      auto rewrite =
+          join->getAttrOfType<StringAttr>("amoeba.neura.joint_rewrite");
       if (!rewrite || rewrite.getValue() != "post-neura-mn-tiling" ||
           join->hasAttr("amoeba.replica.completion_only")) {
         error = "source-owned mixed tile split has the wrong completion "
@@ -2072,8 +2051,7 @@ static bool validateSourceOwnedMixedJoinTree(
         return false;
       }
       for (unsigned index : branchIndices)
-        if (!sameSourceOwnedLineageStep(branchStep,
-                                        lineages[index][split]) ||
+        if (!sameSourceOwnedLineageStep(branchStep, lineages[index][split]) ||
             lineages[index][split].part != branchStep.part) {
           error = "source-owned mixed join state combines different typed "
                   "partition parts";
@@ -2081,8 +2059,8 @@ static bool validateSourceOwnedMixedJoinTree(
           return false;
         }
       if (branchStep.part < 0 || branchStep.part >= splitStep.factor ||
-          !sourceOwnedBoxesCoverRegion(branchIndices, boxes,
-                                       branchStep.after, error)) {
+          !sourceOwnedBoxesCoverRegion(branchIndices, boxes, branchStep.after,
+                                       error)) {
         if (error.empty())
           error = "source-owned mixed completion join has an invalid typed "
                   "branch interval";
@@ -2092,7 +2070,8 @@ static bool validateSourceOwnedMixedJoinTree(
 
       Value stateRoot = stripSourceOwnedMemrefCasts(state);
       if (TaskflowTaskOp leaf = stateRoot.getDefiningOp<TaskflowTaskOp>()) {
-        if (branchIndices.size() != 1 || leaf != records[branchIndices.front()].child ||
+        if (branchIndices.size() != 1 ||
+            leaf != records[branchIndices.front()].child ||
             leaf.getDoneWrites().size() != 1 ||
             stripSourceOwnedMemrefCasts(leaf.getDoneWrites().front()) !=
                 stateRoot) {
@@ -2164,9 +2143,8 @@ static bool validateSourceOwnedMixedJoinTree(
 // every unsharded axis.  It also authenticates the join states to the child
 // done-write roots, so a forged parent name cannot borrow an unrelated join.
 static bool validateSourceOwnedNestedJoins(
-    ArrayRef<ReplicaRecord> records,
-    ArrayRef<SourceOwnedPartitionBox> boxes, size_t canonicalDoneReadCount,
-    std::string &error) {
+    ArrayRef<ReplicaRecord> records, ArrayRef<SourceOwnedPartitionBox> boxes,
+    size_t canonicalDoneReadCount, std::string &error) {
   if (records.size() != boxes.size() || records.empty())
     return false;
   func::FuncOp function =
@@ -2178,8 +2156,8 @@ static bool validateSourceOwnedNestedJoins(
 
   std::map<std::string, SmallVector<unsigned>> groups;
   for (auto [index, record] : llvm::enumerate(records)) {
-    auto parent = record.child->getAttrOfType<StringAttr>(
-        "amoeba.replica.parent_task");
+    auto parent =
+        record.child->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
     if (!parent)
       continue;
     groups[parent.getValue().str()].push_back(index);
@@ -2196,22 +2174,22 @@ static bool validateSourceOwnedNestedJoins(
     for (unsigned index : indices) {
       const ReplicaRecord &record = records[index];
       TaskflowTaskOp child = record.child;
-      auto parent = child->getAttrOfType<StringAttr>(
-          "amoeba.replica.parent_task");
-      auto axis = child->getAttrOfType<IntegerAttr>(
-          "amoeba.replica.shard_axis");
-      auto count = child->getAttrOfType<IntegerAttr>(
-          "amoeba.replica.count");
+      auto parent =
+          child->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+      auto axis =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
+      auto count = child->getAttrOfType<IntegerAttr>("amoeba.replica.count");
       auto id = child->getAttrOfType<IntegerAttr>("amoeba.replica.id");
-      auto lower = child->getAttrOfType<IntegerAttr>(
-          "amoeba.replica.shard_lower");
-      auto upper = child->getAttrOfType<IntegerAttr>(
-          "amoeba.replica.shard_upper");
+      auto lower =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
+      auto upper =
+          child->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
       if (!parent || parent.getValue() != parentName || !axis || !count ||
           !id || !lower || !upper || axis.getInt() < 0 || axis.getInt() > 1 ||
-          count.getInt() < 2 || id.getInt() < 0 || id.getInt() >= count.getInt() ||
-          lower.getInt() >= upper.getInt() ||
-          !child.getTaskName().starts_with((Twine(parentName) + ".replica.").str())) {
+          count.getInt() < 2 || id.getInt() < 0 ||
+          id.getInt() >= count.getInt() || lower.getInt() >= upper.getInt() ||
+          !child.getTaskName().starts_with(
+              (Twine(parentName) + ".replica.").str())) {
         error = "source-owned nested replica has incomplete parent or shard "
                 "identity";
         return false;
@@ -2237,8 +2215,7 @@ static bool validateSourceOwnedNestedJoins(
 
     TaskflowJoinOp completionJoin;
     function.walk([&](TaskflowJoinOp candidate) {
-      if (completionJoin ||
-          candidate.getTileStates().size() != indices.size())
+      if (completionJoin || candidate.getTileStates().size() != indices.size())
         return;
       DenseSet<Operation *> actualTasks;
       for (Value state : candidate.getTileStates()) {
@@ -2252,7 +2229,8 @@ static bool validateSourceOwnedNestedJoins(
       if (actualTasks.size() == expectedTasks.size())
         completionJoin = candidate;
     });
-    if (!completionJoin || !completionJoin->hasAttr("amoeba.replica.completion_only") ||
+    if (!completionJoin ||
+        !completionJoin->hasAttr("amoeba.replica.completion_only") ||
         !completionJoin->hasAttr("amoeba.semantic.completion_only")) {
       error = "source-owned nested replica parent has no authenticated "
               "completion join";
@@ -2297,14 +2275,14 @@ static bool validateSourceOwnedNestedJoins(
               child.getWillWrites().size() ||
           stripSourceOwnedMemrefCasts(child.getWillWrites().front()) !=
               joinBase ||
-          stripSourceOwnedMemrefCasts(child.getOriginalWriteMemrefs().front()) !=
-              joinBase) {
+          stripSourceOwnedMemrefCasts(
+              child.getOriginalWriteMemrefs().front()) != joinBase) {
         error = "source-owned nested completion join has a child storage-root "
                 "or write-arity mismatch";
         return false;
       }
-      intervals.push_back({box.bounds[selectedAxis].lower,
-                           box.bounds[selectedAxis].upper});
+      intervals.push_back(
+          {box.bounds[selectedAxis].lower, box.bounds[selectedAxis].upper});
     }
     llvm::sort(intervals);
     int64_t cursor = completionJoin.getRegionLower()[selectedAxis];
@@ -2419,8 +2397,8 @@ static bool validateSourceOwnedRankOneTilingMetadata(
   int64_t remainder = extent % factor.getInt();
   int64_t expectedLower = canonicalBounds.lower + part.getInt() * width +
                           std::min(part.getInt(), remainder);
-  int64_t expectedUpper = expectedLower + width +
-                          (part.getInt() < remainder ? 1 : 0);
+  int64_t expectedUpper =
+      expectedLower + width + (part.getInt() < remainder ? 1 : 0);
   if (currentBounds.lower != expectedLower ||
       currentBounds.upper != expectedUpper) {
     error = "source-owned rank-1 tile interval does not match its ordered part";
@@ -2751,7 +2729,8 @@ static bool validateSourceOwnedPartition(const TaskMetadata &parent,
   }
   for (size_t axis = 0; axis < rank; ++axis) {
     CounterBounds neuraBounds;
-    if (!findTaskflowCounterBounds(parentTask, axis, parentBounds[axis], error) ||
+    if (!findTaskflowCounterBounds(parentTask, axis, parentBounds[axis],
+                                   error) ||
         !findNeuraCounterBounds(parentTask, axis, neuraBounds, error) ||
         !equalBounds(parentBounds[axis], neuraBounds) ||
         parentBounds[axis].step != 1) {
@@ -2819,8 +2798,8 @@ static bool validateSourceOwnedPartition(const TaskMetadata &parent,
     if (!record.child->hasAttr(kNeighborhoodPartitionLineageAttr))
       continue;
     SmallVector<SourceOwnedLineageStep> steps;
-    if (!decodeSourceOwnedLineageSteps(record.child, parent.name,
-                                       parentBounds, steps, error))
+    if (!decodeSourceOwnedLineageSteps(record.child, parent.name, parentBounds,
+                                       steps, error))
       return false;
     for (const SourceOwnedLineageStep &step : steps) {
       hasLineageTiling |= step.family == "tiling";
@@ -2930,7 +2909,7 @@ static bool sourceOwnedTypesCompatible(Type lhs, Type rhs,
     auto right = dyn_cast<neura::PredicatedValue>(rhs);
     return right && left.getPredicateType() == right.getPredicateType() &&
            sourceOwnedTypesCompatible(left.getValueType(), right.getValueType(),
-                                       /*sourceOwnedTiling=*/true);
+                                      /*sourceOwnedTiling=*/true);
   }
   auto leftMemref = dyn_cast<MemRefType>(lhs);
   auto rightMemref = dyn_cast<MemRefType>(rhs);
@@ -3002,8 +2981,7 @@ static bool compareRegion(Region &lhs, Region &rhs,
                           DenseMap<Value, Value> &mapping,
                           const DenseSet<Operation *> &ignoredLhs,
                           const DenseSet<Operation *> &ignoredRhs,
-                          std::string &reason,
-                          bool sourceOwnedTiling = false);
+                          std::string &reason, bool sourceOwnedTiling = false);
 
 static bool compareOperation(Operation *lhs, Operation *rhs,
                              DenseMap<Value, Value> &mapping,
@@ -3061,8 +3039,8 @@ static bool compareOperation(Operation *lhs, Operation *rhs,
           return false;
         }
   }
-  for (auto [index, pair] : llvm::enumerate(llvm::zip(lhs->getOperands(),
-                                                        rhs->getOperands()))) {
+  for (auto [index, pair] :
+       llvm::enumerate(llvm::zip(lhs->getOperands(), rhs->getOperands()))) {
     Value left = std::get<0>(pair);
     Value right = std::get<1>(pair);
     if (!sourceOwnedTypesCompatible(left.getType(), right.getType(),
@@ -3113,8 +3091,8 @@ static bool compareRegion(Region &lhs, Region &rhs,
       reason = "Neura body block arguments changed";
       return false;
     }
-    for (auto args : llvm::zip(leftBlock.getArguments(),
-                               rightBlock.getArguments())) {
+    for (auto args :
+         llvm::zip(leftBlock.getArguments(), rightBlock.getArguments())) {
       Value left = std::get<0>(args);
       Value right = std::get<1>(args);
       if (!sourceOwnedTypesCompatible(left.getType(), right.getType(),
@@ -3202,8 +3180,7 @@ static bool proveTaskBody(TaskflowTaskOp parent, TaskflowTaskOp child,
   if (parent->getNumOperands() != child->getNumOperands() ||
       parent->getNumResults() != child->getNumResults() ||
       !attrsEquivalent(parent, child, /*taskAttrs=*/true,
-                       /*counterAttrs=*/false, sequentialK,
-                       sourceOwnedTiling,
+                       /*counterAttrs=*/false, sequentialK, sourceOwnedTiling,
                        verifiedOriginalAmoebaRealization)) {
     error = "task shell inputs, outputs, or semantic attributes changed";
     return false;
@@ -3278,7 +3255,8 @@ static bool copyJsonObject(const json::Object &source, json::Object &target) {
 static std::optional<double> predictedDuration(const json::Object &entry,
                                                int64_t tripCount,
                                                std::string &error) {
-  if (entry.getString("support_status") != std::optional<StringRef>("supported"))
+  if (entry.getString("support_status") !=
+      std::optional<StringRef>("supported"))
     return std::nullopt;
   auto ii = entry.getNumber("predicted_ii");
   auto startup = entry.getNumber("startup_cycles");
@@ -3288,9 +3266,9 @@ static std::optional<double> predictedDuration(const json::Object &entry,
             "trip count";
     return std::nullopt;
   }
-  long double duration = static_cast<long double>(*startup) +
-                         static_cast<long double>(*ii) *
-                             static_cast<long double>(tripCount - 1);
+  long double duration =
+      static_cast<long double>(*startup) +
+      static_cast<long double>(*ii) * static_cast<long double>(tripCount - 1);
   if (!std::isfinite(duration) || duration <= 0.0L ||
       duration > static_cast<long double>(std::numeric_limits<double>::max())) {
     error = "child replica duration is outside the finite ranker range";
@@ -3299,13 +3277,11 @@ static std::optional<double> predictedDuration(const json::Object &entry,
   return static_cast<double>(duration);
 }
 
-static bool validateModelMetadata(const json::Object &metadata,
-                                  StringRef namespaceValue,
-                                  StringRef expectedNamespace, StringRef model,
-                                  StringRef modelSchema,
-                                  StringRef featureContract,
-                                  StringRef featureExtractor,
-                                  std::string &error) {
+static bool
+validateModelMetadata(const json::Object &metadata, StringRef namespaceValue,
+                      StringRef expectedNamespace, StringRef model,
+                      StringRef modelSchema, StringRef featureContract,
+                      StringRef featureExtractor, std::string &error) {
   auto provenance = requiredString(metadata, "provenance_schema", error);
   auto actualModel = requiredString(metadata, "model", error);
   auto actualSchema = requiredString(metadata, "model_schema", error);
@@ -3367,8 +3343,7 @@ static bool parseParentCatalogue(
       !rejectMeasuredFields(*parsedRoot, "parent catalogue", error) ||
       !validateModelMetadata(*metadata, *namespaceValue, expectedNamespace,
                              expectedModel, expectedModelSchema,
-                             expectedFeatureContract, expectedExtractor,
-                             error))
+                             expectedFeatureContract, expectedExtractor, error))
     return false;
   auto sourceGraph = requiredString(*metadata, "source_graph_id", error);
   auto sourceRepositoryValue =
@@ -3438,8 +3413,8 @@ static bool parseIntegerAttr(TaskflowTaskOp task, StringRef attr,
                              int64_t &value, std::string &error) {
   auto integer = task->getAttrOfType<IntegerAttr>(attr);
   if (!integer) {
-    error = "sequential-K task " + task.getTaskName().str() +
-            " is missing " + attr.str();
+    error = "sequential-K task " + task.getTaskName().str() + " is missing " +
+            attr.str();
     return false;
   }
   value = integer.getInt();
@@ -3487,12 +3462,12 @@ static bool validateSequentialKShard(const TaskMetadata &parent,
               " has an invalid block index/count";
     return false;
   }
-  if (!readRange(task, "amoeba.semantic.K_range", record.kLower,
-                 record.kUpper, error) ||
-      !readRange(task, "amoeba.semantic.M_range", record.mLower,
-                 record.mUpper, error) ||
-      !readRange(task, "amoeba.semantic.N_range", record.nLower,
-                 record.nUpper, error))
+  if (!readRange(task, "amoeba.semantic.K_range", record.kLower, record.kUpper,
+                 error) ||
+      !readRange(task, "amoeba.semantic.M_range", record.mLower, record.mUpper,
+                 error) ||
+      !readRange(task, "amoeba.semantic.N_range", record.nLower, record.nUpper,
+                 error))
     return false;
 
   CounterBounds taskM, taskN, taskK;
@@ -3536,8 +3511,7 @@ static bool validateSequentialKShard(const TaskMetadata &parent,
   }
   if (parentM.lower != record.mLower || parentM.upper != record.mUpper ||
       parentN.lower != record.nLower || parentN.upper != record.nUpper) {
-    error = "sequential-K task " + child.name +
-            " changed canonical M/N bounds";
+    error = "sequential-K task " + child.name + " changed canonical M/N bounds";
     return false;
   }
   int64_t expectedTrip = 0;
@@ -3555,22 +3529,22 @@ static bool validateSequentialKShard(const TaskMetadata &parent,
     return false;
   }
   if (record.id == 0) {
-    auto initial = task->getAttrOfType<StringAttr>(
-        "amoeba.semantic.initial_C_ownership");
+    auto initial =
+        task->getAttrOfType<StringAttr>("amoeba.semantic.initial_C_ownership");
     if (!initial || initial.getValue() != "initial_C_once") {
       error = "first sequential-K block does not own initial C exactly once";
       return false;
     }
   } else {
-    auto initial = task->getAttrOfType<StringAttr>(
-        "amoeba.semantic.initial_C_ownership");
+    auto initial =
+        task->getAttrOfType<StringAttr>("amoeba.semantic.initial_C_ownership");
     if (!initial || initial.getValue() != "state_carry") {
       error = "non-first sequential-K block does not declare state carry";
       return false;
     }
   }
-  auto final = task->getAttrOfType<StringAttr>(
-      "amoeba.semantic.final_C_ownership");
+  auto final =
+      task->getAttrOfType<StringAttr>("amoeba.semantic.final_C_ownership");
   if (!final || (final.getValue() != "state_carry" &&
                  final.getValue() != "external_final_C")) {
     error = "sequential-K block has invalid final C ownership";
@@ -3585,8 +3559,7 @@ static bool validateSequentialKShard(const TaskMetadata &parent,
 }
 
 static bool hasOnlyIncomingStateEdge(TaskflowTaskOp task, StringRef source) {
-  auto edges = task->getAttrOfType<ArrayAttr>(
-      "amoeba.semantic.incoming_edges");
+  auto edges = task->getAttrOfType<ArrayAttr>("amoeba.semantic.incoming_edges");
   if (!edges)
     // Some prepared canonical modules do not carry the optional edge
     // annotation.  The required direct SSA state read is checked by the
@@ -3606,8 +3579,7 @@ static bool hasOnlyIncomingStateEdge(TaskflowTaskOp task, StringRef source) {
 }
 
 static bool hasAnyIncomingStateEdge(TaskflowTaskOp task) {
-  auto edges = task->getAttrOfType<ArrayAttr>(
-      "amoeba.semantic.incoming_edges");
+  auto edges = task->getAttrOfType<ArrayAttr>("amoeba.semantic.incoming_edges");
   if (!edges)
     return false;
   return llvm::any_of(edges, [](Attribute edge) {
@@ -3616,9 +3588,9 @@ static bool hasAnyIncomingStateEdge(TaskflowTaskOp task) {
   });
 }
 
-static bool validateSequentialKStateGroup(
-    const TaskMetadata &parent, ArrayRef<ReplicaRecord> records,
-    std::string &error) {
+static bool validateSequentialKStateGroup(const TaskMetadata &parent,
+                                          ArrayRef<ReplicaRecord> records,
+                                          std::string &error) {
   if (records.empty())
     return false;
   std::map<int64_t, const ReplicaRecord *> byIndex;
@@ -3664,8 +3636,8 @@ static bool validateSequentialKStateGroup(
   for (int64_t index = 0; index < count; ++index) {
     auto found = byIndex.find(index);
     if (found == byIndex.end()) {
-      error = "sequential-K group is missing block index " +
-              std::to_string(index);
+      error =
+          "sequential-K group is missing block index " + std::to_string(index);
       return false;
     }
     const ReplicaRecord &record = *found->second;
@@ -3676,11 +3648,10 @@ static bool validateSequentialKStateGroup(
       return false;
     }
     kCursor = record.kUpper;
-    auto final = current->getAttrOfType<StringAttr>(
-        "amoeba.semantic.final_C_ownership");
-    if (!final || (index + 1 == count
-                       ? final.getValue() != "external_final_C"
-                       : final.getValue() != "state_carry")) {
+    auto final =
+        current->getAttrOfType<StringAttr>("amoeba.semantic.final_C_ownership");
+    if (!final || (index + 1 == count ? final.getValue() != "external_final_C"
+                                      : final.getValue() != "state_carry")) {
       error = "sequential-K group has invalid final C ownership order";
       return false;
     }
@@ -3715,14 +3686,16 @@ static bool validateSequentialKStateGroup(
       for (Value read : current.getWillReads())
         if (read == previousTask.getDoneWrites().front()) {
           ++stateReads;
-          if (read.getType() != previousTask.getDoneWrites().front().getType()) {
+          if (read.getType() !=
+              previousTask.getDoneWrites().front().getType()) {
             error = "sequential-K state-carry type changed";
             return false;
           }
         }
       if (stateReads != 1 ||
           !hasOnlyIncomingStateEdge(current, previousTask.getTaskName())) {
-        error = "sequential-K state-carry SSA or incoming-edge proof is missing";
+        error =
+            "sequential-K state-carry SSA or incoming-edge proof is missing";
         return false;
       }
       if (current.getOriginalWriteMemrefs().size() != 1 ||
@@ -3781,22 +3754,21 @@ static bool collectReplicaLayout(
   for (const TaskMetadata &task : childTasks) {
     bool hasFusionMetadata = false;
     for (NamedAttribute attribute : task.op->getAttrs())
-      hasFusionMetadata |= attribute.getName().strref().starts_with(
-          "amoeba.neura.fusion.");
+      hasFusionMetadata |=
+          attribute.getName().strref().starts_with("amoeba.neura.fusion.");
     if (!hasFusionMetadata)
       continue;
-    auto mode = task.op->getAttrOfType<StringAttr>(
-        "amoeba.neura.fusion.mode");
+    auto mode = task.op->getAttrOfType<StringAttr>("amoeba.neura.fusion.mode");
     auto loads = task.op->getAttrOfType<IntegerAttr>(
         "amoeba.neura.fusion.eliminated_loads");
     auto stores = task.op->getAttrOfType<IntegerAttr>(
         "amoeba.neura.fusion.eliminated_stores");
-    auto first = task.op->getAttrOfType<StringAttr>(
-        "amoeba.neura.fusion.sibling_first");
+    auto first =
+        task.op->getAttrOfType<StringAttr>("amoeba.neura.fusion.sibling_first");
     auto second = task.op->getAttrOfType<StringAttr>(
         "amoeba.neura.fusion.sibling_second");
-    auto rewrite = task.op->getAttrOfType<StringAttr>(
-        "amoeba.neura.joint_rewrite");
+    auto rewrite =
+        task.op->getAttrOfType<StringAttr>("amoeba.neura.joint_rewrite");
     if (!mode || !loads || !stores || !rewrite) {
       error = "composite source-domain proof requires exact post-Neura "
               "fusion metadata";
@@ -3816,8 +3788,7 @@ static bool collectReplicaLayout(
       firstName = first.getValue().str();
       secondName = second.getValue().str();
     } else if (mode.getValue() == "retained" &&
-               rewrite.getValue() ==
-                   "post-neura-producer-consumer-retained" &&
+               rewrite.getValue() == "post-neura-producer-consumer-retained" &&
                ((loads.getInt() == 0 && stores.getInt() == 0) ||
                 (loads.getInt() == 1 && stores.getInt() == 0)) &&
                !first && !second) {
@@ -3838,11 +3809,10 @@ static bool collectReplicaLayout(
       kind = CompositeFusionKind::ProducerConsumerRetained;
       materializerMode = "producer-consumer-retained";
       firstName = fusedName.take_front(separator).str();
-      secondName = fusedName.drop_front(separator + StringRef(".fuse.").size())
-                       .str();
+      secondName =
+          fusedName.drop_front(separator + StringRef(".fuse.").size()).str();
     } else if (mode.getValue() == "forwarded" &&
-               rewrite.getValue() ==
-                   "post-neura-producer-consumer-forwarded" &&
+               rewrite.getValue() == "post-neura-producer-consumer-forwarded" &&
                loads.getInt() == 1 && stores.getInt() == 1 && !first &&
                !second) {
       StringRef fusedName = task.name;
@@ -3857,15 +3827,14 @@ static bool collectReplicaLayout(
       kind = CompositeFusionKind::ProducerConsumerForwarded;
       materializerMode = "producer-consumer-forwarded";
       firstName = fusedName.take_front(separator).str();
-      secondName = fusedName.drop_front(separator + StringRef(".fuse.").size())
-                       .str();
+      secondName =
+          fusedName.drop_front(separator + StringRef(".fuse.").size()).str();
     } else {
       error = "composite source-domain proof supports only exact sibling or "
               "retained/forwarded producer-consumer fusion metadata";
       return false;
     }
-    std::string expectedName =
-        (Twine(firstName) + ".fuse." + secondName).str();
+    std::string expectedName = (Twine(firstName) + ".fuse." + secondName).str();
     if (task.name != expectedName) {
       error = "composite fusion task name disagrees with its ordered parent "
               "pair";
@@ -3911,8 +3880,8 @@ static bool collectReplicaLayout(
     const CompositeFusionRecord &fusion = compositeFusions.begin()->second;
     auto first = parents.find(fusion.firstParent);
     auto second = parents.find(fusion.secondParent);
-    if (first == parents.end() || second == parents.end() ||
-        first == second || children.count(fusion.firstParent) ||
+    if (first == parents.end() || second == parents.end() || first == second ||
+        children.count(fusion.firstParent) ||
         children.count(fusion.secondParent) ||
         fusion.childName !=
             (fusion.firstParent + ".fuse." + fusion.secondParent)) {
@@ -3969,28 +3938,25 @@ static bool collectReplicaLayout(
       continue;
     if (!validateSourceOwnedTilingTask(task.op, error))
       return false;
-    auto parent = task.op->getAttrOfType<StringAttr>(
-        "amoeba.neura.tiling.parent_task");
-    auto axis = task.op->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.axis");
-    auto factor = task.op->getAttrOfType<IntegerAttr>(
-        "amoeba.neura.tiling.factor");
+    auto parent =
+        task.op->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
+    auto axis = task.op->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.axis");
+    auto factor =
+        task.op->getAttrOfType<IntegerAttr>("amoeba.neura.tiling.factor");
     std::string family =
         (Twine(parent.getValue()) + ".tile." + Twine(axis.getInt()) + ".")
             .str();
     auto found = tilingFamilies.find(family);
     if (found == tilingFamilies.end()) {
-      tilingFamilies.emplace(family,
-                             TilingFamily{parent.getValue().str(),
-                                          factor.getInt()});
+      tilingFamilies.emplace(
+          family, TilingFamily{parent.getValue().str(), factor.getInt()});
     } else if (found->second.root != parent.getValue() ||
                found->second.factor != factor.getInt()) {
       error = "source-owned tiling family has inconsistent parent/factor";
       return false;
     }
   }
-  auto resolveSourceOwnedFamily = [&](StringRef candidate,
-                                      std::string &root) {
+  auto resolveSourceOwnedFamily = [&](StringRef candidate, std::string &root) {
     bool matched = false;
     for (const auto &family : tilingFamilies) {
       if (!candidate.starts_with(family.first))
@@ -4008,12 +3974,12 @@ static bool collectReplicaLayout(
     return matched;
   };
   for (const TaskMetadata &task : childTasks) {
-    auto replicaParent = task.op->getAttrOfType<StringAttr>(
-        "amoeba.replica.parent_task");
-    auto sequentialKParent = task.op->getAttrOfType<StringAttr>(
-        "amoeba.tiling.parent_task");
-    auto sourceTilingParent = task.op->getAttrOfType<StringAttr>(
-        "amoeba.neura.tiling.parent_task");
+    auto replicaParent =
+        task.op->getAttrOfType<StringAttr>("amoeba.replica.parent_task");
+    auto sequentialKParent =
+        task.op->getAttrOfType<StringAttr>("amoeba.tiling.parent_task");
+    auto sourceTilingParent =
+        task.op->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
     if (replicaParent && sequentialKParent &&
         replicaParent.getValue() != sequentialKParent.getValue()) {
       error = "task " + task.name +
@@ -4034,11 +4000,10 @@ static bool collectReplicaLayout(
       sourceOwnedLineage[task.name] = false;
       continue;
     }
-    StringRef declaredParent = sourceTilingParent
-                                   ? sourceTilingParent.getValue()
-                                   : (sequentialKParent
-                                          ? sequentialKParent.getValue()
-                                          : replicaParent.getValue());
+    StringRef declaredParent =
+        sourceTilingParent ? sourceTilingParent.getValue()
+                           : (sequentialKParent ? sequentialKParent.getValue()
+                                                : replicaParent.getValue());
     if (declaredParent.empty()) {
       error = "derived task " + task.name + " has an empty parent task";
       return false;
@@ -4058,8 +4023,7 @@ static bool collectReplicaLayout(
         }
       }
       if (!foundRoot || parents.find(resolved) == parents.end()) {
-        error = "replica task " + task.name +
-                " names an unknown parent task";
+        error = "replica task " + task.name + " names an unknown parent task";
         return false;
       }
       parentName = std::move(resolved);
@@ -4086,8 +4050,7 @@ static bool collectReplicaLayout(
       return false;
     }
     if (!sourceOwnedTiling &&
-        (!parseReplicaInteger(task.op, "amoeba.replica.id", record.id,
-                              error) ||
+        (!parseReplicaInteger(task.op, "amoeba.replica.id", record.id, error) ||
          !parseReplicaInteger(task.op, "amoeba.replica.count", record.count,
                               error) ||
          record.id < 0 || record.count <= 0 || record.id >= record.count)) {
@@ -4111,11 +4074,11 @@ static bool collectReplicaLayout(
       // trip count without changing that historical replica attribute.
     } else {
       if (!parseReplicaInteger(task.op, "amoeba.replica.shard_axis",
-                              record.shardAxis, error) ||
+                               record.shardAxis, error) ||
           record.shardAxis < 0) {
         if (error.empty())
-          error = "ordinary replica shard axis is invalid for task " +
-                  task.name;
+          error =
+              "ordinary replica shard axis is invalid for task " + task.name;
         return false;
       }
       if (auto outputAxis = task.op->getAttrOfType<IntegerAttr>(
@@ -4152,28 +4115,28 @@ static bool collectReplicaLayout(
     if (!hasReplicas)
       continue;
     const std::vector<ReplicaRecord> &groupRecords = group->second;
-    bool hasSequentialK = llvm::any_of(
-        groupRecords, [](const ReplicaRecord &record) {
+    bool hasSequentialK =
+        llvm::any_of(groupRecords, [](const ReplicaRecord &record) {
           return record.sequentialK;
         });
     if (hasSequentialK) {
-      if (!llvm::all_of(groupRecords, [](const ReplicaRecord &record) {
-            return record.sequentialK;
-          }) ||
+      if (!llvm::all_of(
+              groupRecords,
+              [](const ReplicaRecord &record) { return record.sequentialK; }) ||
           !validateSequentialKStateGroup(parent.second, groupRecords, error))
         return false;
       continue;
     }
-    bool hasSourceOwnedTiling = llvm::any_of(
-        groupRecords, [](const ReplicaRecord &record) {
+    bool hasSourceOwnedTiling =
+        llvm::any_of(groupRecords, [](const ReplicaRecord &record) {
           return record.sourceOwnedTiling;
         });
     if (hasSourceOwnedTiling) {
       int64_t tripSum = 0;
       for (const ReplicaRecord &record : groupRecords) {
         if (record.childTripCount <= 0 ||
-            tripSum > std::numeric_limits<int64_t>::max() -
-                          record.childTripCount) {
+            tripSum >
+                std::numeric_limits<int64_t>::max() - record.childTripCount) {
           error = "source-owned nested partition has invalid trip counts";
           return false;
         }
@@ -4193,7 +4156,8 @@ static bool collectReplicaLayout(
     int64_t tripSum = 0;
     for (const ReplicaRecord &record : groupRecords) {
       if (record.count != count || !ids.insert(record.id).second ||
-          tripSum > std::numeric_limits<int64_t>::max() - record.childTripCount) {
+          tripSum >
+              std::numeric_limits<int64_t>::max() - record.childTripCount) {
         error = "replica set has inconsistent count or duplicate IDs";
         return false;
       }
@@ -4215,9 +4179,10 @@ static bool collectReplicaLayout(
   return true;
 }
 
-static bool exactSimpleSourceCounterDomain(
-    TaskflowTaskOp task, const SourceIterationDomainInfo &domain,
-    std::string &error) {
+static bool
+exactSimpleSourceCounterDomain(TaskflowTaskOp task,
+                               const SourceIterationDomainInfo &domain,
+                               std::string &error) {
   if (!domain.complete || domain.internalMultiplicity != 1 ||
       domain.axes.empty()) {
     error = "composite fusion requires a complete taskflow-only source domain "
@@ -4225,9 +4190,8 @@ static bool exactSimpleSourceCounterDomain(
     return false;
   }
   SmallVector<TaskflowCounterOp> taskflowCounters;
-  task.walk([&](TaskflowCounterOp counter) {
-    taskflowCounters.push_back(counter);
-  });
+  task.walk(
+      [&](TaskflowCounterOp counter) { taskflowCounters.push_back(counter); });
   SmallVector<neura::KernelOp> kernels;
   task.walk([&](neura::KernelOp kernel) { kernels.push_back(kernel); });
   if (taskflowCounters.size() != domain.axes.size() || kernels.size() != 1) {
@@ -4236,9 +4200,8 @@ static bool exactSimpleSourceCounterDomain(
     return false;
   }
   SmallVector<neura::CounterOp> neuraCounters;
-  kernels.front().walk([&](neura::CounterOp counter) {
-    neuraCounters.push_back(counter);
-  });
+  kernels.front().walk(
+      [&](neura::CounterOp counter) { neuraCounters.push_back(counter); });
   if (neuraCounters.size() != domain.axes.size()) {
     error = "composite fusion source Neura counters differ from its complete "
             "Taskflow source domain";
@@ -4253,8 +4216,7 @@ static bool exactSimpleSourceCounterDomain(
       return false;
     }
     CounterBounds taskflowBounds, neuraBounds;
-    if (!findTaskflowCounterBounds(task, axis.ordinal, taskflowBounds,
-                                   error) ||
+    if (!findTaskflowCounterBounds(task, axis.ordinal, taskflowBounds, error) ||
         !findNeuraCounterBounds(task, axis.ordinal, neuraBounds, error))
       return false;
     CounterBounds certified{axis.lower, axis.upper, axis.step};
@@ -4268,11 +4230,11 @@ static bool exactSimpleSourceCounterDomain(
   return true;
 }
 
-static std::string compositeSourceOriginBinding(
-    StringRef fusionKind,
-    StringRef firstName, const TaskMetadata &first, StringRef firstBinding,
-    StringRef secondName, const TaskMetadata &second,
-    StringRef secondBinding, StringRef domainWitness) {
+static std::string
+compositeSourceOriginBinding(StringRef fusionKind, StringRef firstName,
+                             const TaskMetadata &first, StringRef firstBinding,
+                             StringRef secondName, const TaskMetadata &second,
+                             StringRef secondBinding, StringRef domainWitness) {
   std::string result;
   llvm::raw_string_ostream stream(result);
   if (fusionKind == "sibling")
@@ -4283,10 +4245,8 @@ static std::string compositeSourceOriginBinding(
     stream << "amoeba-source-iteration-producer-consumer-retained-origin-v1\n";
   stream << "domain_witness_bytes=" << domainWitness.size() << ':'
          << domainWitness << '\n'
-         << "first_name_bytes=" << firstName.size() << ':' << firstName
-         << '\n'
-         << "first_source_work_count=" << first.sourceIterationWorkCount
-         << '\n'
+         << "first_name_bytes=" << firstName.size() << ':' << firstName << '\n'
+         << "first_source_work_count=" << first.sourceIterationWorkCount << '\n'
          << "first_source_binding_bytes=" << firstBinding.size() << ':'
          << firstBinding << '\n'
          << "second_name_bytes=" << secondName.size() << ':' << secondName
@@ -4300,8 +4260,7 @@ static std::string compositeSourceOriginBinding(
 }
 
 static std::string comparableSourceFunctionText(func::FuncOp function) {
-  OwningOpRef<func::FuncOp> copy =
-      cast<func::FuncOp>(function->clone());
+  OwningOpRef<func::FuncOp> copy = cast<func::FuncOp>(function->clone());
   // Joint neighborhood search writes a state-local variant identity on this
   // function after source-owned fusion materialization. It does not alter the
   // function body or the fusion proof, so omit only this search bookkeeping
@@ -4345,8 +4304,8 @@ static FailureOr<ArrayAttr> expectedIdentityFusionLineage(
   };
   Builder builder(canonicalFunction.getContext());
   SmallVector<Attribute> roots;
-  for (StringRef name : {StringRef(fusion.firstParent),
-                         StringRef(fusion.secondParent)}) {
+  for (StringRef name :
+       {StringRef(fusion.firstParent), StringRef(fusion.secondParent)}) {
     TaskflowTaskOp task = findCanonicalTask(name);
     if (!task) {
       error = "composite fusion lineage cannot find its canonical parent";
@@ -4375,16 +4334,17 @@ static FailureOr<ArrayAttr> expectedIdentityFusionLineage(
   return builder.getArrayAttr(roots);
 }
 
-static bool replayAndVerifyCompositeFusion(
-    func::FuncOp canonicalFunction, func::FuncOp currentFunction,
-    const CompositeFusionRecord &fusion,
-    const SourceIterationDomainInfo &domain, StringRef domainWitness,
-    std::string &error) {
+static bool
+replayAndVerifyCompositeFusion(func::FuncOp canonicalFunction,
+                               func::FuncOp currentFunction,
+                               const CompositeFusionRecord &fusion,
+                               const SourceIterationDomainInfo &domain,
+                               StringRef domainWitness, std::string &error) {
   auto simpleTaskName = [](StringRef name) {
     return !name.empty() && llvm::all_of(name, [](char c) {
-             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                    (c >= '0' && c <= '9') || c == '_' || c == '.';
-           });
+      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+             (c >= '0' && c <= '9') || c == '_' || c == '.';
+    });
   };
   if (!simpleTaskName(fusion.firstParent) ||
       !simpleTaskName(fusion.secondParent)) {
@@ -4400,9 +4360,8 @@ static bool replayAndVerifyCompositeFusion(
   OwningOpRef<ModuleOp> expectedModule =
       cast<ModuleOp>(canonicalModule->clone());
   std::string selectError;
-  FailureOr<func::FuncOp> expectedFunction =
-      selectTaskFunction(*expectedModule, canonicalFunction.getSymName(),
-                         selectError);
+  FailureOr<func::FuncOp> expectedFunction = selectTaskFunction(
+      *expectedModule, canonicalFunction.getSymName(), selectError);
   if (failed(expectedFunction)) {
     error = selectError.empty()
                 ? "cannot select canonical composite fusion replay function"
@@ -4411,16 +4370,14 @@ static bool replayAndVerifyCompositeFusion(
   }
   std::unique_ptr<Pass> materializer =
       mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
-  std::string options =
-      "first-task-name=\"" + fusion.firstParent +
-      "\" second-task-name=\"" + fusion.secondParent +
-      "\" fusion-mode=" + fusion.materializerMode;
-  if (!materializer ||
-      failed(materializer->initializeOptions(
-          options, [&](const llvm::Twine &message) {
-            error = message.str();
-            return failure();
-          }))) {
+  std::string options = "first-task-name=\"" + fusion.firstParent +
+                        "\" second-task-name=\"" + fusion.secondParent +
+                        "\" fusion-mode=" + fusion.materializerMode;
+  if (!materializer || failed(materializer->initializeOptions(
+                           options, [&](const llvm::Twine &message) {
+                             error = message.str();
+                             return failure();
+                           }))) {
     if (error.empty())
       error = "cannot initialize source-owned composite fusion replay";
     return false;
@@ -4448,12 +4405,11 @@ static bool replayAndVerifyCompositeFusion(
       error += ": " + diagnosticText;
     return false;
   }
-  expectedFunction = selectTaskFunction(*expectedModule,
-                                        canonicalFunction.getSymName(),
-                                        selectError);
+  expectedFunction = selectTaskFunction(
+      *expectedModule, canonicalFunction.getSymName(), selectError);
   if (failed(expectedFunction)) {
-    error = "cannot select materialized canonical composite fusion: " +
-            selectError;
+    error =
+        "cannot select materialized canonical composite fusion: " + selectError;
     return false;
   }
   std::string fusedName =
@@ -4472,10 +4428,10 @@ static bool replayAndVerifyCompositeFusion(
     error = "composite fusion replay did not identify the exact fused child";
     return false;
   }
-  for (StringRef attribute : {
-           StringRef("amoeba.neura.fusion.mode"),
-           StringRef("amoeba.neura.fusion.eliminated_loads"),
-           StringRef("amoeba.neura.fusion.eliminated_stores")}) {
+  for (StringRef attribute :
+       {StringRef("amoeba.neura.fusion.mode"),
+        StringRef("amoeba.neura.fusion.eliminated_loads"),
+        StringRef("amoeba.neura.fusion.eliminated_stores")}) {
     if (expectedFused.front()->getAttr(attribute) !=
         currentFused.front()->getAttr(attribute)) {
       error = "composite fusion elimination metadata differs from the exact "
@@ -4483,8 +4439,8 @@ static bool replayAndVerifyCompositeFusion(
       return false;
     }
   }
-  FailureOr<ArrayAttr> expectedLineage = expectedIdentityFusionLineage(
-      canonicalFunction, fusion, domain, error);
+  FailureOr<ArrayAttr> expectedLineage =
+      expectedIdentityFusionLineage(canonicalFunction, fusion, domain, error);
   if (failed(expectedLineage))
     return false;
   Attribute actualLineage =
@@ -4498,8 +4454,8 @@ static bool replayAndVerifyCompositeFusion(
                                  *expectedLineage);
   std::string expectedBinding = currentSourceIterationControlBinding(
       expectedFused.front(), domainWitness);
-  std::string actualBinding = currentSourceIterationControlBinding(
-      currentFused.front(), domainWitness);
+  std::string actualBinding =
+      currentSourceIterationControlBinding(currentFused.front(), domainWitness);
   if (expectedBinding.empty() || actualBinding.empty() ||
       expectedBinding != actualBinding) {
     error = "current fused task shell, counters, memory roots, or mapper body "
@@ -4531,9 +4487,10 @@ static std::optional<StringRef> originalAmoebaString(DictionaryAttr dictionary,
   return value.getValue();
 }
 
-static bool buildOriginalAmoebaCounterBounds(
-    TaskflowTaskOp task, SmallVectorImpl<CounterBounds> &bounds,
-    std::string &error) {
+static bool
+buildOriginalAmoebaCounterBounds(TaskflowTaskOp task,
+                                 SmallVectorImpl<CounterBounds> &bounds,
+                                 std::string &error) {
   SmallVector<int64_t> ids;
   if (!collectCounterIds(task, ids, error))
     return false;
@@ -4906,18 +4863,17 @@ static bool validateOriginalAmoebaRealizationMetadata(
 }
 
 static std::string sourceTaskName(TaskflowTaskOp task) {
-  if (auto parent = task->getAttrOfType<StringAttr>(
-          "amoeba.tiling.parent_task"))
+  if (auto parent =
+          task->getAttrOfType<StringAttr>("amoeba.tiling.parent_task"))
     return parent.getValue().str();
-  if (auto parent = task->getAttrOfType<StringAttr>(
-          "amoeba.replica.parent_task"))
+  if (auto parent =
+          task->getAttrOfType<StringAttr>("amoeba.replica.parent_task"))
     return parent.getValue().str();
   return task.getTaskName().str();
 }
 
 static bool isSequentialKLineage(TaskflowTaskOp task) {
-  return task->hasAttr("amoeba.tiling.parent_task") &&
-         isSequentialKTask(task);
+  return task->hasAttr("amoeba.tiling.parent_task") && isSequentialKTask(task);
 }
 
 struct InheritReplicaAnalyticalTaskCostCatalogPass
@@ -4943,20 +4899,48 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
                     scf::SCFDialect, TaskflowDialect, neura::NeuraDialect>();
   }
 
-  Option<std::string> functionName{*this, "function", llvm::cl::desc("Child taskflow function"), llvm::cl::init("")};
-  Option<std::string> parentCostFile{*this, "parent-cost-file", llvm::cl::desc("Canonical parent ML catalogue"), llvm::cl::init("")};
-  Option<std::string> parentModuleFile{*this, "parent-module", llvm::cl::desc("Canonical parent MLIR module"), llvm::cl::init("")};
-  Option<std::string> childSpaceFile{*this, "child-space-file", llvm::cl::desc("Child factored task-shape manifest"), llvm::cl::init("")};
-  Option<std::string> outputFile{*this, "output", llvm::cl::desc("Inherited child catalogue"), llvm::cl::init("")};
-  Option<std::string> sourceRepository{*this, "source-git-repository", llvm::cl::desc("Expected source Git repository"), llvm::cl::init("")};
-  Option<std::string> sourceCommit{*this, "source-git-commit", llvm::cl::desc("Expected source Git commit"), llvm::cl::init("")};
-  Option<std::string> architecturePath{*this, "architecture-path", llvm::cl::desc("Expected architecture path"), llvm::cl::init("")};
-  Option<std::string> parentGraphVariantId{*this, "parent-graph-variant-id", llvm::cl::desc("Canonical parent graph identity"), llvm::cl::init("")};
-  Option<std::string> modelNamespace{*this, "model-namespace", llvm::cl::desc("Expected predictor namespace"), llvm::cl::init("")};
-  Option<std::string> model{*this, "model", llvm::cl::desc("Expected predictor model"), llvm::cl::init("")};
-  Option<std::string> modelSchema{*this, "model-schema", llvm::cl::desc("Expected predictor model schema"), llvm::cl::init("")};
-  Option<std::string> featureContract{*this, "feature-contract-id", llvm::cl::desc("Expected feature contract"), llvm::cl::init("")};
-  Option<std::string> featureExtractor{*this, "feature-extractor", llvm::cl::desc("Expected feature extractor"), llvm::cl::init("")};
+  Option<std::string> functionName{*this, "function",
+                                   llvm::cl::desc("Child taskflow function"),
+                                   llvm::cl::init("")};
+  Option<std::string> parentCostFile{
+      *this, "parent-cost-file",
+      llvm::cl::desc("Canonical parent ML catalogue"), llvm::cl::init("")};
+  Option<std::string> parentModuleFile{
+      *this, "parent-module", llvm::cl::desc("Canonical parent MLIR module"),
+      llvm::cl::init("")};
+  Option<std::string> childSpaceFile{
+      *this, "child-space-file",
+      llvm::cl::desc("Child factored task-shape manifest"), llvm::cl::init("")};
+  Option<std::string> outputFile{*this, "output",
+                                 llvm::cl::desc("Inherited child catalogue"),
+                                 llvm::cl::init("")};
+  Option<std::string> sourceRepository{
+      *this, "source-git-repository",
+      llvm::cl::desc("Expected source Git repository"), llvm::cl::init("")};
+  Option<std::string> sourceCommit{*this, "source-git-commit",
+                                   llvm::cl::desc("Expected source Git commit"),
+                                   llvm::cl::init("")};
+  Option<std::string> architecturePath{
+      *this, "architecture-path", llvm::cl::desc("Expected architecture path"),
+      llvm::cl::init("")};
+  Option<std::string> parentGraphVariantId{
+      *this, "parent-graph-variant-id",
+      llvm::cl::desc("Canonical parent graph identity"), llvm::cl::init("")};
+  Option<std::string> modelNamespace{
+      *this, "model-namespace", llvm::cl::desc("Expected predictor namespace"),
+      llvm::cl::init("")};
+  Option<std::string> model{*this, "model",
+                            llvm::cl::desc("Expected predictor model"),
+                            llvm::cl::init("")};
+  Option<std::string> modelSchema{
+      *this, "model-schema", llvm::cl::desc("Expected predictor model schema"),
+      llvm::cl::init("")};
+  Option<std::string> featureContract{
+      *this, "feature-contract-id", llvm::cl::desc("Expected feature contract"),
+      llvm::cl::init("")};
+  Option<std::string> featureExtractor{
+      *this, "feature-extractor", llvm::cl::desc("Expected feature extractor"),
+      llvm::cl::init("")};
 
   void runOnOperation() override {
     ModuleOp childModule = getOperation();
@@ -4968,15 +4952,18 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
       return signalPassFailure();
     }
     func::FuncOp childFunction = *selected;
-    if (parentCostFile.getValue().empty() || parentModuleFile.getValue().empty() ||
+    if (parentCostFile.getValue().empty() ||
+        parentModuleFile.getValue().empty() ||
         childSpaceFile.getValue().empty() || outputFile.getValue().empty() ||
-        sourceRepository.getValue().empty() || sourceCommit.getValue().empty() ||
+        sourceRepository.getValue().empty() ||
+        sourceCommit.getValue().empty() ||
         architecturePath.getValue().empty() ||
         parentGraphVariantId.getValue().empty() ||
         modelNamespace.getValue().empty() || model.getValue().empty() ||
         modelSchema.getValue().empty() || featureContract.getValue().empty() ||
         featureExtractor.getValue().empty() || !isGitCommit(sourceCommit) ||
-        samePath(parentCostFile, outputFile) || samePath(childSpaceFile, outputFile) ||
+        samePath(parentCostFile, outputFile) ||
+        samePath(childSpaceFile, outputFile) ||
         samePath(parentModuleFile, outputFile)) {
       childFunction.emitError()
           << "replica cost inheritance requires distinct paths and complete "
@@ -4991,19 +4978,19 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
       return signalPassFailure();
     }
     MLIRContext *context = childModule.getContext();
-    context->loadDialect<func::FuncDialect, arith::ArithDialect,
-                         affine::AffineDialect, memref::MemRefDialect,
-                         scf::SCFDialect, TaskflowDialect,
-                         neura::NeuraDialect>();
+    context
+        ->loadDialect<func::FuncDialect, arith::ArithDialect,
+                      affine::AffineDialect, memref::MemRefDialect,
+                      scf::SCFDialect, TaskflowDialect, neura::NeuraDialect>();
     OwningOpRef<ModuleOp> parentModule =
         parseSourceFile<ModuleOp>(parentModuleFile, ParserConfig(context));
     if (!parentModule) {
-      childFunction.emitError() << "cannot parse canonical parent module "
-                                << parentModuleFile;
+      childFunction.emitError()
+          << "cannot parse canonical parent module " << parentModuleFile;
       return signalPassFailure();
     }
-    FailureOr<func::FuncOp> parentFunction = selectTaskFunction(
-        *parentModule, functionName.getValue(), error);
+    FailureOr<func::FuncOp> parentFunction =
+        selectTaskFunction(*parentModule, functionName.getValue(), error);
     if (failed(parentFunction)) {
       childFunction.emitError() << error;
       return signalPassFailure();
@@ -5027,8 +5014,9 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
       return signalPassFailure();
     }
     if (childSpace.factors.size() != childTasks->size()) {
-      childFunction.emitError() << "child factored manifest task count does not "
-                                   "match child module";
+      childFunction.emitError()
+          << "child factored manifest task count does not "
+             "match child module";
       return signalPassFailure();
     }
     for (auto [index, factor] : llvm::enumerate(childSpace.factors)) {
@@ -5091,14 +5079,14 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
                   return std::string();
                 }();
       if (sourceName.empty()) {
-        childFunction.emitError() << "source-owned child has no lineage: "
-                                  << childTask.name;
+        childFunction.emitError()
+            << "source-owned child has no lineage: " << childTask.name;
         return signalPassFailure();
       }
       auto parent = parents.find(sourceName);
       if (parent == parents.end()) {
-        childFunction.emitError() << "no canonical body for child task "
-                                  << childTask.name;
+        childFunction.emitError()
+            << "no canonical body for child task " << childTask.name;
         return signalPassFailure();
       }
       BodyProof proof;
@@ -5119,8 +5107,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
     for (const ChildFactor &factor : childSpace.factors) {
       auto child = children.find(factor.task);
       if (child == children.end()) {
-        childFunction.emitError() << "child manifest names task absent from IR: "
-                                  << factor.task;
+        childFunction.emitError()
+            << "child manifest names task absent from IR: " << factor.task;
         return signalPassFailure();
       }
       auto lineage = sourceOwnedLineage.find(factor.task);
@@ -5135,8 +5123,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
                   return std::string();
                 }();
       if (sourceName.empty()) {
-        childFunction.emitError() << "child task has no source lineage: "
-                                  << factor.task;
+        childFunction.emitError()
+            << "child task has no source lineage: " << factor.task;
         return signalPassFailure();
       }
       for (const ShapeKey &shape : factor.shapes) {
@@ -5149,8 +5137,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
           return signalPassFailure();
         }
         if (!covered.insert(shape).second) {
-          childFunction.emitError() << "child manifest repeats task/shape "
-                                    << shape.task;
+          childFunction.emitError()
+              << "child manifest repeats task/shape " << shape.task;
           return signalPassFailure();
         }
         json::Object entry;
@@ -5166,8 +5154,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
                   ? "proved-sequential-k-memory-feedback-body"
                   : "proved-mapper-visible-neura-body";
         }
-        auto duration = predictedDuration(*source->second, factor.tripCount,
-                                          error);
+        auto duration =
+            predictedDuration(*source->second, factor.tripCount, error);
         if (!error.empty()) {
           childFunction.emitError() << error;
           return signalPassFailure();
@@ -5209,16 +5197,17 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
                         return record.parent;
                   return std::string();
                 }();
-      json::Object record{{"task", task.name},
-                          {"source_task", sourceName},
-                          {"structural_equality", proof.equal},
-                          {"parent_operation_count", proof.parentOperations},
-                          {"child_operation_count", proof.childOperations},
-                          {"parent_kernel_count", proof.parentKernels},
-                          {"child_kernel_count", proof.childKernels},
-                          {"parent_counter_count", proof.parentCounters},
-                          {"child_counter_count", proof.childCounters},
-                          {"counter_bound_variation", "ignored-only-in-counter"}};
+      json::Object record{
+          {"task", task.name},
+          {"source_task", sourceName},
+          {"structural_equality", proof.equal},
+          {"parent_operation_count", proof.parentOperations},
+          {"child_operation_count", proof.childOperations},
+          {"parent_kernel_count", proof.parentKernels},
+          {"child_kernel_count", proof.childKernels},
+          {"parent_counter_count", proof.parentCounters},
+          {"child_counter_count", proof.childCounters},
+          {"counter_bound_variation", "ignored-only-in-counter"}};
       if (isSequentialKLineage(task.op)) {
         record["lineage"] = "sequential-k-memory-feedback";
         record["counter_bound_proof"] =
@@ -5244,8 +5233,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
         for (StringRef dimension : {StringRef("M"), StringRef("N")}) {
           std::string attribute =
               (Twine("amoeba.semantic.") + dimension + "_range").str();
-          if (auto range = task.op->getAttrOfType<DenseI64ArrayAttr>(
-                  attribute)) {
+          if (auto range =
+                  task.op->getAttrOfType<DenseI64ArrayAttr>(attribute)) {
             json::Array values;
             for (int64_t value : range.asArrayRef())
               values.push_back(value);
@@ -5268,7 +5257,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
         {"source_parent_graph_variant_id", parentGraphVariantId.getValue()},
         {"child_graph_variant_id", childSpace.graphVariantId},
         {"trip_count_role", "ranker-duration-only"},
-        {"cache_identity", json::Object{
+        {"cache_identity",
+         json::Object{
              {"namespace", modelNamespace.getValue()},
              {"model", model.getValue()},
              {"model_schema", modelSchema.getValue()},
@@ -5282,7 +5272,8 @@ struct InheritReplicaAnalyticalTaskCostCatalogPass
     root["replica_inheritance_schema"] = kInheritanceSchema.str();
 
     if (!writeAtomically(
-            outputFile, [&](llvm::raw_ostream &os) {
+            outputFile,
+            [&](llvm::raw_ostream &os) {
               os << json::Value(std::move(root)) << "\n";
               return true;
             },
@@ -5409,10 +5400,10 @@ static LogicalResult processSourceIterationDomainPartition(
       TaskflowTaskOp firstTask = first->second.op;
       TaskflowTaskOp secondTask = second->second.op;
       TaskflowTaskOp actualTask = actual->second;
-      auto firstDomain = firstTask->getAttrOfType<DictionaryAttr>(
-          kSourceIterationDomainAttr);
-      auto secondDomain = secondTask->getAttrOfType<DictionaryAttr>(
-          kSourceIterationDomainAttr);
+      auto firstDomain =
+          firstTask->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
+      auto secondDomain =
+          secondTask->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
       auto firstSourceBinding = firstTask->getAttrOfType<StringAttr>(
           kSourceIterationSourceControlBindingAttr);
       auto secondSourceBinding = secondTask->getAttrOfType<StringAttr>(
@@ -5435,15 +5426,13 @@ static LogicalResult processSourceIterationDomainPartition(
                 (failed(firstInfo) ? firstParseError : secondParseError);
         return failure();
       }
-      std::string witness =
-          sourceIterationDomainCanonicalWitness(*firstInfo);
+      std::string witness = sourceIterationDomainCanonicalWitness(*firstInfo);
       if (witness.empty() ||
           witness != sourceIterationDomainCanonicalWitness(*secondInfo) ||
           firstInfo->internalMultiplicity != 1 ||
           secondInfo->internalMultiplicity != 1 ||
           first->second.tripCount != second->second.tripCount ||
-          first->second.taskflowTripCount !=
-              second->second.taskflowTripCount ||
+          first->second.taskflowTripCount != second->second.taskflowTripCount ||
           first->second.sourceIterationMultiplicity !=
               second->second.sourceIterationMultiplicity ||
           first->second.sourceIterationWorkCount !=
@@ -5468,9 +5457,9 @@ static LogicalResult processSourceIterationDomainPartition(
 
       std::string compositeSourceBinding = compositeSourceOriginBinding(
           fusion->second.materializerMode, fusion->second.firstParent,
-          first->second,
-          firstSourceBinding.getValue(), fusion->second.secondParent,
-          second->second, secondSourceBinding.getValue(), witness);
+          first->second, firstSourceBinding.getValue(),
+          fusion->second.secondParent, second->second,
+          secondSourceBinding.getValue(), witness);
       std::string currentBinding =
           currentSourceIterationControlBinding(actualTask, witness);
       if (currentBinding.empty()) {
@@ -5540,12 +5529,12 @@ static LogicalResult processSourceIterationDomainPartition(
       return failure();
     }
     if (actualTask->hasAttr(kSourceIterationCapturePendingAttr)) {
-      error = "source-domain child " + child.name +
-              " has a pending source capture";
+      error =
+          "source-domain child " + child.name + " has a pending source capture";
       return failure();
     }
-    auto existingDomain = actualTask->getAttrOfType<DictionaryAttr>(
-        kSourceIterationDomainAttr);
+    auto existingDomain =
+        actualTask->getAttrOfType<DictionaryAttr>(kSourceIterationDomainAttr);
     if (actualTask->hasAttr(kSourceIterationDomainAttr) &&
         (!existingDomain || existingDomain != canonicalDomain)) {
       error = "source-domain child " + child.name +
@@ -5568,9 +5557,8 @@ static LogicalResult processSourceIterationDomainPartition(
               "source";
       return failure();
     }
-    if (!refreshBindings &&
-        (!existingSourceBinding ||
-         existingSourceBinding != canonicalSourceBinding)) {
+    if (!refreshBindings && (!existingSourceBinding ||
+                             existingSourceBinding != canonicalSourceBinding)) {
       error = "imported source-domain child " + child.name +
               " is missing the exact canonical source-origin witness";
       return failure();
@@ -5580,15 +5568,22 @@ static LogicalResult processSourceIterationDomainPartition(
         !actualTask->hasAttr("amoeba.replica.parent_task") &&
         !actualTask->hasAttr("amoeba.tiling.parent_task")) {
       auto domainInfo = parseSourceIterationDomain(canonicalTask, error);
-      if (failed(domainInfo)) return failure();
+      if (failed(domainInfo))
+        return failure();
       for (const SourceIterationAxis &axis : domainInfo->axes) {
-        if (!axis.representedByTaskflow) continue;
+        if (!axis.representedByTaskflow)
+          continue;
         CounterBounds parentTF, childTF, parentNeura, childNeura;
-        if (!findTaskflowCounterBounds(canonicalTask, axis.ordinal, parentTF, error) ||
-            !findTaskflowCounterBounds(child.op, axis.ordinal, childTF, error) ||
-            !findNeuraCounterBounds(canonicalTask, axis.ordinal, parentNeura, error) ||
-            !findNeuraCounterBounds(child.op, axis.ordinal, childNeura, error) ||
-            !equalBounds(parentTF, childTF) || !equalBounds(parentNeura, childNeura)) {
+        if (!findTaskflowCounterBounds(canonicalTask, axis.ordinal, parentTF,
+                                       error) ||
+            !findTaskflowCounterBounds(child.op, axis.ordinal, childTF,
+                                       error) ||
+            !findNeuraCounterBounds(canonicalTask, axis.ordinal, parentNeura,
+                                    error) ||
+            !findNeuraCounterBounds(child.op, axis.ordinal, childNeura,
+                                    error) ||
+            !equalBounds(parentTF, childTF) ||
+            !equalBounds(parentNeura, childNeura)) {
           error = "unchanged source-domain task " + child.name +
                   " changed exact counter bounds: " + error;
           return failure();
@@ -5597,11 +5592,11 @@ static LogicalResult processSourceIterationDomainPartition(
     }
     if (!compositeGraphReplayVerified) {
       BodyProof bodyProof;
-      if (!proveTaskBody(
-              canonicalTask, child.op, bodyProof, error,
-              isSequentialKLineage(child.op),
-              lineage != sourceOwnedLineage.end() && lineage->second,
-              verifiedOriginalAmoebaChildren.count(child.name) != 0)) {
+      if (!proveTaskBody(canonicalTask, child.op, bodyProof, error,
+                         isSequentialKLineage(child.op),
+                         lineage != sourceOwnedLineage.end() && lineage->second,
+                         verifiedOriginalAmoebaChildren.count(child.name) !=
+                             0)) {
         error = "source-domain child body proof failed for " + child.name +
                 ": " + error;
         return failure();
@@ -5618,8 +5613,8 @@ static LogicalResult processSourceIterationDomainPartition(
     }
     std::string domainWitness =
         sourceIterationDomainCanonicalWitness(*sourceInfo);
-    std::string currentBinding = currentSourceIterationControlBinding(
-        actualTask, domainWitness);
+    std::string currentBinding =
+        currentSourceIterationControlBinding(actualTask, domainWitness);
     if (currentBinding.empty()) {
       error = "source-domain child " + child.name +
               " has no exact current body witness";
@@ -5654,10 +5649,9 @@ static LogicalResult processSourceIterationDomainPartition(
         return failure();
       }
     }
-    pendingRefreshes.push_back({actualTask, canonicalDomain,
-                                canonicalSourceBinding,
-                                std::move(domainWitness),
-                                std::move(currentBinding)});
+    pendingRefreshes.push_back(
+        {actualTask, canonicalDomain, canonicalSourceBinding,
+         std::move(domainWitness), std::move(currentBinding)});
   }
 
   if (!refreshBindings)
@@ -5679,17 +5673,18 @@ static LogicalResult processSourceIterationDomainPartition(
   return success();
 }
 
-LogicalResult proveAndRefreshSourceIterationDomainPartition(
-    func::FuncOp canonicalParent, func::FuncOp currentChild,
-    std::string &error) {
+LogicalResult
+proveAndRefreshSourceIterationDomainPartition(func::FuncOp canonicalParent,
+                                              func::FuncOp currentChild,
+                                              std::string &error) {
   return processSourceIterationDomainPartition(canonicalParent, currentChild,
                                                error,
                                                /*refreshBindings=*/true);
 }
 
-LogicalResult verifySourceIterationDomainPartition(
-    func::FuncOp canonicalParent, func::FuncOp currentChild,
-    std::string &error) {
+LogicalResult verifySourceIterationDomainPartition(func::FuncOp canonicalParent,
+                                                   func::FuncOp currentChild,
+                                                   std::string &error) {
   return processSourceIterationDomainPartition(canonicalParent, currentChild,
                                                error,
                                                /*refreshBindings=*/false);

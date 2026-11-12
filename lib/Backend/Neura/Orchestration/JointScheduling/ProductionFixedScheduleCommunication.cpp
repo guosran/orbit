@@ -1,4 +1,5 @@
-//===- ProductionFixedScheduleCommunication.cpp - Production network bridge ===//
+//===- ProductionFixedScheduleCommunication.cpp - Production network bridge
+//===//
 #include "ProductionFixedScheduleCommunication.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 
@@ -26,7 +27,8 @@ ProductionFixedScheduleCommunication::ProductionFixedScheduleCommunication(
   std::set<Operation *> seen;
   for (Operation *operation : operations_)
     if (!operation || !seen.insert(operation).second)
-      validationError_ = "fixed schedule Taskflow operations must be unique and nonnull";
+      validationError_ =
+          "fixed schedule Taskflow operations must be unique and nonnull";
 }
 
 bool ProductionFixedScheduleCommunication::supportsCanonicalReservationState()
@@ -65,7 +67,8 @@ bool ProductionFixedScheduleCommunication::captureReservationCheckpoint(
     return false;
   if (state->model.owner != &model_ || state->model.typeTag == 0 ||
       !state->model.state) {
-    error = "fixed schedule communication returned an invalid reservation checkpoint";
+    error = "fixed schedule communication returned an invalid reservation "
+            "checkpoint";
     return false;
   }
   checkpoint.owner = this;
@@ -93,8 +96,9 @@ bool ProductionFixedScheduleCommunication::restoreReservationCheckpoint(
     error = "fixed schedule reservation checkpoint has no state";
     return false;
   }
-  const auto state = std::static_pointer_cast<
-      const ProductionReservationCheckpointState>(checkpoint.state);
+  const auto state =
+      std::static_pointer_cast<const ProductionReservationCheckpointState>(
+          checkpoint.state);
   if (!state) {
     error = "fixed schedule reservation checkpoint has invalid state";
     return false;
@@ -118,7 +122,8 @@ bool ProductionFixedScheduleCommunication::getPredecessors(
   if (!model_.getTaskPredecessors(operations_[consumer], operations, error))
     return false;
   for (Operation *operation : operations) {
-    const auto it = std::find(operations_.begin(), operations_.end(), operation);
+    const auto it =
+        std::find(operations_.begin(), operations_.end(), operation);
     if (it == operations_.end() || !operation) {
       error = "communication predecessor is absent from fixed schedule";
       return false;
@@ -129,12 +134,15 @@ bool ProductionFixedScheduleCommunication::getPredecessors(
 }
 
 bool ProductionFixedScheduleCommunication::getTransferLowerBound(
-    unsigned producer, unsigned consumer, int64_t &cycles, std::string &error) const {
+    unsigned producer, unsigned consumer, int64_t &cycles,
+    std::string &error) const {
   cycles = 0;
   if (producer >= operations_.size() || consumer >= operations_.size()) {
-    error = "lower bound has an unknown task"; return false;
+    error = "lower bound has an unknown task";
+    return false;
   }
-  return model_.getTransferLowerBound(operations_[producer], operations_[consumer], cycles, error);
+  return model_.getTransferLowerBound(operations_[producer],
+                                      operations_[consumer], cycles, error);
 }
 
 bool ProductionFixedScheduleCommunication::getTransferLowerBoundForEndpoints(
@@ -151,8 +159,8 @@ bool ProductionFixedScheduleCommunication::getTransferLowerBoundForEndpoints(
       destinationRow, destinationCol, cycles, error);
 }
 
-bool ProductionFixedScheduleCommunication::supportsStaticEndpointLowerBoundCache()
-    const {
+bool ProductionFixedScheduleCommunication::
+    supportsStaticEndpointLowerBoundCache() const {
   // The provider itself must certify that its endpoint lower bound ignores
   // committed/trial reservations. Legacy/custom models fail closed.
   return validationError_.empty() &&

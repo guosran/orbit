@@ -40,7 +40,7 @@ struct SyncAPICostEvaluation {
 // model_id is a declared label. Only this API scope is priced; compute, wait,
 // internal DMA and physical DDR/cache traffic are explicitly outside it.
 bool parseSyncAPICostModel(llvm::StringRef jsonBytes, SyncAPICostModel &,
-                          std::string &error);
+                           std::string &error);
 bool evaluateSyncAPICost(const SyncAPICostModel &, const SyncCostRequest &,
                          SyncAPICostEvaluation &, std::string &error);
 llvm::json::Value serializeSyncAPICostModel(const SyncAPICostModel &);

@@ -49,14 +49,15 @@ std::vector<NeighborhoodAction> enumerateNeighborhoodActions(
 mlir::FailureOr<std::vector<NeighborhoodAction>>
 enumerateTaskflowFissionNeighborhoodActions(
     ModuleOp preparedTaskflowSource, llvm::StringRef function,
-    uint64_t maxFissionActionsPerTask,
-    std::vector<std::string> &diagnostics, std::string &error);
+    uint64_t maxFissionActionsPerTask, std::vector<std::string> &diagnostics,
+    std::string &error);
 // Must match the cap used for enumeration when replaying an action.
-bool applyNeighborhoodAction(
-    ModuleOp cloned, ModuleOp canonical, llvm::StringRef function,
-    const NeighborhoodAction &action, std::vector<NeighborhoodShape> &shapes,
-    std::string &reason, std::string &diagnostic,
-    unsigned maxPartitionFactor = 4);
+bool applyNeighborhoodAction(ModuleOp cloned, ModuleOp canonical,
+                             llvm::StringRef function,
+                             const NeighborhoodAction &action,
+                             std::vector<NeighborhoodShape> &shapes,
+                             std::string &reason, std::string &diagnostic,
+                             unsigned maxPartitionFactor = 4);
 } // namespace mlir::amoeba::neura::joint_scheduling
 
 #endif

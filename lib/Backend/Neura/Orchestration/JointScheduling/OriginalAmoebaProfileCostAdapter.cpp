@@ -10,13 +10,13 @@
 #include "AnalyticalMLPInference.h"
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
+#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "Conversion/NeuraConversionPasses.h"
 #include "MapperCostAnalysis.h"
-#include "OriginalAmoebaCtrlToDataFlowPass.h"
-#include "Backend/Neura/Orchestration/SourceIterationDomain.h"
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/NeuraOps.h"
 #include "NeuraDialect/NeuraPasses.h"
+#include "OriginalAmoebaCtrlToDataFlowPass.h"
 
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -68,8 +68,7 @@ namespace mlir::amoeba::neura::joint_scheduling {
 
 bool verifyOriginalAmoebaSourceDomainCoverage(
     llvm::ArrayRef<TaskMetadata> tasks, std::string &error,
-    bool allowStaticInternalExpansion,
-    bool allowScheduledReplicaInventory) {
+    bool allowStaticInternalExpansion, bool allowScheduledReplicaInventory) {
   if (tasks.empty()) {
     error = "original source-domain coverage has no Taskflow tasks";
     return false;
@@ -79,9 +78,11 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
     if (!task.sourceIterationDomainCertified ||
         !task.sourceIterationDomainComplete || !task.tripCountKnown ||
         task.sourceIterationDomainStatus != "certified-complete" ||
-        (!allowStaticInternalExpansion && task.sourceIterationMultiplicity != 1) ||
+        (!allowStaticInternalExpansion &&
+         task.sourceIterationMultiplicity != 1) ||
         task.taskflowTripCount != task.tripCount ||
-        (!allowStaticInternalExpansion && task.sourceIterationWorkCount != task.tripCount)) {
+        (!allowStaticInternalExpansion &&
+         task.sourceIterationWorkCount != task.tripCount)) {
       error = "original task " + task.name +
               " lacks a complete one-to-one source iteration-domain proof";
       if (!task.sourceIterationDomainReason.empty())
@@ -95,26 +96,32 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
       auto resolved = resolveTaskIterationDomain(operation, error);
       int64_t internal = 1;
       int64_t work = 0;
-      if (failed(resolved) || !resolved->sourceCertified || !resolved->complete ||
-          !resolved->countKnown || resolved->status != "certified-complete" ||
+      if (failed(resolved) || !resolved->sourceCertified ||
+          !resolved->complete || !resolved->countKnown ||
+          resolved->status != "certified-complete" ||
           resolved->effectiveMapperFiringCount != task.tripCount ||
           resolved->taskflowTripCount != task.taskflowTripCount ||
           resolved->internalMultiplicity != task.sourceIterationMultiplicity ||
           resolved->sourceIterationWorkCount != task.sourceIterationWorkCount ||
           resolved->expandedInternalExtents != task.expandedInternalExtents) {
         if (error.empty())
-          error = "original static-internal domain is not bound to the current task " + task.name;
+          error = "original static-internal domain is not bound to the current "
+                  "task " +
+                  task.name;
         return false;
       }
       for (int64_t extent : resolved->expandedInternalExtents)
         if (extent < 1 || !checkedMultiply(internal, extent, internal)) {
-          error = "original static-internal multiplicity is invalid for " + task.name;
+          error = "original static-internal multiplicity is invalid for " +
+                  task.name;
           return false;
         }
       if (internal != resolved->internalMultiplicity ||
           !checkedMultiply(task.tripCount, internal, work) ||
           work != task.sourceIterationWorkCount) {
-        error = "original macro firings and expanded source work disagree for " + task.name;
+        error =
+            "original macro firings and expanded source work disagree for " +
+            task.name;
         return false;
       }
     }
@@ -129,15 +136,15 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
     if (allowScheduledReplicaInventory) {
       auto trace = operation->getAttrOfType<DictionaryAttr>(
           "amoeba.task_scheduler_schedule_info");
-      auto traceActive = trace ? trace.getAs<IntegerAttr>("active_replicas")
-                               : IntegerAttr();
-      auto shapes = trace ? trace.getAs<ArrayAttr>("replica_shapes")
-                          : ArrayAttr();
-      auto placements = trace ? trace.getAs<ArrayAttr>("placements")
-                              : ArrayAttr();
+      auto traceActive =
+          trace ? trace.getAs<IntegerAttr>("active_replicas") : IntegerAttr();
+      auto shapes =
+          trace ? trace.getAs<ArrayAttr>("replica_shapes") : ArrayAttr();
+      auto placements =
+          trace ? trace.getAs<ArrayAttr>("placements") : ArrayAttr();
       if (!traceActive || traceActive.getInt() != activeReplicas.getInt() ||
-          !shapes || shapes.size() !=
-                         static_cast<size_t>(activeReplicas.getInt()) ||
+          !shapes ||
+          shapes.size() != static_cast<size_t>(activeReplicas.getInt()) ||
           !placements || placements.empty()) {
         error = "original task " + task.name +
                 " has no exact scheduler replica inventory";
@@ -147,17 +154,16 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
       int64_t expectedCells = 0;
       for (Attribute rawShape : shapes) {
         auto shape = dyn_cast<DictionaryAttr>(rawShape);
-        auto id = shape ? shape.getAs<IntegerAttr>("replica_id")
-                        : IntegerAttr();
-        auto count = shape ? shape.getAs<IntegerAttr>("cgra_count")
-                           : IntegerAttr();
+        auto id =
+            shape ? shape.getAs<IntegerAttr>("replica_id") : IntegerAttr();
+        auto count =
+            shape ? shape.getAs<IntegerAttr>("cgra_count") : IntegerAttr();
         auto name = shape ? shape.getAs<StringAttr>("shape") : StringAttr();
-        if (!id || id.getInt() < 0 ||
-            id.getInt() >= activeReplicas.getInt() || !count ||
-            count.getInt() < 1 || !name || name.getValue().empty() ||
+        if (!id || id.getInt() < 0 || id.getInt() >= activeReplicas.getInt() ||
+            !count || count.getInt() < 1 || !name || name.getValue().empty() ||
             !replicaIds.insert(id.getInt()).second ||
-            expectedCells > std::numeric_limits<int64_t>::max() -
-                                count.getInt()) {
+            expectedCells >
+                std::numeric_limits<int64_t>::max() - count.getInt()) {
           error = "original task " + task.name +
                   " has malformed scheduler replica geometry";
           return false;
@@ -167,18 +173,16 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
       std::set<std::tuple<int64_t, int64_t, int64_t>> placementCells;
       for (Attribute rawPlacement : placements) {
         auto placement = dyn_cast<DictionaryAttr>(rawPlacement);
-        auto row = placement ? placement.getAs<IntegerAttr>("row")
-                             : IntegerAttr();
-        auto col = placement ? placement.getAs<IntegerAttr>("col")
-                             : IntegerAttr();
-        auto context = placement
-                           ? placement.getAs<IntegerAttr>("context_id")
-                           : IntegerAttr();
-        auto replica = placement
-                           ? placement.getAs<IntegerAttr>("replica_id")
-                           : IntegerAttr();
-        if (!row || row.getInt() < 0 || !col || col.getInt() < 0 ||
-            !context || context.getInt() < 0 || context.getInt() >= 6 || !replica ||
+        auto row =
+            placement ? placement.getAs<IntegerAttr>("row") : IntegerAttr();
+        auto col =
+            placement ? placement.getAs<IntegerAttr>("col") : IntegerAttr();
+        auto context = placement ? placement.getAs<IntegerAttr>("context_id")
+                                 : IntegerAttr();
+        auto replica = placement ? placement.getAs<IntegerAttr>("replica_id")
+                                 : IntegerAttr();
+        if (!row || row.getInt() < 0 || !col || col.getInt() < 0 || !context ||
+            context.getInt() < 0 || context.getInt() >= 6 || !replica ||
             !replicaIds.count(replica.getInt()) ||
             !placementCells
                  .emplace(replica.getInt(), row.getInt(), col.getInt())
@@ -189,8 +193,7 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
         }
       }
       if (expectedCells != static_cast<int64_t>(placements.size()) ||
-          replicaIds.size() !=
-              static_cast<size_t>(activeReplicas.getInt())) {
+          replicaIds.size() != static_cast<size_t>(activeReplicas.getInt())) {
         error = "original task " + task.name +
                 " scheduler replica inventory does not exactly cover its "
                 "placed cells";
@@ -211,11 +214,14 @@ bool verifyOriginalAmoebaSourceDomainCoverage(
   return true;
 }
 
-StringRef originalAmoebaSourceDomainCoverageStatus(ArrayRef<TaskMetadata> tasks) {
-  return llvm::any_of(tasks, [](const TaskMetadata &task) {
-           return task.sourceIterationMultiplicity > 1;
-         }) ? kOriginalAmoebaStaticInternalCoverageStatus
-            : kOriginalAmoebaSourceDomainCoverageStatus;
+StringRef
+originalAmoebaSourceDomainCoverageStatus(ArrayRef<TaskMetadata> tasks) {
+  return llvm::any_of(tasks,
+                      [](const TaskMetadata &task) {
+                        return task.sourceIterationMultiplicity > 1;
+                      })
+             ? kOriginalAmoebaStaticInternalCoverageStatus
+             : kOriginalAmoebaSourceDomainCoverageStatus;
 }
 
 namespace {
@@ -397,14 +403,16 @@ static bool parseSelectedShape(StringRef shape, int64_t &rows,
          rows <= 4 && columns <= 4 && rows * columns <= 4;
 }
 
-static bool readSelectedReplicaPlacements(
-    Operation *operation, int64_t selectedRows, int64_t selectedCols,
-    int64_t selectedCount, std::vector<SelectedReplicaPlacement> &result,
-    std::string &error) {
+static bool
+readSelectedReplicaPlacements(Operation *operation, int64_t selectedRows,
+                              int64_t selectedCols, int64_t selectedCount,
+                              std::vector<SelectedReplicaPlacement> &result,
+                              std::string &error) {
   auto fail = [&](StringRef reason) {
     auto name = operation->getAttrOfType<StringAttr>("task_name");
-    error = "task " + (name ? name.getValue().str() : std::string("<unknown>")) +
-            ": " + reason.str();
+    error = "task " +
+            (name ? name.getValue().str() : std::string("<unknown>")) + ": " +
+            reason.str();
     return false;
   };
   auto active = operation->getAttrOfType<IntegerAttr>("active_replicas");
@@ -422,7 +430,8 @@ static bool readSelectedReplicaPlacements(
       shapes.size() != static_cast<size_t>(active.getInt()) || !placements ||
       placements.empty() || !infoActive || *infoActive != active.getInt() ||
       !orchestrationCells || orchestrationCells.size() != placements.size())
-    return fail("original scheduler replica and physical-cell inventories are incomplete");
+    return fail("original scheduler replica and physical-cell inventories are "
+                "incomplete");
 
   result.assign(active.getInt(), SelectedReplicaPlacement{});
   for (Attribute rawShape : shapes) {
@@ -444,7 +453,8 @@ static bool readSelectedReplicaPlacements(
          (*rows != selectedCols || *cols != selectedRows)) ||
         *rows * *cols != *count || *row + *rows > 4 || *col + *cols > 4 ||
         result[*id].cgraCount != 0)
-      return fail("captured replica shape/count/orientation is invalid or duplicated");
+      return fail(
+          "captured replica shape/count/orientation is invalid or duplicated");
     SelectedReplicaPlacement &replica = result[*id];
     replica.replicaId = *id;
     replica.shape = name->str();
@@ -466,13 +476,15 @@ static bool readSelectedReplicaPlacements(
     auto replicaId = cell ? getInteger(cell, "replica_id") : std::nullopt;
     auto start = cell ? getInteger(cell, "scheduler_start_time") : std::nullopt;
     auto end = cell ? getInteger(cell, "scheduler_end_time") : std::nullopt;
-    auto duration = cell ? getInteger(cell, "scheduler_duration") : std::nullopt;
+    auto duration =
+        cell ? getInteger(cell, "scheduler_duration") : std::nullopt;
     if (!row || *row < 0 || *row >= 4 || !col || *col < 0 || *col >= 4 ||
         !context || *context < 0 || !replicaId || *replicaId < 0 ||
         *replicaId >= active.getInt() || !start || *start < 0 || !end ||
         *end <= *start || !duration || *duration != *end - *start ||
         !allCells.emplace(*row, *col).second)
-      return fail("physical placement cell, time, or replica identity is malformed/duplicated");
+      return fail("physical placement cell, time, or replica identity is "
+                  "malformed/duplicated");
     if (commonStart < 0) {
       commonStart = *start;
       commonEnd = *end;
@@ -493,7 +505,8 @@ static bool readSelectedReplicaPlacements(
   for (SelectedReplicaPlacement &replica : result) {
     if (replica.cgraCount != static_cast<int64_t>(replica.cells.size()) ||
         replica.cgraCount != replica.rows * replica.cols)
-      return fail("original replica omits cells from its exact rectangular placement");
+      return fail(
+          "original replica omits cells from its exact rectangular placement");
   }
   if (commonStart < 0 || allCells.size() != placements.size())
     return fail("original scheduler placement does not cover its cells");
@@ -508,7 +521,8 @@ static bool readSelectedReplicaPlacements(
         !orchestrationContexts.emplace(std::make_pair(*row, *col), *context)
              .second ||
         !contexts.count({*row, *col}) || contexts[{*row, *col}] != *context)
-      return fail("task_orchestration_info disagrees with scheduler replica cells");
+      return fail(
+          "task_orchestration_info disagrees with scheduler replica cells");
   }
   if (orchestrationContexts.size() != contexts.size())
     return fail("task_orchestration_info omits a scheduler replica cell");
@@ -693,7 +707,8 @@ static bool getSelectedProfile(const json::Object &profileRoot,
   }
   const json::Array *profiles =
       taskRecord ? taskRecord->getArray("profiles") : nullptr;
-  const bool hasAttemptsField = profileRoot.get("candidate_attempts") != nullptr;
+  const bool hasAttemptsField =
+      profileRoot.get("candidate_attempts") != nullptr;
   const json::Array *attempts = profileRoot.getArray("candidate_attempts");
   if (hasAttemptsField && !attempts) {
     error = "profile candidate-attempt inventory is not an array";
@@ -785,9 +800,8 @@ static bool getSelectedProfile(const json::Object &profileRoot,
       if (!candidateIndex || *candidateIndex < 1 ||
           *candidateIndex >
               static_cast<int64_t>(kExpectedProfileShapes.size()) ||
-          !shape ||
-          *shape != kExpectedProfileShapes[*candidateIndex - 1] || !count ||
-          !parseSelectedShape(*shape, rows, columns) ||
+          !shape || *shape != kExpectedProfileShapes[*candidateIndex - 1] ||
+          !count || !parseSelectedShape(*shape, rows, columns) ||
           *count != rows * columns || !profileCreated || !mapperSucceeded ||
           !attemptsByShape.emplace(shape->str(), attempt).second) {
         error =
@@ -811,8 +825,8 @@ static bool getSelectedProfile(const json::Object &profileRoot,
       const bool hasRow = row != profileRowsByShape.end();
       auto rowSucceeded =
           hasRow ? row->second->getBoolean("mapper_succeeded") : std::nullopt;
-      if (created != hasRow || succeeded != (created && rowSucceeded &&
-                                              *rowSucceeded)) {
+      if (created != hasRow ||
+          succeeded != (created && rowSucceeded && *rowSucceeded)) {
         error = "candidate attempt and emitted profile rows do not agree for " +
                 taskName.str() + " shape=" + shape.str();
         return false;
@@ -980,16 +994,16 @@ static bool fillFeatures(SelectedTask &task, MLIRContext *context,
   return true;
 }
 
-static bool fillDirectShapePredictions(
-    SelectedTask &task, MLIRContext *context,
-    const PerCgra2x2DirectEnsemble &model, int64_t perCgraRows,
-    int64_t perCgraCols, std::string &error) {
-  static constexpr std::array<std::pair<int64_t, int64_t>, 8> kCgraShapes =
-      {{{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
+static bool fillDirectShapePredictions(SelectedTask &task, MLIRContext *context,
+                                       const PerCgra2x2DirectEnsemble &model,
+                                       int64_t perCgraRows, int64_t perCgraCols,
+                                       std::string &error) {
+  static constexpr std::array<std::pair<int64_t, int64_t>, 8> kCgraShapes = {
+      {{1, 1}, {1, 2}, {2, 1}, {1, 3}, {3, 1}, {1, 4}, {2, 2}, {4, 1}}};
   const double runtimeCeiling = model.getRuntimeIICeiling();
   const auto &names = orbit::mapper_features::perCgra2x2MapperFeatureNames();
-  if (!model.featureNamesMatch(ArrayRef<std::string>(names.data(),
-                                                     names.size()))) {
+  if (!model.featureNamesMatch(
+          ArrayRef<std::string>(names.data(), names.size()))) {
     error = "C++ feature frontend feature_names differ from the direct 2x2 "
             "model";
     return false;
@@ -1015,7 +1029,7 @@ static bool fillDirectShapePredictions(
   const json::Object graphJSON = graphFacts(graph);
   double startupCycles = 0.0;
   if (!deriveStartupCyclesFromCppFeatureOutput(graphJSON, startupCycles,
-                                              error)) {
+                                               error)) {
     error = "cannot derive structural startup for " + task.metadata.name +
             ": " + error;
     return false;
@@ -1043,11 +1057,11 @@ static bool fillDirectShapePredictions(
       return false;
     }
     if (!computeMapperAnalyticalFacts(mapper.getBody(), item.mapperRows,
-                                      item.mapperCols, item.recMII,
-                                      item.resMII, item.lowerBound, error)) {
+                                      item.mapperCols, item.recMII, item.resMII,
+                                      item.lowerBound, error)) {
       error = "cannot derive direct mapper RecMII/ResMII for task=" +
-              task.metadata.name + " shape=" + std::to_string(cgraRows) +
-              "x" + std::to_string(cgraCols) + ": " + error;
+              task.metadata.name + " shape=" + std::to_string(cgraRows) + "x" +
+              std::to_string(cgraCols) + ": " + error;
       return false;
     }
     if (item.lowerBound > runtimeCeiling) {
@@ -1062,18 +1076,20 @@ static bool fillDirectShapePredictions(
             static_cast<int>(item.mapperCols), item.recMII, item.resMII,
             item.lowerBound, features, error,
             model.hasDiagnosticOverride()
-                ? orbit::mapper_features::PerCgra2x2MapperFeatureInterval::Diagnostic23
-                : orbit::mapper_features::PerCgra2x2MapperFeatureInterval::Training20)) {
-      error = "direct feature extraction failed for task=" +
-              task.metadata.name + " shape=" + std::to_string(cgraRows) +
-              "x" + std::to_string(cgraCols) + ": " + error;
+                ? orbit::mapper_features::PerCgra2x2MapperFeatureInterval::
+                      Diagnostic23
+                : orbit::mapper_features::PerCgra2x2MapperFeatureInterval::
+                      Training20)) {
+      error =
+          "direct feature extraction failed for task=" + task.metadata.name +
+          " shape=" + std::to_string(cgraRows) + "x" +
+          std::to_string(cgraCols) + ": " + error;
       return false;
     }
     DirectMapperIIPrediction prediction;
-    if (!model.predict(ArrayRef<double>(features.values.data(),
-                                        features.values.size()),
-                       item.recMII, item.resMII, item.lowerBound, prediction,
-                       error)) {
+    if (!model.predict(
+            ArrayRef<double>(features.values.data(), features.values.size()),
+            item.recMII, item.resMII, item.lowerBound, prediction, error)) {
       error = "direct model inference failed for task=" + task.metadata.name +
               " shape=" + std::to_string(cgraRows) + "x" +
               std::to_string(cgraCols) + ": " + error;
@@ -1085,13 +1101,14 @@ static bool fillDirectShapePredictions(
         prediction.memberPredictions.size() != 4) {
       error = "direct model prediction violates finite/lower-bound/ceiling/"
               "four-member contract for task=" +
-              task.metadata.name + " shape=" + std::to_string(cgraRows) +
-              "x" + std::to_string(cgraCols);
+              task.metadata.name + " shape=" + std::to_string(cgraRows) + "x" +
+              std::to_string(cgraCols);
       return false;
     }
     double variance = 0.0;
     for (double member : prediction.memberPredictions) {
-      if (!std::isfinite(member) || member < item.lowerBound || member > runtimeCeiling) {
+      if (!std::isfinite(member) || member < item.lowerBound ||
+          member > runtimeCeiling) {
         error = "direct member prediction violates its interval contract for " +
                 task.metadata.name;
         return false;
@@ -1107,8 +1124,8 @@ static bool fillDirectShapePredictions(
   return true;
 }
 
-static json::Array makeReplicaInventoryJson(
-    ArrayRef<SelectedReplicaPlacement> replicas) {
+static json::Array
+makeReplicaInventoryJson(ArrayRef<SelectedReplicaPlacement> replicas) {
   json::Array inventory;
   for (const SelectedReplicaPlacement &replica : replicas) {
     json::Object record;
@@ -1122,7 +1139,8 @@ static json::Array makeReplicaInventoryJson(
     json::Array cells;
     json::Array contexts;
     for (const SelectedReplicaCell &cell : replica.cells) {
-      cells.push_back(json::Object{{"row", cell.row}, {"col", cell.col},
+      cells.push_back(json::Object{{"row", cell.row},
+                                   {"col", cell.col},
                                    {"replica_id", replica.replicaId},
                                    {"context_id", cell.contextId}});
       contexts.push_back(cell.contextId);
@@ -1247,11 +1265,14 @@ writeCostCatalog(raw_ostream &os, func::FuncOp function,
       tasks, [](const SelectedTask &task) { return task.replicas.size() > 1; });
   metadata["iteration_domain_coverage_evidence"] =
       hasMultiReplicaTask
-          ? "every original task has a complete bound source-domain certificate, "
+          ? "every original task has a complete bound source-domain "
+            "certificate, "
             "unit internal multiplicity, unchanged task firing extent, and its "
             "complete original scheduler replica placement inventory"
-          : "every original task has a complete bound source-domain certificate, "
-            "unit internal multiplicity, unchanged task firing extent, one active "
+          : "every original task has a complete bound source-domain "
+            "certificate, "
+            "unit internal multiplicity, unchanged task firing extent, one "
+            "active "
             "replica, and no replica or tiling lineage";
   metadata["body_equivalence_checked"] = true;
   metadata["feature_contract_id"] = model.getFeatureContractId().str();
@@ -1294,11 +1315,10 @@ static json::Object makeDirectBinding(
     const OriginalAmoebaProfileBodyExport &bodies, StringRef profilePath,
     StringRef graphVariant, StringRef architecturePath,
     StringRef architectureContract, StringRef architectureText,
-    StringRef ensemblePath, StringRef ensembleText,
-    StringRef sourceRepository, StringRef sourceCommit,
-    const json::Object &sourceModel, ArrayRef<int64_t> memberSeeds,
-    ArrayRef<SelectedTask> selected, StringRef canonicalModuleWitness,
-    int64_t runtimeIICeiling,
+    StringRef ensemblePath, StringRef ensembleText, StringRef sourceRepository,
+    StringRef sourceCommit, const json::Object &sourceModel,
+    ArrayRef<int64_t> memberSeeds, ArrayRef<SelectedTask> selected,
+    StringRef canonicalModuleWitness, int64_t runtimeIICeiling,
     StringRef sourceDomainCoverageStatus,
     const json::Object *diagnosticOverride) {
   json::Object binding;
@@ -1340,8 +1360,8 @@ static json::Object makeDirectBinding(
   binding["current_ir_body_equivalence_verified"] = true;
   json::Array members;
   for (auto [index, seed] : llvm::enumerate(memberSeeds))
-    members.push_back(json::Object{{"member_index", static_cast<int64_t>(index)},
-                                   {"seed", seed}});
+    members.push_back(json::Object{
+        {"member_index", static_cast<int64_t>(index)}, {"seed", seed}});
   binding["direct_ensemble_members"] = std::move(members);
 
   json::Array taskBindings;
@@ -1378,8 +1398,7 @@ static json::Object makeDirectBinding(
       json::Array expandedInternalExtents;
       for (int64_t extent : task.metadata.expandedInternalExtents)
         expandedInternalExtents.push_back(extent);
-      record["expanded_internal_extents"] =
-          std::move(expandedInternalExtents);
+      record["expanded_internal_extents"] = std::move(expandedInternalExtents);
     }
     json::Array shapePredictions;
     for (const auto &prediction : task.directPredictions) {
@@ -1398,36 +1417,35 @@ static json::Object makeDirectBinding(
       if (prediction.supported) {
         shape["rec_mii"] = prediction.recMII;
         shape["res_mii"] = prediction.resMII;
-      shape["startup_cycles"] = prediction.startupCycles;
-      shape["predicted_ii_std"] = prediction.predictedIIStd;
-      shape["ii_mean_source"] = "direct_four_member_arithmetic_mean";
-      if (diagnosticOverride) {
-        const bool extrapolated =
-            prediction.lowerBound > 20.0 ||
-            llvm::any_of(prediction.memberPredictions,
-                         [](double member) { return member > 20.0; });
-        shape["extrapolation_status"] =
-            extrapolated ? "out-of-training-ceiling"
-                         : "within-training-ceiling";
-      }
-      json::Array directMembers;
+        shape["startup_cycles"] = prediction.startupCycles;
+        shape["predicted_ii_std"] = prediction.predictedIIStd;
+        shape["ii_mean_source"] = "direct_four_member_arithmetic_mean";
+        if (diagnosticOverride) {
+          const bool extrapolated =
+              prediction.lowerBound > 20.0 ||
+              llvm::any_of(prediction.memberPredictions,
+                           [](double member) { return member > 20.0; });
+          shape["extrapolation_status"] = extrapolated
+                                              ? "out-of-training-ceiling"
+                                              : "within-training-ceiling";
+        }
+        json::Array directMembers;
         for (auto [index, member] :
              llvm::enumerate(prediction.memberPredictions))
-          directMembers.push_back(json::Object{
-              {"member_index", static_cast<int64_t>(index)},
-              {"seed", memberSeeds[index]},
-              {"predicted_ii", member}});
+          directMembers.push_back(
+              json::Object{{"member_index", static_cast<int64_t>(index)},
+                           {"seed", memberSeeds[index]},
+                           {"predicted_ii", member}});
         shape["direct_ensemble_members"] = std::move(directMembers);
       } else {
         if (diagnosticOverride)
           shape["status"] = kDirectUnsupportedStatus.str();
-        shape["unsupported_reason"] = diagnosticOverride
-                                           ? kDirectDiagnosticUnsupportedReason.str()
-                                           : kDirectUnsupportedReason.str();
+        shape["unsupported_reason"] =
+            diagnosticOverride ? kDirectDiagnosticUnsupportedReason.str()
+                               : kDirectUnsupportedReason.str();
         shape["model_interval_max_ii"] = 20.0;
         if (diagnosticOverride)
-          shape["extrapolation_status"] =
-              "outside-diagnostic-runtime-domain";
+          shape["extrapolation_status"] = "outside-diagnostic-runtime-domain";
       }
       shapePredictions.push_back(std::move(shape));
     }
@@ -1457,8 +1475,7 @@ static bool writeDirectCostCatalog(
 
   json::Object metadata;
   metadata["provenance_schema"] = kCostProvenanceSchema.str();
-  metadata["predictor_source"] =
-      "per-cgra-2x2-direct-four-member-ii-predictor";
+  metadata["predictor_source"] = "per-cgra-2x2-direct-four-member-ii-predictor";
   metadata["source_repository"] = sourceRepository.str();
   metadata["source_commit"] = sourceCommit.str();
   metadata["architecture_path"] = architecturePath.str();
@@ -1477,8 +1494,7 @@ static bool writeDirectCostCatalog(
   metadata["model"] = "orbit-cgra-ii-per-cgra-2x2-direct-4member-v1";
   metadata["model_namespace"] = modelNamespace.str();
   metadata["model_schema"] = kPerCgra2x2EnsembleSchema.str();
-  metadata["model_status"] =
-      "candidate_pending_amoeba_benchmark_overlap_audit";
+  metadata["model_status"] = "candidate_pending_amoeba_benchmark_overlap_audit";
   metadata["quality_status"] =
       "candidate_pending_amoeba_benchmark_overlap_audit";
   metadata["candidate_only"] = true;
@@ -1489,33 +1505,45 @@ static bool writeDirectCostCatalog(
   metadata["iteration_domain_coverage_status"] =
       sourceDomainCoverageStatus.str();
   metadata["iteration_domain_coverage_verified"] = true;
-  const bool hasMultiReplicaTask = llvm::any_of(
-      selected, [](const SelectedTask &task) { return task.replicas.size() > 1; });
+  const bool hasMultiReplicaTask =
+      llvm::any_of(selected, [](const SelectedTask &task) {
+        return task.replicas.size() > 1;
+      });
   metadata["iteration_domain_coverage_evidence"] =
       diagnosticOverride
-          ? (hasMultiReplicaTask
-                 ? "every original task has a re-resolved complete source-domain "
-                   "certificate; static internal loops are admitted only when fully "
-                   "expanded into the mapper body, macro firings remain separate "
-                   "from expanded source work, and all original scheduler replica "
-                   "placements are retained"
-                 : "every original task has a re-resolved complete source-domain "
-                   "certificate; static internal loops are admitted only when fully "
-                   "expanded into the mapper body, with macro firings distinct from "
-                   "expanded source work; one active replica and no replica or tiling lineage")
+          ? (hasMultiReplicaTask ? "every original task has a re-resolved "
+                                   "complete source-domain "
+                                   "certificate; static internal loops are "
+                                   "admitted only when fully "
+                                   "expanded into the mapper body, macro "
+                                   "firings remain separate "
+                                   "from expanded source work, and all "
+                                   "original scheduler replica "
+                                   "placements are retained"
+                                 : "every original task has a re-resolved "
+                                   "complete source-domain "
+                                   "certificate; static internal loops are "
+                                   "admitted only when fully "
+                                   "expanded into the mapper body, with macro "
+                                   "firings distinct from "
+                                   "expanded source work; one active replica "
+                                   "and no replica or tiling lineage")
           : (hasMultiReplicaTask
-                 ? "every original task has a complete bound source-domain certificate, "
-                   "unit internal multiplicity, unchanged task firing extent, and its "
+                 ? "every original task has a complete bound source-domain "
+                   "certificate, "
+                   "unit internal multiplicity, unchanged task firing extent, "
+                   "and its "
                    "complete original scheduler replica placement inventory"
-                 : "every original task has a complete bound source-domain certificate, "
-                   "unit internal multiplicity, unchanged task firing extent, one active "
+                 : "every original task has a complete bound source-domain "
+                   "certificate, "
+                   "unit internal multiplicity, unchanged task firing extent, "
+                   "one active "
                    "replica, and no replica or tiling lineage");
   metadata["body_equivalence_checked"] = true;
   metadata["feature_contract_id"] = model.getFeatureContractId().str();
   metadata["feature_extractor"] =
       "cgra_ii_predictor.mapper_model:mapper_feature_vector";
-  metadata["feature_frontend"] =
-      "c++-mlir-current-body-direct-148-v1";
+  metadata["feature_frontend"] = "c++-mlir-current-body-direct-148-v1";
   metadata["shape_protocol_id"] = model.getShapeProtocolId().str();
   metadata["communication_latency"] = "scored_by_scheduler";
   metadata["ranking_policy"] =
@@ -1525,9 +1553,8 @@ static bool writeDirectCostCatalog(
   metadata["selection_policy"] = "original-amoeba-selected-shape-only";
   metadata["model_interval_max_ii"] = 20;
   metadata["unsupported_prediction_policy"] =
-      diagnosticOverride
-          ? kDirectDiagnosticUnsupportedPolicy.str()
-          : "analytical-lower-bound-exceeds-model-ceiling-v1";
+      diagnosticOverride ? kDirectDiagnosticUnsupportedPolicy.str()
+                         : "analytical-lower-bound-exceeds-model-ceiling-v1";
   if (diagnosticOverride) {
     metadata["diagnostic_only"] = true;
     metadata["formal"] = false;
@@ -1544,9 +1571,9 @@ static bool writeDirectCostCatalog(
                    {"uncertainty", "population_standard_deviation"}};
   root["predictor_metadata"] = std::move(metadata);
   const std::string canonicalModuleWitness =
-      hasMultiReplicaTask ? neighborhoodReplaySourceText(
-                                function->getParentOfType<ModuleOp>())
-                          : std::string();
+      hasMultiReplicaTask
+          ? neighborhoodReplaySourceText(function->getParentOfType<ModuleOp>())
+          : std::string();
   if (hasMultiReplicaTask && canonicalModuleWitness.empty())
     return false;
   root["original_amoeba_profile_binding"] = makeDirectBinding(
@@ -1560,22 +1587,21 @@ static bool writeDirectCostCatalog(
   for (const SelectedTask &task : selected) {
     for (const auto &prediction : task.directPredictions) {
       if (!prediction.supported) {
-        json::Object entry{
-            {"task", task.metadata.name},
-            {"mapper_tile_rows", prediction.mapperRows},
-            {"mapper_tile_cols", prediction.mapperCols},
-            {"support_status", "unsupported"},
-            {"status", kDirectUnsupportedStatus.str()},
-            {"unsupported_reason", diagnosticOverride
-                                       ? kDirectDiagnosticUnsupportedReason.str()
-                                       : kDirectUnsupportedReason.str()},
-            {"analytical_lower_bound", prediction.lowerBound},
-            {"model_interval_max_ii", 20}};
+        json::Object entry{{"task", task.metadata.name},
+                           {"mapper_tile_rows", prediction.mapperRows},
+                           {"mapper_tile_cols", prediction.mapperCols},
+                           {"support_status", "unsupported"},
+                           {"status", kDirectUnsupportedStatus.str()},
+                           {"unsupported_reason",
+                            diagnosticOverride
+                                ? kDirectDiagnosticUnsupportedReason.str()
+                                : kDirectUnsupportedReason.str()},
+                           {"analytical_lower_bound", prediction.lowerBound},
+                           {"model_interval_max_ii", 20}};
         if (diagnosticOverride) {
           entry["training_ceiling_ii"] = 20;
           entry["runtime_ceiling_ii"] = runtimeIICeiling;
-          entry["extrapolation_status"] =
-              "outside-diagnostic-runtime-domain";
+          entry["extrapolation_status"] = "outside-diagnostic-runtime-domain";
         }
         entries.push_back(std::move(entry));
         continue;
@@ -1585,12 +1611,11 @@ static bool writeDirectCostCatalog(
         predictedII += member;
       predictedII /= static_cast<double>(prediction.memberPredictions.size());
       json::Array members;
-      for (auto [index, member] :
-           llvm::enumerate(prediction.memberPredictions))
-        members.push_back(json::Object{
-            {"member_index", static_cast<int64_t>(index)},
-            {"seed", memberSeeds[index]},
-            {"predicted_ii", member}});
+      for (auto [index, member] : llvm::enumerate(prediction.memberPredictions))
+        members.push_back(
+            json::Object{{"member_index", static_cast<int64_t>(index)},
+                         {"seed", memberSeeds[index]},
+                         {"predicted_ii", member}});
       json::Object entry{
           {"task", task.metadata.name},
           {"mapper_tile_rows", prediction.mapperRows},
@@ -1605,8 +1630,7 @@ static bool writeDirectCostCatalog(
           {"res_mii", prediction.resMII},
           {"startup_cycles", prediction.startupCycles},
           {"ii_mean_source", "direct_four_member_arithmetic_mean"},
-          {"model_status",
-           "candidate_pending_amoeba_benchmark_overlap_audit"},
+          {"model_status", "candidate_pending_amoeba_benchmark_overlap_audit"},
           {"production_ready", false}};
       if (diagnosticOverride) {
         const bool extrapolated =
@@ -1615,9 +1639,9 @@ static bool writeDirectCostCatalog(
                          [](double member) { return member > 20.0; });
         entry["training_ceiling_ii"] = 20;
         entry["runtime_ceiling_ii"] = runtimeIICeiling;
-        entry["extrapolation_status"] =
-            extrapolated ? "out-of-training-ceiling"
-                         : "within-training-ceiling";
+        entry["extrapolation_status"] = extrapolated
+                                            ? "out-of-training-ceiling"
+                                            : "within-training-ceiling";
       }
       entries.push_back(std::move(entry));
     }
@@ -1820,8 +1844,8 @@ struct OriginalAmoebaProfileCostAdapterPass
     auto graph = function->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     const bool assignedOriginalGraphId = !graph || graph.getValue().empty();
     if (assignedOriginalGraphId) {
-      graph = StringAttr::get(module.getContext(),
-                              kOriginalBaselineGraphVariantId);
+      graph =
+          StringAttr::get(module.getContext(), kOriginalBaselineGraphVariantId);
       function->setAttr("amoeba.graph_variant_id", graph);
     }
     auto orchestration =
@@ -1842,10 +1866,9 @@ struct OriginalAmoebaProfileCostAdapterPass
       return;
     }
     llvm::SmallVector<TaskMetadata> tasks = std::move(*collected);
-    const bool hasScheduledReplicaInventory = llvm::any_of(
-        tasks, [](const TaskMetadata &task) {
-          auto active =
-              task.op->getAttrOfType<IntegerAttr>("active_replicas");
+    const bool hasScheduledReplicaInventory =
+        llvm::any_of(tasks, [](const TaskMetadata &task) {
+          auto active = task.op->getAttrOfType<IntegerAttr>("active_replicas");
           return active && active.getInt() > 1;
         });
     if (!verifyOriginalAmoebaSourceDomainCoverage(
@@ -1903,9 +1926,8 @@ struct OriginalAmoebaProfileCostAdapterPass
     if (!profileTasks || profileTasks->size() != tasks.size() ||
         (hasCandidateAttemptsField && !candidateAttempts) ||
         (!candidateAttempts && diagnosticIICeiling != 20) ||
-        (candidateAttempts &&
-         candidateAttempts->size() !=
-             static_cast<size_t>(expectedProfileCount))) {
+        (candidateAttempts && candidateAttempts->size() !=
+                                  static_cast<size_t>(expectedProfileCount))) {
       fail("profile file does not contain exact task coverage");
       return;
     }
@@ -1974,8 +1996,7 @@ struct OriginalAmoebaProfileCostAdapterPass
       fail(error);
       return;
     }
-    const bool directModelMode =
-        bundleSchema == kPerCgra2x2EnsembleSchema;
+    const bool directModelMode = bundleSchema == kPerCgra2x2EnsembleSchema;
     if (directModelMode !=
         (StringRef(modelNamespace) == kPerCgra2x2ModelNamespace)) {
       fail("model bundle schema and explicit model namespace disagree; the "
@@ -1994,9 +2015,8 @@ struct OriginalAmoebaProfileCostAdapterPass
       const json::Object *bundleArchitecture =
           ensembleObject.getObject("architecture");
       const auto exactArchitecture =
-          bundleArchitecture
-              ? bundleArchitecture->getString("exact_yaml_text")
-              : std::nullopt;
+          bundleArchitecture ? bundleArchitecture->getString("exact_yaml_text")
+                             : std::nullopt;
       const json::Object *sourceModelObject =
           ensembleObject.getObject("source_model");
       const json::Object *featureContract =
@@ -2008,15 +2028,16 @@ struct OriginalAmoebaProfileCostAdapterPass
       if (architectureContract != expectedArchitectureContract ||
           architecture.getPerCgraRows() != 2 ||
           architecture.getPerCgraColumns() != 2 || !exactArchitecture ||
-          !sourceModelObject ||
-          !extractor || !members || members->size() != 4) {
+          !sourceModelObject || !extractor || !members ||
+          members->size() != 4) {
         fail("direct 2x2 model requires its exact context6 architecture text, "
              "four-member package, and explicit 2x2 architecture contract");
         return;
       }
       trainingArchitectureText = exactArchitecture->str();
-      if (!validatePerCgra2x2RuntimeContract(
-              diagnosticIICeiling, *exactArchitecture, architectureText, error)) {
+      if (!validatePerCgra2x2RuntimeContract(diagnosticIICeiling,
+                                             *exactArchitecture,
+                                             architectureText, error)) {
         fail(error);
         return;
       }
@@ -2037,10 +2058,10 @@ struct OriginalAmoebaProfileCostAdapterPass
       }
       const std::vector<int64_t> expectedSeeds = {17, 41, 113, 239};
       if (directMemberSeeds != expectedSeeds ||
-          !directModel.load(ensembleFile, architectureText, diagnosticIICeiling, error) ||
+          !directModel.load(ensembleFile, architectureText, diagnosticIICeiling,
+                            error) ||
           directModel.getModelNamespace() != kPerCgra2x2ModelNamespace ||
-          directModel.getFeatureContractId() !=
-              kPerCgra2x2FeatureContractId ||
+          directModel.getFeatureContractId() != kPerCgra2x2FeatureContractId ||
           directModel.getShapeProtocolId() != kPerCgra2x2ShapeProtocolId) {
         fail(error.empty()
                  ? "direct 2x2 model package does not satisfy its bound schema"
@@ -2120,10 +2141,9 @@ struct OriginalAmoebaProfileCostAdapterPass
       SelectedTask item;
       item.metadata = metadata;
       item.body = bodyIt->second;
-      if (!readSelectedReplicaPlacements(metadata.op.getOperation(),
-                                         selectedRows, selectedCols,
-                                         countAttr.getInt(), item.replicas,
-                                         error)) {
+      if (!readSelectedReplicaPlacements(
+              metadata.op.getOperation(), selectedRows, selectedCols,
+              countAttr.getInt(), item.replicas, error)) {
         metadata.op.emitError() << error;
         return signalPassFailure();
       }
@@ -2175,13 +2195,12 @@ struct OriginalAmoebaProfileCostAdapterPass
                "replica-duration contract";
         return signalPassFailure();
       }
-      const bool featuresReady = directModelMode
-                                     ? fillDirectShapePredictions(
-                                           item, module.getContext(),
+      const bool featuresReady =
+          directModelMode
+              ? fillDirectShapePredictions(item, module.getContext(),
                                            directModel, perCgraRows,
                                            perCgraCols, error)
-                                     : fillFeatures(item, module.getContext(),
-                                                    model, error);
+              : fillFeatures(item, module.getContext(), model, error);
       if (!featuresReady) {
         metadata.op.emitError() << error;
         return signalPassFailure();
@@ -2195,10 +2214,9 @@ struct OriginalAmoebaProfileCostAdapterPass
     }
     json::Object diagnosticOverride;
     const bool hasDiagnosticOverride = diagnosticIICeiling == 23;
-    if (hasDiagnosticOverride &&
-        !makePerCgra2x2DiagnosticOverrideMetadata(
-            trainingArchitectureText, architectureText, diagnosticOverride,
-            error)) {
+    if (hasDiagnosticOverride && !makePerCgra2x2DiagnosticOverrideMetadata(
+                                     trainingArchitectureText, architectureText,
+                                     diagnosticOverride, error)) {
       fail(error);
       return;
     }
@@ -2209,10 +2227,10 @@ struct OriginalAmoebaProfileCostAdapterPass
             [&](raw_ostream &os) {
               if (directModelMode) {
                 return writeDirectCostCatalog(
-                    os, function, modelNamespace, sourceRepository, sourceCommit,
-                    architecturePath, architectureContract, graph.getValue(),
-                    profileFile, bodyExport, directModel, ensembleFile,
-                    ensembleText, architectureText, sourceModel,
+                    os, function, modelNamespace, sourceRepository,
+                    sourceCommit, architecturePath, architectureContract,
+                    graph.getValue(), profileFile, bodyExport, directModel,
+                    ensembleFile, ensembleText, architectureText, sourceModel,
                     directMemberSeeds, selectedTasks, diagnosticIICeiling,
                     sourceDomainCoverageStatus,
                     hasDiagnosticOverride ? &diagnosticOverride : nullptr);
@@ -2221,11 +2239,10 @@ struct OriginalAmoebaProfileCostAdapterPass
                   bodyExport, profileFile, graph.getValue(), architecturePath,
                   ensembleFile, checkpointDirectory, sourceRepository,
                   sourceCommit, model, modelResources, selectedTasks);
-              return writeCostCatalog(os, function, modelNamespace,
-                                      sourceRepository, sourceCommit,
-                                      architecturePath, architectureContract,
-                                      graph.getValue(), model, selectedTasks,
-                                      std::move(binding));
+              return writeCostCatalog(
+                  os, function, modelNamespace, sourceRepository, sourceCommit,
+                  architecturePath, architectureContract, graph.getValue(),
+                  model, selectedTasks, std::move(binding));
             },
             error)) {
       fail(error);

@@ -6,8 +6,8 @@
 
 #include "Backend/Neura/Orchestration/JointScheduling/InterTaskNetwork.h"
 
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/YAMLParser.h"
@@ -32,7 +32,8 @@ namespace yaml = llvm::yaml;
 constexpr llvm::StringLiteral kInterTaskNetwork = "inter_task_network";
 llvm::cl::opt<std::string> interTaskNetworkSpecOverride(
     "joint-inter-task-network-spec",
-    llvm::cl::desc("Separate explicit inter-task network YAML; Neura's physical architecture remains unchanged"),
+    llvm::cl::desc("Separate explicit inter-task network YAML; Neura's "
+                   "physical architecture remains unchanged"),
     llvm::cl::init(""));
 constexpr llvm::StringLiteral kVersion = "version";
 constexpr llvm::StringLiteral kRows = "rows";

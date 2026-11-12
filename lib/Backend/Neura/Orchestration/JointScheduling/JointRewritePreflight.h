@@ -1,4 +1,5 @@
-//===- JointRewritePreflight.h -----------------------------------*- C++ -*-===//
+//===- JointRewritePreflight.h -----------------------------------*- C++
+//-*-===//
 // Exact necessary conditions for the source-owned graph rewrites. A successful
 // preflight still requires the real materializer and final facts validation.
 //===----------------------------------------------------------------------===//
@@ -82,7 +83,8 @@ preflightJointRewrite(ModuleOp module, JointRewritePreflightKind kind,
   // graph RAW means absent aliasing.
   if (kind == JointRewritePreflightKind::ProducerConsumer && rawEdges == 0) {
     if (forwardValueEdge ||
-        first.getOriginalWriteMemrefs().size() != first.getWillWrites().size() ||
+        first.getOriginalWriteMemrefs().size() !=
+            first.getWillWrites().size() ||
         second.getOriginalReadMemrefs().size() != second.getWillReads().size())
       return {JointRewritePreflightDisposition::Unknown,
               "producer_consumer_relationship_not_classified"};
@@ -133,9 +135,9 @@ public:
 
   uint64_t getGraphBuildCount() const { return graphBuildCount_; }
 
-  JointRewritePreflightResult
-  evaluate(JointRewritePreflightKind kind, StringRef firstName,
-           StringRef secondName) {
+  JointRewritePreflightResult evaluate(JointRewritePreflightKind kind,
+                                       StringRef firstName,
+                                       StringRef secondName) {
     if (kind == JointRewritePreflightKind::Other)
       return {};
 
@@ -168,8 +170,7 @@ public:
       bool forward = edge.producer == first && edge.consumer == second;
       bool reverse = edge.producer == second && edge.consumer == first;
       forwardValueEdge |= forward && edge.kind == TaskEdgeKind::Value;
-      if (kind == JointRewritePreflightKind::Sibling &&
-          (forward || reverse) &&
+      if (kind == JointRewritePreflightKind::Sibling && (forward || reverse) &&
           (edge.consumer_segment == TaskOperandSegment::WillReads ||
            edge.consumer_segment == TaskOperandSegment::ValueInputs))
         return {JointRewritePreflightDisposition::ProvenIllegal,

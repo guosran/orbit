@@ -309,8 +309,8 @@ static Value buildLoopUpperBoundValue(OpBuilder &builder, Location loc,
     return nullptr;
   }
 
-  return builder.create<affine::AffineApplyOp>(
-      loc, upper_bound_map, loop.getUpperBoundOperands());
+  return builder.create<affine::AffineApplyOp>(loc, upper_bound_map,
+                                               loop.getUpperBoundOperands());
 }
 
 // Creates a condition checking if all inner loop indices are at their upper

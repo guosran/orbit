@@ -24,8 +24,7 @@ using namespace mlir;
 namespace {
 
 constexpr StringLiteral kPassName = "repair-lu-affine-determinant-carry";
-constexpr StringLiteral kPassVersion =
-    "repair-lu-affine-determinant-carry-v1";
+constexpr StringLiteral kPassVersion = "repair-lu-affine-determinant-carry-v1";
 
 constexpr StringLiteral kSourceAttribute =
     "amoeba.lu_affine_repair_source_file";
@@ -43,20 +42,23 @@ constexpr StringLiteral kReasonAttribute = "amoeba.lu_affine_repair_reason";
 // source file that merely happens to contain a similarly named function is
 // rejected.
 constexpr StringLiteral kFixedScaleDefinition = "#define FIXED_SCALE 1024";
-constexpr StringLiteral kLuFunctionContract = R"SRC(void lu_func(int matrix_size, const int input[MAX_MATRIX][MAX_MATRIX],
+constexpr StringLiteral kLuFunctionContract =
+    R"SRC(void lu_func(int matrix_size, const int input[MAX_MATRIX][MAX_MATRIX],
              const int rhs[MAX_MATRIX],
              int working_matrix[MAX_MATRIX][MAX_MATRIX],
              int lower[MAX_MATRIX][MAX_MATRIX],
              int upper[MAX_MATRIX][MAX_MATRIX],
              int forward_solution[MAX_MATRIX], int solution[MAX_MATRIX],
              int inverse[MAX_MATRIX][MAX_MATRIX], int determinant_out[1]) {)SRC";
-constexpr StringLiteral kDeterminantRecurrence = R"SRC(  // Task 8: Q10 determinant from the product of U's diagonal.
+constexpr StringLiteral kDeterminantRecurrence =
+    R"SRC(  // Task 8: Q10 determinant from the product of U's diagonal.
   determinant_out[0] = FIXED_SCALE;
   for (int idx = 0; idx < matrix_size; ++idx) {
     determinant_out[0] = determinant_out[0] * upper[idx][idx] / FIXED_SCALE;
   })SRC";
 
-constexpr StringLiteral kFrozenLuSource = R"ORBITLU(// LU decomposition benchmark for AMOEBA evaluation.
+constexpr StringLiteral kFrozenLuSource =
+    R"ORBITLU(// LU decomposition benchmark for AMOEBA evaluation.
 //
 // Reference:
 // - Streaming-Bench, commit 333782f78d5475c8b33b11ff2b9ba9d75c93ca49:
@@ -216,13 +218,16 @@ static SourceContractResult verifySourceContract(StringRef source) {
   if (source != kFrozenLuSource)
     return {false, "source differs from the exact audited frozen LU program"};
   if (source.count(kFixedScaleDefinition) != 1) {
-    return {false, "source must contain exactly one '#define FIXED_SCALE 1024'"};
+    return {false,
+            "source must contain exactly one '#define FIXED_SCALE 1024'"};
   }
   if (source.count(kLuFunctionContract) != 1) {
-    return {false, "frozen lu_func function contract was not found exactly once"};
+    return {false,
+            "frozen lu_func function contract was not found exactly once"};
   }
   if (source.count(kDeterminantRecurrence) != 1) {
-    return {false, "frozen Task 8 determinant recurrence was not found exactly once"};
+    return {false,
+            "frozen Task 8 determinant recurrence was not found exactly once"};
   }
   return {true, "source contract verified"};
 }
@@ -433,8 +438,7 @@ static void setAuditAttrs(ModuleOp module, StringRef sourceFile,
   module->setAttr(kSourceAttribute, StringAttr::get(context, sourceFile));
   module->setAttr(kSourceVerifiedAttribute,
                   BoolAttr::get(context, sourceVerified));
-  module->setAttr(kInputStatusAttribute,
-                  StringAttr::get(context, inputStatus));
+  module->setAttr(kInputStatusAttribute, StringAttr::get(context, inputStatus));
   module->setAttr(kRepairStatusAttribute,
                   StringAttr::get(context, repairStatus));
   module->setAttr(kPassAttribute, StringAttr::get(context, kPassVersion));
@@ -506,17 +510,20 @@ public:
 
     func::FuncOp function;
     if (!findUniqueLuFunction(module, function)) {
-      failVerified("expected exactly one function whose symbol contains lu_func");
+      failVerified(
+          "expected exactly one function whose symbol contains lu_func");
       return;
     }
     if (!isExactFunctionContract(function)) {
-      failVerified("LU function type/layout does not match the frozen contract");
+      failVerified(
+          "LU function type/layout does not match the frozen contract");
       return;
     }
 
     arith::ConstantOp scale;
     if (!hasExactlyOneScaleConstant(function, scale)) {
-      failVerified("expected exactly one i32 constant with value FIXED_SCALE=1024");
+      failVerified(
+          "expected exactly one i32 constant with value FIXED_SCALE=1024");
       return;
     }
 
@@ -541,7 +548,8 @@ public:
     affine::AffineForOp loop = candidateLoops.front();
     if (loop->getBlock() != &function.getBody().front() ||
         !isExactLoopBound(loop, function)) {
-      failVerified("determinant loop must be a top-level 0-to-matrix_size loop");
+      failVerified(
+          "determinant loop must be a top-level 0-to-matrix_size loop");
       return;
     }
 
@@ -567,7 +575,8 @@ public:
       if (store->getBlock() == &function.getBody().front() &&
           store->isBeforeInBlock(loop.getOperation())) {
         if (initStore) {
-          failVerified("multiple determinant initialization stores are ambiguous");
+          failVerified(
+              "multiple determinant initialization stores are ambiguous");
           return;
         }
         initStore = store;
@@ -575,7 +584,8 @@ public:
     }
     if (!initStore || !isZeroStore(initStore, determinant) ||
         initStore.getValue() != scale) {
-      failVerified("determinant initialization must be one FIXED_SCALE scalar store");
+      failVerified(
+          "determinant initialization must be one FIXED_SCALE scalar store");
       return;
     }
     if (determinantStores.size() != 2) {
@@ -598,13 +608,15 @@ public:
 
     CarryBody body = inspectCarryBody(loop, upper, determinant, scale);
     if (body.kind == CarryBodyKind::Invalid) {
-      failVerified("determinant loop body is not the exact malformed or repaired recurrence");
+      failVerified("determinant loop body is not the exact malformed or "
+                   "repaired recurrence");
       return;
     }
 
     if (body.kind == CarryBodyKind::Correct) {
       setAuditAttrs(module, sourceFile.getValue(), /*sourceVerified=*/true,
-                    "already-correct", "unchanged", "input recurrence already correct");
+                    "already-correct", "unchanged",
+                    "input recurrence already correct");
       return;
     }
 
@@ -613,8 +625,8 @@ public:
     // existing divide/store SSA chain intact.
     OpBuilder builder(body.multiply.getOperation());
     AffineMap zeroMap = AffineMap::get(
-        /*dimCount=*/0, /*symbolCount=*/0,
-        {builder.getAffineConstantExpr(0)}, builder.getContext());
+        /*dimCount=*/0, /*symbolCount=*/0, {builder.getAffineConstantExpr(0)},
+        builder.getContext());
     affine::AffineLoadOp carryLoad = builder.create<affine::AffineLoadOp>(
         body.multiply.getLoc(), determinant, zeroMap, ValueRange{});
     body.multiply->setOperand(0, carryLoad.getResult());
@@ -622,9 +634,10 @@ public:
 
     CarryBody repaired = inspectCarryBody(loop, upper, determinant, scale);
     if (repaired.kind != CarryBodyKind::Correct) {
-      setAuditAttrs(module, sourceFile.getValue(), /*sourceVerified=*/true,
-                    "malformed-determinant-carry", "failed",
-                    "repair did not produce the exact carried determinant recurrence");
+      setAuditAttrs(
+          module, sourceFile.getValue(), /*sourceVerified=*/true,
+          "malformed-determinant-carry", "failed",
+          "repair did not produce the exact carried determinant recurrence");
       module.emitError()
           << "repair did not produce the exact carried determinant recurrence";
       signalPassFailure();

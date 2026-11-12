@@ -20,17 +20,18 @@ namespace mlir::amoeba::neura::joint_scheduling {
 // and state-carry proofs. Only after all source groups pass does it attach
 // inherited source certificates and refresh current body bindings. It does no
 // prediction, cost lookup, file I/O, or scheduling.
-LogicalResult proveAndRefreshSourceIterationDomainPartition(
-    func::FuncOp canonicalParent, func::FuncOp currentChild,
-    std::string &error);
+LogicalResult
+proveAndRefreshSourceIterationDomainPartition(func::FuncOp canonicalParent,
+                                              func::FuncOp currentChild,
+                                              std::string &error);
 
 // Read-only counterpart for imported, restored, or replayed candidates. It
 // repeats the same parent-to-full-child group/body proof and requires the
 // current certificate, source-origin witness, partition marker, and exact
 // current body binding to match. It never adds or repairs attributes.
-LogicalResult verifySourceIterationDomainPartition(
-    func::FuncOp canonicalParent, func::FuncOp currentChild,
-    std::string &error);
+LogicalResult verifySourceIterationDomainPartition(func::FuncOp canonicalParent,
+                                                   func::FuncOp currentChild,
+                                                   std::string &error);
 
 } // namespace mlir::amoeba::neura::joint_scheduling
 

@@ -12,9 +12,10 @@ namespace mlir::amoeba::neura::joint_scheduling {
 llvm::StringRef taskflowFissionCanonicalLoweringPipeline();
 void registerTaskflowFissionCanonicalLoweringDependencies(
     DialectRegistry &registry);
-mlir::LogicalResult lowerPreparedTaskflowFissionSource(
-    mlir::ModuleOp source, mlir::OwningOpRef<mlir::ModuleOp> &lowered,
-    std::string &error);
+mlir::LogicalResult
+lowerPreparedTaskflowFissionSource(mlir::ModuleOp source,
+                                   mlir::OwningOpRef<mlir::ModuleOp> &lowered,
+                                   std::string &error);
 mlir::LogicalResult verifyTaskflowFissionCanonicalLowering(
     mlir::ModuleOp source, mlir::ModuleOp canonicalNeura, std::string &error);
 std::string printTaskflowFissionModuleWitness(mlir::ModuleOp module);

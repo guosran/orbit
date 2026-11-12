@@ -1,6 +1,6 @@
 #include "TaskflowDialect/TaskflowOps.h"
-#include "TaskflowDialect/TaskflowDialect.h"
 #include "Taskflow/OutputCoordinateProof.h"
+#include "TaskflowDialect/TaskflowDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
@@ -27,8 +27,7 @@ static std::optional<int64_t> constantIndex(Value value) {
 }
 
 static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
-regionFromOutputProof(const OutputCoordinateProof &proof,
-                      MemRefType baseType) {
+regionFromOutputProof(const OutputCoordinateProof &proof, MemRefType baseType) {
   if (!baseType || !baseType.hasStaticShape() ||
       proof.producedLowers.size() != static_cast<size_t>(baseType.getRank()) ||
       proof.producedShape.size() != proof.producedLowers.size())
@@ -48,33 +47,31 @@ regionFromOutputProof(const OutputCoordinateProof &proof,
   return std::make_pair(std::move(lower), std::move(upper));
 }
 
-static LogicalResult verifyReplicaShardMetadata(
-    TaskflowTaskOp task,
-    const OutputCoordinateProof &proof,
-    int64_t selectedAxis) {
+static LogicalResult
+verifyReplicaShardMetadata(TaskflowTaskOp task,
+                           const OutputCoordinateProof &proof,
+                           int64_t selectedAxis) {
   if (selectedAxis < 0 ||
       selectedAxis >= static_cast<int64_t>(proof.outputCounterAxes.size()))
     return failure();
-  auto outputAxis = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.output_shard_axis");
-  auto shardAxis = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.shard_axis");
+  auto outputAxis =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.output_shard_axis");
+  auto shardAxis =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
   if ((outputAxis && outputAxis.getInt() != selectedAxis) ||
       (!outputAxis && (!shardAxis || shardAxis.getInt() != selectedAxis)))
     return failure();
 
   unsigned shardCounter = proof.outputCounterAxes[selectedAxis];
-  if (shardCounter ==
-          OutputCoordinateProof::kConstantAxis ||
+  if (shardCounter == OutputCoordinateProof::kConstantAxis ||
       shardCounter >= proof.taskLowers.size() ||
       shardCounter >= proof.taskUppers.size() || !shardAxis ||
-      (outputAxis &&
-       shardAxis.getInt() != static_cast<int64_t>(shardCounter)))
+      (outputAxis && shardAxis.getInt() != static_cast<int64_t>(shardCounter)))
     return failure();
-  auto shardLower = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.shard_lower");
-  auto shardUpper = task->getAttrOfType<IntegerAttr>(
-      "amoeba.replica.shard_upper");
+  auto shardLower =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_lower");
+  auto shardUpper =
+      task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_upper");
   if (!shardLower || !shardUpper ||
       shardLower.getInt() != proof.taskLowers[shardCounter] ||
       shardUpper.getInt() != proof.taskUppers[shardCounter])
@@ -224,14 +221,13 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
   // state.  A standalone join verifier must rederive that rectangle from the
   // indexed accesses for this write slot; materializer metadata is only a
   // witness which must agree with the independent proof.
-  auto lowers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_lowers");
-  auto uppers = task->getAttrOfType<ArrayAttr>(
-      "amoeba.tiling.output_region_uppers");
+  auto lowers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_lowers");
+  auto uppers =
+      task->getAttrOfType<ArrayAttr>("amoeba.tiling.output_region_uppers");
   if (task.getWillWrites().size() > 1) {
-    auto proof =
-        analyzeOutputCoordinates(
-            task, selectedAxis, static_cast<unsigned>(writeIndex));
+    auto proof = analyzeOutputCoordinates(task, selectedAxis,
+                                          static_cast<unsigned>(writeIndex));
     if (!proof.proven) {
       task.emitError() << "authenticated multi-output coordinate proof failed: "
                        << proof.reason;
@@ -245,8 +241,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
     if (failed(actual))
       return failure();
     if (lowers || uppers) {
-      if (!lowers || !uppers ||
-          lowers.size() != task.getWillWrites().size() ||
+      if (!lowers || !uppers || lowers.size() != task.getWillWrites().size() ||
           uppers.size() != lowers.size())
         return failure();
       auto lower = dyn_cast<DenseI64ArrayAttr>(lowers[writeIndex]);
@@ -271,9 +266,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
   if (task->hasAttr("amoeba.replica.output_counter_axes")) {
     if (!baseType)
       return failure();
-    auto proof =
-        analyzeOutputCoordinates(
-            task, selectedAxis);
+    auto proof = analyzeOutputCoordinates(task, selectedAxis);
     if (!proof.proven) {
       task.emitError() << "authenticated output-coordinate proof failed: "
                        << proof.reason;
@@ -291,7 +284,7 @@ stateRegion(Value state, Value expectedBase, int64_t selectedAxis = -1) {
       if (actual->second[dimension] <= actual->first[dimension])
         return failure();
     return std::move(*actual);
-}
+  }
   SmallVector<int64_t> lower;
   SmallVector<int64_t> upper;
   SmallVector<TaskflowCounterOp> counters;

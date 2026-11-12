@@ -46,18 +46,14 @@ namespace json = llvm::json;
 namespace {
 
 constexpr StringLiteral kScoreSchema = "amoeba-exact-joint-task-scores-v1";
-constexpr StringLiteral kSearchScope =
-    "budgeted-complete-program-neighborhood";
-constexpr StringLiteral kDiagnosticTag =
-    "explicit-complete-program-diagnostic";
+constexpr StringLiteral kSearchScope = "budgeted-complete-program-neighborhood";
+constexpr StringLiteral kDiagnosticTag = "explicit-complete-program-diagnostic";
 constexpr StringLiteral kScoreSource =
     "ml-ii-startup-plus-production-explicit-communication";
 constexpr StringLiteral kLatencyProvenance =
     "source-owned-ml-ii-startup-trip-count-contract";
-constexpr StringLiteral kStartPolicy =
-    "production-spatial-temporal-scheduler";
-constexpr StringLiteral kTemporalSearchScope =
-    "production-task-scheduler-only";
+constexpr StringLiteral kStartPolicy = "production-spatial-temporal-scheduler";
+constexpr StringLiteral kTemporalSearchScope = "production-task-scheduler-only";
 
 static std::string jsonText(const json::Value &value) {
   std::string text;
@@ -139,8 +135,8 @@ static bool parseShape(StringRef text, int64_t &rows, int64_t &cols) {
   StringRef rowText = text.take_front(separator).trim();
   StringRef colText = text.drop_front(separator + 1).trim();
   return !rowText.empty() && !colText.empty() &&
-         !rowText.getAsInteger(10, rows) &&
-         !colText.getAsInteger(10, cols) && rows > 0 && cols > 0;
+         !rowText.getAsInteger(10, rows) && !colText.getAsInteger(10, cols) &&
+         rows > 0 && cols > 0;
 }
 
 static std::optional<int64_t> durationFromCost(const TaskShapeCost &cost,
@@ -159,8 +155,8 @@ static std::optional<int64_t> durationFromCost(const TaskShapeCost &cost,
                          static_cast<long double>(cost.predictedII) *
                              static_cast<long double>(tripCount - 1);
   if (!std::isfinite(duration) || duration <= 0.0L ||
-      duration > static_cast<long double>(
-                     std::numeric_limits<int64_t>::max())) {
+      duration >
+          static_cast<long double>(std::numeric_limits<int64_t>::max())) {
     error = "ML II/startup duration is outside scheduler range";
     return std::nullopt;
   }
@@ -223,37 +219,36 @@ static json::Array costRecords(ArrayRef<TaskShapeChoice> choices,
                                ArrayRef<int64_t> durations) {
   json::Array result;
   for (size_t index = 0; index < choices.size(); ++index) {
-    json::Object entry{
-        {"task", choices[index].task},
-        {"mapper_tile_rows", choices[index].shape.mapperRows},
-        {"mapper_tile_cols", choices[index].shape.mapperCols},
-        {"trip_count", choices[index].tripCount},
-        {"predicted_duration", durations[index]},
-        {"predicted_ii", costs[index].predictedII},
-        {"startup_cycles", costs[index].startupCycles},
-        {"support_status",
-         costs[index].supported ? "supported" : "unsupported"}};
+    json::Object entry{{"task", choices[index].task},
+                       {"mapper_tile_rows", choices[index].shape.mapperRows},
+                       {"mapper_tile_cols", choices[index].shape.mapperCols},
+                       {"trip_count", choices[index].tripCount},
+                       {"predicted_duration", durations[index]},
+                       {"predicted_ii", costs[index].predictedII},
+                       {"startup_cycles", costs[index].startupCycles},
+                       {"support_status",
+                        costs[index].supported ? "supported" : "unsupported"}};
     result.push_back(std::move(entry));
   }
   return result;
 }
 
-static json::Array scheduleRecords(ArrayRef<TaskShapeChoice> choices,
-                                   ArrayRef<ExactSchedulePlacement> placements) {
+static json::Array
+scheduleRecords(ArrayRef<TaskShapeChoice> choices,
+                ArrayRef<ExactSchedulePlacement> placements) {
   json::Array result;
   for (const ExactSchedulePlacement &placement : placements) {
     if (placement.task >= choices.size())
       continue;
     const TaskShapeChoice &choice = choices[placement.task];
-    result.push_back(json::Object{
-        {"task", choice.task},
-        {"row", placement.row},
-        {"col", placement.col},
-        {"rows", choice.shape.rows},
-        {"cols", choice.shape.cols},
-        {"start_cycle", placement.start},
-        {"end_cycle", placement.end},
-        {"idle_cycles", placement.idleCycles}});
+    result.push_back(json::Object{{"task", choice.task},
+                                  {"row", placement.row},
+                                  {"col", placement.col},
+                                  {"rows", choice.shape.rows},
+                                  {"cols", choice.shape.cols},
+                                  {"start_cycle", placement.start},
+                                  {"end_cycle", placement.end},
+                                  {"idle_cycles", placement.idleCycles}});
   }
   return result;
 }
@@ -267,10 +262,12 @@ static json::Array dispatchRecords(ArrayRef<unsigned> dispatch,
   return result;
 }
 
-static json::Object makeScoreRecord(
-    StringRef candidateId, StringRef graphId, int64_t makespan,
-    ArrayRef<TaskShapeChoice> choices, ArrayRef<TaskShapeCost> costs,
-    ArrayRef<int64_t> durations, const ProductionScheduledResult &schedule) {
+static json::Object makeScoreRecord(StringRef candidateId, StringRef graphId,
+                                    int64_t makespan,
+                                    ArrayRef<TaskShapeChoice> choices,
+                                    ArrayRef<TaskShapeCost> costs,
+                                    ArrayRef<int64_t> durations,
+                                    const ProductionScheduledResult &schedule) {
   return json::Object{
       {"schema", kScoreSchema},
       {"record_type", "score"},
@@ -311,7 +308,8 @@ public:
     return "prepare-joint-diagnostic-candidate";
   }
   StringRef getDescription() const override {
-    return "Emit one source-bound explicit joint scheduling diagnostic candidate";
+    return "Emit one source-bound explicit joint scheduling diagnostic "
+           "candidate";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -323,8 +321,7 @@ public:
                                      llvm::cl::init("")};
   Option<std::string> sourceRepository{*this, "source-repository",
                                        llvm::cl::init("")};
-  Option<std::string> sourceCommit{*this, "source-commit",
-                                   llvm::cl::init("")};
+  Option<std::string> sourceCommit{*this, "source-commit", llvm::cl::init("")};
   Option<std::string> architecturePath{*this, "architecture-path",
                                        llvm::cl::init("")};
   Option<std::string> candidateId{*this, "candidate-id", llvm::cl::init("")};
@@ -428,9 +425,10 @@ public:
         return legal.rows == rows && legal.cols == cols;
       });
       if (shape == legalShapes.end()) {
-        error = "task-shapes selects an unsupported area-four oriented shape for " +
-                task.name + ": " + std::to_string(rows) + "x" +
-                std::to_string(cols);
+        error =
+            "task-shapes selects an unsupported area-four oriented shape for " +
+            task.name + ": " + std::to_string(rows) + "x" +
+            std::to_string(cols);
         fail(error);
         return;
       }
@@ -452,7 +450,8 @@ public:
       auto duration = durationFromCost(*cost, task.tripCount, error);
       if (!duration) {
         if (error.empty())
-          error = "requested task shape has no finite duration for " + task.name;
+          error =
+              "requested task shape has no finite duration for " + task.name;
         fail(error);
         return;
       }
@@ -498,9 +497,9 @@ public:
     const std::string scorePath = outputDir + "/score.jsonl";
     const std::string selectionPath = outputDir + "/selection.jsonl";
 
-    json::Object scoreRecord = makeScoreRecord(
-        candidate.id, graph.getValue(), schedule.makespan, candidate.choices,
-        costs, durations, schedule);
+    json::Object scoreRecord =
+        makeScoreRecord(candidate.id, graph.getValue(), schedule.makespan,
+                        candidate.choices, costs, durations, schedule);
     json::Object header{
         {"record_type", "header"},
         {"schema", kScoreSchema},
@@ -530,8 +529,9 @@ public:
                         {"diagnostic_tag", kDiagnosticTag},
                         {"search_winner_claim", false}};
     std::string scoreText = jsonText(json::Value(std::move(header))) + "\n" +
-                            jsonText(json::Value(json::Object(scoreRecord))) + "\n" +
-                            jsonText(json::Value(std::move(footer))) + "\n";
+                            jsonText(json::Value(json::Object(scoreRecord))) +
+                            "\n" + jsonText(json::Value(std::move(footer))) +
+                            "\n";
 
     json::Object selection{
         {"record_type", "selection"},
@@ -565,8 +565,8 @@ public:
     json::Array seedShapes;
     for (const auto &choice : candidate.choices)
       seedShapes.push_back(json::Object{{"task", choice.task},
-                                       {"rows", choice.shape.rows},
-                                       {"cols", choice.shape.cols}});
+                                        {"rows", choice.shape.rows},
+                                        {"cols", choice.shape.cols}});
     selection["shapes"] = std::move(seedShapes);
 
     std::string selectionText =
@@ -575,10 +575,11 @@ public:
 
     if (!writeTextAtomically(candidatePath, sourceText, error) ||
         !writeNeighborhoodShapeSelection(module, function, candidate, shapePath,
-                                          error) ||
+                                         error) ||
         !writeTextAtomically(scorePath, scoreText, error) ||
         !writeTextAtomically(selectionPath, selectionText, error)) {
-      fail(error.empty() ? "cannot publish diagnostic candidate outputs" : error);
+      fail(error.empty() ? "cannot publish diagnostic candidate outputs"
+                         : error);
       return;
     }
   }

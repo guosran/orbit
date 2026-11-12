@@ -17,10 +17,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCandidateCommon.h"
+#include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
 #include "ClosureLegalityPreflight.h"
 #include "JointRewritePreflight.h"
-#include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
-#include "Backend/Neura/NeuraBackendPasses.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 #include "TaskflowDialect/TaskflowOps.h"
@@ -32,9 +32,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Parser/Parser.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -218,16 +218,15 @@ static json::Object lineageObject(const TaskLineageState &state) {
     json::Array members;
     for (const auto &lineageEntry : taskEntry.second) {
       const DimensionSelection &selection = lineageEntry.second;
-      members.push_back(json::Object{
-          {"lineage", lineageEntry.first},
-          {"m_factor", selection.mFactor},
-          {"n_factor", selection.nFactor},
-          {"k_factor", selection.kFactor},
-          {"replica_factor", selection.replicaFactor}});
+      members.push_back(
+          json::Object{{"lineage", lineageEntry.first},
+                       {"m_factor", selection.mFactor},
+                       {"n_factor", selection.nFactor},
+                       {"k_factor", selection.kFactor},
+                       {"replica_factor", selection.replicaFactor}});
     }
-    tasks.push_back(json::Object{
-        {"task", taskEntry.first},
-        {"members", std::move(members)}});
+    tasks.push_back(json::Object{{"task", taskEntry.first},
+                                 {"members", std::move(members)}});
   }
   return json::Object{{"tasks", std::move(tasks)}};
 }
@@ -242,11 +241,10 @@ static bool parseLineageObject(const json::Object &object,
   }
   for (const json::Value &taskValue : *tasks) {
     const json::Object *taskObject = taskValue.getAsObject();
-    const auto taskName = taskObject ? taskObject->getString("task")
-                                     : std::optional<StringRef>();
-    const json::Array *members = taskObject
-                                     ? taskObject->getArray("members")
-                                     : nullptr;
+    const auto taskName =
+        taskObject ? taskObject->getString("task") : std::optional<StringRef>();
+    const json::Array *members =
+        taskObject ? taskObject->getArray("members") : nullptr;
     if (!taskName || !members || taskName->empty() ||
         state.count(taskName->str())) {
       error = "resume checkpoint lineage has an invalid task entry";
@@ -255,27 +253,26 @@ static bool parseLineageObject(const json::Object &object,
     LineageState lineage;
     for (const json::Value &memberValue : *members) {
       const json::Object *member = memberValue.getAsObject();
-      const auto lineageName = member ? member->getString("lineage")
-                                      : std::optional<StringRef>();
-      const auto mFactor = member ? member->getInteger("m_factor")
-                                  : std::optional<int64_t>();
-      const auto nFactor = member ? member->getInteger("n_factor")
-                                  : std::optional<int64_t>();
-      const auto kFactor = member ? member->getInteger("k_factor")
-                                  : std::optional<int64_t>();
-      const auto replicaFactor = member
-                                     ? member->getInteger("replica_factor")
-                                     : std::optional<int64_t>();
-      if (!lineageName || lineageName->empty() || lineage.count(lineageName->str()) ||
-          !mFactor || !nFactor || !kFactor || !replicaFactor ||
-          *mFactor <= 0 || *nFactor <= 0 || *kFactor <= 0 ||
-          *replicaFactor <= 0) {
+      const auto lineageName =
+          member ? member->getString("lineage") : std::optional<StringRef>();
+      const auto mFactor =
+          member ? member->getInteger("m_factor") : std::optional<int64_t>();
+      const auto nFactor =
+          member ? member->getInteger("n_factor") : std::optional<int64_t>();
+      const auto kFactor =
+          member ? member->getInteger("k_factor") : std::optional<int64_t>();
+      const auto replicaFactor = member ? member->getInteger("replica_factor")
+                                        : std::optional<int64_t>();
+      if (!lineageName || lineageName->empty() ||
+          lineage.count(lineageName->str()) || !mFactor || !nFactor ||
+          !kFactor || !replicaFactor || *mFactor <= 0 || *nFactor <= 0 ||
+          *kFactor <= 0 || *replicaFactor <= 0) {
         error = "resume checkpoint lineage has an invalid member entry";
         return false;
       }
-      lineage.emplace(lineageName->str(), DimensionSelection{
-                                               *mFactor, *nFactor, *kFactor,
-                                               *replicaFactor});
+      lineage.emplace(
+          lineageName->str(),
+          DimensionSelection{*mFactor, *nFactor, *kFactor, *replicaFactor});
     }
     if (lineage.empty()) {
       error = "resume checkpoint lineage has an empty task lineage";
@@ -302,9 +299,8 @@ static SmallVector<std::string> taskNames(ModuleOp module,
   if (failed(selected))
     return {};
   SmallVector<std::string> names;
-  selected->walk([&](TaskflowTaskOp task) {
-    names.push_back(task.getTaskName().str());
-  });
+  selected->walk(
+      [&](TaskflowTaskOp task) { names.push_back(task.getTaskName().str()); });
   return names;
 }
 
@@ -349,16 +345,15 @@ static bool runPassOnClone(ModuleOp module, std::unique_ptr<Pass> pass,
   LogicalResult runResult = failure();
   LogicalResult verifyResult = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(
-                                            diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     runResult = manager.run(module);
     if (succeeded(runResult))
       verifyResult = verify(module.getOperation());
@@ -379,8 +374,8 @@ static bool runPassOnClone(ModuleOp module, std::unique_ptr<Pass> pass,
 static bool isFactsOutputResourceDiagnostic(StringRef diagnostic,
                                             StringRef factsPath) {
   std::string failedPrefix = "failed while writing " + factsPath.str() + ":";
-  std::string temporaryPrefix = "cannot create temporary output " +
-                                factsPath.str() + ".tmp-";
+  std::string temporaryPrefix =
+      "cannot create temporary output " + factsPath.str() + ".tmp-";
   std::string publishPrefix = "cannot publish " + factsPath.str() + ":";
   return diagnostic.contains(failedPrefix) ||
          diagnostic.contains(temporaryPrefix) ||
@@ -396,35 +391,35 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
   case Action::Kind::Tile:
     pass = mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
     options = "task-name=" + quoteOption(action.firstTask) +
-               " tile-axis=" + std::to_string(action.axis) +
-               " tile-factor=" + std::to_string(action.factor) +
-               " fusion-mode=none";
+              " tile-axis=" + std::to_string(action.axis) +
+              " tile-factor=" + std::to_string(action.factor) +
+              " fusion-mode=none";
     break;
   case Action::Kind::KTile:
     pass = mlir::amoeba::neura::createMaterializeNeuraKReductionPass();
     options = "function=" + quoteOption(functionName) +
               " task-name=" + quoteOption(action.firstTask) +
-               " k-mode=" + action.kMode + " k-factor=" +
-               std::to_string(action.factor);
+              " k-mode=" + action.kMode +
+              " k-factor=" + std::to_string(action.factor);
     break;
   case Action::Kind::Replica:
     pass = mlir::amoeba::neura::createMaterializeJointTaskReplicasPass();
     options = "function=" + quoteOption(functionName) +
               " task=" + quoteOption(action.firstTask) +
-               " replicas=" + std::to_string(action.factor) +
-               " axis=" + std::to_string(action.axis);
+              " replicas=" + std::to_string(action.factor) +
+              " axis=" + std::to_string(action.axis);
     break;
   case Action::Kind::ProducerConsumer:
     pass = mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
     options = "first-task-name=" + quoteOption(action.firstTask) +
-               " second-task-name=" + quoteOption(action.secondTask) +
-               " fusion-mode=" + quoteOption(action.fusionMode);
+              " second-task-name=" + quoteOption(action.secondTask) +
+              " fusion-mode=" + quoteOption(action.fusionMode);
     break;
   case Action::Kind::Sibling:
     pass = mlir::amoeba::neura::createMaterializeNeuraJointRewritePass();
     options = "first-task-name=" + quoteOption(action.firstTask) +
-               " second-task-name=" + quoteOption(action.secondTask) +
-               " fusion-mode=sibling";
+              " second-task-name=" + quoteOption(action.secondTask) +
+              " fusion-mode=sibling";
     break;
   }
   if (!pass) {
@@ -443,11 +438,10 @@ static bool runMaterializer(ModuleOp module, StringRef functionName,
 }
 
 static bool extractFacts(ModuleOp module, StringRef functionName,
-                         StringRef outputPath, uint64_t serial,
-                         Facts &facts, std::string &reason,
-                         std::string &diagnostic) {
-  std::string factsPath = outputPath.str() + ".closure-facts-" +
-                          std::to_string(serial) + ".json";
+                         StringRef outputPath, uint64_t serial, Facts &facts,
+                         std::string &reason, std::string &diagnostic) {
+  std::string factsPath =
+      outputPath.str() + ".closure-facts-" + std::to_string(serial) + ".json";
   auto pass = mlir::amoeba::neura::createExtractJointTaskGraphFactsPass();
   std::string options = "function=" + quoteOption(functionName) +
                         " output=" + quoteOption(factsPath) +
@@ -493,8 +487,8 @@ static bool extractFacts(ModuleOp module, StringRef functionName,
   facts.structuralText = jsonText(json::Value(json::Object(*structural)));
   facts.factsPath = factsPath;
   facts.factsText = (*buffer)->getBuffer().str();
-  facts.kFactsComplete = root->getBoolean("k_reduction_tasks_complete")
-                             .value_or(false);
+  facts.kFactsComplete =
+      root->getBoolean("k_reduction_tasks_complete").value_or(false);
   facts.siblingFactsComplete =
       root->getBoolean("sibling_fusion_candidates_complete").value_or(false);
   facts.siblingMaterializationComplete =
@@ -506,16 +500,12 @@ static bool extractFacts(ModuleOp module, StringRef functionName,
 static json::Object actionObject(const Action &action, StringRef status,
                                  StringRef reason, StringRef diagnostic,
                                  StringRef order, StringRef path) {
-  json::Object object{{"schema", kSchema.str()},
-                      {"record_type", "action"},
-                      {"kind", action.kindName()},
-                      {"status", status.str()},
-                      {"reason", reason.str()},
-                      {"diagnostic", diagnostic.str()},
-                      {"order", order.str()},
-                      {"path", path.str()},
-                      {"first_task", action.firstTask},
-                      {"factor", action.factor}};
+  json::Object object{
+      {"schema", kSchema.str()},        {"record_type", "action"},
+      {"kind", action.kindName()},      {"status", status.str()},
+      {"reason", reason.str()},         {"diagnostic", diagnostic.str()},
+      {"order", order.str()},           {"path", path.str()},
+      {"first_task", action.firstTask}, {"factor", action.factor}};
   if (!action.secondTask.empty())
     object["second_task"] = action.secondTask;
   if (action.axis >= 0)
@@ -529,39 +519,38 @@ static json::Object actionObject(const Action &action, StringRef status,
 
 static json::Object graphObject(const Facts &facts, StringRef path,
                                 bool deduplicated, StringRef firstPath,
-                                StringRef order, const GraphArtifact &artifact) {
-  json::Object object{{"schema", kSchema.str()},
-                      {"record_type", "graph"},
-                      {"status", "legal"},
-                      {"resource_placement_checked", false},
-                      {"path", path.str()},
-                      {"order", order.str()},
-                      {"deduplicated", deduplicated},
-                      {"k_facts_complete", facts.kFactsComplete},
-                      {"sibling_facts_complete", facts.siblingFactsComplete},
-                      {"sibling_materialization_complete",
-                       facts.siblingMaterializationComplete},
-                      {"graph_id", artifact.graphId},
-                      {"mlir_path", artifact.mlirPath},
-                      {"facts_path", artifact.factsPath},
-                      {"structural_key", json::Value(
-                                             json::Object(facts.structuralKey))}};
+                                StringRef order,
+                                const GraphArtifact &artifact) {
+  json::Object object{
+      {"schema", kSchema.str()},
+      {"record_type", "graph"},
+      {"status", "legal"},
+      {"resource_placement_checked", false},
+      {"path", path.str()},
+      {"order", order.str()},
+      {"deduplicated", deduplicated},
+      {"k_facts_complete", facts.kFactsComplete},
+      {"sibling_facts_complete", facts.siblingFactsComplete},
+      {"sibling_materialization_complete",
+       facts.siblingMaterializationComplete},
+      {"graph_id", artifact.graphId},
+      {"mlir_path", artifact.mlirPath},
+      {"facts_path", artifact.factsPath},
+      {"structural_key", json::Value(json::Object(facts.structuralKey))}};
   if (!firstPath.empty())
     object["first_path"] = firstPath.str();
   return object;
 }
 
 static bool isTransientResourceBlocker(StringRef blocker) {
-  return blocker == "max_actions_reached" ||
-         blocker == "max_graphs_reached";
+  return blocker == "max_actions_reached" || blocker == "max_graphs_reached";
 }
 
 class EnumerateJointGraphClosurePass
     : public PassWrapper<EnumerateJointGraphClosurePass,
                          OperationPass<ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      EnumerateJointGraphClosurePass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EnumerateJointGraphClosurePass)
 
   EnumerateJointGraphClosurePass() = default;
   EnumerateJointGraphClosurePass(const EnumerateJointGraphClosurePass &other)
@@ -575,10 +564,9 @@ public:
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, func::FuncDialect,
-                    memref::MemRefDialect, scf::SCFDialect,
-                    neura::NeuraDialect,
-                    TaskflowDialect>();
+    registry
+        .insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
+                scf::SCFDialect, neura::NeuraDialect, TaskflowDialect>();
   }
 
   Option<std::string> outputFile{*this, "output", llvm::cl::init("")};
@@ -589,13 +577,13 @@ public:
   Option<std::string> tilingFactors{*this, "tiling-factors",
                                     llvm::cl::init("")};
   Option<bool> artifactBytecode{*this, "artifact-bytecode",
-                               llvm::cl::init(false)};
+                                llvm::cl::init(false)};
   Option<std::string> factsCompression{*this, "facts-compression",
-                                        llvm::cl::init("legacy-json")};
+                                       llvm::cl::init("legacy-json")};
   Option<std::string> resumeJournal{*this, "resume-journal",
                                     llvm::cl::init("")};
-  Option<int64_t> resumeSnapshotActions{
-      *this, "resume-snapshot-actions", llvm::cl::init(256)};
+  Option<int64_t> resumeSnapshotActions{*this, "resume-snapshot-actions",
+                                        llvm::cl::init(256)};
   Option<std::string> resumeSnapshotCompression{
       *this, "resume-snapshot-compression", llvm::cl::init("legacy-json")};
   Option<int64_t> maxGraphs{*this, "max-graphs", llvm::cl::init(1024)};
@@ -637,11 +625,16 @@ private:
 
   int stageLevel() const {
     StringRef stage = stageName.getValue();
-    if (stage == "shape-only") return 1;
-    if (stage == "shape-temporal") return 2;
-    if (stage == "shape-temporal-replica") return 3;
-    if (stage == "shape-temporal-replica-tiling") return 4;
-    if (stage == "full-joint") return 5;
+    if (stage == "shape-only")
+      return 1;
+    if (stage == "shape-temporal")
+      return 2;
+    if (stage == "shape-temporal-replica")
+      return 3;
+    if (stage == "shape-temporal-replica-tiling")
+      return 4;
+    if (stage == "full-joint")
+      return 5;
     return 0;
   }
 
@@ -717,7 +710,8 @@ private:
         {"graph_artifact_directory", graphArtifactDirectory},
         {"graph_facts_storage_format", factsCompression.getValue()},
         {"graph_artifact_format", artifactBytecode.getValue()
-             ? "identity-text-variants-bytecode-v1" : "text"},
+                                      ? "identity-text-variants-bytecode-v1"
+                                      : "text"},
         {"coverage", "graph-rewrites-only; scheduling-coverage-delegated"},
         {"stage_coverage_note",
          "all stages delegate order and location to the selected downstream "
@@ -741,11 +735,9 @@ private:
         {"graph_scope_complete", complete},
         {"action_attempts", static_cast<int64_t>(actionAttempts)},
         {"graph_count", static_cast<int64_t>(graphCount)},
-        {"unique_structural_keys",
-         static_cast<int64_t>(seenStructural.size())},
+        {"unique_structural_keys", static_cast<int64_t>(seenStructural.size())},
         {"unknown_action_count", static_cast<int64_t>(unknownCount)},
-        {"incomplete_facts_count",
-         static_cast<int64_t>(incompleteFactsCount)},
+        {"incomplete_facts_count", static_cast<int64_t>(incompleteFactsCount)},
         {"rejected_action_count", static_cast<int64_t>(rejectedCount)},
         {"proven_illegal_action_count",
          static_cast<int64_t>(provenIllegalCount)},
@@ -763,8 +755,7 @@ private:
         {"first_blocker", firstBlocker.empty() ? "" : firstBlocker}};
     if (durableCheckpoint) {
       object["durable_checkpoint"] = true;
-      object["journal_record_count"] =
-          static_cast<int64_t>(journalRecordCount);
+      object["journal_record_count"] = static_cast<int64_t>(journalRecordCount);
       object["journal_data_bytes"] = static_cast<int64_t>(journalDataBytes);
       object["journal_write_failed"] = journalWriteFailed;
       object["resource_failure"] = resourceFailure;
@@ -786,17 +777,19 @@ private:
         {"output", outputFile.getValue()},
         {"graph_artifact_directory", graphArtifactDirectory},
         {"source_module_text", originalInputText},
-        {"options", json::Object{
-            {"function", functionName.getValue()},
-            {"stage", stageName.getValue()},
-            {"replica_factors", replicaFactors.getValue()},
-            {"tiling_factors", tilingFactors.getValue()},
-            {"artifact_bytecode", artifactBytecode.getValue()},
-            {"facts_compression", factsCompression.getValue()},
-            {"resume_snapshot_actions", resumeSnapshotActions.getValue()},
-            {"resume_snapshot_compression", resumeSnapshotCompression.getValue()},
-            {"max_graphs", maxGraphs.getValue()},
-            {"max_actions", maxActions.getValue()}}},
+        {"options",
+         json::Object{
+             {"function", functionName.getValue()},
+             {"stage", stageName.getValue()},
+             {"replica_factors", replicaFactors.getValue()},
+             {"tiling_factors", tilingFactors.getValue()},
+             {"artifact_bytecode", artifactBytecode.getValue()},
+             {"facts_compression", factsCompression.getValue()},
+             {"resume_snapshot_actions", resumeSnapshotActions.getValue()},
+             {"resume_snapshot_compression",
+              resumeSnapshotCompression.getValue()},
+             {"max_graphs", maxGraphs.getValue()},
+             {"max_actions", maxActions.getValue()}}},
         {"complete", false},
         {"status", "incomplete"}});
   }
@@ -824,8 +817,8 @@ private:
         llvm::sys::fs::resize_file(descriptor, journalBytes);
     std::error_code closeError = llvm::sys::fs::closeFile(descriptor);
     if (resizeError) {
-      error = "cannot restore durable journal prefix " + journalPath +
-              ": " + resizeError.message();
+      error = "cannot restore durable journal prefix " + journalPath + ": " +
+              resizeError.message();
       if (closeError)
         error += "; close: " + closeError.message();
       return false;
@@ -848,12 +841,12 @@ private:
       return false;
     }
     std::error_code ec;
-    llvm::raw_fd_ostream stream(
-        journalPath, ec, llvm::sys::fs::CD_OpenAlways,
-        llvm::sys::fs::FA_Write, llvm::sys::fs::OF_Append);
+    llvm::raw_fd_ostream stream(journalPath, ec, llvm::sys::fs::CD_OpenAlways,
+                                llvm::sys::fs::FA_Write,
+                                llvm::sys::fs::OF_Append);
     if (ec) {
-      std::string error = "cannot append durable journal " + journalPath +
-                           ": " + ec.message();
+      std::string error =
+          "cannot append durable journal " + journalPath + ": " + ec.message();
       noteJournalFailure(error);
       if (errorOut)
         *errorOut = error;
@@ -863,7 +856,7 @@ private:
     stream.close();
     if (stream.has_error()) {
       std::string error = "failed appending durable journal " + journalPath +
-                           ": " + stream.error().message();
+                          ": " + stream.error().message();
       stream.clear_error();
       std::string restoreError;
       if (!restoreJournalPrefix(restoreError))
@@ -886,9 +879,10 @@ private:
     resumeSnapshotPath = outputFile.getValue() + ".resume.snapshot.json";
     llvm::sys::fs::file_status status;
     std::error_code ec = llvm::sys::fs::status(journalPath, status);
-    if (ec && ec != std::make_error_code(std::errc::no_such_file_or_directory)) {
-      error = "cannot inspect durable journal " + journalPath + ": " +
-              ec.message();
+    if (ec &&
+        ec != std::make_error_code(std::errc::no_such_file_or_directory)) {
+      error =
+          "cannot inspect durable journal " + journalPath + ": " + ec.message();
       noteJournalFailure(error);
       return false;
     }
@@ -904,8 +898,7 @@ private:
       journalBytes = status.getSize();
     }
     journalSegmentStart = journalBytes;
-    if (!appendJournalText(journalHeaderLine(), /*isDataRecord=*/false,
-                           &error))
+    if (!appendJournalText(journalHeaderLine(), /*isDataRecord=*/false, &error))
       return false;
     journalHeaderBytes = journalBytes;
     return true;
@@ -927,19 +920,19 @@ private:
 
     json::Array frontier;
     for (const FrontierCheckpointEntry &entry : frontierLedger) {
-      frontier.push_back(json::Object{
-          {"structural_text", entry.structuralText},
-          {"graph_id", entry.artifact.graphId},
-          {"mlir_path", entry.artifact.mlirPath},
-          {"facts_path", entry.artifact.factsPath},
-          {"path", entry.path},
-          {"kind", frontierKindName(entry.kind).str()},
-          {"include_replica", entry.includeReplica},
-          {"include_tiling", entry.includeTiling},
-          {"module_text", entry.moduleText},
-          {"graph_variant_present", entry.graphVariantPresent},
-          {"graph_variant_value", entry.graphVariantValue},
-          {"lineage", lineageObject(entry.lineage)}});
+      frontier.push_back(
+          json::Object{{"structural_text", entry.structuralText},
+                       {"graph_id", entry.artifact.graphId},
+                       {"mlir_path", entry.artifact.mlirPath},
+                       {"facts_path", entry.artifact.factsPath},
+                       {"path", entry.path},
+                       {"kind", frontierKindName(entry.kind).str()},
+                       {"include_replica", entry.includeReplica},
+                       {"include_tiling", entry.includeTiling},
+                       {"module_text", entry.moduleText},
+                       {"graph_variant_present", entry.graphVariantPresent},
+                       {"graph_variant_value", entry.graphVariantValue},
+                       {"lineage", lineageObject(entry.lineage)}});
     }
     return json::Object{
         {"schema", kSchema.str()},
@@ -962,8 +955,7 @@ private:
         {"resume_data_record_count", static_cast<int64_t>(journalRecordCount)},
         {"action_attempts", static_cast<int64_t>(actionAttempts)},
         {"graph_count", static_cast<int64_t>(graphCount)},
-        {"unique_structural_keys",
-         static_cast<int64_t>(seenStructural.size())},
+        {"unique_structural_keys", static_cast<int64_t>(seenStructural.size())},
         {"unknown_action_count", static_cast<int64_t>(unknownCount)},
         {"incomplete_facts_count", static_cast<int64_t>(incompleteFactsCount)},
         {"rejected_action_count", static_cast<int64_t>(rejectedCount)},
@@ -982,9 +974,9 @@ private:
         {"snapshot_write_failed", snapshotWriteFailed},
         {"journal_error", journalError},
         {"first_blocker", firstBlocker.empty() ? "" : firstBlocker},
-        {"pending_frontier_count",
-         static_cast<int64_t>(frontierLedger.size())},
-        {"frontier_memo_keys", [&]() {
+        {"pending_frontier_count", static_cast<int64_t>(frontierLedger.size())},
+        {"frontier_memo_keys",
+         [&]() {
            json::Array keys;
            SmallVector<std::string> sortedKeys;
            sortedKeys.reserve(frontierMemo.size());
@@ -1023,8 +1015,8 @@ private:
     auto codec = resumeSnapshotCompression.getValue() == "zstd"
                      ? graph_facts_io::FactsCompression::Zstd
                      : graph_facts_io::FactsCompression::LegacyJson;
-    if (!graph_facts_io::encodeGraphFacts(
-            jsonLine(resumeCheckpointObject()), codec, storedSnapshot, error)) {
+    if (!graph_facts_io::encodeGraphFacts(jsonLine(resumeCheckpointObject()),
+                                          codec, storedSnapshot, error)) {
       noteSnapshotFailure(error);
       return false;
     }
@@ -1033,8 +1025,9 @@ private:
     if (!writeAtomically(
             resumeSnapshotPath,
             [&](llvm::raw_ostream &stream) {
-              stream.write(reinterpret_cast<const char *>(storedSnapshot.data()),
-                           storedSnapshot.size());
+              stream.write(
+                  reinterpret_cast<const char *>(storedSnapshot.data()),
+                  storedSnapshot.size());
               return true;
             },
             error)) {
@@ -1081,8 +1074,8 @@ private:
     llvm::sys::fs::file_status status;
     std::error_code ec = llvm::sys::fs::status(journalPath, status);
     if (ec) {
-      error = "cannot stat durable journal " + journalPath + ": " +
-              ec.message();
+      error =
+          "cannot stat durable journal " + journalPath + ": " + ec.message();
       return false;
     }
     if (status.getSize() < journalHeaderBytes + journalDataBytes) {
@@ -1094,8 +1087,8 @@ private:
     uint64_t remaining = journalDataBytes;
     while (remaining != 0) {
       uint64_t chunk = std::min<uint64_t>(remaining, kChunkBytes);
-      auto buffer = llvm::MemoryBuffer::getFileSlice(journalPath, chunk,
-                                                      offset);
+      auto buffer =
+          llvm::MemoryBuffer::getFileSlice(journalPath, chunk, offset);
       if (!buffer) {
         error = "cannot read durable journal record prefix " + journalPath;
         return false;
@@ -1146,7 +1139,8 @@ private:
       error = "resume journal path is empty";
       return false;
     }
-    const std::string expectedJournal = outputFile.getValue() + ".journal.jsonl";
+    const std::string expectedJournal =
+        outputFile.getValue() + ".journal.jsonl";
     if (path != expectedJournal) {
       error = "resume journal must be the output's exact durable journal path";
       return false;
@@ -1172,7 +1166,8 @@ private:
       std::string translated;
       if (bytes.starts_with("ORBITRS1")) {
         translated = bytes.str();
-        std::memcpy(translated.data(), graph_facts_io::kCompressedFactsMagic, 8);
+        std::memcpy(translated.data(), graph_facts_io::kCompressedFactsMagic,
+                    8);
         bytes = translated;
       } else if (bytes.starts_with(graph_facts_io::kCompressedFactsMagic)) {
         error = "graph facts artifact cannot be used as a resume snapshot";
@@ -1181,8 +1176,7 @@ private:
       std::string snapshotText;
       if (!graph_facts_io::decodeGraphFacts(bytes, snapshotText, error))
         return false;
-      llvm::Expected<json::Value> parsed =
-          json::parse(snapshotText);
+      llvm::Expected<json::Value> parsed = json::parse(snapshotText);
       if (!parsed || !parsed->getAsObject()) {
         error = "resume snapshot is invalid JSON";
         if (!parsed)
@@ -1199,8 +1193,8 @@ private:
       }
       int64_t segmentStart = 0;
       int64_t prefixEnd = 0;
-      if (!parseRequiredInteger(snapshot, "journal_segment_start",
-                                segmentStart, error) ||
+      if (!parseRequiredInteger(snapshot, "journal_segment_start", segmentStart,
+                                error) ||
           !parseRequiredInteger(snapshot, "journal_prefix_end", prefixEnd,
                                 error) ||
           segmentStart < 0 || prefixEnd <= segmentStart) {
@@ -1226,7 +1220,7 @@ private:
     StringRef remaining = (*buffer)->getBuffer();
     if (loadedSnapshot)
       remaining = remaining.substr(snapshotSegmentStart,
-                                  snapshotPrefixEnd - snapshotSegmentStart);
+                                   snapshotPrefixEnd - snapshotSegmentStart);
     while (!remaining.empty()) {
       size_t newline = remaining.find('\n');
       StringRef line = newline == StringRef::npos
@@ -1276,10 +1270,12 @@ private:
     if (loadedSnapshot)
       currentCheckpoint = snapshot;
     if (currentHeader.empty() || !currentCheckpoint) {
-      error = "resume journal has no frontier checkpoint; old or interrupted ledger is not resumable";
+      error = "resume journal has no frontier checkpoint; old or interrupted "
+              "ledger is not resumable";
       return false;
     }
-    if (currentHeader.getString("schema") != std::optional<StringRef>(kSchema) ||
+    if (currentHeader.getString("schema") !=
+            std::optional<StringRef>(kSchema) ||
         currentHeader.getString("journal_schema") !=
             std::optional<StringRef>("orbit-joint-graph-closure-journal-v1") ||
         currentHeader.getString("resume_schema") !=
@@ -1291,7 +1287,8 @@ private:
     }
     if (currentHeader.getString("function") !=
             std::optional<StringRef>(functionName) ||
-        currentHeader.getString("stage") != std::optional<StringRef>(stageName) ||
+        currentHeader.getString("stage") !=
+            std::optional<StringRef>(stageName) ||
         currentHeader.getString("output") !=
             std::optional<StringRef>(outputFile.getValue()) ||
         currentHeader.getString("graph_artifact_directory") !=
@@ -1305,8 +1302,9 @@ private:
       return false;
     }
     const json::Object *options = currentHeader.getObject("options");
-    if (!options || options->getString("function") !=
-                        std::optional<StringRef>(functionName) ||
+    if (!options ||
+        options->getString("function") !=
+            std::optional<StringRef>(functionName) ||
         options->getString("stage") != std::optional<StringRef>(stageName) ||
         options->getString("replica_factors") !=
             std::optional<StringRef>(replicaFactors.getValue()) ||
@@ -1325,8 +1323,8 @@ private:
     }
     int64_t savedMaxGraphs = 0;
     int64_t savedMaxActions = 0;
-    if (!options || !parseRequiredInteger(*options, "max_graphs", savedMaxGraphs,
-                                          error) ||
+    if (!options ||
+        !parseRequiredInteger(*options, "max_graphs", savedMaxGraphs, error) ||
         !parseRequiredInteger(*options, "max_actions", savedMaxActions, error))
       return false;
     if (maxGraphs.getValue() < savedMaxGraphs ||
@@ -1366,19 +1364,20 @@ private:
                               checkpointDataBytes, error) ||
         !parseRequiredInteger(checkpoint, "journal_prefix_end",
                               checkpointPrefixEnd, error) ||
-        checkpointSegmentStart < 0 || checkpointHeaderBytes <= checkpointSegmentStart ||
-        checkpointDataBytes < 0 || checkpointPrefixEnd !=
-            checkpointHeaderBytes + checkpointDataBytes ||
-        (!loadedSnapshot ||
-         static_cast<uint64_t>(checkpointSegmentStart) != snapshotSegmentStart) ||
+        checkpointSegmentStart < 0 ||
+        checkpointHeaderBytes <= checkpointSegmentStart ||
+        checkpointDataBytes < 0 ||
+        checkpointPrefixEnd != checkpointHeaderBytes + checkpointDataBytes ||
+        (!loadedSnapshot || static_cast<uint64_t>(checkpointSegmentStart) !=
+                                snapshotSegmentStart) ||
         (!loadedSnapshot ||
          static_cast<uint64_t>(checkpointPrefixEnd) != snapshotPrefixEnd)) {
       error = "resume snapshot journal binding is inconsistent";
       return false;
     }
     if (auto savedSequence = checkpoint.getInteger("snapshot_sequence"))
-      snapshotSequence = static_cast<uint64_t>(std::max<int64_t>(
-          0, *savedSequence));
+      snapshotSequence =
+          static_cast<uint64_t>(std::max<int64_t>(0, *savedSequence));
     if (checkpoint.getBoolean("journal_write_failed").value_or(true)) {
       error = "resume journal was itself write-failed and is not trustworthy";
       return false;
@@ -1465,7 +1464,8 @@ private:
       auto graphPath = object->getString("path");
       auto order = object->getString("order");
       if (!structural || !graphId || !mlirPath || !factsPath || !graphPath ||
-          !order || graphId->empty() || mlirPath->empty() || factsPath->empty()) {
+          !order || graphId->empty() || mlirPath->empty() ||
+          factsPath->empty()) {
         error = "resume graph record is missing artifact binding";
         return false;
       }
@@ -1541,7 +1541,8 @@ private:
       return false;
     }
 
-    const json::Array *attempted = checkpoint.getArray("attempted_action_paths");
+    const json::Array *attempted =
+        checkpoint.getArray("attempted_action_paths");
     if (!attempted) {
       error = "resume checkpoint has no attempted action ledger";
       return false;
@@ -1554,7 +1555,8 @@ private:
         return false;
       }
       if (!recordedActionPaths.contains(*pathValue)) {
-        error = "resume checkpoint attempted action is absent from the action ledger";
+        error = "resume checkpoint attempted action is absent from the action "
+                "ledger";
         return false;
       }
       attemptedActionPaths.insert(*pathValue);
@@ -1618,7 +1620,8 @@ private:
       if (!structuralText || !graphId || !mlirPath || !factsPath ||
           !pathValue || !kindName || !includeReplica || !includeTiling ||
           !moduleText || !graphVariantPresent || !graphVariantValue ||
-          !lineageObjectValue || structuralText->empty() || pathValue->empty() ||
+          !lineageObjectValue || structuralText->empty() ||
+          pathValue->empty() ||
           (*graphVariantPresent && graphVariantValue->empty())) {
         error = "resume checkpoint frontier entry is incomplete";
         return false;
@@ -1677,10 +1680,11 @@ private:
       }
       FailureOr<func::FuncOp> artifactFunction =
           selectTaskFunction(*artifactModule, functionName, parseError);
-      auto artifactVariant = failed(artifactFunction)
-                                 ? StringAttr()
-                                 : (*artifactFunction)->getAttrOfType<StringAttr>(
-                                       "amoeba.graph_variant_id");
+      auto artifactVariant =
+          failed(artifactFunction)
+              ? StringAttr()
+              : (*artifactFunction)
+                    ->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
       if (failed(artifactFunction) || !artifactVariant ||
           artifactVariant.getValue() != graphId->str()) {
         error = "resume frontier graph artifact function binding differs";
@@ -1691,10 +1695,10 @@ private:
       // comparing and memoizing it; the graph id must never leak into the
       // source-owned module used for subsequent rewrites.
       if (*graphVariantPresent)
-        (*artifactFunction)->setAttr(
-            "amoeba.graph_variant_id",
-            StringAttr::get(artifactFunction->getContext(),
-                            *graphVariantValue));
+        (*artifactFunction)
+            ->setAttr("amoeba.graph_variant_id",
+                      StringAttr::get(artifactFunction->getContext(),
+                                      *graphVariantValue));
       else
         (*artifactFunction)->removeAttr("amoeba.graph_variant_id");
       if (printedModuleText(*artifactModule) != moduleText->str()) {
@@ -1710,10 +1714,10 @@ private:
           *includeReplica, *includeTiling, moduleText->str(),
           *graphVariantPresent, graphVariantValue->str(),
           restoredFrontier.back().lineage});
-      std::string restoredMemoKey = frontierStateKey(
-          *structuralText, *restoredFrontier.back().module,
-          restoredFrontier.back().lineage, kind, *includeReplica,
-          *includeTiling);
+      std::string restoredMemoKey =
+          frontierStateKey(*structuralText, *restoredFrontier.back().module,
+                           restoredFrontier.back().lineage, kind,
+                           *includeReplica, *includeTiling);
       if (!frontierMemo.contains(restoredMemoKey)) {
         error = "resume frontier is absent from the durable memo state";
         return false;
@@ -1735,8 +1739,7 @@ private:
     SmallVector<StringRef, 8> fields;
     specification.split(fields, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/true);
     if (fields.empty()) {
-      error = optionName.str() +
-              " must contain at least one factor";
+      error = optionName.str() + " must contain at least one factor";
       return false;
     }
     for (StringRef field : fields) {
@@ -1752,8 +1755,7 @@ private:
       for (int64_t candidate : kSupportedFactors)
         allowed |= factor == candidate;
       if (!allowed) {
-        error = optionName.str() +
-                " contains a value outside {1,2,4,8}";
+        error = optionName.str() + " contains a value outside {1,2,4,8}";
         return false;
       }
       for (int64_t existing : alphabet) {
@@ -1798,8 +1800,8 @@ private:
       return;
     if (attemptedActionPaths.contains(path))
       return;
-    if (!appendJournalRecord(jsonLine(actionObject(
-            action, status, reason, diagnostic, order, path))))
+    if (!appendJournalRecord(jsonLine(
+            actionObject(action, status, reason, diagnostic, order, path))))
       return;
     attemptedActionPaths.insert(path);
     if (resumeSnapshotActions.getValue() > 0 &&
@@ -1832,12 +1834,12 @@ private:
 
   bool persistGraphArtifact(ModuleOp module, Facts &facts,
                             GraphArtifact &artifact, bool identity) {
-    artifact.graphId = identity ? "identity"
-                                : "graph-" + std::to_string(nextGraphOrdinal++);
-    artifact.mlirPath = graphArtifactDirectory + "/" + artifact.graphId +
-                        ".mlir";
-    artifact.factsPath = graphArtifactDirectory + "/" + artifact.graphId +
-                         ".facts.json";
+    artifact.graphId =
+        identity ? "identity" : "graph-" + std::to_string(nextGraphOrdinal++);
+    artifact.mlirPath =
+        graphArtifactDirectory + "/" + artifact.graphId + ".mlir";
+    artifact.factsPath =
+        graphArtifactDirectory + "/" + artifact.graphId + ".facts.json";
 
     std::string error;
     graph_facts_io::FactsCompression compression = selectedFactsCompression();
@@ -1877,9 +1879,10 @@ private:
       llvm::sys::fs::remove(artifact.factsPath);
       return false;
     }
-    (*artifactFunction)->setAttr(
-        "amoeba.graph_variant_id",
-        StringAttr::get(artifactFunction->getContext(), artifact.graphId));
+    (*artifactFunction)
+        ->setAttr(
+            "amoeba.graph_variant_id",
+            StringAttr::get(artifactFunction->getContext(), artifact.graphId));
     if (!writeAtomically(
             artifact.mlirPath,
             [&](llvm::raw_ostream &stream) {
@@ -1914,8 +1917,8 @@ private:
     Facts facts;
     std::string reason;
     std::string diagnostic;
-    if (!extractFacts(module, functionName, outputFile, serial++, facts,
-                      reason, diagnostic)) {
+    if (!extractFacts(module, functionName, outputFile, serial++, facts, reason,
+                      diagnostic)) {
       if (reason == "facts_output_resource_failure") {
         resourceFailure = true;
         budgetReached = true;
@@ -1923,14 +1926,14 @@ private:
       }
       ++unknownCount;
       noteFirstBlocker(reason);
-      bool appended = appendJournalRecord(jsonLine(json::Object{
-          {"schema", kSchema.str()},
-          {"record_type", "graph"},
-          {"status", "unknown"},
-          {"path", path.str()},
-          {"order", order.str()},
-          {"reason", reason},
-          {"diagnostic", diagnostic}}));
+      bool appended = appendJournalRecord(
+          jsonLine(json::Object{{"schema", kSchema.str()},
+                                {"record_type", "graph"},
+                                {"status", "unknown"},
+                                {"path", path.str()},
+                                {"order", order.str()},
+                                {"reason", reason},
+                                {"diagnostic", diagnostic}}));
       if (appended)
         recordedGraphPaths.insert(path);
       return false;
@@ -1954,13 +1957,13 @@ private:
       bool identity = order == "identity" && path == "identity";
       if (!persistGraphArtifact(module, facts, artifact, identity)) {
         ++unknownCount;
-        bool appended = appendJournalRecord(jsonLine(json::Object{
-            {"schema", kSchema.str()},
-            {"record_type", "graph"},
-            {"status", "unknown"},
-            {"path", path.str()},
-            {"order", order.str()},
-            {"reason", firstBlocker}}));
+        bool appended = appendJournalRecord(
+            jsonLine(json::Object{{"schema", kSchema.str()},
+                                  {"record_type", "graph"},
+                                  {"status", "unknown"},
+                                  {"path", path.str()},
+                                  {"order", order.str()},
+                                  {"reason", firstBlocker}}));
         if (appended)
           recordedGraphPaths.insert(path);
         return false;
@@ -1975,8 +1978,8 @@ private:
           firstBlocker = "max_graphs_reached";
       }
     }
-    bool appended = appendJournalRecord(jsonLine(graphObject(
-        facts, path, duplicate, firstPath, order, artifact)));
+    bool appended = appendJournalRecord(jsonLine(
+        graphObject(facts, path, duplicate, firstPath, order, artifact)));
     if (appended)
       recordedGraphPaths.insert(path);
     return appended;
@@ -1987,8 +1990,7 @@ private:
     target.mFactor = std::max(target.mFactor, source.mFactor);
     target.nFactor = std::max(target.nFactor, source.nFactor);
     target.kFactor = std::max(target.kFactor, source.kFactor);
-    target.replicaFactor = std::max(target.replicaFactor,
-                                    source.replicaFactor);
+    target.replicaFactor = std::max(target.replicaFactor, source.replicaFactor);
   }
 
   static LineageState mergeLineages(const LineageState &first,
@@ -2001,9 +2003,8 @@ private:
     return merged;
   }
 
-  static void setDimensionSelection(LineageState &lineage,
-                                    Action::Kind kind, int64_t axis,
-                                    int64_t factor) {
+  static void setDimensionSelection(LineageState &lineage, Action::Kind kind,
+                                    int64_t axis, int64_t factor) {
     for (auto &entry : lineage) {
       if (kind == Action::Kind::Tile && axis == 0)
         entry.second.mFactor = factor;
@@ -2054,8 +2055,8 @@ private:
     for (TaskflowTaskOp task : taskOps(module, functionName)) {
       bool child = false;
       if (action.kind == Action::Kind::Tile) {
-        auto parent = task->getAttrOfType<StringAttr>(
-            "amoeba.neura.tiling.parent_task");
+        auto parent =
+            task->getAttrOfType<StringAttr>("amoeba.neura.tiling.parent_task");
         child = parent && parent.getValue() == action.firstTask;
       } else if (action.kind == Action::Kind::Replica) {
         auto parent =
@@ -2075,8 +2076,7 @@ private:
 
   bool trySingle(ModuleOp source, const Action &action, StringRef order,
                  StringRef path, const TaskLineageState &lineage,
-                 OwningOpRef<ModuleOp> *result,
-                 TaskLineageState *resultLineage,
+                 OwningOpRef<ModuleOp> *result, TaskLineageState *resultLineage,
                  std::string *resultStructuralText = nullptr,
                  JointRewritePreflightContext *preflightContext = nullptr) {
     if (attemptedActionPaths.contains(path))
@@ -2105,22 +2105,20 @@ private:
         }
       if (matches == 1) {
         ClosureDimensionKind dimensionKind =
-            action.kind == Action::Kind::Tile
-                ? ClosureDimensionKind::Tile
-                : action.kind == Action::Kind::KTile
-                      ? ClosureDimensionKind::KTile
-                      : ClosureDimensionKind::Replica;
-        ClosureDimensionResult localLegality = preflightClosureDimension(
-            dimensionTask, dimensionKind, action.axis, action.factor,
-            action.kMode);
+            action.kind == Action::Kind::Tile ? ClosureDimensionKind::Tile
+            : action.kind == Action::Kind::KTile
+                ? ClosureDimensionKind::KTile
+                : ClosureDimensionKind::Replica;
+        ClosureDimensionResult localLegality =
+            preflightClosureDimension(dimensionTask, dimensionKind, action.axis,
+                                      action.factor, action.kMode);
         if (localLegality.disposition ==
             ClosureDimensionDisposition::ProvenIllegal) {
           recordAction(action, "proven_illegal", localLegality.reason,
                        localLegality.diagnostic, order, path);
           return false;
         }
-        if (localLegality.disposition ==
-                ClosureDimensionDisposition::Unknown &&
+        if (localLegality.disposition == ClosureDimensionDisposition::Unknown &&
             localLegality.skipMaterializer) {
           recordAction(action, "unknown", localLegality.reason,
                        localLegality.diagnostic, order, path);
@@ -2140,8 +2138,8 @@ private:
         ephemeralContext.emplace(source, &preflightGraphBuildCount);
         context = &*ephemeralContext;
       }
-      JointRewritePreflightResult preflight = context->evaluate(
-          preflightKind, action.firstTask, action.secondTask);
+      JointRewritePreflightResult preflight =
+          context->evaluate(preflightKind, action.firstTask, action.secondTask);
       if (preflight.disposition ==
           JointRewritePreflightDisposition::ProvenIllegal) {
         recordAction(action, "proven_illegal", preflight.reason,
@@ -2155,8 +2153,8 @@ private:
     OwningOpRef<ModuleOp> trial = source.clone();
     std::string reason;
     std::string diagnostic;
-    bool success = runMaterializer(*trial, functionName, action, reason,
-                                   diagnostic);
+    bool success =
+        runMaterializer(*trial, functionName, action, reason, diagnostic);
     if (!success) {
       recordAction(action, "unknown", reason, diagnostic, order, path);
       return false;
@@ -2167,8 +2165,8 @@ private:
       size_t trialTaskCount = taskOps(*trial, functionName).size();
       if (trialTaskCount >= sourceTaskCount) {
         recordAction(action, "unknown", "fusion_did_not_reduce_task_count",
-                     "source-owned fusion did not reduce the task count",
-                     order, path);
+                     "source-owned fusion did not reduce the task count", order,
+                     path);
         return false;
       }
     }
@@ -2176,8 +2174,8 @@ private:
     if (!rebindLineageState(*trial, functionName, lineage, action,
                             nextLineage)) {
       recordAction(action, "unknown", "rewrite_lineage_not_rebindable",
-                   "source-owned rewrite produced no attributable child",
-                   order, path);
+                   "source-owned rewrite produced no attributable child", order,
+                   path);
       return false;
     }
     std::string structuralText;
@@ -2197,7 +2195,7 @@ private:
   }
 
   static SmallVector<TaskflowTaskOp> taskOps(ModuleOp module,
-                                              StringRef functionName) {
+                                             StringRef functionName) {
     std::string error;
     FailureOr<func::FuncOp> selected =
         selectTaskFunction(module, functionName, error);
@@ -2227,18 +2225,18 @@ private:
           continue;
         if (!lineageKnown ||
             allLineagesFree(selected, &DimensionSelection::mFactor))
-          actions.push_back(Action{Action::Kind::Tile, task, "", 0, factor,
-                                   ""});
+          actions.push_back(
+              Action{Action::Kind::Tile, task, "", 0, factor, ""});
         if (!lineageKnown ||
             allLineagesFree(selected, &DimensionSelection::nFactor))
-          actions.push_back(Action{Action::Kind::Tile, task, "", 1, factor,
-                                   ""});
+          actions.push_back(
+              Action{Action::Kind::Tile, task, "", 1, factor, ""});
         if (!lineageKnown ||
             allLineagesFree(selected, &DimensionSelection::kFactor))
-          for (StringRef kMode : {"sequential", "parallel-linear",
-                                  "parallel-tree"})
-            actions.push_back(Action{Action::Kind::KTile, task, "", -1,
-                                     factor, "", kMode.str()});
+          for (StringRef kMode :
+               {"sequential", "parallel-linear", "parallel-tree"})
+            actions.push_back(Action{Action::Kind::KTile, task, "", -1, factor,
+                                     "", kMode.str()});
       }
     }
     return actions;
@@ -2263,8 +2261,8 @@ private:
         for (int64_t factor : replicaAlphabet) {
           if (factor == 1)
             continue;
-          actions.push_back(Action{Action::Kind::Replica, task, "", axis,
-                                   factor, ""});
+          actions.push_back(
+              Action{Action::Kind::Replica, task, "", axis, factor, ""});
         }
     }
     return actions;
@@ -2328,8 +2326,7 @@ private:
   // cryptographic identity or digest is used.
   std::string frontierStateKey(StringRef structuralText, ModuleOp module,
                                const TaskLineageState &lineage,
-                               FrontierEntry::Kind kind,
-                               bool includeReplica,
+                               FrontierEntry::Kind kind, bool includeReplica,
                                bool includeTiling) const {
     std::string key = "structural=";
     appendKeyPart(key, structuralText);
@@ -2368,14 +2365,9 @@ private:
     StringAttr graphVariant =
         (*selected)->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
     frontierLedger.push_back(FrontierCheckpointEntry{
-        entry.structuralText,
-        artifact,
-        entry.path,
-        entry.kind,
-        entry.includeReplica,
-        entry.includeTiling,
-        printedModuleText(*entry.module),
-        static_cast<bool>(graphVariant),
+        entry.structuralText, artifact, entry.path, entry.kind,
+        entry.includeReplica, entry.includeTiling,
+        printedModuleText(*entry.module), static_cast<bool>(graphVariant),
         graphVariant ? graphVariant.getValue().str() : std::string(),
         entry.lineage});
     return true;
@@ -2399,10 +2391,10 @@ private:
   }
 
   bool enqueueFrontier(SmallVector<FrontierEntry> &destination,
-                       OwningOpRef<ModuleOp> module,
-                       TaskLineageState lineage, StringRef path,
-                       FrontierEntry::Kind kind, bool includeReplica,
-                       bool includeTiling, StringRef structuralText) {
+                       OwningOpRef<ModuleOp> module, TaskLineageState lineage,
+                       StringRef path, FrontierEntry::Kind kind,
+                       bool includeReplica, bool includeTiling,
+                       StringRef structuralText) {
     std::string key = frontierStateKey(structuralText, *module, lineage, kind,
                                        includeReplica, includeTiling);
     if (!frontierMemo.insert(key).second) {
@@ -2418,9 +2410,9 @@ private:
         firstBlocker = "frontier_graph_artifact_binding_missing";
       return false;
     }
-    destination.push_back(FrontierEntry{
-        std::move(module), std::move(lineage), path.str(), kind,
-        includeReplica, includeTiling, structuralText.str()});
+    destination.push_back(FrontierEntry{std::move(module), std::move(lineage),
+                                        path.str(), kind, includeReplica,
+                                        includeTiling, structuralText.str()});
     return true;
   }
 
@@ -2432,8 +2424,8 @@ private:
                            bool includeTiling,
                            const TaskLineageState &lineage) {
     SmallVector<FrontierEntry> frontier;
-    JointRewritePreflightContext rootPreflight(
-        source, &preflightGraphBuildCount);
+    JointRewritePreflightContext rootPreflight(source,
+                                               &preflightGraphBuildCount);
 
     // A resumed checkpoint is the queue prefix that was already enqueued by
     // the interrupted traversal.  Put it before newly regenerated root
@@ -2511,8 +2503,8 @@ private:
           break;
         }
         FrontierEntry &entry = frontier[frontierIndex];
-        JointRewritePreflightContext entryPreflight(
-            *entry.module, &preflightGraphBuildCount);
+        JointRewritePreflightContext entryPreflight(*entry.module,
+                                                    &preflightGraphBuildCount);
 
         if (entry.kind == FrontierEntry::Kind::Dimensions) {
           // The old tile -> fuse recursion offered fusion before another
@@ -2527,38 +2519,35 @@ private:
               TaskLineageState intermediateLineage;
               std::string intermediateStructuralText;
               if (!trySingle(*entry.module, action, "tile_then_fuse", path,
-                             entry.lineage, &intermediate,
-                             &intermediateLineage,
+                             entry.lineage, &intermediate, &intermediateLineage,
                              &intermediateStructuralText, &entryPreflight))
                 continue;
-              enqueueFrontier(next, std::move(intermediate),
-                              std::move(intermediateLineage), path,
-                              FrontierEntry::Kind::FusionOnly,
-                              /*includeReplica=*/false,
-                              /*includeTiling=*/false,
-                              intermediateStructuralText);
+              enqueueFrontier(
+                  next, std::move(intermediate), std::move(intermediateLineage),
+                  path, FrontierEntry::Kind::FusionOnly,
+                  /*includeReplica=*/false,
+                  /*includeTiling=*/false, intermediateStructuralText);
             }
           }
           if (budgetReached)
             break;
-          for (const Action &action : dimensionActions(
-                   *entry.module, entry.lineage, entry.includeReplica,
-                   entry.includeTiling)) {
+          for (const Action &action :
+               dimensionActions(*entry.module, entry.lineage,
+                                entry.includeReplica, entry.includeTiling)) {
             if (budgetReached)
               break;
             std::string path = entry.path + "/" + actionText(action);
             OwningOpRef<ModuleOp> intermediate;
             TaskLineageState intermediateLineage;
             std::string intermediateStructuralText;
-            if (!trySingle(*entry.module, action, "single", path,
-                           entry.lineage, &intermediate, &intermediateLineage,
+            if (!trySingle(*entry.module, action, "single", path, entry.lineage,
+                           &intermediate, &intermediateLineage,
                            &intermediateStructuralText, &entryPreflight))
               continue;
-            enqueueFrontier(next, std::move(intermediate),
-                            std::move(intermediateLineage), path,
-                            FrontierEntry::Kind::Dimensions,
-                            entry.includeReplica, entry.includeTiling,
-                            intermediateStructuralText);
+            enqueueFrontier(
+                next, std::move(intermediate), std::move(intermediateLineage),
+                path, FrontierEntry::Kind::Dimensions, entry.includeReplica,
+                entry.includeTiling, intermediateStructuralText);
           }
           if (!maybeWritePendingSnapshot(frontier, frontierIndex, next)) {
             interruptedIndex = frontierIndex;
@@ -2580,16 +2569,14 @@ private:
             TaskLineageState intermediateLineage;
             std::string intermediateStructuralText;
             if (!trySingle(*entry.module, action, "tile_then_fuse", path,
-                           entry.lineage, &intermediate,
-                           &intermediateLineage,
+                           entry.lineage, &intermediate, &intermediateLineage,
                            &intermediateStructuralText, &entryPreflight))
               continue;
-            enqueueFrontier(next, std::move(intermediate),
-                            std::move(intermediateLineage), path,
-                            FrontierEntry::Kind::FusionOnly,
-                            /*includeReplica=*/false,
-                            /*includeTiling=*/false,
-                            intermediateStructuralText);
+            enqueueFrontier(
+                next, std::move(intermediate), std::move(intermediateLineage),
+                path, FrontierEntry::Kind::FusionOnly,
+                /*includeReplica=*/false,
+                /*includeTiling=*/false, intermediateStructuralText);
           }
           if (!maybeWritePendingSnapshot(frontier, frontierIndex, next)) {
             interruptedIndex = frontierIndex;
@@ -2616,16 +2603,14 @@ private:
             TaskLineageState intermediateLineage;
             std::string intermediateStructuralText;
             if (!trySingle(*entry.module, action, "fuse_then_tile", path,
-                           entry.lineage, &intermediate,
-                           &intermediateLineage,
+                           entry.lineage, &intermediate, &intermediateLineage,
                            &intermediateStructuralText, &entryPreflight))
               continue;
             enqueueFrontier(next, std::move(intermediate),
                             std::move(intermediateLineage), path,
                             FrontierEntry::Kind::DimensionSuffix,
                             /*includeReplica=*/true,
-                            /*includeTiling=*/true,
-                            intermediateStructuralText);
+                            /*includeTiling=*/true, intermediateStructuralText);
           }
           if (budgetReached)
             break;
@@ -2637,16 +2622,14 @@ private:
             TaskLineageState intermediateLineage;
             std::string intermediateStructuralText;
             if (!trySingle(*entry.module, action, "fuse_then_tile", path,
-                           entry.lineage, &intermediate,
-                           &intermediateLineage,
+                           entry.lineage, &intermediate, &intermediateLineage,
                            &intermediateStructuralText, &entryPreflight))
               continue;
             enqueueFrontier(next, std::move(intermediate),
                             std::move(intermediateLineage), path,
                             FrontierEntry::Kind::FusionPrefix,
                             /*includeReplica=*/true,
-                            /*includeTiling=*/true,
-                            intermediateStructuralText);
+                            /*includeTiling=*/true, intermediateStructuralText);
           }
           if (!maybeWritePendingSnapshot(frontier, frontierIndex, next)) {
             interruptedIndex = frontierIndex;
@@ -2693,8 +2676,7 @@ private:
         if (interruptedIndex == frontier.size())
           interruptedIndex = frontier.empty() ? 0 : frontier.size() - 1;
         clearPendingFrontierLedger();
-        for (size_t index = interruptedIndex; index < frontier.size();
-             ++index)
+        for (size_t index = interruptedIndex; index < frontier.size(); ++index)
           if (!capturePendingFrontierEntry(frontier[index]))
             break;
         for (FrontierEntry &entry : next)
@@ -2717,10 +2699,9 @@ private:
   // unsupported replica/tile composition remains visible as an unknown
   // materialization record rather than being called illegal by this
   // controller.
-  void exploreDimensions(ModuleOp source, StringRef order,
-                         StringRef pathPrefix, bool includeReplica,
-                         bool includeTiling, bool allowFusionAfter,
-                         bool hasDimensionAction,
+  void exploreDimensions(ModuleOp source, StringRef order, StringRef pathPrefix,
+                         bool includeReplica, bool includeTiling,
+                         bool allowFusionAfter, bool hasDimensionAction,
                          const TaskLineageState &lineage) {
     if (budgetReached)
       return;
@@ -2833,9 +2814,10 @@ public:
     if (outputFile.empty() || functionName.empty() || stageLevel() == 0 ||
         maxGraphs.getValue() <= 0 || maxActions.getValue() <= 0 ||
         resumeSnapshotActions.getValue() <= 0) {
-      module.emitError("graph closure requires a known stage, function, output, "
-                       "positive max-graphs/max-actions, and a positive "
-                       "resume-snapshot-actions interval");
+      module.emitError(
+          "graph closure requires a known stage, function, output, "
+          "positive max-graphs/max-actions, and a positive "
+          "resume-snapshot-actions interval");
       return signalPassFailure();
     }
     if (factsCompression.getValue() != "legacy-json" &&
@@ -2846,7 +2828,8 @@ public:
     }
     if (resumeSnapshotCompression.getValue() != "legacy-json" &&
         resumeSnapshotCompression.getValue() != "zstd") {
-      module.emitError("resume-snapshot-compression must be legacy-json or zstd");
+      module.emitError(
+          "resume-snapshot-compression must be legacy-json or zstd");
       return signalPassFailure();
     }
     std::string alphabetError;
@@ -2920,10 +2903,9 @@ public:
         }
         if (stageLevel() >= 3) {
           Action replicaNoOp{Action::Kind::Replica, task, "", axis, 1, ""};
-          std::string replicaNoOpPath =
-              "identity/" + actionText(replicaNoOp);
-          recordAction(replicaNoOp, "legal", "identity_no_op", "",
-                       "identity", replicaNoOpPath);
+          std::string replicaNoOpPath = "identity/" + actionText(replicaNoOp);
+          recordAction(replicaNoOp, "legal", "identity_no_op", "", "identity",
+                       replicaNoOpPath);
           recordGraph(module, "identity", replicaNoOpPath);
         }
       }
@@ -2936,8 +2918,7 @@ public:
       }
     }
     if (stageLevel() >= 5) {
-      Action fusionNoOp{Action::Kind::ProducerConsumer, "", "", -1, 1,
-                        "none"};
+      Action fusionNoOp{Action::Kind::ProducerConsumer, "", "", -1, 1, "none"};
       recordAction(fusionNoOp, "legal", "identity_no_op", "", "identity",
                    "identity/producer-consumer-fusion-none");
       recordGraph(module, "identity", "identity/producer-consumer-fusion-none");
@@ -2951,8 +2932,7 @@ public:
         initialTaskLineageState(module, functionName);
     if (stageLevel() >= 3 && !budgetReached)
       exploreBreadthFirst(module, /*includeReplica=*/true,
-                          /*includeTiling=*/stageLevel() >= 4,
-                          initialLineage);
+                          /*includeTiling=*/stageLevel() >= 4, initialLineage);
 
     // No arbitrary action-count or changed-task restriction is used to claim
     // legality.  A complete footer is emitted only when every generated
@@ -2963,15 +2943,15 @@ public:
     // that limitation is carried by the header and
     // requires_downstream_4x4_schedule, rather than falsely making an
     // otherwise exhaustive identity closure incomplete.
-    bool complete = !budgetReached && unknownCount == 0 &&
-                    incompleteFactsCount == 0;
+    bool complete =
+        !budgetReached && unknownCount == 0 && incompleteFactsCount == 0;
     if (!complete && firstBlocker.empty())
       firstBlocker = "joint_candidate_space_not_proven_complete";
     writeOutput(module, complete);
     if (resourceFailure && !outputWriteFailed) {
       module.emitError() << "graph closure resource failure: "
                          << (this->journalError.empty() ? firstBlocker
-                                                       : this->journalError);
+                                                        : this->journalError);
       signalPassFailure();
     }
   }

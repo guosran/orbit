@@ -12,8 +12,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -39,17 +39,19 @@ static bool isNeighborhoodSelection(StringRef path) {
     return false;
   }
   const auto *object = parsed->getAsObject();
-  return object && object->getString("schema") ==
-                       std::optional<StringRef>(kNeighborhoodShapeSelectionSchema);
+  return object &&
+         object->getString("schema") ==
+             std::optional<StringRef>(kNeighborhoodShapeSelectionSchema);
 }
 
 // Validate the entire singular selection before the existing materializer
 // mutates any task. Exact source text binds all bodies, bounds and graph roots;
 // task metadata and physical dimensions independently bind the selected tuple.
 static bool readNeighborhoodSelection(
-    StringRef path, StringRef requestedId, ModuleOp module, func::FuncOp function,
-    ArrayRef<TaskMetadata> tasks, const ::mlir::neura::Architecture &architecture,
-    Candidate &candidate, std::string &graphVariantId, std::string &error) {
+    StringRef path, StringRef requestedId, ModuleOp module,
+    func::FuncOp function, ArrayRef<TaskMetadata> tasks,
+    const ::mlir::neura::Architecture &architecture, Candidate &candidate,
+    std::string &graphVariantId, std::string &error) {
   auto reject = [&](StringRef reason) {
     error = (Twine("invalid neighborhood replay selection: ") + reason).str();
     return false;
@@ -129,8 +131,10 @@ static bool readNeighborhoodSelection(
              rectangle.toCgraShapeAttrValue() == *spelling;
     });
     if (found == legal.end())
-      return reject("rectangle is outside the architecture and area-four policy");
-    result.choices.push_back({tasks[index].name, tasks[index].tripCount, *found});
+      return reject(
+          "rectangle is outside the architecture and area-four policy");
+    result.choices.push_back(
+        {tasks[index].name, tasks[index].tripCount, *found});
   }
   candidate = std::move(result);
   graphVariantId = graph->str();
@@ -149,7 +153,8 @@ readUnsignedDecimal(const llvm::json::Object &object, StringRef key,
         (value->size() == 1 || value->front() != '0'))
       return value->str();
   }
-  error = "factored candidate " + key.str() + " must be a canonical "
+  error = "factored candidate " + key.str() +
+          " must be a canonical "
           "unsigned decimal";
   return std::nullopt;
 }
@@ -172,13 +177,12 @@ static bool isFactoredCandidateSpace(StringRef path) {
   return false;
 }
 
-static bool readFactoredCandidate(StringRef path, StringRef requestedId,
-                                  func::FuncOp func,
-                                  ArrayRef<TaskMetadata> tasks,
-                                  const ::mlir::neura::Architecture &architecture,
-                                  Candidate &selected,
-                                  std::string &graphVariantId,
-                                  std::string &error) {
+static bool
+readFactoredCandidate(StringRef path, StringRef requestedId, func::FuncOp func,
+                      ArrayRef<TaskMetadata> tasks,
+                      const ::mlir::neura::Architecture &architecture,
+                      Candidate &selected, std::string &graphVariantId,
+                      std::string &error) {
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
     error = "cannot read factored candidate space " + path.str() + ": " +
@@ -247,9 +251,9 @@ static bool readFactoredCandidate(StringRef path, StringRef requestedId,
     error = "factored candidate max-cgras-per-task exceeds the architecture";
     return false;
   }
-  SmallVector<RectShape> canonicalShapes = enumerateStaticRectShapes(
-      rows, cols, architecture.getPerCgraRows(),
-      architecture.getPerCgraColumns(), *maxCgras);
+  SmallVector<RectShape> canonicalShapes =
+      enumerateStaticRectShapes(rows, cols, architecture.getPerCgraRows(),
+                                architecture.getPerCgraColumns(), *maxCgras);
   if (canonicalShapes.empty()) {
     error = "factored candidate shape alphabet is empty";
     return false;
@@ -319,9 +323,9 @@ static bool readFactoredCandidate(StringRef path, StringRef requestedId,
     return false;
   }
   SmallVector<SmallVector<RectShape>> shapesByTask(tasks.size(),
-                                                    canonicalShapes);
-  ShapeCandidateSpaceCounts expected = countShapeCandidateSpace(
-      shapesByTask, kShapePruningPolicyNone, -1);
+                                                   canonicalShapes);
+  ShapeCandidateSpaceCounts expected =
+      countShapeCandidateSpace(shapesByTask, kShapePruningPolicyNone, -1);
   if (expected.declared.empty() || *count != expected.declared) {
     error = "factored candidate count does not match the canonical Cartesian "
             "space";
@@ -330,8 +334,7 @@ static bool readFactoredCandidate(StringRef path, StringRef requestedId,
   StringRef ordinal = requestedId;
   if (!ordinal.consume_front("candidate-") || ordinal.empty() ||
       (ordinal.size() > 1 && ordinal.front() == '0') ||
-      !llvm::all_of(ordinal,
-                    [](char c) { return c >= '0' && c <= '9'; })) {
+      !llvm::all_of(ordinal, [](char c) { return c >= '0' && c <= '9'; })) {
     error = "factored candidate ID must be candidate-N with a canonical "
             "unsigned decimal N";
     return false;
@@ -358,9 +361,9 @@ static bool readFactoredCandidate(StringRef path, StringRef requestedId,
     llvm::APInt radix(width, canonicalShapes.size());
     const size_t shapeIndex = (index.urem(radix)).getZExtValue();
     index = index.udiv(radix);
-    selected.choices[taskIndex] =
-        {tasks[taskIndex].name, tasks[taskIndex].tripCount,
-         canonicalShapes[shapeIndex]};
+    selected.choices[taskIndex] = {tasks[taskIndex].name,
+                                   tasks[taskIndex].tripCount,
+                                   canonicalShapes[shapeIndex]};
   }
   if (!index.isZero()) {
     error = "factored candidate ID does not decode within the shape space";
@@ -424,7 +427,8 @@ struct MaterializeAnalyticalTaskCandidatePass
     }
     std::optional<Candidate> selected;
     std::string graphVariantId;
-    bool neighborhoodSelection = isNeighborhoodSelection(candidateFile.getValue());
+    bool neighborhoodSelection =
+        isNeighborhoodSelection(candidateFile.getValue());
     if (neighborhoodSelection) {
       Candidate tuple;
       if (!readNeighborhoodSelection(
@@ -437,10 +441,10 @@ struct MaterializeAnalyticalTaskCandidatePass
       selected = std::move(tuple);
     } else if (isFactoredCandidateSpace(candidateFile.getValue())) {
       Candidate factoredCandidate;
-      if (!readFactoredCandidate(candidateFile.getValue(),
-                                 candidateIdOption.getValue(), func,
-                                 *taskMetadata, ::mlir::neura::getArchitecture(),
-                                 factoredCandidate, graphVariantId, error)) {
+      if (!readFactoredCandidate(
+              candidateFile.getValue(), candidateIdOption.getValue(), func,
+              *taskMetadata, ::mlir::neura::getArchitecture(),
+              factoredCandidate, graphVariantId, error)) {
         func.emitError() << error;
         return signalPassFailure();
       }
@@ -450,8 +454,7 @@ struct MaterializeAnalyticalTaskCandidatePass
       // selecting an early row never bypasses completeness validation.
       ManifestHeader header;
       ManifestFooter footer;
-      auto consume = [&](uint64_t, const Candidate &candidate,
-                         std::string &) {
+      auto consume = [&](uint64_t, const Candidate &candidate, std::string &) {
         if (candidate.id == candidateIdOption.getValue()) {
           if (selected)
             return false;
@@ -459,10 +462,10 @@ struct MaterializeAnalyticalTaskCandidatePass
         }
         return true;
       };
-      if (!readCandidateManifest(
-              candidateFile.getValue(), *taskMetadata, func.getSymName(),
-              ::mlir::neura::getArchitecture(), consume, header, footer,
-              error)) {
+      if (!readCandidateManifest(candidateFile.getValue(), *taskMetadata,
+                                 func.getSymName(),
+                                 ::mlir::neura::getArchitecture(), consume,
+                                 header, footer, error)) {
         if (error.empty())
           error = "candidate selection is ambiguous";
         func.emitError() << error;
@@ -474,8 +477,7 @@ struct MaterializeAnalyticalTaskCandidatePass
         return signalPassFailure();
       }
       graphVariantId = header.graphVariantId;
-      auto irGraph =
-          func->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
+      auto irGraph = func->getAttrOfType<StringAttr>("amoeba.graph_variant_id");
       if ((irGraph && irGraph.getValue() != graphVariantId) ||
           static_cast<bool>(irGraph) != !graphVariantId.empty()) {
         func.emitError() << "candidate manifest graph variant identity does "
@@ -525,9 +527,10 @@ struct MaterializeAnalyticalTaskCandidatePass
     func->setAttr("joint_scheduling_candidate_id",
                   builder.getStringAttr(selected->id));
     func->setAttr("joint_scheduling_candidate_scope",
-                  builder.getStringAttr(neighborhoodSelection
-                      ? StringRef("budgeted-complete-program-neighborhood")
-                      : StringRef(kSearchScope)));
+                  builder.getStringAttr(
+                      neighborhoodSelection
+                          ? StringRef("budgeted-complete-program-neighborhood")
+                          : StringRef(kSearchScope)));
     if (!graphVariantId.empty())
       func->setAttr("joint_scheduling_graph_variant_id",
                     builder.getStringAttr(graphVariantId));

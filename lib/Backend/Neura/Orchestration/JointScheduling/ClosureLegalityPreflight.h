@@ -57,8 +57,7 @@ struct ClosureStrictKClassification {
   std::string reason;
 };
 
-ClosureStrictKClassification
-classifyClosureKLegality(TaskflowTaskOp task);
+ClosureStrictKClassification classifyClosureKLegality(TaskflowTaskOp task);
 
 inline bool closureMemrefRank(Value storage, int64_t &rank) {
   if (!storage)
@@ -70,15 +69,15 @@ inline bool closureMemrefRank(Value storage, int64_t &rank) {
   return true;
 }
 
-inline ClosureDimensionFacts
-inspectClosureTask(TaskflowTaskOp task,
-                   const ClosureStrictKClassification *strictOverride = nullptr) {
+inline ClosureDimensionFacts inspectClosureTask(
+    TaskflowTaskOp task,
+    const ClosureStrictKClassification *strictOverride = nullptr) {
   ClosureDimensionFacts facts;
-  Value outputStorage = !task.getOriginalWriteMemrefs().empty()
-                            ? task.getOriginalWriteMemrefs().front()
-                            : (task.getWillWrites().empty()
-                                   ? Value()
-                                   : task.getWillWrites().front());
+  Value outputStorage =
+      !task.getOriginalWriteMemrefs().empty()
+          ? task.getOriginalWriteMemrefs().front()
+          : (task.getWillWrites().empty() ? Value()
+                                          : task.getWillWrites().front());
   facts.outputRankKnown = closureMemrefRank(outputStorage, facts.outputRank);
 
   ClosureStrictKClassification strict =
@@ -86,9 +85,9 @@ inspectClosureTask(TaskflowTaskOp task,
   facts.kCandidate = strict.potential;
   facts.kExtentKnown = strict.extentKnown;
   facts.kExtent = strict.extent;
-  facts.crossCellK = strict.provenIllegal &&
-                     strict.reason ==
-                         "memory-carried-cross-cell-feedback-order-not-preserved";
+  facts.crossCellK =
+      strict.provenIllegal &&
+      strict.reason == "memory-carried-cross-cell-feedback-order-not-preserved";
   return facts;
 }
 
@@ -107,11 +106,11 @@ preflightClosureDimension(TaskflowTaskOp task, ClosureDimensionKind kind,
     return {ClosureDimensionDisposition::Unknown, "tile_domain_unproven",
             "tile axes and extents are not proven by the local closure facts"};
   if (kind == ClosureDimensionKind::Replica) {
-    Value outputStorage = !task.getOriginalWriteMemrefs().empty()
-                              ? task.getOriginalWriteMemrefs().front()
-                              : (task.getWillWrites().empty()
-                                     ? Value()
-                                     : task.getWillWrites().front());
+    Value outputStorage =
+        !task.getOriginalWriteMemrefs().empty()
+            ? task.getOriginalWriteMemrefs().front()
+            : (task.getWillWrites().empty() ? Value()
+                                            : task.getWillWrites().front());
     int64_t outputRank = 0;
     if (!closureMemrefRank(outputStorage, outputRank))
       return {ClosureDimensionDisposition::Unknown, "output_rank_unproven",
@@ -123,24 +122,25 @@ preflightClosureDimension(TaskflowTaskOp task, ClosureDimensionKind kind,
     return {};
   }
 
-  if (kind == ClosureDimensionKind::KTile &&
-      !task.getDoneReads().empty())
-    return {ClosureDimensionDisposition::Unknown,
-            "k_task_has_done_read_results",
-            "K materializer ABI does not preserve live done-read results",
-            true};
+  if (kind == ClosureDimensionKind::KTile && !task.getDoneReads().empty())
+    return {
+        ClosureDimensionDisposition::Unknown, "k_task_has_done_read_results",
+        "K materializer ABI does not preserve live done-read results", true};
 
   ClosureStrictKClassification strict = classifyClosureKLegality(task);
   if (strict.provenIllegal)
-    return {ClosureDimensionDisposition::ProvenIllegal,
-            strict.reason.empty() ? "k_rewrite_proven_illegal" : strict.reason,
-            "source-owned strict K recurrence classifier rejected this rewrite"};
+    return {
+        ClosureDimensionDisposition::ProvenIllegal,
+        strict.reason.empty() ? "k_rewrite_proven_illegal" : strict.reason,
+        "source-owned strict K recurrence classifier rejected this rewrite"};
   if (!strict.potential)
     return {ClosureDimensionDisposition::Unknown, "k_domain_unproven",
-            "a K reduction domain was not proven by the strict source-owned classifier"};
+            "a K reduction domain was not proven by the strict source-owned "
+            "classifier"};
   if (!strict.extentKnown)
     return {ClosureDimensionDisposition::Unknown, "k_extent_unproven",
-            "K reduction exists but its extent is not proven by the strict source-owned classifier"};
+            "K reduction exists but its extent is not proven by the strict "
+            "source-owned classifier"};
   if (factor > strict.extent)
     return {ClosureDimensionDisposition::ProvenIllegal,
             "k_factor_exceeds_extent",

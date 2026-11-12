@@ -51,7 +51,7 @@ static std::optional<int64_t> requiredInteger(const llvm::json::Object &object,
 // returned value is normalized so header/footer comparisons are deterministic.
 static std::optional<std::string>
 requiredDecimalCount(const llvm::json::Object &object, StringRef key,
-                    std::string &error) {
+                     std::string &error) {
   if (std::optional<int64_t> numeric = object.getInteger(key)) {
     if (*numeric < 0) {
       error = "count field \"" + key.str() + "\" must be nonnegative";
@@ -60,12 +60,10 @@ requiredDecimalCount(const llvm::json::Object &object, StringRef key,
     return std::to_string(*numeric);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char character) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char character) {
         return character < '0' || character > '9';
       })) {
-    error = "missing or invalid decimal count field \"" + key.str() +
-            "\"";
+    error = "missing or invalid decimal count field \"" + key.str() + "\"";
     return std::nullopt;
   }
   StringRef normalized = text->ltrim('0');
@@ -140,11 +138,10 @@ static bool parseHeader(const llvm::json::Object &object,
     return false;
   }
   StringRef expectedScope =
-      *pruningPolicy == kShapePruningPolicyNone
-          ? StringRef(kSearchScope)
-          : *pruningPolicy == kShapePruningPolicyBoundedChangesFromUnit
-                ? StringRef(kBoundedShapeSearchScope)
-                : StringRef();
+      *pruningPolicy == kShapePruningPolicyNone ? StringRef(kSearchScope)
+      : *pruningPolicy == kShapePruningPolicyBoundedChangesFromUnit
+          ? StringRef(kBoundedShapeSearchScope)
+          : StringRef();
   if (expectedScope.empty() || *scope != expectedScope ||
       (*pruningPolicy != kShapePruningPolicyNone &&
        *pruningPolicy != kShapePruningPolicyBoundedChangesFromUnit)) {
@@ -198,7 +195,8 @@ static bool parseHeader(const llvm::json::Object &object,
   std::optional<StringRef> graphVariantId =
       object.getString("graph_variant_id");
   header.function = function->str();
-  header.graphVariantId = graphVariantId ? graphVariantId->str() : std::string();
+  header.graphVariantId =
+      graphVariantId ? graphVariantId->str() : std::string();
   header.searchScope = scope->str();
   header.shapePruningPolicy = pruningPolicy->str();
   header.unrestrictedCandidateCount = *unrestrictedCount;
@@ -394,9 +392,10 @@ static bool validateCandidateAtIndex(
 // Counts the exact Cartesian space, but stops as soon as it proves
 // that the manifest's declared count is too small. Combined with strictly
 // increasing legal records, equal counts prove that no valid tuple is missing.
-static bool hasExactCandidateCount(
-    uint64_t declaredCount, ArrayRef<SmallVector<RectShape>> shapesByTask,
-    StringRef shapePruningPolicy, int64_t maxChangedTasks) {
+static bool
+hasExactCandidateCount(uint64_t declaredCount,
+                       ArrayRef<SmallVector<RectShape>> shapesByTask,
+                       StringRef shapePruningPolicy, int64_t maxChangedTasks) {
   uint64_t computedCount = 0;
   bool exceededDeclaredCount = false;
   bool completed = visitShapeCandidateSpace(
@@ -516,7 +515,8 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
     if (*recordType == "footer") {
       auto schema = requiredString(*object, "schema", error);
       auto expectedCount = requiredInteger(*object, "candidate_count", error);
-      auto footerPolicy = requiredString(*object, "shape_pruning_policy", error);
+      auto footerPolicy =
+          requiredString(*object, "shape_pruning_policy", error);
       const llvm::json::Object *spaceSummary =
           object->getObject("space_summary");
       auto footerMaxChanged =
@@ -529,20 +529,17 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
                                      "unrestricted_candidate_count", error)
               : std::nullopt;
       auto footerDeclared =
-          spaceSummary
-              ? requiredDecimalCount(*spaceSummary, "declared_candidate_count",
-                                     error)
-              : std::nullopt;
+          spaceSummary ? requiredDecimalCount(*spaceSummary,
+                                              "declared_candidate_count", error)
+                       : std::nullopt;
       auto footerExcluded =
-          spaceSummary
-              ? requiredDecimalCount(*spaceSummary, "excluded_candidate_count",
-                                     error)
-              : std::nullopt;
+          spaceSummary ? requiredDecimalCount(*spaceSummary,
+                                              "excluded_candidate_count", error)
+                       : std::nullopt;
       auto footerUnmeasured =
-          spaceSummary
-              ? requiredDecimalCount(*spaceSummary,
-                                     "unmeasured_candidate_count", error)
-              : std::nullopt;
+          spaceSummary ? requiredDecimalCount(
+                             *spaceSummary, "unmeasured_candidate_count", error)
+                       : std::nullopt;
       if (!sawHeader || sawFooter || !schema || !expectedCount ||
           !footerPolicy || !spaceSummary || !footerMaxChanged ||
           !footerUnrestricted || !footerDeclared || !footerExcluded ||
@@ -555,8 +552,7 @@ bool readCandidateManifest(StringRef path, ArrayRef<TaskMetadata> tasks,
       }
       const std::string countText = std::to_string(*expectedCount);
       ShapeCandidateSpaceCounts expected = countShapeCandidateSpace(
-          legalShapesByTask, header.shapePruningPolicy,
-          header.maxChangedTasks);
+          legalShapesByTask, header.shapePruningPolicy, header.maxChangedTasks);
       if (expected.declared.empty() ||
           static_cast<uint64_t>(*expectedCount) != count ||
           countText != header.declaredCandidateCount ||

@@ -11,17 +11,19 @@ struct ProgramPartitionPlan {
 };
 bool planProgramPartition(const GenericAnalysis &, int64_t chunk,
                           ProgramPartitionPlan &, std::string &error);
-bool materializeProgramPartition(mlir::ModuleOp,
-    const ProgramPartitionPlan &, int64_t extent,
-    mlir::OwningOpRef<mlir::ModuleOp> &, std::string &error);
+bool materializeProgramPartition(mlir::ModuleOp, const ProgramPartitionPlan &,
+                                 int64_t extent,
+                                 mlir::OwningOpRef<mlir::ModuleOp> &,
+                                 std::string &error);
 llvm::json::Value serializeProgramPartition(const GenericAnalysis &,
                                             const ProgramPartitionPlan &);
 llvm::json::Value evaluatePartitionedGenericMLIR(mlir::ModuleOp,
-    const llvm::json::Value &, std::string &error);
+                                                 const llvm::json::Value &,
+                                                 std::string &error);
 // Checked aggregation of repeated complete-template metrics. Unknown costs
 // pass zero here; the evaluator retains a separate uncalibrated/null status.
 bool accumulateProgramPartitionMetrics(int64_t transferBytes, int64_t count,
-    double estimatedMs, int64_t &totalBytes, double &totalMs,
-    std::string &error);
+                                       double estimatedMs, int64_t &totalBytes,
+                                       double &totalMs, std::string &error);
 } // namespace orbit::taskflow
 #endif

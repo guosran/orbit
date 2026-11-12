@@ -3,7 +3,8 @@
 #include "Taskflow/ProgramMapping.h"
 namespace orbit::taskflow {
 // Cost annotations reference the existing graph; they do not carry computation,
-// data or an alternative mapping. A composite exclusively owns all listed events.
+// data or an alternative mapping. A composite exclusively owns all listed
+// events.
 struct ProgramActivityCost {
   std::string id, implementation, boundary, provenance, unknownReason;
   std::vector<size_t> events, regionEvents;
@@ -12,8 +13,8 @@ struct ProgramActivityCost {
   std::vector<size_t> executionRegions;
   std::map<std::string, int64_t> resourceDemands;
   std::optional<double> durationMs, lowerMs, upperMs;
-  // Additional runtime work outside the graph requires explicit ordering by cost
-  // ID. Its boundary must say which executor work is included.
+  // Additional runtime work outside the graph requires explicit ordering by
+  // cost ID. Its boundary must say which executor work is included.
   bool runtimeOnly = false;
   std::vector<std::string> predecessors;
 };
@@ -31,7 +32,7 @@ struct ProgramTimedActivity {
   std::vector<size_t> events, regionEvents, executionRegions;
   std::vector<std::string> predecessors, resourcePredecessors;
   std::vector<std::string> bufferPredecessors;
-  std::map<std::string,int64_t> resourceDemands;
+  std::map<std::string, int64_t> resourceDemands;
   std::optional<double> durationMs, startMs, endMs;
   double lowerStartMs = 0, lowerEndMs = 0;
 };
@@ -45,7 +46,7 @@ struct ProgramTimingEvaluation {
   std::vector<std::string> unknowns, assumptions, criticalPath;
   std::vector<std::string> schedulePriority;
   std::vector<ProgramBufferOrdering> bufferOrdering;
-  std::map<std::string,int64_t> peakMemoryBytes;
+  std::map<std::string, int64_t> peakMemoryBytes;
 };
 // Uses scheduleStaticPlan for resource calendars. Explicit integer resource
 // shares reserve fixed capacity at the duration supplied by the implementation;

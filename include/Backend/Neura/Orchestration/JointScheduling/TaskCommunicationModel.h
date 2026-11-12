@@ -37,7 +37,8 @@ public:
   InterTaskNetworkCommunicationModel(TaskEdgeGraph edge_graph,
                                      InterTaskNetworkSpec network,
                                      bool publicGraph = false)
-      : publicGraph_(publicGraph), edge_graph_(std::move(edge_graph)), network_(std::move(network)),
+      : publicGraph_(publicGraph), edge_graph_(std::move(edge_graph)),
+        network_(std::move(network)),
         committedLinkIntervals_(network_.getLinks().size()),
         trialLinkIntervals_(network_.getLinks().size()),
         committedLocalIntervals_(network_.getRows() * network_.getColumns()),

@@ -3,11 +3,11 @@
 #ifndef AMOEBA_BACKEND_NEURA_PASSES_H
 #define AMOEBA_BACKEND_NEURA_PASSES_H
 
+#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "Backend/Neura/Orchestration/JointScheduling/ProveStaticActiveTransferShapesPass.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <memory>

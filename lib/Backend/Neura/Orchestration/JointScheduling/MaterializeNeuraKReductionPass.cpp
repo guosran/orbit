@@ -46,8 +46,7 @@ constexpr StringLiteral kSchemaAttr = "amoeba.semantic.schema";
 constexpr StringLiteral kKindAttr = "amoeba.semantic.task_kind";
 constexpr StringLiteral kRoleAttr = "amoeba.semantic.task_role";
 constexpr StringLiteral kKPolicyAttr = "amoeba.semantic.k_policy";
-constexpr StringLiteral kTopologyAttr =
-    "amoeba.semantic.reduction_topology";
+constexpr StringLiteral kTopologyAttr = "amoeba.semantic.reduction_topology";
 constexpr StringLiteral kKRangeAttr = "amoeba.semantic.K_range";
 constexpr StringLiteral kMRangeAttr = "amoeba.semantic.M_range";
 constexpr StringLiteral kNRangeAttr = "amoeba.semantic.N_range";
@@ -57,12 +56,9 @@ constexpr StringLiteral kFinalCOwnershipAttr =
     "amoeba.semantic.final_C_ownership";
 constexpr StringLiteral kNumericReductionAttr =
     "amoeba.semantic.numeric_reduction";
-constexpr StringLiteral kReductionFinalAttr =
-    "amoeba.semantic.reduction_final";
-constexpr StringLiteral kPrivatePartialAttr =
-    "amoeba.semantic.private_partial";
-constexpr StringLiteral kRewriteSchemaAttr =
-    "amoeba.semantic.rewrite_schema";
+constexpr StringLiteral kReductionFinalAttr = "amoeba.semantic.reduction_final";
+constexpr StringLiteral kPrivatePartialAttr = "amoeba.semantic.private_partial";
+constexpr StringLiteral kRewriteSchemaAttr = "amoeba.semantic.rewrite_schema";
 constexpr StringLiteral kRewriteSchema = "orbit-joint-semantic-rewrite-v1";
 constexpr StringLiteral kIncomingEdgesAttr = "amoeba.semantic.incoming_edges";
 constexpr StringLiteral kInputRegionLowersAttr =
@@ -95,8 +91,8 @@ static bool isNoAliasArgument(Value value) {
   auto argument = dyn_cast<BlockArgument>(value);
   if (!argument)
     return false;
-  auto function = dyn_cast_or_null<func::FuncOp>(
-      argument.getOwner()->getParentOp());
+  auto function =
+      dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
   return function && argument.getOwner() == &function.getBody().front() &&
          function.getArgAttr(argument.getArgNumber(), "amoeba.noalias");
 }
@@ -224,9 +220,9 @@ static void setRegionContracts(OpBuilder &builder, TaskflowTaskOp task,
   task->setAttr(kOutputRegionUppersAttr, builder.getArrayAttr(uppers));
 }
 
-static void setIncomingEdges(
-    OpBuilder &builder, TaskflowTaskOp task,
-    ArrayRef<std::tuple<StringRef, StringRef, StringRef>> edges) {
+static void
+setIncomingEdges(OpBuilder &builder, TaskflowTaskOp task,
+                 ArrayRef<std::tuple<StringRef, StringRef, StringRef>> edges) {
   SmallVector<Attribute> attrs;
   for (auto [source, role, scope] : edges)
     attrs.push_back(builder.getStringAttr(
@@ -236,8 +232,8 @@ static void setIncomingEdges(
 
 static void markTask(OpBuilder &builder, TaskflowTaskOp task, StringRef kind,
                      StringRef role, StringRef policy, StringRef topology) {
-  task->setAttr(kSchemaAttr,
-                builder.getStringAttr("orbit-joint-taskflow-materialization-v1"));
+  task->setAttr(kSchemaAttr, builder.getStringAttr(
+                                 "orbit-joint-taskflow-materialization-v1"));
   task->setAttr(kKindAttr, builder.getStringAttr(kind));
   task->setAttr(kRoleAttr, builder.getStringAttr(role));
   task->setAttr(kKPolicyAttr, builder.getStringAttr(policy));
@@ -292,7 +288,8 @@ static std::optional<unsigned> findInput(TaskflowTaskOp task, Value value) {
 static BlockArgument kernelMemrefArgument(neura::KernelOp kernel,
                                           Value taskArgument) {
   for (auto [index, input] : llvm::enumerate(kernel.getInputs()))
-    if (input == taskArgument && index < kernel.getBody().front().getNumArguments())
+    if (input == taskArgument &&
+        index < kernel.getBody().front().getNumArguments())
       return kernel.getBody().front().getArgument(index);
   return BlockArgument();
 }
@@ -354,7 +351,8 @@ static FailureOr<func::FuncOp> selectFunction(ModuleOp module,
   module.walk([&](func::FuncOp function) {
     bool hasTask = false;
     function.walk([&](TaskflowTaskOp) { hasTask = true; });
-    if (hasTask && (functionName.empty() || function.getSymName() == functionName))
+    if (hasTask &&
+        (functionName.empty() || function.getSymName() == functionName))
       matches.push_back(function);
   });
   if (matches.size() != 1) {
@@ -366,7 +364,8 @@ static FailureOr<func::FuncOp> selectFunction(ModuleOp module,
   return matches.front();
 }
 
-static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName) {
+static FailureOr<KSource> analyzeSource(ModuleOp module,
+                                        StringRef functionName) {
   FailureOr<func::FuncOp> function = selectFunction(module, functionName);
   if (failed(function))
     return failure();
@@ -391,9 +390,10 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
   if (producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer))
     return reject(consumer, "post-Neura K reduction requires ordered producer "
-                           "and consumer tasks");
+                            "and consumer tasks");
   if (!producer.getBody().hasOneBlock() || !consumer.getBody().hasOneBlock())
-    return reject(producer, "post-Neura K reduction requires single-block tasks");
+    return reject(producer,
+                  "post-Neura K reduction requires single-block tasks");
   if (producer.getWillReads().size() != 3 ||
       producer.getWillWrites().size() != 1 ||
       producer.getDoneReads().size() != 0 ||
@@ -401,7 +401,8 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
       producer.getValueInputs().size() != 0 ||
       producer.getOriginalReadMemrefs().size() != 3 ||
       producer.getOriginalWriteMemrefs().size() != 1)
-    return reject(producer, "post-Neura K reduction expects A/B/C and one T state");
+    return reject(producer,
+                  "post-Neura K reduction expects A/B/C and one T state");
   if (consumer.getWillReads().size() != 2 ||
       consumer.getWillWrites().size() != 1 ||
       consumer.getDoneReads().size() != 0 ||
@@ -409,7 +410,8 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
       consumer.getValueInputs().size() != 0 ||
       consumer.getOriginalReadMemrefs().size() != 2 ||
       consumer.getOriginalWriteMemrefs().size() != 1)
-    return reject(consumer, "post-Neura K reduction expects T/E and one D state");
+    return reject(consumer,
+                  "post-Neura K reduction expects T/E and one D state");
   if (producer.getDoneWrites().front().getUses().begin() ==
       producer.getDoneWrites().front().getUses().end())
     return reject(producer, "producer T state has no consumer use");
@@ -417,8 +419,10 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
   auto consumerIndex = findInput(consumer, produced);
   if (!consumerIndex || !produced.hasOneUse())
     return reject(consumer, "producer T must have one direct consumer use");
-  if (consumer.getWillReads()[*consumerIndex].getDefiningOp<TaskflowChannelOp>())
-    return reject(consumer, "post-Neura K reduction rejects channel-wrapped T state");
+  if (consumer.getWillReads()[*consumerIndex]
+          .getDefiningOp<TaskflowChannelOp>())
+    return reject(consumer,
+                  "post-Neura K reduction rejects channel-wrapped T state");
 
   KSource result;
   result.function = *function;
@@ -436,15 +440,16 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
       result.tensorType.getRank() != 2 ||
       !result.tensorType.getElementType().isInteger(32))
     return reject(producer, "post-Neura K reduction requires static 2-D i32 T");
-  for (Value value : {result.A, result.B, result.C, result.T, result.E,
-                      result.D}) {
+  for (Value value :
+       {result.A, result.B, result.C, result.T, result.E, result.D}) {
     auto type = dyn_cast<MemRefType>(value.getType());
     if (!type || type != result.tensorType)
-      return reject(producer,
-                    "post-Neura K reduction requires matching static tensor types");
+      return reject(
+          producer,
+          "post-Neura K reduction requires matching static tensor types");
   }
-  SmallVector<Value> storage{result.A, result.B, result.C, result.T, result.E,
-                              result.D};
+  SmallVector<Value> storage{result.A, result.B, result.C,
+                             result.T, result.E, result.D};
   for (size_t i = 0; i < storage.size(); ++i)
     for (size_t j = i + 1; j < storage.size(); ++j)
       if (!provesDistinctStorage(storage[i], storage[j]))
@@ -454,7 +459,9 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
 
   Block &producerBody = producer.getBody().front();
   if (producerBody.getNumArguments() != 4)
-    return reject(producer, "post-Neura K reduction expects four producer body arguments");
+    return reject(
+        producer,
+        "post-Neura K reduction expects four producer body arguments");
   result.taskA = producerBody.getArgument(0);
   result.taskB = producerBody.getArgument(1);
   result.taskC = producerBody.getArgument(2);
@@ -464,15 +471,19 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
     if (auto counter = dyn_cast<TaskflowCounterOp>(&operation))
       result.taskCounters.push_back(counter);
   if (result.taskCounters.size() != 2)
-    return reject(producer, "post-Neura K reduction requires two outer M/N counters");
+    return reject(producer,
+                  "post-Neura K reduction requires two outer M/N counters");
   for (auto [index, counter] : llvm::enumerate(result.taskCounters)) {
     auto lower = constantIndex(counter.getLowerBound());
     auto upper = constantIndex(counter.getUpperBound());
     auto step = constantIndex(counter.getStep());
     if (!lower || !upper || !step || *lower != 0 || *upper <= *lower ||
-        *step != 1 || (index == 0 ? static_cast<bool>(counter.getParentIndex())
-                                  : !counter.getParentIndex()))
-      return reject(counter, "post-Neura K reduction requires static unit-step M/N counters");
+        *step != 1 ||
+        (index == 0 ? static_cast<bool>(counter.getParentIndex())
+                    : !counter.getParentIndex()))
+      return reject(
+          counter,
+          "post-Neura K reduction requires static unit-step M/N counters");
     if (index == 0)
       result.M = *upper;
     else
@@ -484,16 +495,21 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
       continue;
     if (auto kernel = dyn_cast<neura::KernelOp>(&operation)) {
       if (result.producerKernel)
-        return reject(producer, "post-Neura K reduction requires one neura.kernel");
+        return reject(producer,
+                      "post-Neura K reduction requires one neura.kernel");
       result.producerKernel = kernel;
       continue;
     }
-    return reject(&operation, "post-Neura K reduction found unsupported producer shell operation");
+    return reject(
+        &operation,
+        "post-Neura K reduction found unsupported producer shell operation");
   }
-  if (!result.producerKernel || !result.producerKernel.getBody().hasOneBlock() ||
+  if (!result.producerKernel ||
+      !result.producerKernel.getBody().hasOneBlock() ||
       !result.producerKernel.getIterArgsInit().empty() ||
       !result.producerKernel.getOutputs().empty())
-    return reject(producer, "post-Neura K reduction requires one stateless kernel");
+    return reject(producer,
+                  "post-Neura K reduction requires one stateless kernel");
   result.kernelA = kernelMemrefArgument(result.producerKernel, result.taskA);
   result.kernelB = kernelMemrefArgument(result.producerKernel, result.taskB);
   result.kernelC = kernelMemrefArgument(result.producerKernel, result.taskC);
@@ -520,7 +536,9 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
         !id || id.getInt() != static_cast<int64_t>(index) ||
         *lower != *outerLower || *upper != *outerUpper || *step != *outerStep ||
         *step != 1)
-      return reject(counter, "post-Neura K reduction requires matching static Neura counters");
+      return reject(
+          counter,
+          "post-Neura K reduction requires matching static Neura counters");
   }
 
   SmallVector<scf::ForOp> loops;
@@ -556,10 +574,11 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
       tStores.push_back(store);
   });
   if (cLoads.size() != 1 || aLoads.size() != 1 || bLoads.size() != 1 ||
-      tStores.size() != 1 || cLoads.front().getResult() !=
-          result.kLoop.getInitArgs().front())
-    return reject(result.producerKernel,
-                  "post-Neura K reduction requires canonical C/A/B loads and T store");
+      tStores.size() != 1 ||
+      cLoads.front().getResult() != result.kLoop.getInitArgs().front())
+    return reject(
+        result.producerKernel,
+        "post-Neura K reduction requires canonical C/A/B loads and T store");
   result.initialLoad = cLoads.front();
   if (!equivalentIndices(result.initialLoad.getIndices(),
                          {result.kernelCounters[0].getCurrentIndex(),
@@ -573,7 +592,8 @@ static FailureOr<KSource> analyzeSource(ModuleOp module, StringRef functionName)
                     "C may only feed the canonical initial accumulator load");
   if (producer->hasAttr("amoeba.semantic.k_tiled") ||
       producer->hasAttr("amoeba.semantic.parallel_partials_pending"))
-    return reject(producer, "post-Neura K reduction refuses an already tiled producer");
+    return reject(producer,
+                  "post-Neura K reduction refuses an already tiled producer");
   return result;
 }
 
@@ -585,8 +605,10 @@ static LogicalResult updateKLoopBounds(neura::KernelOp kernel, int64_t lower,
     return reject(kernel, "K clone must contain one scf.for");
   OpBuilder builder(kernel.getContext());
   builder.setInsertionPointToStart(&kernel.getBody().front());
-  Value lowerValue = builder.create<arith::ConstantIndexOp>(kernel.getLoc(), lower);
-  Value upperValue = builder.create<arith::ConstantIndexOp>(kernel.getLoc(), upper);
+  Value lowerValue =
+      builder.create<arith::ConstantIndexOp>(kernel.getLoc(), lower);
+  Value upperValue =
+      builder.create<arith::ConstantIndexOp>(kernel.getLoc(), upper);
   Value stepValue = builder.create<arith::ConstantIndexOp>(kernel.getLoc(), 1);
   loops.front().getLowerBoundMutable().assign(lowerValue);
   loops.front().getUpperBoundMutable().assign(upperValue);
@@ -595,8 +617,8 @@ static LogicalResult updateKLoopBounds(neura::KernelOp kernel, int64_t lower,
 }
 
 static FailureOr<neura::KernelOp>
-clonePartialKernel(OpBuilder &builder, KSource &source,
-                   IRMapping &outerMapping, int64_t kLower, int64_t kUpper) {
+clonePartialKernel(OpBuilder &builder, KSource &source, IRMapping &outerMapping,
+                   int64_t kLower, int64_t kUpper) {
   neura::KernelOp oldKernel = source.producerKernel;
   memref::LoadOp initialLoad = source.initialLoad;
   SmallVector<Value> inputs;
@@ -606,7 +628,8 @@ clonePartialKernel(OpBuilder &builder, KSource &source,
       continue;
     Value mapped = outerMapping.lookupOrDefault(input);
     if (!mapped)
-      return reject(oldKernel, "partial kernel input has no cloned task argument");
+      return reject(oldKernel,
+                    "partial kernel input has no cloned task argument");
     inputs.push_back(mapped);
     keptInputIndices.push_back(index);
   }
@@ -624,7 +647,8 @@ clonePartialKernel(OpBuilder &builder, KSource &source,
     mapping.map(oldKernel.getBody().front().getArgument(index), newArg);
   }
   OpBuilder blockBuilder = OpBuilder::atBlockBegin(newBlock);
-  Value zero = blockBuilder.create<arith::ConstantIntOp>(oldKernel.getLoc(), 0, 32);
+  Value zero =
+      blockBuilder.create<arith::ConstantIntOp>(oldKernel.getLoc(), 0, 32);
   SmallVector<scf::ForOp> clonedLoops;
   OpBuilder cloneBuilder = OpBuilder::atBlockEnd(newBlock);
   for (Operation &operation : oldKernel.getBody().front()) {
@@ -650,10 +674,10 @@ clonePartialKernel(OpBuilder &builder, KSource &source,
 
 static FailureOr<TaskflowTaskOp>
 createProducerClone(OpBuilder &builder, KSource &source, Value carry,
-                  Value output, ArrayRef<Value> roots, StringRef name,
-                  int64_t kLower, int64_t kUpper, unsigned blockIndex,
-                  unsigned blockCount, StringRef policy, bool partial,
-                  StringRef topology) {
+                    Value output, ArrayRef<Value> roots, StringRef name,
+                    int64_t kLower, int64_t kUpper, unsigned blockIndex,
+                    unsigned blockCount, StringRef policy, bool partial,
+                    StringRef topology) {
   SmallVector<Value> reads;
   if (partial)
     reads = {source.A, source.B};
@@ -683,8 +707,8 @@ createProducerClone(OpBuilder &builder, KSource &source, Value carry,
       continue;
     if (auto kernel = dyn_cast<neura::KernelOp>(&operation)) {
       if (partial) {
-        FailureOr<neura::KernelOp> partialKernel =
-            clonePartialKernel(bodyBuilder, source, outerMapping, kLower, kUpper);
+        FailureOr<neura::KernelOp> partialKernel = clonePartialKernel(
+            bodyBuilder, source, outerMapping, kLower, kUpper);
         if (failed(partialKernel))
           return failure();
         clonedKernel = *partialKernel;
@@ -713,7 +737,7 @@ createProducerClone(OpBuilder &builder, KSource &source, Value carry,
                 builder.getI64IntegerAttr(blockCount));
   task->setAttr("amoeba.semantic.output_visibility",
                 builder.getStringAttr(partial ? "private_partial"
-                                               : "global_materialized"));
+                                              : "global_materialized"));
   if (!partial) {
     task->setAttr(kInitialCOwnershipAttr,
                   builder.getStringAttr(blockIndex == 0 ? "initial_C_once"
@@ -729,8 +753,7 @@ createProducerClone(OpBuilder &builder, KSource &source, Value carry,
     task->setAttr("amoeba.semantic.logical_k_block",
                   builder.getI64IntegerAttr(blockIndex));
   }
-  setRangeAttrs(builder, task, {0, source.M}, {0, source.N},
-                {kLower, kUpper});
+  setRangeAttrs(builder, task, {0, source.M}, {0, source.N}, {kLower, kUpper});
   SmallVector<StaticRegion> inputRegions;
   inputRegions.push_back({{0, kLower}, {source.M, kUpper}});
   inputRegions.push_back({{kLower, 0}, {kUpper, source.N}});
@@ -742,14 +765,15 @@ createProducerClone(OpBuilder &builder, KSource &source, Value carry,
   return task;
 }
 
-static FailureOr<TaskflowTaskOp>
-createReductionTask(OpBuilder &builder, KSource &source,
-                  ArrayRef<Value> reads, ArrayRef<Value> roots, Value output,
-                  StringRef name, StringRef topology, bool finalReduction,
-                  ArrayRef<std::tuple<StringRef, StringRef, StringRef>> edges) {
+static FailureOr<TaskflowTaskOp> createReductionTask(
+    OpBuilder &builder, KSource &source, ArrayRef<Value> reads,
+    ArrayRef<Value> roots, Value output, StringRef name, StringRef topology,
+    bool finalReduction,
+    ArrayRef<std::tuple<StringRef, StringRef, StringRef>> edges) {
   if (reads.empty() || reads.size() != roots.size())
-    return reject(source.producer,
-                  "numeric reduction reads and roots must be non-empty and aligned");
+    return reject(
+        source.producer,
+        "numeric reduction reads and roots must be non-empty and aligned");
   TaskflowTaskOp task = builder.create<TaskflowTaskOp>(
       source.producer.getLoc(), TypeRange{}, TypeRange{output.getType()},
       TypeRange{}, reads, ValueRange{output}, ValueRange{},
@@ -758,7 +782,8 @@ createReductionTask(OpBuilder &builder, KSource &source,
   task.getBody().push_back(body);
   for (Value read : reads)
     body->addArgument(read.getType(), source.producer.getLoc());
-  BlockArgument outputArg = body->addArgument(output.getType(), source.producer.getLoc());
+  BlockArgument outputArg =
+      body->addArgument(output.getType(), source.producer.getLoc());
   OpBuilder tb = OpBuilder::atBlockEnd(body);
   createTaskflowCounters(tb, source.producer.getLoc(), source.M, source.N);
   SmallVector<Value> kernelInputs;
@@ -776,15 +801,18 @@ createReductionTask(OpBuilder &builder, KSource &source,
   kernel.getBody().push_back(kernelBody);
   SmallVector<BlockArgument> kernelArgs;
   for (Value input : kernelInputs)
-    kernelArgs.push_back(kernelBody->addArgument(input.getType(), kernel.getLoc()));
+    kernelArgs.push_back(
+        kernelBody->addArgument(input.getType(), kernel.getLoc()));
   OpBuilder kb = OpBuilder::atBlockBegin(kernelBody);
   Value mLower, mUpper, mStep, nLower, nUpper, nStep;
-  createCounterConstants(kb, kernel.getLoc(), 0, source.M, mLower, mUpper, mStep);
+  createCounterConstants(kb, kernel.getLoc(), 0, source.M, mLower, mUpper,
+                         mStep);
   auto m = kb.create<neura::CounterOp>(
       kernel.getLoc(), kb.getIndexType(), mLower, mUpper, mStep,
       kb.getStringAttr("root"), kb.getStringAttr("constant_bound"),
       kb.getI32IntegerAttr(0));
-  createCounterConstants(kb, kernel.getLoc(), 0, source.N, nLower, nUpper, nStep);
+  createCounterConstants(kb, kernel.getLoc(), 0, source.N, nLower, nUpper,
+                         nStep);
   auto n = kb.create<neura::CounterOp>(
       kernel.getLoc(), kb.getIndexType(), nLower, nUpper, nStep,
       kb.getStringAttr("leaf"), kb.getStringAttr("constant_bound"),
@@ -800,11 +828,12 @@ createReductionTask(OpBuilder &builder, KSource &source,
       accumulator = kb.create<arith::AddIOp>(source.producer.getLoc(),
                                              accumulator, loaded);
   }
-  kb.create<memref::StoreOp>(source.producer.getLoc(), accumulator,
-                             kernelArgs.back(),
-                             ValueRange{m.getCurrentIndex(), n.getCurrentIndex()});
+  kb.create<memref::StoreOp>(
+      source.producer.getLoc(), accumulator, kernelArgs.back(),
+      ValueRange{m.getCurrentIndex(), n.getCurrentIndex()});
   kb.setInsertionPointToEnd(kernelBody);
-  kb.create<neura::YieldOp>(source.producer.getLoc(), ValueRange{}, ValueRange{});
+  kb.create<neura::YieldOp>(source.producer.getLoc(), ValueRange{},
+                            ValueRange{});
   addTaskYield(body, outputArg);
 
   markTask(builder, task, "reduction", "reduction", "parallel", topology);
@@ -816,7 +845,8 @@ createReductionTask(OpBuilder &builder, KSource &source,
   task->setAttr("amoeba.semantic.output_visibility",
                 builder.getStringAttr("global_materialized"));
   setRangeAttrs(builder, task, {0, source.M}, {0, source.N}, {0, source.K});
-  SmallVector<StaticRegion> regions(reads.size(), fullRegion(source.M, source.N));
+  SmallVector<StaticRegion> regions(reads.size(),
+                                    fullRegion(source.M, source.N));
   setRegionContracts(builder, task, regions, {fullRegion(source.M, source.N)},
                      "numeric_reduction");
   setIncomingEdges(builder, task, edges);
@@ -828,12 +858,13 @@ static void markConsumer(OpBuilder &builder, TaskflowTaskOp consumer,
                          StringRef topology, StringRef inputSource) {
   markTask(builder, consumer, "elementwise_consumer", "consumer", policy,
            topology);
-  setRangeAttrs(builder, consumer, {0, source.M}, {0, source.N},
-                {0, source.K});
-  setRegionContracts(builder, consumer,
-                     {fullRegion(source.M, source.N), fullRegion(source.M, source.N)},
-                     {fullRegion(source.M, source.N)}, "consumer_tile");
-  setIncomingEdges(builder, consumer, {{inputSource, "producer_consumer", "tile_local"}});
+  setRangeAttrs(builder, consumer, {0, source.M}, {0, source.N}, {0, source.K});
+  setRegionContracts(
+      builder, consumer,
+      {fullRegion(source.M, source.N), fullRegion(source.M, source.N)},
+      {fullRegion(source.M, source.N)}, "consumer_tile");
+  setIncomingEdges(builder, consumer,
+                   {{inputSource, "producer_consumer", "tile_local"}});
 }
 
 static FailureOr<int64_t> resolveWidth(int64_t K, int64_t tileSize,
@@ -860,7 +891,8 @@ static LogicalResult runSequential(ModuleOp module, StringRef functionName,
   if (failed(width))
     return reject(source->producer,
                   "post-Neura sequential K tiling requires width in [1,K)");
-  unsigned blockCount = static_cast<unsigned>((source->K + *width - 1) / *width);
+  unsigned blockCount =
+      static_cast<unsigned>((source->K + *width - 1) / *width);
   OpBuilder builder(source->producer);
   Value carry = source->C;
   SmallVector<TaskflowTaskOp> blocks;
@@ -877,24 +909,28 @@ static LogicalResult runSequential(ModuleOp module, StringRef functionName,
     if (failed(block))
       return failure();
     if (index != 0)
-      setIncomingEdges(builder, *block,
-                       {{blocks.back().getTaskName(), "state_carry", "tile_local"}});
+      setIncomingEdges(
+          builder, *block,
+          {{blocks.back().getTaskName(), "state_carry", "tile_local"}});
     else
       setIncomingEdges(builder, *block, {});
     blocks.push_back(*block);
     carry = block->getDoneWrites().front();
   }
-  auto input = findInput(source->consumer, source->producer.getDoneWrites().front());
+  auto input =
+      findInput(source->consumer, source->producer.getDoneWrites().front());
   if (!input)
     return reject(source->consumer, "consumer has no T input to rewire");
   source->consumer.getWillReadsMutable().slice(*input, 1).assign(carry);
   OpBuilder consumerBuilder(source->consumer);
   markConsumer(consumerBuilder, source->consumer, *source, "sequential", "none",
                blocks.back().getTaskName());
-  source->function->setAttr(kKPolicyAttr, consumerBuilder.getStringAttr("sequential"));
-  source->function->setAttr(kTopologyAttr, consumerBuilder.getStringAttr("none"));
+  source->function->setAttr(kKPolicyAttr,
+                            consumerBuilder.getStringAttr("sequential"));
+  source->function->setAttr(kTopologyAttr,
+                            consumerBuilder.getStringAttr("none"));
   source->function->setAttr(kRewriteSchemaAttr,
-                             consumerBuilder.getStringAttr(kRewriteSchema));
+                            consumerBuilder.getStringAttr(kRewriteSchema));
   source->producer.erase();
   return success();
 }
@@ -909,10 +945,12 @@ static LogicalResult runParallel(ModuleOp module, StringRef functionName,
   if (failed(width))
     return reject(source->producer,
                   "post-Neura parallel K tiling requires width in [1,K]");
-  unsigned blockCount = static_cast<unsigned>((source->K + *width - 1) / *width);
+  unsigned blockCount =
+      static_cast<unsigned>((source->K + *width - 1) / *width);
   if (blockCount < 2)
-    return reject(source->producer,
-                  "post-Neura parallel K tiling requires at least two K blocks");
+    return reject(
+        source->producer,
+        "post-Neura parallel K tiling requires at least two K blocks");
   OpBuilder builder(source->producer);
   SmallVector<Value> states;
   SmallVector<Value> roots;
@@ -927,9 +965,8 @@ static LogicalResult runParallel(ModuleOp module, StringRef functionName,
                    builder.getI64IntegerAttr(index));
     std::string name = (Twine("partial_k.") + Twine(index)).str();
     FailureOr<TaskflowTaskOp> partial = createProducerClone(
-        builder, *source, Value{}, alloc.getMemref(),
-        {source->A, source->B}, name, lower, upper, index, blockCount,
-        "parallel", true, topology);
+        builder, *source, Value{}, alloc.getMemref(), {source->A, source->B},
+        name, lower, upper, index, blockCount, "parallel", true, topology);
     if (failed(partial))
       return failure();
     setIncomingEdges(builder, *partial, {});
@@ -947,9 +984,9 @@ static LogicalResult runParallel(ModuleOp module, StringRef functionName,
     SmallVector<std::tuple<StringRef, StringRef, StringRef>> edges;
     for (TaskflowTaskOp task : partialTasks)
       edges.push_back({task.getTaskName(), "partial_reduction", "tile_local"});
-    FailureOr<TaskflowTaskOp> reduction = createReductionTask(
-        builder, *source, reads, reductionRoots, source->T, "reduction.final",
-        "linear", true, edges);
+    FailureOr<TaskflowTaskOp> reduction =
+        createReductionTask(builder, *source, reads, reductionRoots, source->T,
+                            "reduction.final", "linear", true, edges);
     if (failed(reduction))
       return failure();
     finalReduction = *reduction;
@@ -970,11 +1007,13 @@ static LogicalResult runParallel(ModuleOp module, StringRef functionName,
                                                      source->tensorType);
         alloc->setAttr(kPrivatePartialAttr, builder.getUnitAttr());
         std::string name =
-            (Twine("reduction.tree.") + Twine(level) + "." +
-             Twine(index / 2)).str();
+            (Twine("reduction.tree.") + Twine(level) + "." + Twine(index / 2))
+                .str();
         SmallVector<std::tuple<StringRef, StringRef, StringRef>> edges{
-            {partialTasks[index].getTaskName(), "partial_reduction", "tile_local"},
-            {partialTasks[index + 1].getTaskName(), "partial_reduction", "tile_local"}};
+            {partialTasks[index].getTaskName(), "partial_reduction",
+             "tile_local"},
+            {partialTasks[index + 1].getTaskName(), "partial_reduction",
+             "tile_local"}};
         FailureOr<TaskflowTaskOp> reduction = createReductionTask(
             builder, *source, {states[index], states[index + 1]},
             {roots[index], roots[index + 1]}, alloc.getMemref(), name,
@@ -993,31 +1032,33 @@ static LogicalResult runParallel(ModuleOp module, StringRef functionName,
     SmallVector<Value> reads{source->C, states.front()};
     SmallVector<Value> reductionRoots{source->C, roots.front()};
     SmallVector<std::tuple<StringRef, StringRef, StringRef>> edges{
-        {partialTasks.front().getTaskName(), "partial_reduction", "tile_local"}};
-    FailureOr<TaskflowTaskOp> reduction = createReductionTask(
-        builder, *source, reads, reductionRoots, source->T, "reduction.final",
-        "balanced_tree", true, edges);
+        {partialTasks.front().getTaskName(), "partial_reduction",
+         "tile_local"}};
+    FailureOr<TaskflowTaskOp> reduction =
+        createReductionTask(builder, *source, reads, reductionRoots, source->T,
+                            "reduction.final", "balanced_tree", true, edges);
     if (failed(reduction))
       return failure();
     finalReduction = *reduction;
   }
-  auto input = findInput(source->consumer, source->producer.getDoneWrites().front());
+  auto input =
+      findInput(source->consumer, source->producer.getDoneWrites().front());
   if (!input)
     return reject(source->consumer, "consumer has no T input to rewire");
-  source->consumer.getWillReadsMutable()
-      .slice(*input, 1)
-      .assign(finalReduction.getDoneWrites().front());
+  source->consumer.getWillReadsMutable().slice(*input, 1).assign(
+      finalReduction.getDoneWrites().front());
   OpBuilder consumerBuilder(source->consumer);
   markConsumer(consumerBuilder, source->consumer, *source, "parallel", topology,
                finalReduction.getTaskName());
-  source->function->setAttr(kKPolicyAttr, consumerBuilder.getStringAttr("parallel"));
-  source->function->setAttr(kTopologyAttr, consumerBuilder.getStringAttr(topology));
+  source->function->setAttr(kKPolicyAttr,
+                            consumerBuilder.getStringAttr("parallel"));
+  source->function->setAttr(kTopologyAttr,
+                            consumerBuilder.getStringAttr(topology));
   source->function->setAttr(kRewriteSchemaAttr,
-                             consumerBuilder.getStringAttr(kRewriteSchema));
+                            consumerBuilder.getStringAttr(kRewriteSchema));
   source->producer.erase();
   return success();
 }
-
 
 // Memory-carried reductions retain the output buffer as the reduction state.
 // Unlike the canonical producer/consumer adapter above, no scalar SSA
@@ -1044,15 +1085,15 @@ struct MemoryFeedbackKSource {
   bool predicateForm = false;
 };
 
-static std::optional<int64_t>
-memoryTaskConstantIndex(Value value, TaskflowTaskOp task) {
+static std::optional<int64_t> memoryTaskConstantIndex(Value value,
+                                                      TaskflowTaskOp task) {
   if (auto literal = constantIndex(value))
     return literal;
   auto argument = dyn_cast<BlockArgument>(value);
   if (!argument || argument.getOwner() != &task.getBody().front())
     return std::nullopt;
-  unsigned firstValueInput = task.getWillReads().size() +
-                              task.getWillWrites().size();
+  unsigned firstValueInput =
+      task.getWillReads().size() + task.getWillWrites().size();
   if (argument.getArgNumber() < firstValueInput)
     return std::nullopt;
   unsigned index = argument.getArgNumber() - firstValueInput;
@@ -1063,7 +1104,7 @@ memoryTaskConstantIndex(Value value, TaskflowTaskOp task) {
 
 static std::optional<int64_t>
 memoryKernelConstantIndex(Value value, TaskflowTaskOp task,
-                         neura::KernelOp kernel) {
+                          neura::KernelOp kernel) {
   if (auto literal = memoryTaskConstantIndex(value, task))
     return literal;
   auto argument = dyn_cast<BlockArgument>(value);
@@ -1074,8 +1115,7 @@ memoryKernelConstantIndex(Value value, TaskflowTaskOp task,
                                  task);
 }
 
-static std::optional<unsigned>
-parseKernelInputReference(Attribute attribute) {
+static std::optional<unsigned> parseKernelInputReference(Attribute attribute) {
   auto text = dyn_cast_or_null<StringAttr>(attribute);
   if (!text)
     return std::nullopt;
@@ -1107,8 +1147,8 @@ predicateKernelConstantIndex(neura::CounterOp counter, StringRef attrName,
   else if (auto reference = parseKernelInputReference(attribute)) {
     if (*reference >= kernel.getInputs().size())
       return std::nullopt;
-    folded = memoryKernelConstantIndex(kernel.getInputs()[*reference], task,
-                                       kernel);
+    folded =
+        memoryKernelConstantIndex(kernel.getInputs()[*reference], task, kernel);
   }
   // A real SSA operand is authoritative. If it cannot be resolved, or if a
   // folded attribute disagrees with it, fail closed instead of certifying a
@@ -1120,9 +1160,11 @@ predicateKernelConstantIndex(neura::CounterOp counter, StringRef attrName,
   return actual ? actual : folded;
 }
 
-static bool predicateValueReferencesKernelInput(
-    Value value, unsigned inputIndex, neura::KernelOp kernel,
-    DenseSet<Value> &visiting, unsigned depth = 0) {
+static bool predicateValueReferencesKernelInput(Value value,
+                                                unsigned inputIndex,
+                                                neura::KernelOp kernel,
+                                                DenseSet<Value> &visiting,
+                                                unsigned depth = 0) {
   if (!value || depth >= 24 || !visiting.insert(value).second)
     return false;
   bool result = false;
@@ -1137,12 +1179,12 @@ static bool predicateValueReferencesKernelInput(
       if (auto reference =
               parseKernelInputReference(definition->getAttr("value")))
         result = *reference == inputIndex;
-    } else if (name == "neura.grant_predicate" ||
-               name == "neura.ctrl_mov" || name == "neura.cast") {
+    } else if (name == "neura.grant_predicate" || name == "neura.ctrl_mov" ||
+               name == "neura.cast") {
       result = definition->getNumOperands() >= 1 &&
-               predicateValueReferencesKernelInput(
-                   definition->getOperand(0), inputIndex, kernel, visiting,
-                   depth + 1);
+               predicateValueReferencesKernelInput(definition->getOperand(0),
+                                                   inputIndex, kernel, visiting,
+                                                   depth + 1);
     } else if (name == "neura.phi" || name == "neura.sel") {
       unsigned first = name == "neura.sel" ? 1u : 0u;
       result = first < definition->getNumOperands();
@@ -1153,8 +1195,8 @@ static bool predicateValueReferencesKernelInput(
            result && operand < definition->getNumOperands(); ++operand) {
         DenseSet<Value> armVisiting = visiting;
         result = predicateValueReferencesKernelInput(
-            definition->getOperand(operand), inputIndex, kernel,
-            armVisiting, depth + 1);
+            definition->getOperand(operand), inputIndex, kernel, armVisiting,
+            depth + 1);
       }
     }
   }
@@ -1162,7 +1204,8 @@ static bool predicateValueReferencesKernelInput(
   return result;
 }
 
-static bool predicateValueReferencesKernelInput(Value value, unsigned inputIndex,
+static bool predicateValueReferencesKernelInput(Value value,
+                                                unsigned inputIndex,
                                                 neura::KernelOp kernel) {
   DenseSet<Value> visited;
   return predicateValueReferencesKernelInput(value, inputIndex, kernel,
@@ -1196,18 +1239,19 @@ static MemoryIndexRole memoryIndexRole(Value value, Value m, Value n, Value k,
     if (definition->getNumOperands() < 1)
       return MemoryIndexRole::Unknown;
     DenseSet<Value> operandVisited = visited;
-    return memoryIndexRole(definition->getOperand(0), m, n, k,
-                           operandVisited, depth + 1);
+    return memoryIndexRole(definition->getOperand(0), m, n, k, operandVisited,
+                           depth + 1);
   }
   if (name == "neura.phi" || name == "neura.sel") {
     if (definition->getNumOperands() < (name == "neura.sel" ? 3u : 1u))
       return MemoryIndexRole::Unknown;
     unsigned first = name == "neura.sel" ? 1u : 0u;
     MemoryIndexRole common = MemoryIndexRole::Unknown;
-    for (unsigned index = first; index < definition->getNumOperands(); ++index) {
+    for (unsigned index = first; index < definition->getNumOperands();
+         ++index) {
       DenseSet<Value> branchVisited = visited;
-      MemoryIndexRole branch = memoryIndexRole(
-          definition->getOperand(index), m, n, k, branchVisited, depth + 1);
+      MemoryIndexRole branch = memoryIndexRole(definition->getOperand(index), m,
+                                               n, k, branchVisited, depth + 1);
       if (branch == MemoryIndexRole::Unknown)
         return MemoryIndexRole::Unknown;
       if (common == MemoryIndexRole::Unknown)
@@ -1251,7 +1295,7 @@ static bool memoryCellIndices(ValueRange indices, Value m, Value n, Value k) {
 }
 
 static bool memoryCrossCellIndices(ValueRange indices, Value m, Value n,
-                                    Value k) {
+                                   Value k) {
   bool hasK = false;
   bool hasOuter = false;
   for (Value index : indices) {
@@ -1306,9 +1350,9 @@ static bool predicateIsKZeroGuarded(Value value, Value m, Value n, Value k) {
   return predicateIsKZero(definition->getOperand(1), m, n, k);
 }
 
-static LogicalResult validatePredicateMemoryFeedbackK(
-    MemoryFeedbackKSource &source, Value outputStorage,
-    unsigned outputInput) {
+static LogicalResult
+validatePredicateMemoryFeedbackK(MemoryFeedbackKSource &source,
+                                 Value outputStorage, unsigned outputInput) {
   neura::KernelOp kernel = source.kernel;
   Value m = source.kernelCounters[0].getCurrentIndex();
   Value n = source.kernelCounters[1].getCurrentIndex();
@@ -1332,9 +1376,8 @@ static LogicalResult validatePredicateMemoryFeedbackK(
       }
       if (*input == outputInput)
         outputLoads.push_back(load);
-      else if (load.getBase() &&
-               predicateValueReferencesKernelInput(load.getBase(), outputInput,
-                                                   kernel))
+      else if (load.getBase() && predicateValueReferencesKernelInput(
+                                     load.getBase(), outputInput, kernel))
         invalidAccess = operation;
       return;
     }
@@ -1352,9 +1395,8 @@ static LogicalResult validatePredicateMemoryFeedbackK(
         return;
       }
       bool baseIsOutput =
-          store.getBase() &&
-          predicateValueReferencesKernelInput(store.getBase(), outputInput,
-                                               kernel);
+          store.getBase() && predicateValueReferencesKernelInput(
+                                 store.getBase(), outputInput, kernel);
       auto input = parseKernelInputReference(store->getAttr("rhs_value"));
       if (baseIsOutput) {
         outputStores.push_back(store);
@@ -1368,9 +1410,8 @@ static LogicalResult validatePredicateMemoryFeedbackK(
         outputStores.push_back(store);
       else {
         ++nonOutputStores;
-        if (store.getBase() &&
-            predicateValueReferencesKernelInput(store.getBase(), outputInput,
-                                                kernel))
+        if (store.getBase() && predicateValueReferencesKernelInput(
+                                   store.getBase(), outputInput, kernel))
           invalidAccess = operation;
       }
       return;
@@ -1380,10 +1421,11 @@ static LogicalResult validatePredicateMemoryFeedbackK(
       invalidAccess = operation;
   });
   if (invalidAccess)
-    return reject(invalidAccess,
-                  "predicate memory-feedback K has unclassified indexed memory access");
-  if (outputLoads.size() != 1 || outputStores.empty() || outputStores.size() > 2 ||
-      nonOutputStores != 0 || !sawMultiply)
+    return reject(
+        invalidAccess,
+        "predicate memory-feedback K has unclassified indexed memory access");
+  if (outputLoads.size() != 1 || outputStores.empty() ||
+      outputStores.size() > 2 || nonOutputStores != 0 || !sawMultiply)
     return reject(kernel,
                   "predicate memory-feedback K recurrence shape differs");
 
@@ -1391,8 +1433,8 @@ static LogicalResult validatePredicateMemoryFeedbackK(
   unsigned initialStoreCount = 0;
   for (neura::StoreIndexedOp store : outputStores) {
     if (!memoryCellIndices(store.getIndices(), m, n, k))
-      return reject(store,
-                    "predicate memory-feedback K store coordinates are not [M,N]");
+      return reject(
+          store, "predicate memory-feedback K store coordinates are not [M,N]");
     Operation *valueDefinition = store.getValue().getDefiningOp();
     if (valueDefinition &&
         (valueDefinition->getName().getStringRef() == "neura.add" ||
@@ -1401,21 +1443,21 @@ static LogicalResult validatePredicateMemoryFeedbackK(
     else if (predicateIsKZeroGuarded(store.getValue(), m, n, k))
       ++initialStoreCount;
     else
-      return reject(store,
-                    "predicate memory-feedback K store is neither recurrence nor K==0 initialization");
+      return reject(store, "predicate memory-feedback K store is neither "
+                           "recurrence nor K==0 initialization");
   }
-  bool storeShapeOK =
-      (outputStores.size() == 1 && recurrenceStoreCount == 1 &&
-       initialStoreCount == 0) ||
-      (outputStores.size() == 2 && recurrenceStoreCount == 1 &&
-       initialStoreCount == 1);
+  bool storeShapeOK = (outputStores.size() == 1 && recurrenceStoreCount == 1 &&
+                       initialStoreCount == 0) ||
+                      (outputStores.size() == 2 && recurrenceStoreCount == 1 &&
+                       initialStoreCount == 1);
   if (!storeShapeOK)
-    return reject(kernel,
-                  "predicate memory-feedback K requires one recurrence and optional K==0 store");
+    return reject(kernel, "predicate memory-feedback K requires one recurrence "
+                          "and optional K==0 store");
 
   if (!memoryCellIndices(outputLoads.front().getIndices(), m, n, k))
-    return reject(outputLoads.front(),
-                  "predicate memory-feedback K output load coordinates are not [M,N]");
+    return reject(
+        outputLoads.front(),
+        "predicate memory-feedback K output load coordinates are not [M,N]");
   bool sawMatchingAccumulator = false;
   for (neura::StoreIndexedOp store : outputStores) {
     if (!memoryCellIndices(store.getIndices(), m, n, k) ||
@@ -1424,8 +1466,7 @@ static LogicalResult validatePredicateMemoryFeedbackK(
     for (Operation *user : outputLoads.front().getResult().getUsers()) {
       StringRef name = user->getName().getStringRef();
       if ((name != "neura.add" && name != "neura.sub") ||
-          store.getValue() != user->getResult(0) ||
-          user->getNumOperands() != 2)
+          store.getValue() != user->getResult(0) || user->getNumOperands() != 2)
         continue;
       unsigned accumulatorCount = 0;
       Value other;
@@ -1445,8 +1486,9 @@ static LogicalResult validatePredicateMemoryFeedbackK(
     }
   }
   if (!sawMatchingAccumulator)
-    return reject(kernel,
-                  "predicate memory-feedback K lacks same-cell accumulator recurrence");
+    return reject(
+        kernel,
+        "predicate memory-feedback K lacks same-cell accumulator recurrence");
 
   // The proof deliberately admits only a same-[M,N]-cell state carry. Any
   // second output read, or any coordinate containing K/another outer index,
@@ -1458,8 +1500,7 @@ static LogicalResult validatePredicateMemoryFeedbackK(
   return success();
 }
 
-static void setMemoryFeedbackRegions(OpBuilder &builder,
-                                     TaskflowTaskOp task) {
+static void setMemoryFeedbackRegions(OpBuilder &builder, TaskflowTaskOp task) {
   SmallVector<Attribute> inputLowers;
   SmallVector<Attribute> inputUppers;
   SmallVector<Attribute> inputReasons;
@@ -1533,17 +1574,17 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
     ++outputReadIndex;
   if (outputReadIndex == task.getWillReads().size() ||
       llvm::count(task.getWillReads(), task.getWillWrites().front()) != 1)
-    return reject(task, "memory-feedback K requires one output read/write state");
+    return reject(task,
+                  "memory-feedback K requires one output read/write state");
   if (task.getOriginalReadMemrefs().size() != task.getWillReads().size() ||
       task.getOriginalWriteMemrefs().size() != 1)
-    return reject(task,
-                  "memory-feedback K output read/write provenance is incomplete");
+    return reject(
+        task, "memory-feedback K output read/write provenance is incomplete");
   Value outputStorage = task.getOriginalWriteMemrefs().front();
   unsigned aliasedOutputReads = 0;
   for (auto [index, read] : llvm::enumerate(task.getWillReads()))
-    aliasedOutputReads +=
-        representsOriginalStorage(read, outputStorage) ||
-        task.getOriginalReadMemrefs()[index] == outputStorage;
+    aliasedOutputReads += representsOriginalStorage(read, outputStorage) ||
+                          task.getOriginalReadMemrefs()[index] == outputStorage;
   if (aliasedOutputReads != 1)
     return reject(task,
                   "memory-feedback K output read/write has an ambiguous alias");
@@ -1568,7 +1609,9 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
   }
   if (taskCounters.size() != 3 || !kernel || !kernel.getBody().hasOneBlock() ||
       !kernel.getIterArgsInit().empty() || kernel.getNumResults() != 0)
-    return reject(task, "memory-feedback K requires three counters and a stateless kernel");
+    return reject(
+        task,
+        "memory-feedback K requires three counters and a stateless kernel");
   bool predicateForm =
       kernel->getAttrOfType<StringAttr>("dataflow_mode") &&
       kernel->getAttrOfType<StringAttr>("dataflow_mode").getValue() ==
@@ -1578,13 +1621,11 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
     auto lower = memoryTaskConstantIndex(counter.getLowerBound(), task);
     auto step = memoryTaskConstantIndex(counter.getStep(), task);
     auto upper = memoryTaskConstantIndex(counter.getUpperBound(), task);
-    bool parentOK = index == 0
-                        ? !counter.getParentIndex()
-                        : counter.getParentIndex() ==
-                              taskCounters[index - 1].getCounterIndex();
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *lower != 0 || *upper <= *lower || *step != 1 ||
-        !parentOK)
+    bool parentOK = index == 0 ? !counter.getParentIndex()
+                               : counter.getParentIndex() ==
+                                     taskCounters[index - 1].getCounterIndex();
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *lower != 0 || *upper <= *lower || *step != 1 || !parentOK)
       return reject(counter, "memory-feedback K Taskflow counters differ");
   }
   MemoryFeedbackKSource result;
@@ -1614,10 +1655,11 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
       ++outputInputAliases;
     }
   if (!outputInput)
-    return reject(kernel, "memory-feedback K cannot resolve output kernel input");
-  if (outputInputAliases != 1)
     return reject(kernel,
-                  "memory-feedback K output kernel input has an ambiguous alias");
+                  "memory-feedback K cannot resolve output kernel input");
+  if (outputInputAliases != 1)
+    return reject(
+        kernel, "memory-feedback K output kernel input has an ambiguous alias");
 
   SmallVector<neura::CounterOp> kernelCounters;
   for (Operation &operation : kernel.getBody().front())
@@ -1627,8 +1669,8 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
     return reject(kernel, "memory-feedback K requires three Neura counters");
   for (auto [index, counter] : llvm::enumerate(kernelCounters)) {
     auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
-    auto resolveBound = [&](StringRef attrName, Value operand)
-        -> std::optional<int64_t> {
+    auto resolveBound = [&](StringRef attrName,
+                            Value operand) -> std::optional<int64_t> {
       if (predicateForm)
         return predicateKernelConstantIndex(counter, attrName, operand, task,
                                             kernel);
@@ -1638,14 +1680,14 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
     auto step = resolveBound("step_value", counter.getStep());
     auto upper = resolveBound("upper_bound_value", counter.getUpperBound());
     auto hierarchy = counter.getCounterHierarchyAttr();
-    StringRef expectedHierarchy = index == 0 ? "root" :
-                                  (index == 1 ? "relay" : "leaf");
+    StringRef expectedHierarchy =
+        index == 0 ? "root" : (index == 1 ? "relay" : "leaf");
     bool hierarchyOK = hierarchy && hierarchy.getValue() == expectedHierarchy;
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *lower != 0 || *upper <= *lower || *step != 1 ||
-        !hierarchyOK || *upper !=
-                          *memoryTaskConstantIndex(
-                              taskCounters[index].getUpperBound(), task))
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *lower != 0 || *upper <= *lower || *step != 1 ||
+        !hierarchyOK ||
+        *upper !=
+            *memoryTaskConstantIndex(taskCounters[index].getUpperBound(), task))
       return reject(counter, "memory-feedback K Neura counters differ");
     result.kernelCounters.push_back(counter);
   }
@@ -1741,7 +1783,8 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
   if (initial) {
     if (nestedOutputStores.size() != 1 ||
         !memoryIsZeroComparison(initial.getCondition(), k) ||
-        !initial.getThenRegion().hasOneBlock() || !initial.getElseRegion().empty())
+        !initial.getThenRegion().hasOneBlock() ||
+        !initial.getElseRegion().empty())
       return reject(initial, "memory-feedback K initialization must be K==0");
     Block &thenBody = initial.getThenRegion().front();
     auto initialStore = nestedOutputStores.front();
@@ -1768,7 +1811,8 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
         llvm::is_contained(update->getOperands(), load.getResult()))
       accumulator = load;
   if (!accumulator)
-    return reject(updateStore, "memory-feedback K update lacks accumulator load");
+    return reject(updateStore,
+                  "memory-feedback K update lacks accumulator load");
   if (update->getNumOperands() != 2)
     return reject(updateStore, "memory-feedback K update has extra operands");
   unsigned accumulatorCount = 0;
@@ -1780,8 +1824,7 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
       product = operand;
   }
   Operation *productDef = product ? product.getDefiningOp() : nullptr;
-  if (accumulatorCount != 1 || !productDef ||
-      !isa<arith::MulIOp>(productDef) ||
+  if (accumulatorCount != 1 || !productDef || !isa<arith::MulIOp>(productDef) ||
       (isa<arith::SubIOp>(update) &&
        update->getOperand(0) != accumulator.getResult()))
     return reject(updateStore,
@@ -1806,19 +1849,22 @@ analyzeMemoryFeedbackK(ModuleOp module, StringRef functionName,
                   "memory-feedback K has duplicate or missing output reads");
   if (outputLoads.size() == 2) {
     if (!isa<arith::SubIOp>(update) || !sawCrossCellLoad)
-      return reject(kernel,
-                    "memory-feedback K cross-cell recurrence is not LU subtraction");
+      return reject(
+          kernel,
+          "memory-feedback K cross-cell recurrence is not LU subtraction");
     bool differs = false;
     for (memref::LoadOp load : outputLoads)
       differs |= load.getIndices() != accumulator.getIndices();
     if (!differs)
-      return reject(kernel, "memory-feedback K second output load is not cross-cell");
+      return reject(kernel,
+                    "memory-feedback K second output load is not cross-cell");
     // K materialization clones the complete M/N body for each K block. A
     // cross-cell output address containing K and an outer counter therefore
     // changes the original M/N/K iteration order. Without a separate ordered
     // schedule proof, retaining this recurrence would be unsound.
-    return reject(kernel,
-                  "memory-feedback K cross-cell recurrence order is not preserved");
+    return reject(
+        kernel,
+        "memory-feedback K cross-cell recurrence order is not preserved");
   }
   result.kernelCounters = kernelCounters;
   return result;
@@ -1830,10 +1876,10 @@ static void updateMemoryCounterBounds(TaskflowCounterOp taskCounter,
                                       neura::KernelOp kernel, int64_t lower,
                                       int64_t upper) {
   OpBuilder taskBuilder(taskCounter);
-  Value taskLower = taskBuilder.create<arith::ConstantIndexOp>(
-      taskCounter.getLoc(), lower);
-  Value taskUpper = taskBuilder.create<arith::ConstantIndexOp>(
-      taskCounter.getLoc(), upper);
+  Value taskLower =
+      taskBuilder.create<arith::ConstantIndexOp>(taskCounter.getLoc(), lower);
+  Value taskUpper =
+      taskBuilder.create<arith::ConstantIndexOp>(taskCounter.getLoc(), upper);
   taskCounter.getLowerBoundMutable().assign(taskLower);
   taskCounter.getUpperBoundMutable().assign(taskUpper);
   taskCounter->setAttr("counter_dynamism",
@@ -1883,12 +1929,9 @@ static void addMemoryFeedbackYield(Block *body, TaskflowYieldOp originalYield,
                                   ValueRange{output}, valueOutputs);
 }
 
-static FailureOr<TaskflowTaskOp>
-cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
-                                   MemoryFeedbackKSource &source,
-                                   Value previousState, unsigned index,
-                                   unsigned blockCount, int64_t lower,
-                                   int64_t upper) {
+static FailureOr<TaskflowTaskOp> cloneMemoryFeedbackSequentialBlock(
+    OpBuilder &builder, MemoryFeedbackKSource &source, Value previousState,
+    unsigned index, unsigned blockCount, int64_t lower, int64_t upper) {
   TaskflowTaskOp original = source.task;
   SmallVector<Value> reads(original.getWillReads());
   if (previousState)
@@ -1898,10 +1941,10 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
       (Twine(original.getTaskName()) + ".k." + Twine(index)).str();
   auto task = builder.create<TaskflowTaskOp>(
       original.getLoc(), original.getDoneReads().getTypes(),
-      original.getDoneWrites().getTypes(), original.getValueOutputs().getTypes(),
-      reads, ValueRange{output}, original.getValueInputs(),
-      builder.getStringAttr(name), original.getOriginalReadMemrefs(),
-      original.getOriginalWriteMemrefs());
+      original.getDoneWrites().getTypes(),
+      original.getValueOutputs().getTypes(), reads, ValueRange{output},
+      original.getValueInputs(), builder.getStringAttr(name),
+      original.getOriginalReadMemrefs(), original.getOriginalWriteMemrefs());
   Block *body = new Block();
   task.getBody().push_back(body);
   for (Value read : reads)
@@ -1920,8 +1963,8 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
   unsigned writeArgument = reads.size();
   mapping.map(oldBody.getArgument(original.getWillReads().size()),
               body->getArgument(writeArgument));
-  unsigned valueOffset = original.getWillReads().size() +
-                         original.getWillWrites().size();
+  unsigned valueOffset =
+      original.getWillReads().size() + original.getWillWrites().size();
   for (unsigned input = 0; input < original.getValueInputs().size(); ++input)
     mapping.map(oldBody.getArgument(valueOffset + input),
                 body->getArgument(writeArgument + 1 + input));
@@ -1929,7 +1972,7 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
   for (Operation &operation : oldBody.without_terminator())
     bodyBuilder.clone(operation, mapping);
   addMemoryFeedbackYield(body, originalYield, mapping,
-                          body->getArgument(writeArgument));
+                         body->getArgument(writeArgument));
 
   TaskflowCounterOp taskK;
   neura::KernelOp kernel;
@@ -1964,8 +2007,9 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
       if (auto initial = dyn_cast<scf::IfOp>(&operation)) {
         for (Value result : initial->getResults())
           if (!result.use_empty())
-            return reject(initial,
-                          "memory-feedback K cannot erase a live initialization result");
+            return reject(
+                initial,
+                "memory-feedback K cannot erase a live initialization result");
         initial.erase();
         break;
       }
@@ -1991,26 +2035,25 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
                 builder.getI64IntegerAttr(index));
   task->setAttr("amoeba.semantic.k_block_count",
                 builder.getI64IntegerAttr(blockCount));
-  task->setAttr(kInitialCOwnershipAttr,
-                builder.getStringAttr(index == 0 ? "initial_C_once"
-                                                  : "state_carry"));
+  task->setAttr(
+      kInitialCOwnershipAttr,
+      builder.getStringAttr(index == 0 ? "initial_C_once" : "state_carry"));
   task->setAttr(kFinalCOwnershipAttr,
                 builder.getStringAttr(index + 1 == blockCount
                                           ? "external_final_C"
                                           : "state_carry"));
-  setRangeAttrs(builder, task, {0, source.M}, {0, source.N},
-                {lower, upper});
+  setRangeAttrs(builder, task, {0, source.M}, {0, source.N}, {lower, upper});
   setMemoryFeedbackRegions(builder, task);
   SmallVector<std::tuple<StringRef, StringRef, StringRef>> edges;
   llvm::SmallPtrSet<Operation *, 4> producers;
   for (unsigned read = 0; read < original.getWillReads().size(); ++read) {
     if (read == source.outputReadIndex)
       continue;
-    if (auto producer = original.getWillReads()[read]
-                            .getDefiningOp<TaskflowTaskOp>())
+    if (auto producer =
+            original.getWillReads()[read].getDefiningOp<TaskflowTaskOp>())
       if (producers.insert(producer.getOperation()).second)
-        edges.push_back({producer.getTaskName(), "producer_consumer",
-                         "tensor_wide"});
+        edges.push_back(
+            {producer.getTaskName(), "producer_consumer", "tensor_wide"});
   }
   if (previousState) {
     std::string previousName =
@@ -2035,7 +2078,7 @@ cloneMemoryFeedbackSequentialBlock(OpBuilder &builder,
 // a newly introduced result segment must fail closed rather than reintroduce
 // the operation-lifetime abort that motivated this pass.
 static LogicalResult replaceMemoryFeedbackResults(TaskflowTaskOp source,
-                                                   TaskflowTaskOp finalBlock) {
+                                                  TaskflowTaskOp finalBlock) {
   if (source.getDoneReads().size() != finalBlock.getDoneReads().size() ||
       source.getDoneWrites().size() != finalBlock.getDoneWrites().size() ||
       source.getValueOutputs().size() != finalBlock.getValueOutputs().size())
@@ -2052,16 +2095,16 @@ static LogicalResult replaceMemoryFeedbackResults(TaskflowTaskOp source,
 
   for (Value result : source->getResults())
     if (!result.use_empty())
-      return reject(source,
-                    "memory-feedback K source result remains live after rewrite");
+      return reject(
+          source, "memory-feedback K source result remains live after rewrite");
   return success();
 }
 
 static LogicalResult runMemoryFeedbackSequentialK(ModuleOp module,
-                                                   StringRef functionName,
-                                                   StringRef taskName,
-                                                   int64_t tileSize,
-                                                   int64_t factor) {
+                                                  StringRef functionName,
+                                                  StringRef taskName,
+                                                  int64_t tileSize,
+                                                  int64_t factor) {
   FailureOr<MemoryFeedbackKSource> source =
       analyzeMemoryFeedbackK(module, functionName, taskName);
   if (failed(source))
@@ -2070,8 +2113,8 @@ static LogicalResult runMemoryFeedbackSequentialK(ModuleOp module,
   if (failed(width))
     return reject(source->task,
                   "memory-feedback sequential K requires a width in [1,K)");
-  unsigned blockCount = static_cast<unsigned>(
-      (source->K + *width - 1) / *width);
+  unsigned blockCount =
+      static_cast<unsigned>((source->K + *width - 1) / *width);
   if (blockCount < 2)
     return reject(source->task,
                   "memory-feedback sequential K requires at least two blocks");
@@ -2083,7 +2126,8 @@ static LogicalResult runMemoryFeedbackSequentialK(ModuleOp module,
       collision |= task != source->task && task.getTaskName() == name;
     });
     if (collision)
-      return reject(source->task, "memory-feedback K derived task name collides");
+      return reject(source->task,
+                    "memory-feedback K derived task name collides");
   }
   OpBuilder builder(source->task);
   Value previousState;
@@ -2100,8 +2144,7 @@ static LogicalResult runMemoryFeedbackSequentialK(ModuleOp module,
   }
   if (failed(replaceMemoryFeedbackResults(source->task, blocks.back())))
     return failure();
-  source->function->setAttr(kKPolicyAttr,
-                            builder.getStringAttr("sequential"));
+  source->function->setAttr(kKPolicyAttr, builder.getStringAttr("sequential"));
   source->function->setAttr(kRewriteSchemaAttr,
                             builder.getStringAttr(kRewriteSchema));
   source->task.erase();
@@ -2155,7 +2198,8 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
   if (function.getSymName() !=
       "_Z10llama_funciPA256_KiS1_S1_S1_S1_S1_S1_PA256_i")
     return reject(function, "application K requires the pinned LLaMA function");
-  auto bound = function->getAttrOfType<IntegerAttr>("amoeba.static_bound.arg.0");
+  auto bound =
+      function->getAttrOfType<IntegerAttr>("amoeba.static_bound.arg.0");
   if (!bound || bound.getInt() != 320)
     return reject(function, "application K requires input-0 bound 320");
 
@@ -2185,10 +2229,9 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
       matches.push_back(task);
   });
   if (matches.size() != 1)
-    return reject(function,
-                  (Twine("application K requires exactly one ") +
-                   selectedTaskName)
-                      .str());
+    return reject(function, (Twine("application K requires exactly one ") +
+                             selectedTaskName)
+                                .str());
   TaskflowTaskOp task = matches.front();
   if (task->hasAttr("amoeba.semantic.k_tiled") ||
       task->hasAttr("amoeba.neura.tiling.parent_task") ||
@@ -2223,10 +2266,9 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
                             task.getOriginalReadMemrefs()[1]) &&
       representsOriginalStorage(A, task.getOriginalReadMemrefs()[0]) &&
       representsOriginalStorage(B, task.getOriginalReadMemrefs()[1]);
-  bool originalInputsMatch =
-      task3 ? staticTask3Storage
-            : (task.getOriginalReadMemrefs()[0] == A &&
-               task.getOriginalReadMemrefs()[1] == B);
+  bool originalInputsMatch = task3 ? staticTask3Storage
+                                   : (task.getOriginalReadMemrefs()[0] == A &&
+                                      task.getOriginalReadMemrefs()[1] == B);
   if (!originalInputsMatch || task.getOriginalWriteMemrefs()[0] != T ||
       !isa_and_nonnull<memref::AllocaOp>(T.getDefiningOp()) ||
       (!callerInputsMatch && !staticTask3Storage) ||
@@ -2262,7 +2304,7 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
       constantIndex(counters[0].getStep()) != 1 ||
       constantIndex(counters[1].getLowerBound()) != 0 ||
       (task3 ? counters[1].getUpperBound() != body.getArgument(3)
-              : constantIndex(counters[1].getUpperBound()) != 256) ||
+             : constantIndex(counters[1].getUpperBound()) != 256) ||
       constantIndex(counters[1].getStep()) != 1 ||
       constantIndex(counters[2].getLowerBound()) != 0 ||
       constantIndex(counters[2].getUpperBound()) != 256 ||
@@ -2345,8 +2387,8 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
   Value m = neuraCounters[0].getCurrentIndex();
   Value n = neuraCounters[1].getCurrentIndex();
   Value k = neuraCounters[2].getCurrentIndex();
-  if (cmp.getPredicate() != arith::CmpIPredicate::eq ||
-      cmp.getLhs() != k || constantIndex(cmp.getRhs()) != 0 ||
+  if (cmp.getPredicate() != arith::CmpIPredicate::eq || cmp.getLhs() != k ||
+      constantIndex(cmp.getRhs()) != 0 ||
       init.getCondition() != cmp.getResult() ||
       loads[0].getMemRef() != inputA ||
       !hasIndices(loads[0].getIndices(), m, k) ||
@@ -2354,9 +2396,8 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
       !(task3 ? hasIndices(loads[1].getIndices(), n, k)
               : hasIndices(loads[1].getIndices(), k, n)) ||
       mul.getLhs() != loads[0].getResult() ||
-      mul.getRhs() != loads[1].getResult() ||
-      add.getLhs() != acc || add.getRhs() != mul.getResult() ||
-      stores[0].getMemRef() != output ||
+      mul.getRhs() != loads[1].getResult() || add.getLhs() != acc ||
+      add.getRhs() != mul.getResult() || stores[0].getMemRef() != output ||
       stores[0].getValue() != add.getResult() ||
       !hasIndices(stores[0].getIndices(), m, n))
     return reject(kernel, "application K GEMM recurrence differs");
@@ -2373,9 +2414,17 @@ analyzeLlamaApplicationK(ModuleOp module, StringRef functionName,
       yield.getIterArgsNext()[0] != add.getResult() ||
       yield.getResults()[0] != add.getResult())
     return reject(kernel, "application K scalar yield differs");
-  return LlamaApplicationKSource{function, task, kernel, counters[2],
-                                 neuraCounters[2], add, init,
-                                 selectedTaskName.str(), 320, expectedN, 256,
+  return LlamaApplicationKSource{function,
+                                 task,
+                                 kernel,
+                                 counters[2],
+                                 neuraCounters[2],
+                                 add,
+                                 init,
+                                 selectedTaskName.str(),
+                                 320,
+                                 expectedN,
+                                 256,
                                  task3};
 }
 
@@ -2471,11 +2520,9 @@ cloneLlamaSequentialBlock(OpBuilder &builder, LlamaApplicationKSource &source,
   kernelK->setAttr("counter_dynamism",
                    kernelBuilder.getStringAttr("constant_bound"));
   if (kernelK->hasAttr("lower_bound_value"))
-    kernelK->setAttr("lower_bound_value",
-                     kernelBuilder.getIndexAttr(lower));
+    kernelK->setAttr("lower_bound_value", kernelBuilder.getIndexAttr(lower));
   if (kernelK->hasAttr("upper_bound_value"))
-    kernelK->setAttr("upper_bound_value",
-                     kernelBuilder.getIndexAttr(upper));
+    kernelK->setAttr("upper_bound_value", kernelBuilder.getIndexAttr(upper));
   taskK->setAttr("counter_dynamism",
                  taskBuilder.getStringAttr("constant_bound"));
 
@@ -2512,15 +2559,14 @@ cloneLlamaSequentialBlock(OpBuilder &builder, LlamaApplicationKSource &source,
                 builder.getI64IntegerAttr(index));
   task->setAttr("amoeba.semantic.k_block_count",
                 builder.getI64IntegerAttr(blockCount));
-  task->setAttr("amoeba.semantic.initial_accumulator",
-                builder.getStringAttr(index == 0 ? "zero_once" : "state_carry"));
+  task->setAttr(
+      "amoeba.semantic.initial_accumulator",
+      builder.getStringAttr(index == 0 ? "zero_once" : "state_carry"));
   setRangeAttrs(builder, task, {0, source.M}, {0, source.N}, {lower, upper});
   SmallVector<StaticRegion> inputRegions{
       {{0, lower}, {source.M, upper}},
-      source.relayUsesOuterBound ? StaticRegion{{0, lower},
-                                                {source.N, upper}}
-                                 : StaticRegion{{lower, 0},
-                                                {upper, source.N}}};
+      source.relayUsesOuterBound ? StaticRegion{{0, lower}, {source.N, upper}}
+                                 : StaticRegion{{lower, 0}, {upper, source.N}}};
   if (previousState)
     inputRegions.push_back(fullRegion(source.M, source.N));
   setRegionContracts(builder, task, inputRegions,
@@ -2569,20 +2615,19 @@ cloneLlamaSequentialBlock(OpBuilder &builder, LlamaApplicationKSource &source,
 }
 
 static LogicalResult runLlamaApplicationSequentialK(ModuleOp module,
-                                                       StringRef functionName,
-                                                       StringRef taskName,
-                                                       int64_t tileSize,
-                                                       int64_t factor) {
+                                                    StringRef functionName,
+                                                    StringRef taskName,
+                                                    int64_t tileSize,
+                                                    int64_t factor) {
   FailureOr<LlamaApplicationKSource> source =
       analyzeLlamaApplicationK(module, functionName, taskName);
   if (failed(source))
     return failure();
   FailureOr<int64_t> width = resolveWidth(source->K, tileSize, factor, true);
   if (failed(width) || *width != 64)
-    return reject(source->task,
-                  (Twine("LLaMA ") + taskName +
-                   " sequential K currently requires width 64")
-                      .str());
+    return reject(source->task, (Twine("LLaMA ") + taskName +
+                                 " sequential K currently requires width 64")
+                                    .str());
   unsigned blockCount = static_cast<unsigned>(source->K / *width);
   for (unsigned index = 0; index < blockCount; ++index) {
     std::string name =
@@ -2599,8 +2644,8 @@ static LogicalResult runLlamaApplicationSequentialK(ModuleOp module,
   TaskflowTaskOp finalBlock;
   for (unsigned index = 0; index < blockCount; ++index) {
     FailureOr<TaskflowTaskOp> block = cloneLlamaSequentialBlock(
-        builder, *source, previousState, index, blockCount,
-        index * *width, (index + 1) * *width);
+        builder, *source, previousState, index, blockCount, index * *width,
+        (index + 1) * *width);
     if (failed(block))
       return failure();
     finalBlock = *block;
@@ -2609,7 +2654,7 @@ static LogicalResult runLlamaApplicationSequentialK(ModuleOp module,
   source->task.getDoneWrites().front().replaceAllUsesWith(previousState);
   source->function->setAttr(kKPolicyAttr, builder.getStringAttr("sequential"));
   source->function->setAttr(kRewriteSchemaAttr,
-                             builder.getStringAttr(kRewriteSchema));
+                            builder.getStringAttr(kRewriteSchema));
   source->task.erase();
   return success();
 }
@@ -2638,22 +2683,22 @@ struct MaterializeNeuraKReductionPass
                     scf::SCFDialect, TaskflowDialect>();
   }
 
-  Option<std::string> functionName{
-      *this, "function", llvm::cl::desc("Taskflow function name"),
-      llvm::cl::init("")};
+  Option<std::string> functionName{*this, "function",
+                                   llvm::cl::desc("Taskflow function name"),
+                                   llvm::cl::init("")};
   Option<std::string> kMode{
       *this, "k-mode",
       llvm::cl::desc("sequential, parallel-linear, or parallel-tree"),
       llvm::cl::init("sequential")};
-  Option<int64_t> tileSize{
-      *this, "tile-size", llvm::cl::desc("K block width"),
-      llvm::cl::init(0)};
-  Option<int64_t> kFactor{
-      *this, "k-factor", llvm::cl::desc("Number of K blocks"),
-      llvm::cl::init(0)};
+  Option<int64_t> tileSize{*this, "tile-size", llvm::cl::desc("K block width"),
+                           llvm::cl::init(0)};
+  Option<int64_t> kFactor{*this, "k-factor",
+                          llvm::cl::desc("Number of K blocks"),
+                          llvm::cl::init(0)};
   Option<std::string> taskName{
       *this, "task-name",
-      llvm::cl::desc("Select the checked LLaMA Task_1/Task_2/Task_3 application recurrence"),
+      llvm::cl::desc("Select the checked LLaMA Task_1/Task_2/Task_3 "
+                     "application recurrence"),
       llvm::cl::init("")};
 
   void runOnOperation() override {
@@ -2671,7 +2716,7 @@ struct MaterializeNeuraKReductionPass
         // through the strict state-carry adapter, which rejects any graph
         // that does not prove the canonical or ordered recurrence shape.
         result = runMemoryFeedbackSequentialK(module, functionName, taskName,
-                                               tileSize, kFactor);
+                                              tileSize, kFactor);
       else {
         module.emitError()
             << "application/memory-feedback K supports only sequential mode";
@@ -2682,12 +2727,11 @@ struct MaterializeNeuraKReductionPass
     else if (kMode == "parallel-linear")
       result = runParallel(module, functionName, tileSize, kFactor, "linear");
     else if (kMode == "parallel-tree")
-      result = runParallel(module, functionName, tileSize, kFactor,
-                           "balanced_tree");
+      result =
+          runParallel(module, functionName, tileSize, kFactor, "balanced_tree");
     else {
-      module.emitError()
-          << "post-Neura K reduction mode must be sequential, "
-             "parallel-linear, or parallel-tree";
+      module.emitError() << "post-Neura K reduction mode must be sequential, "
+                            "parallel-linear, or parallel-tree";
       result = failure();
     }
     if (failed(result))

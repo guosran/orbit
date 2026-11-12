@@ -19,12 +19,10 @@ namespace amoeba::neura::joint_scheduling {
 class ProductionFixedScheduleCommunication final
     : public FixedScheduleCommunication {
 public:
-  ProductionFixedScheduleCommunication(
-      taskflow::TaskCommunicationModel &model,
-      std::vector<Operation *> taskOperations);
+  ProductionFixedScheduleCommunication(taskflow::TaskCommunicationModel &model,
+                                       std::vector<Operation *> taskOperations);
 
-  bool getPredecessors(unsigned consumer,
-                       std::vector<unsigned> &predecessors,
+  bool getPredecessors(unsigned consumer, std::vector<unsigned> &predecessors,
                        std::string &error) const override;
   void resetReservations() override { model_.resetReservations(); }
   void beginTrial() override { model_.beginTrial(); }
@@ -33,17 +31,18 @@ public:
   bool getCanonicalReservationState(std::string &state,
                                     std::string &error) const override;
   bool supportsReservationCheckpoint() const override;
-  bool captureReservationCheckpoint(
-      ReservationCheckpoint &checkpoint, std::string &error) const override;
-  bool restoreReservationCheckpoint(
-      const ReservationCheckpoint &checkpoint,
-      std::string &error) override;
+  bool captureReservationCheckpoint(ReservationCheckpoint &checkpoint,
+                                    std::string &error) const override;
+  bool restoreReservationCheckpoint(const ReservationCheckpoint &checkpoint,
+                                    std::string &error) override;
   bool getTransferLowerBound(unsigned producer, unsigned consumer,
-                             int64_t &cycles, std::string &error) const override;
-  bool getTransferLowerBoundForEndpoints(
-      unsigned producer, unsigned consumer, int sourceRow, int sourceCol,
-      int destinationRow, int destinationCol, int64_t &cycles,
-      std::string &error) const override;
+                             int64_t &cycles,
+                             std::string &error) const override;
+  bool getTransferLowerBoundForEndpoints(unsigned producer, unsigned consumer,
+                                         int sourceRow, int sourceCol,
+                                         int destinationRow, int destinationCol,
+                                         int64_t &cycles,
+                                         std::string &error) const override;
   bool supportsStaticEndpointLowerBoundCache() const override;
   bool getTransferReadyCycle(unsigned producer, unsigned consumer,
                              int sourceRow, int sourceCol, int destinationRow,

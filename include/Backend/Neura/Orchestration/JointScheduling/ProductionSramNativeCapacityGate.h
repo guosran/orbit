@@ -12,8 +12,8 @@
 
 #include "Backend/Neura/Orchestration/JointScheduling/ProductionSramNativeUpperBound.h"
 
-#include "llvm/ADT/ArrayRef.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/ArrayRef.h"
 
 #include <cstdint>
 #include <map>
@@ -50,10 +50,10 @@ const char *nativeSramCapacityStatusName(NativeSramCapacityStatus status);
 /// is only `pending`: it may be avoided by streaming, eviction, or a copy
 /// schedule, and this result contains no proof of actual residency overflow.
 /// Malformed coordinates/capacities are `fail`.
-NativeSramCapacityGateResult classifyNativeSramCapacity(
-    const NativeSramUpperBoundResult &upperBound,
-    llvm::ArrayRef<int64_t> capacityBytesByCgra, int64_t gridRows = 4,
-    int64_t gridColumns = 4);
+NativeSramCapacityGateResult
+classifyNativeSramCapacity(const NativeSramUpperBoundResult &upperBound,
+                           llvm::ArrayRef<int64_t> capacityBytesByCgra,
+                           int64_t gridRows = 4, int64_t gridColumns = 4);
 
 /// Annotate a native module with the same classification.  The owning
 /// backend registers this factory and supplies the source-derived per-CGRA

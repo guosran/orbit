@@ -24,8 +24,8 @@
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 
-#include <cstdint>
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
@@ -33,8 +33,8 @@
 #include <set>
 #include <string>
 #include <tuple>
-#include <vector>
 #include <utility>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::amoeba::neura::joint_scheduling;
@@ -69,18 +69,16 @@ struct FactoredDescriptor {
   std::set<ShapeKey> shapes;
 };
 
-static std::optional<StringRef> requiredString(const json::Object &object,
-                                               StringRef key,
-                                               std::string &error) {
+static std::optional<StringRef>
+requiredString(const json::Object &object, StringRef key, std::string &error) {
   std::optional<StringRef> value = object.getString(key);
   if (!value || value->empty())
     error = "missing or empty string field \"" + key.str() + "\"";
   return value;
 }
 
-static std::optional<int64_t> requiredInteger(const json::Object &object,
-                                              StringRef key,
-                                              std::string &error) {
+static std::optional<int64_t>
+requiredInteger(const json::Object &object, StringRef key, std::string &error) {
   std::optional<int64_t> value = object.getInteger(key);
   if (!value)
     error = "missing or invalid integer field \"" + key.str() + "\"";
@@ -88,8 +86,7 @@ static std::optional<int64_t> requiredInteger(const json::Object &object,
 }
 
 static std::optional<bool> requiredBoolean(const json::Object &object,
-                                           StringRef key,
-                                           std::string &error) {
+                                           StringRef key, std::string &error) {
   std::optional<bool> value = object.getBoolean(key);
   if (!value)
     error = "missing or invalid boolean field \"" + key.str() + "\"";
@@ -98,9 +95,10 @@ static std::optional<bool> requiredBoolean(const json::Object &object,
 
 // JSON integers are signed 64-bit in LLVM's JSON API.  Keep the exact
 // factored-space cardinality as canonical decimal text when it is larger.
-static std::optional<std::string>
-requiredDecimal(const json::Object &object, StringRef key, std::string &error,
-                bool requirePositive = true) {
+static std::optional<std::string> requiredDecimal(const json::Object &object,
+                                                  StringRef key,
+                                                  std::string &error,
+                                                  bool requirePositive = true) {
   if (std::optional<int64_t> numeric = object.getInteger(key)) {
     if (*numeric < 0 || (requirePositive && *numeric == 0)) {
       error = "invalid decimal field \"" + key.str() + "\"";
@@ -109,8 +107,7 @@ requiredDecimal(const json::Object &object, StringRef key, std::string &error,
     return std::to_string(*numeric);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char value) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char value) {
         return value < '0' || value > '9';
       })) {
     error = "missing or invalid decimal field \"" + key.str() + "\"";
@@ -131,8 +128,10 @@ static std::string multiplyDecimal(StringRef value, uint64_t factor) {
   uint64_t carry = 0;
   for (auto it = value.rbegin(); it != value.rend(); ++it) {
     uint64_t digit = static_cast<uint64_t>(*it - '0');
-    unsigned __int128 product = static_cast<unsigned __int128>(digit) * factor + carry;
-    result.push_back(static_cast<char>('0' + static_cast<unsigned>(product % 10)));
+    unsigned __int128 product =
+        static_cast<unsigned __int128>(digit) * factor + carry;
+    result.push_back(
+        static_cast<char>('0' + static_cast<unsigned>(product % 10)));
     carry = static_cast<uint64_t>(product / 10);
   }
   while (carry) {
@@ -260,8 +259,7 @@ static bool parseFactoredDescriptor(StringRef path, StringRef expectedFunction,
         return false;
       }
       if (!descriptor.shapes.insert({task->str(), *rows, *cols}).second) {
-        error = "factored descriptor repeats task/mapper shape " +
-                task->str();
+        error = "factored descriptor repeats task/mapper shape " + task->str();
         return false;
       }
     }
@@ -293,13 +291,12 @@ static bool isGitCommit(StringRef value) {
 }
 
 static bool rejectMeasuredMapperFields(const json::Object &object,
-                                      StringRef where,
-                                      std::string &error) {
+                                       StringRef where, std::string &error) {
   for (const auto &item : object) {
     StringRef key = item.first;
     if (key.contains_insensitive("measured") ||
-        key.contains_insensitive("mapper_cost") ||
-        key == "native_cycles" || key == "mapper_cycles") {
+        key.contains_insensitive("mapper_cost") || key == "native_cycles" ||
+        key == "mapper_cycles") {
       error = "measured mapper cost cache field is forbidden in " +
               where.str() + ": " + key.str();
       return true;
@@ -308,30 +305,27 @@ static bool rejectMeasuredMapperFields(const json::Object &object,
   return false;
 }
 
-static bool validateModelProvenance(const json::Object &metadata,
-                                    StringRef actualNamespace,
-                                    StringRef expectedNamespace,
-                                    StringRef expectedModel,
-                                    StringRef expectedModelSchema,
-                                    StringRef expectedFeatureContract,
-                                    StringRef expectedExtractor,
-                                    std::string &error) {
+static bool
+validateModelProvenance(const json::Object &metadata, StringRef actualNamespace,
+                        StringRef expectedNamespace, StringRef expectedModel,
+                        StringRef expectedModelSchema,
+                        StringRef expectedFeatureContract,
+                        StringRef expectedExtractor, std::string &error) {
   auto model = requiredString(metadata, "model", error);
   auto modelSchema = requiredString(metadata, "model_schema", error);
-  auto featureContract =
-      requiredString(metadata, "feature_contract_id", error);
+  auto featureContract = requiredString(metadata, "feature_contract_id", error);
   auto extractor = requiredString(metadata, "feature_extractor", error);
   auto modelStatus = requiredString(metadata, "model_status", error);
   auto qualityStatus = requiredString(metadata, "quality_status", error);
   auto productionReady = requiredBoolean(metadata, "production_ready", error);
-  if (!model || !modelSchema || !featureContract ||
-      !extractor || !modelStatus || !qualityStatus || !productionReady)
+  if (!model || !modelSchema || !featureContract || !extractor ||
+      !modelStatus || !qualityStatus || !productionReady)
     return false;
   if (actualNamespace.empty() || expectedNamespace.empty() ||
       expectedModel.empty() || expectedModelSchema.empty() ||
       expectedFeatureContract.empty() || expectedExtractor.empty() ||
-      actualNamespace != expectedNamespace ||
-      *model != expectedModel || *modelSchema != expectedModelSchema ||
+      actualNamespace != expectedNamespace || *model != expectedModel ||
+      *modelSchema != expectedModelSchema ||
       *featureContract != expectedFeatureContract ||
       *extractor != expectedExtractor) {
     error = "ML model provenance is absent or does not match the requested "
@@ -358,8 +352,8 @@ static bool validateCatalogCoverage(
   }
   llvm::Expected<json::Value> parsed = json::parse((*buffer)->getBuffer());
   if (!parsed) {
-    error = "invalid cost catalogue JSON: " +
-            llvm::toString(parsed.takeError());
+    error =
+        "invalid cost catalogue JSON: " + llvm::toString(parsed.takeError());
     return false;
   }
   json::Object *parsedRoot = parsed->getAsObject();
@@ -380,8 +374,9 @@ static bool validateCatalogCoverage(
   if (const json::Value *rawSource = metadata->get("predictor_source")) {
     std::optional<StringRef> source = rawSource->getAsString();
     if (!source || *source != kMlPredictorSource) {
-      error = "cost catalogue predictor_source conflicts with the ML II/startup "
-              "predictor contract";
+      error =
+          "cost catalogue predictor_source conflicts with the ML II/startup "
+          "predictor contract";
       return false;
     }
   }
@@ -393,9 +388,9 @@ static bool validateCatalogCoverage(
   }
 
   if (!validateModelProvenance(*metadata, *namespaceValue, expectedNamespace,
-                               expectedModel,
-                               expectedModelSchema, expectedFeatureContract,
-                               expectedExtractor, error))
+                               expectedModel, expectedModelSchema,
+                               expectedFeatureContract, expectedExtractor,
+                               error))
     return false;
 
   // Reuse the production parser for Git, architecture, task IDs, ranking
@@ -474,39 +469,40 @@ struct RebindAnalyticalTaskCostCatalogPass
   Option<std::string> functionName{
       *this, "function", llvm::cl::desc("Taskflow function to validate"),
       llvm::cl::init("")};
-  Option<std::string> costFile{
-      *this, "cost-file", llvm::cl::desc("Input predictor catalogue"),
-      llvm::cl::init("")};
-  Option<std::string> spaceFile{
-      *this, "space-file", llvm::cl::desc("Exact factored space JSONL"),
-      llvm::cl::init("")};
-  Option<std::string> outputFile{
-      *this, "output", llvm::cl::desc("Rebound catalogue output"),
-      llvm::cl::init("")};
+  Option<std::string> costFile{*this, "cost-file",
+                               llvm::cl::desc("Input predictor catalogue"),
+                               llvm::cl::init("")};
+  Option<std::string> spaceFile{*this, "space-file",
+                                llvm::cl::desc("Exact factored space JSONL"),
+                                llvm::cl::init("")};
+  Option<std::string> outputFile{*this, "output",
+                                 llvm::cl::desc("Rebound catalogue output"),
+                                 llvm::cl::init("")};
   Option<std::string> sourceRepository{
       *this, "source-git-repository", llvm::cl::desc("Expected Git repository"),
       llvm::cl::init("")};
-  Option<std::string> sourceCommit{
-      *this, "source-git-commit", llvm::cl::desc("Expected Git commit"),
-      llvm::cl::init("")};
+  Option<std::string> sourceCommit{*this, "source-git-commit",
+                                   llvm::cl::desc("Expected Git commit"),
+                                   llvm::cl::init("")};
   Option<std::string> architecturePath{
       *this, "architecture-path", llvm::cl::desc("Expected architecture path"),
       llvm::cl::init("")};
-  Option<std::string> graphVariantId{
-      *this, "graph-variant-id", llvm::cl::desc("Expected graph variant"),
-      llvm::cl::init("")};
+  Option<std::string> graphVariantId{*this, "graph-variant-id",
+                                     llvm::cl::desc("Expected graph variant"),
+                                     llvm::cl::init("")};
   Option<std::string> modelNamespace{
       *this, "model-namespace", llvm::cl::desc("Expected predictor namespace"),
       llvm::cl::init("")};
-  Option<std::string> model{
-      *this, "model", llvm::cl::desc("Expected predictor model identity"),
-      llvm::cl::init("")};
+  Option<std::string> model{*this, "model",
+                            llvm::cl::desc("Expected predictor model identity"),
+                            llvm::cl::init("")};
   Option<std::string> modelSchema{
       *this, "model-schema", llvm::cl::desc("Expected predictor model schema"),
       llvm::cl::init("")};
   Option<std::string> featureContract{
       *this, "feature-contract-id",
-      llvm::cl::desc("Expected predictor feature contract"), llvm::cl::init("")};
+      llvm::cl::desc("Expected predictor feature contract"),
+      llvm::cl::init("")};
   Option<std::string> featureExtractor{
       *this, "feature-extractor",
       llvm::cl::desc("Expected predictor feature extractor"),
@@ -524,10 +520,12 @@ struct RebindAnalyticalTaskCostCatalogPass
     func::FuncOp function = *selected;
     if (costFile.getValue().empty() || spaceFile.getValue().empty() ||
         outputFile.getValue().empty() || sourceRepository.getValue().empty() ||
-        sourceCommit.getValue().empty() || architecturePath.getValue().empty() ||
-        graphVariantId.getValue().empty() || modelNamespace.getValue().empty() ||
-        model.getValue().empty() || modelSchema.getValue().empty() ||
-        featureContract.getValue().empty() || featureExtractor.getValue().empty() ||
+        sourceCommit.getValue().empty() ||
+        architecturePath.getValue().empty() ||
+        graphVariantId.getValue().empty() ||
+        modelNamespace.getValue().empty() || model.getValue().empty() ||
+        modelSchema.getValue().empty() || featureContract.getValue().empty() ||
+        featureExtractor.getValue().empty() ||
         samePath(costFile.getValue(), outputFile.getValue()) ||
         samePath(spaceFile.getValue(), outputFile.getValue()) ||
         samePath(costFile.getValue(), spaceFile.getValue()) ||
@@ -557,7 +555,8 @@ struct RebindAnalyticalTaskCostCatalogPass
             sourceRepository.getValue(), sourceCommit.getValue(),
             architecturePath.getValue(), graphVariantId.getValue(),
             modelNamespace.getValue(), model.getValue(), modelSchema.getValue(),
-            featureContract.getValue(), featureExtractor.getValue(), root, sourceCount, error)) {
+            featureContract.getValue(), featureExtractor.getValue(), root,
+            sourceCount, error)) {
       function.emitError() << error;
       return signalPassFailure();
     }
@@ -569,17 +568,17 @@ struct RebindAnalyticalTaskCostCatalogPass
     }
     putDecimal(*metadata, "candidate_count", descriptor.candidateCount);
     (*metadata)["predictor_source"] = kMlPredictorSource.str();
-    (*metadata)["rebind_provenance"] = json::Object{
-        {"schema", kRebindSchema},
-        {"status", "complete"},
-        {"coverage", "exact-task-oriented-mapper-shapes"},
-        {"input_candidate_count", sourceCount},
-        {"rebound_candidate_count", descriptor.candidateCount},
-        {"space_schema", kFactoredSpaceSchema},
-        {"space_path", spaceFile.getValue()},
-        {"source_catalog_path", costFile.getValue()},
-        {"model_provenance_checked", true},
-        {"source_provenance_checked", true}};
+    (*metadata)["rebind_provenance"] =
+        json::Object{{"schema", kRebindSchema},
+                     {"status", "complete"},
+                     {"coverage", "exact-task-oriented-mapper-shapes"},
+                     {"input_candidate_count", sourceCount},
+                     {"rebound_candidate_count", descriptor.candidateCount},
+                     {"space_schema", kFactoredSpaceSchema},
+                     {"space_path", spaceFile.getValue()},
+                     {"source_catalog_path", costFile.getValue()},
+                     {"model_provenance_checked", true},
+                     {"source_provenance_checked", true}};
 
     if (!writeAtomically(
             outputFile.getValue(),
@@ -592,7 +591,8 @@ struct RebindAnalyticalTaskCostCatalogPass
       return signalPassFailure();
     }
     llvm::errs() << "[JointScheduling] rebound exact cost catalogue with "
-                 << descriptor.shapes.size() << " task/mapper-shape entries and "
+                 << descriptor.shapes.size()
+                 << " task/mapper-shape entries and "
                  << descriptor.candidateCount << " factored candidates\n";
   }
 };

@@ -36,7 +36,9 @@ struct BindStaticScalarArgumentPass
       : PassWrapper<BindStaticScalarArgumentPass, OperationPass<ModuleOp>>(
             other) {}
 
-  StringRef getArgument() const override { return "bind-static-scalar-argument"; }
+  StringRef getArgument() const override {
+    return "bind-static-scalar-argument";
+  }
   StringRef getDescription() const override {
     return "Bind a verified compile-time scalar function argument";
   }
@@ -45,7 +47,8 @@ struct BindStaticScalarArgumentPass
   }
 
   Option<std::string> functionName{
-      *this, "function", llvm::cl::desc("Exact function symbol; inferred if unique"),
+      *this, "function",
+      llvm::cl::desc("Exact function symbol; inferred if unique"),
       llvm::cl::init("")};
   Option<int64_t> argumentIndex{
       *this, "argument", llvm::cl::desc("Zero-based scalar argument index"),
@@ -62,27 +65,32 @@ struct BindStaticScalarArgumentPass
         matches.push_back(function);
     });
     if (matches.size() != 1) {
-      module.emitError("static scalar binding requires exactly one selected function");
+      module.emitError(
+          "static scalar binding requires exactly one selected function");
       signalPassFailure();
       return;
     }
     func::FuncOp function = matches.front();
     if (function.isDeclaration() || argumentIndex < 0 ||
         argumentIndex >= static_cast<int64_t>(function.getNumArguments())) {
-      function.emitError("static scalar binding has no body or invalid argument index");
+      function.emitError(
+          "static scalar binding has no body or invalid argument index");
       signalPassFailure();
       return;
     }
     BlockArgument argument = function.getArgument(argumentIndex);
     Type type = argument.getType();
     if (auto integer = dyn_cast<IntegerType>(type)) {
-      if (!llvm::APInt(64, scalarValue, true).isSignedIntN(integer.getWidth())) {
-        function.emitError("static scalar binding value exceeds argument width");
+      if (!llvm::APInt(64, scalarValue, true)
+               .isSignedIntN(integer.getWidth())) {
+        function.emitError(
+            "static scalar binding value exceeds argument width");
         signalPassFailure();
         return;
       }
     } else if (!type.isIndex()) {
-      function.emitError("static scalar binding requires an integer or index argument");
+      function.emitError(
+          "static scalar binding requires an integer or index argument");
       signalPassFailure();
       return;
     }
@@ -95,12 +103,15 @@ struct BindStaticScalarArgumentPass
     builder.setInsertionPointToStart(&function.getBody().front());
     Value constant;
     if (type.isIndex())
-      constant = builder.create<arith::ConstantIndexOp>(
-          function.getLoc(), scalarValue).getResult();
+      constant =
+          builder.create<arith::ConstantIndexOp>(function.getLoc(), scalarValue)
+              .getResult();
     else
-      constant = builder.create<arith::ConstantIntOp>(
-          function.getLoc(), scalarValue,
-          cast<IntegerType>(type)).getResult();
+      constant =
+          builder
+              .create<arith::ConstantIntOp>(function.getLoc(), scalarValue,
+                                            cast<IntegerType>(type))
+              .getResult();
     argument.replaceAllUsesWith(constant);
     std::string attribute =
         "amoeba.static_bound.arg." + std::to_string(argumentIndex);

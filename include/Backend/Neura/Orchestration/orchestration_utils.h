@@ -97,7 +97,7 @@ class TaskMemoryGraph;
 
 class TaskCommunicationModel;
 // The exact physical context-slot parser used by the production scheduler.
-bool getProductionContextSlots(int &slots,std::string &error);
+bool getProductionContextSlots(int &slots, std::string &error);
 
 // Opaque reservation state supplied by an optional communication model.
 // The owner and type tag are part of the contract: callers must never pass a
@@ -123,13 +123,16 @@ public:
   getTaskPredecessors(Operation *consumer,
                       llvm::SmallVectorImpl<Operation *> &predecessors,
                       std::string &error) const = 0;
-  virtual bool getTransferLowerBound(Operation *, Operation *, int64_t &cycles, std::string &) const {
-    cycles = 0; return true;
+  virtual bool getTransferLowerBound(Operation *, Operation *, int64_t &cycles,
+                                     std::string &) const {
+    cycles = 0;
+    return true;
   }
-  virtual bool getTransferLowerBoundForEndpoints(
-      Operation *producer, Operation *consumer, int source_row, int source_col,
-      int destination_row, int destination_col, int64_t &cycles,
-      std::string &error) const {
+  virtual bool
+  getTransferLowerBoundForEndpoints(Operation *producer, Operation *consumer,
+                                    int source_row, int source_col,
+                                    int destination_row, int destination_col,
+                                    int64_t &cycles, std::string &error) const {
     (void)source_row;
     (void)source_col;
     (void)destination_row;
@@ -255,9 +258,8 @@ private:
   // Checks dependencies and, when requested, commits the single routed
   // transfer for each producer/consumer task pair. Aggregate parent replicas
   // call this once after collecting all replica regions.
-  bool communicationReady(TaskNode *task_node,
-                          const TaskPlacement &placement, bool commit,
-                          int64_t &ready_time);
+  bool communicationReady(TaskNode *task_node, const TaskPlacement &placement,
+                          bool commit, int64_t &ready_time);
 
   // Parses a cgra_shape attribute string into its base placement shape.
   CgraShape parseCgraShapeToBase(StringRef cgra_shape, int cgra_count);

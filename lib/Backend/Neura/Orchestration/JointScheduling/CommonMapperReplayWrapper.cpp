@@ -16,15 +16,16 @@ using namespace mlir;
 namespace mlir::amoeba::neura::joint_scheduling {
 
 func::FuncOp buildCommonMapperReplayWrapper(taskflow::TaskflowTaskOp task,
-                                           ModuleOp owner,
-                                           llvm::StringRef symbolName,
-                                           std::string &error) {
+                                            ModuleOp owner,
+                                            llvm::StringRef symbolName,
+                                            std::string &error) {
   auto fail = [&](llvm::StringRef message) {
     error = message.str();
     return func::FuncOp();
   };
   if (!task || !owner || symbolName.empty())
-    return fail("mapper replay wrapper requires a task, owner module, and symbol");
+    return fail(
+        "mapper replay wrapper requires a task, owner module, and symbol");
 
   SmallVector<::mlir::neura::KernelOp> kernels;
   task.walk([&](::mlir::neura::KernelOp kernel) { kernels.push_back(kernel); });

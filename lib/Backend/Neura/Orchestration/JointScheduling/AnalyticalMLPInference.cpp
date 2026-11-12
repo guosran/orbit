@@ -5,16 +5,16 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/Orchestration/JointScheduling/MapperFeatureExtractor.h"
 
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -31,8 +31,7 @@ namespace {
 
 constexpr float kMapperIICeiling = 20.0F;
 constexpr float kFactsTolerance = 1.0e-6F;
-constexpr llvm::StringLiteral kMLCostCacheSchema =
-    "orbit-cgra-ii-ml-cache-v2";
+constexpr llvm::StringLiteral kMLCostCacheSchema = "orbit-cgra-ii-ml-cache-v2";
 
 static bool finiteNumber(double value) { return std::isfinite(value); }
 
@@ -79,8 +78,8 @@ static bool rejectDigestIdentityKeys(const json::Value &value,
       std::string lower;
       lower.reserve(key.size());
       for (char character : key)
-        lower.push_back(static_cast<char>(std::tolower(
-            static_cast<unsigned char>(character))));
+        lower.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
       // "shape" and "shape_protocol" are legitimate model fields.  Reject
       // only actual digest identity fields, never ordinary shape metadata.
       if (lower == "hash" || lower == "sha256" ||
@@ -137,16 +136,15 @@ static bool requireExactString(const json::Object &object, llvm::StringRef key,
                                llvm::StringRef expected, std::string &error) {
   std::optional<llvm::StringRef> value = object.getString(key);
   if (!value || *value != expected) {
-    error = "field \"" + key.str() + "\" does not match \"" +
-            expected.str() + "\"";
+    error =
+        "field \"" + key.str() + "\" does not match \"" + expected.str() + "\"";
     return false;
   }
   return true;
 }
 
-static bool requireExactBoolean(const json::Object &object,
-                                llvm::StringRef key, bool expected,
-                                std::string &error) {
+static bool requireExactBoolean(const json::Object &object, llvm::StringRef key,
+                                bool expected, std::string &error) {
   std::optional<bool> value = object.getBoolean(key);
   if (!value || *value != expected) {
     error = "field \"" + key.str() + "\" has the wrong boolean value";
@@ -182,8 +180,7 @@ static bool parseShapeArray(const json::Value *raw, unsigned expectedRank,
 }
 
 static bool appendTensorValues(const json::Value &value,
-                               std::vector<float> &values,
-                               std::string &error) {
+                               std::vector<float> &values, std::string &error) {
   if (const json::Array *array = value.getAsArray()) {
     for (const json::Value &element : *array)
       if (!appendTensorValues(element, values, error))
@@ -216,8 +213,7 @@ static bool parseDirectFloatVector(const json::Value *raw, unsigned expected,
 }
 
 static bool parseDirectFloatMatrix(const json::Value *raw, unsigned rows,
-                                   unsigned columns,
-                                   std::vector<float> &values,
+                                   unsigned columns, std::vector<float> &values,
                                    std::string &error) {
   const json::Array *matrix = raw ? raw->getAsArray() : nullptr;
   if (!matrix || matrix->size() != rows) {
@@ -291,10 +287,10 @@ static bool parseTensor(const json::Object &tensors, llvm::StringRef name,
   return true;
 }
 
-static bool validateFeatureContract(const json::Object &contract,
-                                    llvm::StringRef expectedId,
-                                    std::string &error,
-                                    std::vector<std::string> *namesOut = nullptr) {
+static bool
+validateFeatureContract(const json::Object &contract,
+                        llvm::StringRef expectedId, std::string &error,
+                        std::vector<std::string> *namesOut = nullptr) {
   if (!requireExactString(contract, "contract_id", expectedId, error) ||
       !requireExactString(contract, "extractor", kFormalFeatureExtractor,
                           error))
@@ -327,8 +323,12 @@ static bool validateFeatureContract(const json::Object &contract,
     return false;
   }
   static constexpr llvm::StringLiteral expectedInputs[] = {
-      "route_expanded_task_dfg", "mapper_rows", "mapper_columns", "rec_mii",
-      "res_mii", "analytical_lower_bound"};
+      "route_expanded_task_dfg",
+      "mapper_rows",
+      "mapper_columns",
+      "rec_mii",
+      "res_mii",
+      "analytical_lower_bound"};
   for (unsigned index = 0; index < 6; ++index) {
     std::optional<llvm::StringRef> value = (*inputs)[index].getAsString();
     if (!value || *value != expectedInputs[index]) {
@@ -336,8 +336,8 @@ static bool validateFeatureContract(const json::Object &contract,
       return false;
     }
   }
-  return requireExactString(contract, "shape_protocol_id", kFormalShapeProtocolId,
-                            error);
+  return requireExactString(contract, "shape_protocol_id",
+                            kFormalShapeProtocolId, error);
 }
 
 static bool validateSupportedShapeArray(const json::Object &shapeProtocol,
@@ -345,7 +345,8 @@ static bool validateSupportedShapeArray(const json::Object &shapeProtocol,
   if (!requireExactString(shapeProtocol, "protocol_id", kFormalShapeProtocolId,
                           error))
     return false;
-  const json::Array *shapes = shapeProtocol.getArray("supported_mapper_tile_shapes");
+  const json::Array *shapes =
+      shapeProtocol.getArray("supported_mapper_tile_shapes");
   if (!shapes || shapes->size() != 8) {
     error = "shape protocol does not enumerate the eight formal mapper shapes";
     return false;
@@ -368,7 +369,8 @@ static bool validateSupportedShapeArray(const json::Object &shapeProtocol,
   }
   std::set<std::pair<int64_t, int64_t>> expectedSet(expected, expected + 8);
   if (actual != expectedSet) {
-    error = "shape protocol supported mapper shapes differ from the pinned model";
+    error =
+        "shape protocol supported mapper shapes differ from the pinned model";
     return false;
   }
   return true;
@@ -377,9 +379,9 @@ static bool validateSupportedShapeArray(const json::Object &shapeProtocol,
 } // namespace
 
 bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
-                                  llvm::StringRef checkpointDirectory,
-                                  llvm::StringRef requestedArchitectureContract,
-                                  std::string &error) {
+                                 llvm::StringRef checkpointDirectory,
+                                 llvm::StringRef requestedArchitectureContract,
+                                 std::string &error) {
   loaded = false;
   featureNames.clear();
   checkpoints.clear();
@@ -411,9 +413,8 @@ bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
     return false;
 
   const json::Object *architecture = ensemble.getObject("architecture");
-  if (!architecture ||
-      !requireExactString(*architecture, "protocol_id", kFormalShapeProtocolId,
-                          error))
+  if (!architecture || !requireExactString(*architecture, "protocol_id",
+                                           kFormalShapeProtocolId, error))
     return false;
   // The C++ feature frontend supplies the actual architecture contract.  The
   // model package is tied to the same 4x4 protocol; a non-empty caller
@@ -482,8 +483,7 @@ bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
                             error) ||
         !requireExactString(checkpointJson, "quality_status", "exploratory",
                             error) ||
-        !requireExactString(checkpointJson, "output_mode", "continuous",
-                            error))
+        !requireExactString(checkpointJson, "output_mode", "continuous", error))
       return false;
     std::optional<int64_t> version = checkpointJson.getInteger("version");
     if (!version || *version != 2) {
@@ -512,10 +512,10 @@ bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
                                        kFormalShapeProtocolId, error))
       return false;
     const json::Array *hidden = config->getArray("hidden_dimensions");
-    if (!hidden || hidden->size() != 2 ||
-        !hidden->front().getAsInteger() ||
+    if (!hidden || hidden->size() != 2 || !hidden->front().getAsInteger() ||
         *hidden->front().getAsInteger() != 64 ||
-        !hidden->back().getAsInteger() || *hidden->back().getAsInteger() != 32) {
+        !hidden->back().getAsInteger() ||
+        *hidden->back().getAsInteger() != 32) {
       error = "checkpoint hidden dimensions are not [64, 32]";
       return false;
     }
@@ -525,9 +525,10 @@ bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
       error = "checkpoint mapper II ceiling is not 20";
       return false;
     }
-    const json::Object *evidence = checkpointJson.getObject("training_evidence");
-    if (!evidence || !requireExactBoolean(*evidence, "production_ready", false,
-                                          error))
+    const json::Object *evidence =
+        checkpointJson.getObject("training_evidence");
+    if (!evidence ||
+        !requireExactBoolean(*evidence, "production_ready", false, error))
       return false;
     const json::Object *tensors = checkpointJson.getObject("tensors");
     if (!tensors || tensors->size() != 8) {
@@ -559,7 +560,8 @@ bool FormalMax4MLPEnsemble::load(llvm::StringRef ensemblePath,
       }
     }
     checkpoints.push_back(std::move(checkpoint));
-    checkpointSourceTexts.push_back({name.str(), std::move(checkpointSourceText)});
+    checkpointSourceTexts.push_back(
+        {name.str(), std::move(checkpointSourceText)});
   }
   ensembleWeights = std::move(parsedWeights);
   loaded = true;
@@ -584,8 +586,8 @@ MLCostCacheResources FormalMax4MLPEnsemble::makeCacheResources(
 static float gelu(float value) {
   constexpr float inverseSqrtTwo = 0.7071067811865475244F;
   return 0.5F * value *
-         (1.0F + static_cast<float>(std::erf(
-                       static_cast<double>(value * inverseSqrtTwo))));
+         (1.0F + static_cast<float>(
+                     std::erf(static_cast<double>(value * inverseSqrtTwo))));
 }
 
 static float softplus(float value) {
@@ -595,9 +597,8 @@ static float softplus(float value) {
 }
 
 static float linear(const std::vector<float> &weights,
-                    const std::vector<float> &bias,
-                    llvm::ArrayRef<float> input, unsigned output,
-                    unsigned inputWidth) {
+                    const std::vector<float> &bias, llvm::ArrayRef<float> input,
+                    unsigned output, unsigned inputWidth) {
   float sum = bias[output];
   const size_t row = static_cast<size_t>(output) * inputWidth;
   for (unsigned index = 0; index < inputWidth; ++index)
@@ -645,16 +646,16 @@ bool FormalMax4MLPEnsemble::predict(llvm::ArrayRef<double> features,
     SmallVector<float, 64> hidden0;
     hidden0.reserve(64);
     for (unsigned index = 0; index < 64; ++index)
-      hidden0.push_back(gelu(linear(checkpoint.layer0Weight,
-                                    checkpoint.layer0Bias, normalized, index,
-                                    kFormalMapperFeatureWidth)));
+      hidden0.push_back(
+          gelu(linear(checkpoint.layer0Weight, checkpoint.layer0Bias,
+                      normalized, index, kFormalMapperFeatureWidth)));
     SmallVector<float, 32> hidden2;
     hidden2.reserve(32);
     for (unsigned index = 0; index < 32; ++index)
-      hidden2.push_back(gelu(linear(checkpoint.layer2Weight,
-                                    checkpoint.layer2Bias, hidden0, index, 64)));
-    float raw = linear(checkpoint.layer4Weight, checkpoint.layer4Bias, hidden2,
-                       0, 32);
+      hidden2.push_back(gelu(linear(
+          checkpoint.layer2Weight, checkpoint.layer2Bias, hidden0, index, 64)));
+    float raw =
+        linear(checkpoint.layer4Weight, checkpoint.layer4Bias, hidden2, 0, 32);
     float value = lower + softplus(raw);
     value = std::min(value, kMapperIICeiling);
     if (!std::isfinite(value)) {
@@ -696,9 +697,10 @@ namespace amoeba {
 namespace neura {
 namespace joint_scheduling {
 
-bool validatePerCgra2x2RuntimeContract(
-    double runtimeIICeiling, llvm::StringRef trainingArchitectureText,
-    llvm::StringRef runtimeArchitectureText, std::string &error) {
+bool validatePerCgra2x2RuntimeContract(double runtimeIICeiling,
+                                       llvm::StringRef trainingArchitectureText,
+                                       llvm::StringRef runtimeArchitectureText,
+                                       std::string &error) {
   if (trainingArchitectureText.empty() || runtimeArchitectureText.empty()) {
     error = "training and runtime architecture text are required";
     return false;
@@ -721,7 +723,8 @@ bool validatePerCgra2x2RuntimeContract(
   constexpr llvm::StringLiteral runtimeLine = "ctrl_mem_items: 23";
   const size_t position = trainingArchitectureText.find(trainingLine);
   if (position == llvm::StringRef::npos ||
-      trainingArchitectureText.find(trainingLine, position + trainingLine.size()) !=
+      trainingArchitectureText.find(trainingLine,
+                                    position + trainingLine.size()) !=
           llvm::StringRef::npos) {
     error = "diagnostic architecture must contain exactly one training "
             "ctrl_mem_items: 20 field";
@@ -729,15 +732,15 @@ bool validatePerCgra2x2RuntimeContract(
   }
   const size_t previousNewline =
       trainingArchitectureText.substr(0, position).rfind('\n');
-  const size_t lineStart = previousNewline == llvm::StringRef::npos
-                               ? 0
-                               : previousNewline + 1;
-  llvm::StringRef indentation = trainingArchitectureText.substr(
-      lineStart, position - lineStart);
+  const size_t lineStart =
+      previousNewline == llvm::StringRef::npos ? 0 : previousNewline + 1;
+  llvm::StringRef indentation =
+      trainingArchitectureText.substr(lineStart, position - lineStart);
   const size_t lineEnd = position + trainingLine.size();
-  if (llvm::any_of(indentation, [](char character) {
-        return character != ' ' && character != '\t';
-      }) ||
+  if (llvm::any_of(indentation,
+                   [](char character) {
+                     return character != ' ' && character != '\t';
+                   }) ||
       (lineEnd < trainingArchitectureText.size() &&
        trainingArchitectureText[lineEnd] != '\r' &&
        trainingArchitectureText[lineEnd] != '\n')) {
@@ -762,9 +765,9 @@ bool makePerCgra2x2DiagnosticOverrideMetadata(
     std::string &error) {
   error.clear();
   overrideMetadata.clear();
-  if (!validatePerCgra2x2RuntimeContract(
-          kPerCgra2x2DiagnosticIICeiling, trainingArchitectureText,
-          runtimeArchitectureText, error))
+  if (!validatePerCgra2x2RuntimeContract(kPerCgra2x2DiagnosticIICeiling,
+                                         trainingArchitectureText,
+                                         runtimeArchitectureText, error))
     return false;
   overrideMetadata = json::Object{
       {"schema", kPerCgra2x2DiagnosticSchema.str()},
@@ -773,8 +776,7 @@ bool makePerCgra2x2DiagnosticOverrideMetadata(
       {"extrapolation_enabled", true},
       {"formal", false},
       {"output_rule", kPerCgra2x2DiagnosticOutputRule.str()},
-      {"training_architecture_exact_yaml_text",
-       trainingArchitectureText.str()},
+      {"training_architecture_exact_yaml_text", trainingArchitectureText.str()},
       {"runtime_architecture_exact_yaml_text", runtimeArchitectureText.str()}};
   return true;
 }
@@ -785,18 +787,15 @@ bool validatePerCgra2x2DiagnosticMetadata(
   error.clear();
   const json::Object *overrideMetadata =
       predictorMetadata.getObject("diagnostic_override");
-  std::optional<double> trainingCeiling = overrideMetadata
-                                              ? overrideMetadata->getNumber(
-                                                    "training_ii_ceiling")
-                                              : std::nullopt;
-  std::optional<double> runtimeCeiling = overrideMetadata
-                                             ? overrideMetadata->getNumber(
-                                                   "runtime_ii_ceiling")
-                                             : std::nullopt;
+  std::optional<double> trainingCeiling =
+      overrideMetadata ? overrideMetadata->getNumber("training_ii_ceiling")
+                       : std::nullopt;
+  std::optional<double> runtimeCeiling =
+      overrideMetadata ? overrideMetadata->getNumber("runtime_ii_ceiling")
+                       : std::nullopt;
   std::optional<llvm::StringRef> trainingArchitecture =
       overrideMetadata
-          ? overrideMetadata->getString(
-                "training_architecture_exact_yaml_text")
+          ? overrideMetadata->getString("training_architecture_exact_yaml_text")
           : std::nullopt;
   std::optional<llvm::StringRef> runtimeArchitecture =
       overrideMetadata
@@ -805,9 +804,8 @@ bool validatePerCgra2x2DiagnosticMetadata(
   std::string architectureError;
   if (!overrideMetadata || overrideMetadata->size() != 8 ||
       overrideMetadata->getString("schema") != kPerCgra2x2DiagnosticSchema ||
-      !trainingCeiling ||
-      *trainingCeiling != kPerCgra2x2TrainingIICeiling || !runtimeCeiling ||
-      *runtimeCeiling != kPerCgra2x2DiagnosticIICeiling ||
+      !trainingCeiling || *trainingCeiling != kPerCgra2x2TrainingIICeiling ||
+      !runtimeCeiling || *runtimeCeiling != kPerCgra2x2DiagnosticIICeiling ||
       !overrideMetadata->getBoolean("extrapolation_enabled").value_or(false) ||
       overrideMetadata->getBoolean("formal").value_or(true) ||
       overrideMetadata->getString("output_rule") !=
@@ -836,16 +834,17 @@ bool validatePerCgra2x2DiagnosticMetadata(
 } // namespace amoeba
 } // namespace mlir
 
-bool PerCgra2x2DirectEnsemble::load(
-    llvm::StringRef ensemblePath, llvm::StringRef expectedArchitectureText,
-    std::string &error) {
+bool PerCgra2x2DirectEnsemble::load(llvm::StringRef ensemblePath,
+                                    llvm::StringRef expectedArchitectureText,
+                                    std::string &error) {
   return load(ensemblePath, expectedArchitectureText,
               kPerCgra2x2TrainingIICeiling, error);
 }
 
-bool PerCgra2x2DirectEnsemble::load(
-    llvm::StringRef ensemblePath, llvm::StringRef runtimeArchitectureText,
-    double runtimeIICeiling, std::string &error) {
+bool PerCgra2x2DirectEnsemble::load(llvm::StringRef ensemblePath,
+                                    llvm::StringRef runtimeArchitectureText,
+                                    double runtimeIICeiling,
+                                    std::string &error) {
   loaded = false;
   modelNamespace.clear();
   featureContractId.clear();
@@ -867,8 +866,8 @@ bool PerCgra2x2DirectEnsemble::load(
   if (!readJsonObject(ensemblePath, root, error))
     return false;
   if (!requireExactString(root, "schema", kPerCgra2x2EnsembleSchema, error) ||
-      !requireExactString(root, "model_namespace",
-                          kPerCgra2x2ModelNamespace, error))
+      !requireExactString(root, "model_namespace", kPerCgra2x2ModelNamespace,
+                          error))
     return false;
 
   const json::Object *source = root.getObject("source_model");
@@ -882,9 +881,9 @@ bool PerCgra2x2DirectEnsemble::load(
     return false;
   const json::Object *candidate = source->getObject("candidate_metadata");
   if (!candidate ||
-      !requireExactString(
-          *candidate, "promotion_status",
-          "candidate_pending_amoeba_benchmark_overlap_audit", error) ||
+      !requireExactString(*candidate, "promotion_status",
+                          "candidate_pending_amoeba_benchmark_overlap_audit",
+                          error) ||
       !requireExactString(*candidate, "shape_protocol_id",
                           kPerCgra2x2ShapeProtocolId, error) ||
       !requireExactBoolean(*candidate, "candidate_only", true, error) ||
@@ -892,9 +891,9 @@ bool PerCgra2x2DirectEnsemble::load(
                            "amoeba_benchmark_overlap_audit_complete", false,
                            error) ||
       !requireExactBoolean(*candidate, "old_4x4_labels_reused", false, error) ||
-      !requireExactBoolean(
-          *candidate, "supports_whole_program_latency_or_throughput_claim",
-          false, error))
+      !requireExactBoolean(*candidate,
+                           "supports_whole_program_latency_or_throughput_claim",
+                           false, error))
     return false;
   int64_t rawFeatureCount = 0;
   int64_t selectedFeatureCount = 0;
@@ -951,7 +950,8 @@ bool PerCgra2x2DirectEnsemble::load(
     std::optional<int64_t> parsedIndex = (*rawIndices)[position].getAsInteger();
     if (!parsedIndex || *parsedIndex < 0 ||
         *parsedIndex >= static_cast<int64_t>(featureNames.size()) ||
-        (position != 0 && static_cast<unsigned>(*parsedIndex) <= previousIndex)) {
+        (position != 0 &&
+         static_cast<unsigned>(*parsedIndex) <= previousIndex)) {
       error = "direct ensemble feature indices must be increasing and in range";
       return false;
     }
@@ -972,14 +972,12 @@ bool PerCgra2x2DirectEnsemble::load(
                            error))
     return false;
   int64_t maxPhysicalCgras = 0;
-  if (!getRequiredInteger(*shapeProtocol,
-                          "maximum_physical_cgras_per_task",
+  if (!getRequiredInteger(*shapeProtocol, "maximum_physical_cgras_per_task",
                           maxPhysicalCgras, error) ||
       maxPhysicalCgras != 4)
     return false;
   static constexpr std::pair<int64_t, int64_t> expectedShapes[] = {
-      {2, 2}, {2, 4}, {4, 2}, {2, 6},
-      {6, 2}, {2, 8}, {8, 2}, {4, 4},
+      {2, 2}, {2, 4}, {4, 2}, {2, 6}, {6, 2}, {2, 8}, {8, 2}, {4, 4},
   };
   const json::Array *shapeArray =
       shapeProtocol->getArray("supported_mapper_tile_shapes");
@@ -1002,15 +1000,16 @@ bool PerCgra2x2DirectEnsemble::load(
   const json::Object *architecture = root.getObject("architecture");
   std::string trainingArchitectureText;
   if (!architecture ||
-      !requireExactString(*architecture, "name",
-                          "AMOEBA_4x4_CGRA_2x2_Tiles", error) ||
+      !requireExactString(*architecture, "name", "AMOEBA_4x4_CGRA_2x2_Tiles",
+                          error) ||
       !getRequiredString(*architecture, "exact_yaml_text",
                          trainingArchitectureText, error) ||
-      !validatePerCgra2x2RuntimeContract(
-          runtimeIICeiling, trainingArchitectureText, runtimeArchitectureText,
-          error)) {
+      !validatePerCgra2x2RuntimeContract(runtimeIICeiling,
+                                         trainingArchitectureText,
+                                         runtimeArchitectureText, error)) {
     if (error.empty())
-      error = "direct ensemble training/runtime architecture contract is invalid";
+      error =
+          "direct ensemble training/runtime architecture contract is invalid";
     return false;
   }
 
@@ -1018,8 +1017,8 @@ bool PerCgra2x2DirectEnsemble::load(
   if (!network ||
       !requireExactString(*network, "activation", "gelu_erf", error) ||
       !requireExactString(*network, "residual_activation", "softplus", error) ||
-      !requireExactString(*network, "lower_bound_rule",
-                          "max(rec_mii,res_mii)", error) ||
+      !requireExactString(*network, "lower_bound_rule", "max(rec_mii,res_mii)",
+                          error) ||
       !requireExactString(
           *network, "output_rule",
           "min(lower_bound + softplus(logit), mapper_ii_ceiling)", error) ||
@@ -1039,8 +1038,8 @@ bool PerCgra2x2DirectEnsemble::load(
   }
   const json::Array *hidden = network->getArray("hidden_dimensions");
   if (!hidden || hidden->size() != 2 || !(*hidden)[0].getAsInteger() ||
-      *(*hidden)[0].getAsInteger() != 64 ||
-      !(*hidden)[1].getAsInteger() || *(*hidden)[1].getAsInteger() != 32) {
+      *(*hidden)[0].getAsInteger() != 64 || !(*hidden)[1].getAsInteger() ||
+      *(*hidden)[1].getAsInteger() != 32) {
     error = "direct ensemble hidden dimensions are not [64, 32]";
     return false;
   }
@@ -1086,10 +1085,10 @@ bool PerCgra2x2DirectEnsemble::load(
       error = "direct ensemble member must contain three linear layers";
       return false;
     }
-    std::vector<float> *weights[] = {
-        &member.layer0Weight, &member.layer1Weight, &member.layer2Weight};
-    std::vector<float> *biases[] = {
-        &member.layer0Bias, &member.layer1Bias, &member.layer2Bias};
+    std::vector<float> *weights[] = {&member.layer0Weight, &member.layer1Weight,
+                                     &member.layer2Weight};
+    std::vector<float> *biases[] = {&member.layer0Bias, &member.layer1Bias,
+                                    &member.layer2Bias};
     static constexpr unsigned inputWidths[] = {61, 64, 32};
     static constexpr unsigned outputWidths[] = {64, 32, 1};
     for (unsigned layerIndex = 0; layerIndex < 3; ++layerIndex) {
@@ -1101,9 +1100,9 @@ bool PerCgra2x2DirectEnsemble::load(
           !getRequiredInteger(*layer, "output_width", outputWidth, error) ||
           inputWidth != inputWidths[layerIndex] ||
           outputWidth != outputWidths[layerIndex] ||
-          !parseDirectFloatMatrix(layer->get("weights"), outputWidths[layerIndex],
-                                  inputWidths[layerIndex], *weights[layerIndex],
-                                  error) ||
+          !parseDirectFloatMatrix(
+              layer->get("weights"), outputWidths[layerIndex],
+              inputWidths[layerIndex], *weights[layerIndex], error) ||
           !parseDirectFloatVector(layer->get("bias"), outputWidths[layerIndex],
                                   *biases[layerIndex], error)) {
         error = "direct ensemble member layer has invalid dimensions or values";
@@ -1131,10 +1130,11 @@ bool PerCgra2x2DirectEnsemble::featureNamesMatch(
          std::equal(names.begin(), names.end(), featureNames.begin());
 }
 
-bool PerCgra2x2DirectEnsemble::predict(
-    llvm::ArrayRef<double> features, double recMii, double resMii,
-    double lowerBound, DirectMapperIIPrediction &prediction,
-    std::string &error) const {
+bool PerCgra2x2DirectEnsemble::predict(llvm::ArrayRef<double> features,
+                                       double recMii, double resMii,
+                                       double lowerBound,
+                                       DirectMapperIIPrediction &prediction,
+                                       std::string &error) const {
   if (!loaded) {
     error = "per-CGRA 2x2 direct ensemble is not loaded";
     return false;
@@ -1145,8 +1145,7 @@ bool PerCgra2x2DirectEnsemble::predict(
   }
   if (!finiteNumber(recMii) || !finiteNumber(resMii) ||
       !finiteNumber(lowerBound) || recMii < 0.0 || resMii < 0.0 ||
-      lowerBound != std::max(recMii, resMii) ||
-      lowerBound > runtimeIICeiling) {
+      lowerBound != std::max(recMii, resMii) || lowerBound > runtimeIICeiling) {
     error = "direct-model lower bound must equal max(RecMII, ResMII) and fit "
             "the explicitly loaded runtime interval";
     return false;
@@ -1156,7 +1155,8 @@ bool PerCgra2x2DirectEnsemble::predict(
   for (double feature : features) {
     if (!finiteNumber(feature) || feature > std::numeric_limits<float>::max() ||
         feature < -std::numeric_limits<float>::max()) {
-      error = "direct-model feature vector contains a non-finite or out-of-range value";
+      error = "direct-model feature vector contains a non-finite or "
+              "out-of-range value";
       return false;
     }
     input.push_back(static_cast<float>(feature));
@@ -1180,8 +1180,8 @@ bool PerCgra2x2DirectEnsemble::predict(
     SmallVector<float, 32> hidden1;
     hidden1.reserve(32);
     for (unsigned index = 0; index < 32; ++index)
-      hidden1.push_back(gelu(linear(member.layer1Weight, member.layer1Bias,
-                                    hidden0, index, 64)));
+      hidden1.push_back(gelu(
+          linear(member.layer1Weight, member.layer1Bias, hidden0, index, 64)));
     float raw = linear(member.layer2Weight, member.layer2Bias, hidden1, 0, 32);
     float value = std::min(lower + softplus(raw), runtimeIICeiling);
     if (!std::isfinite(value) || value < lower) {
@@ -1201,18 +1201,15 @@ bool mlir::amoeba::neura::joint_scheduling::isFormalMax4MapperShape(
   static constexpr std::pair<int64_t, int64_t> shapes[] = {
       {4, 4}, {4, 8}, {8, 4}, {4, 12}, {12, 4}, {4, 16}, {8, 8}, {16, 4}};
   return std::find(std::begin(shapes), std::end(shapes),
-                   std::pair<int64_t, int64_t>{rows, cols}) !=
-         std::end(shapes);
+                   std::pair<int64_t, int64_t>{rows, cols}) != std::end(shapes);
 }
 
 bool mlir::amoeba::neura::joint_scheduling::isPerCgra2x2MapperShape(
     int64_t rows, int64_t cols) {
   static constexpr std::pair<int64_t, int64_t> shapes[] = {
-      {2, 2}, {2, 4}, {4, 2}, {2, 6},
-      {6, 2}, {2, 8}, {8, 2}, {4, 4}};
+      {2, 2}, {2, 4}, {4, 2}, {2, 6}, {6, 2}, {2, 8}, {8, 2}, {4, 4}};
   return std::find(std::begin(shapes), std::end(shapes),
-                   std::pair<int64_t, int64_t>{rows, cols}) !=
-         std::end(shapes);
+                   std::pair<int64_t, int64_t>{rows, cols}) != std::end(shapes);
 }
 
 static bool sameFacts(const MLCostCacheFacts &left,
@@ -1222,23 +1219,19 @@ static bool sameFacts(const MLCostCacheFacts &left,
          std::fabs(left.lowerBound - right.lowerBound) <= kFactsTolerance;
 }
 
-bool PersistentMLCostCache::load(llvm::StringRef path,
-                                 llvm::StringRef modelSchema,
-                                 llvm::StringRef featureContractId,
-                                 llvm::StringRef architectureContract,
-                                 const MLCostCacheResources &resources,
-                                 double runtimeIICeiling,
-                                 llvm::StringRef
-                                     validatedTrainingArchitectureText,
-                                 std::string &error) {
+bool PersistentMLCostCache::load(
+    llvm::StringRef path, llvm::StringRef modelSchema,
+    llvm::StringRef featureContractId, llvm::StringRef architectureContract,
+    const MLCostCacheResources &resources, double runtimeIICeiling,
+    llvm::StringRef validatedTrainingArchitectureText, std::string &error) {
   entries.clear();
   hitCount = 0;
   missCount = 0;
   const bool directModel = modelSchema == kPerCgra2x2EnsembleSchema;
   if (directModel) {
-    if (!validatePerCgra2x2RuntimeContract(
-            runtimeIICeiling, validatedTrainingArchitectureText,
-            resources.architectureText, error)) {
+    if (!validatePerCgra2x2RuntimeContract(runtimeIICeiling,
+                                           validatedTrainingArchitectureText,
+                                           resources.architectureText, error)) {
       error = "ML cache runtime architecture contract is invalid: " + error;
       return false;
     }
@@ -1268,8 +1261,8 @@ bool PersistentMLCostCache::load(llvm::StringRef path,
   if (!rejectDigestIdentityKeys(*parsed, error, path))
     return false;
   const json::Object *root = parsed->getAsObject();
-  if (!root || !requireExactString(*root, "schema", kMLCostCacheSchema,
-                                   error) ||
+  if (!root ||
+      !requireExactString(*root, "schema", kMLCostCacheSchema, error) ||
       !requireExactString(*root, "model_schema", modelSchema, error) ||
       !requireExactString(*root, "feature_contract_id", featureContractId,
                           error) ||

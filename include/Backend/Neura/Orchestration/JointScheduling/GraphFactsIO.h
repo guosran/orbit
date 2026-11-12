@@ -125,8 +125,7 @@ inline bool encodeGraphFacts(StringRef jsonText, FactsCompression compression,
   }
 
   output.resize(kCompressedFactsHeaderSize);
-  std::memcpy(output.data(), kCompressedFactsMagic,
-              kCompressedFactsMagicSize);
+  std::memcpy(output.data(), kCompressedFactsMagic, kCompressedFactsMagicSize);
   output[8] = static_cast<uint8_t>(compression);
   output[9] = 0;
   std::memset(output.data() + 10, 0, 6);
@@ -230,9 +229,9 @@ inline bool decodeGraphFacts(StringRef bytes, std::string &jsonText,
   return true;
 }
 
-inline bool readGraphFactsFile(StringRef path, std::string &jsonText,
-                               std::string &error,
-                               FactsCompression *detectedCompression = nullptr) {
+inline bool
+readGraphFactsFile(StringRef path, std::string &jsonText, std::string &error,
+                   FactsCompression *detectedCompression = nullptr) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {

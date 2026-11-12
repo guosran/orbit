@@ -44,8 +44,8 @@ struct ShapeDomainPropagationResult {
 namespace detail {
 
 inline bool addWide(int64_t lhs, int64_t rhs, int64_t &result) {
-  const __int128 value = static_cast<__int128>(lhs) +
-                         static_cast<__int128>(rhs);
+  const __int128 value =
+      static_cast<__int128>(lhs) + static_cast<__int128>(rhs);
   if (value > static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
     result = std::numeric_limits<int64_t>::max();
     return false;
@@ -111,16 +111,15 @@ inline bool mandatoryWindowWork(const ShapeDomainOption &option,
   if (release < 0 || deadline < 0 || start < 0 || end <= start)
     return false;
 
-  __int128 before = static_cast<__int128>(start) -
-                    static_cast<__int128>(release);
-  __int128 after = static_cast<__int128>(deadline) -
-                   static_cast<__int128>(end);
+  __int128 before =
+      static_cast<__int128>(start) - static_cast<__int128>(release);
+  __int128 after = static_cast<__int128>(deadline) - static_cast<__int128>(end);
   if (before < 0)
     before = 0;
   if (after < 0)
     after = 0;
-  const __int128 remaining = static_cast<__int128>(option.duration) -
-                             before - after;
+  const __int128 remaining =
+      static_cast<__int128>(option.duration) - before - after;
   if (remaining <= 0)
     return true;
 
@@ -144,8 +143,7 @@ inline int64_t optimisticShapeDuration(const ShapeDomainOption &option) {
   return option.supported && option.duration > 0 ? option.duration : 0;
 }
 
-inline unsigned __int128 optimisticShapeWork(
-    const ShapeDomainOption &option) {
+inline unsigned __int128 optimisticShapeWork(const ShapeDomainOption &option) {
   if (!option.supported || option.duration <= 0)
     return 0;
   return static_cast<unsigned __int128>(option.duration) * option.area;
@@ -180,12 +178,12 @@ inline unsigned __int128 optimisticShapeWork(
 // The last option remains physically present so ordinary domain consumers keep
 // their fail-closed behavior; a verified global-bound caller may consume the
 // separate contradiction result.
-inline ShapeDomainPropagationResult propagateShapeDomains(
-    std::vector<std::vector<ShapeDomainOption>> &domains,
-    const std::vector<std::vector<unsigned>> &predecessors,
-    const std::vector<std::vector<int64_t>> &edgeLowerBounds,
-    int64_t upperBound, unsigned gridArea = 16,
-    bool enableResourceBounds = true) {
+inline ShapeDomainPropagationResult
+propagateShapeDomains(std::vector<std::vector<ShapeDomainOption>> &domains,
+                      const std::vector<std::vector<unsigned>> &predecessors,
+                      const std::vector<std::vector<int64_t>> &edgeLowerBounds,
+                      int64_t upperBound, unsigned gridArea = 16,
+                      bool enableResourceBounds = true) {
   ShapeDomainPropagationResult result;
   result.removedByTask.assign(domains.size(), 0);
   if (domains.empty() || upperBound <= 0 || gridArea == 0 ||
@@ -272,9 +270,8 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
       int64_t best = 0;
       for (unsigned producer : predecessors[task]) {
         int64_t producerEnd = 0;
-        const bool producerEndFinite =
-            detail::addWide(release[producer], minDuration[producer],
-                            producerEnd);
+        const bool producerEndFinite = detail::addWide(
+            release[producer], minDuration[producer], producerEnd);
         int64_t ready = 0;
         const bool readyFinite = detail::addWide(
             producerEnd, edgeLowerBounds[task][producer], ready);
@@ -296,8 +293,8 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
         const bool userAfterFinite =
             detail::addWide(minDuration[user], userTail, userAfter);
         int64_t candidate = 0;
-        const bool candidateFinite = detail::addWide(
-            edgeLowerBounds[user][task], userAfter, candidate);
+        const bool candidateFinite =
+            detail::addWide(edgeLowerBounds[user][task], userAfter, candidate);
         tailFinite = tailFinite && userAfterFinite && candidateFinite;
         best = std::max(best, candidate);
       }
@@ -326,9 +323,8 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
       events.push_back(0);
       events.push_back(upperBound);
       for (unsigned task = 0; task < taskCount; ++task) {
-        const __int128 deadlineWide =
-            static_cast<__int128>(upperBound) -
-            static_cast<__int128>(tail[task]);
+        const __int128 deadlineWide = static_cast<__int128>(upperBound) -
+                                      static_cast<__int128>(tail[task]);
         if (deadlineWide < 0 ||
             deadlineWide >
                 static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
@@ -358,16 +354,14 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
              ++endIndex) {
           const int64_t start = events[startIndex];
           const int64_t end = events[endIndex];
-          const unsigned __int128 width =
-              static_cast<unsigned __int128>(end) -
-              static_cast<unsigned __int128>(start);
+          const unsigned __int128 width = static_cast<unsigned __int128>(end) -
+                                          static_cast<unsigned __int128>(start);
           if (gridArea != 0 && width > maximum / gridArea)
             continue;
           const unsigned __int128 windowCapacity =
               width * static_cast<unsigned __int128>(gridArea);
 
-          std::vector<unsigned __int128> minimumWindowWork(
-              taskCount, maximum);
+          std::vector<unsigned __int128> minimumWindowWork(taskCount, maximum);
           unsigned __int128 totalWindowWork = 0;
           bool validWindow = true;
           for (unsigned task = 0; task < taskCount && validWindow; ++task) {
@@ -380,17 +374,16 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
                 continue;
               }
               unsigned __int128 work = 0;
-              if (!detail::mandatoryWindowWork(
-                      option, release[task], deadline[task], start, end,
-                      work)) {
+              if (!detail::mandatoryWindowWork(option, release[task],
+                                               deadline[task], start, end,
+                                               work)) {
                 validWindow = false;
                 break;
               }
-              minimumWindowWork[task] =
-                  std::min(minimumWindowWork[task], work);
+              minimumWindowWork[task] = std::min(minimumWindowWork[task], work);
             }
-            if (!hasOption || (!hasUnknownCost &&
-                               minimumWindowWork[task] == maximum)) {
+            if (!hasOption ||
+                (!hasUnknownCost && minimumWindowWork[task] == maximum)) {
               validWindow = false;
               break;
             }
@@ -409,15 +402,15 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
           for (unsigned task = 0; task < taskCount; ++task) {
             const unsigned __int128 otherWork =
                 totalWindowWork - minimumWindowWork[task];
-            for (size_t optionIndex = 0;
-                 optionIndex < domains[task].size(); ++optionIndex) {
+            for (size_t optionIndex = 0; optionIndex < domains[task].size();
+                 ++optionIndex) {
               const ShapeDomainOption &option = domains[task][optionIndex];
               if (!option.supported || option.duration <= 0)
                 continue;
               unsigned __int128 optionWork = 0;
-              if (!detail::mandatoryWindowWork(
-                      option, release[task], deadline[task], start, end,
-                      optionWork))
+              if (!detail::mandatoryWindowWork(option, release[task],
+                                               deadline[task], start, end,
+                                               optionWork))
                 continue;
               if (otherWork > windowCapacity ||
                   optionWork > windowCapacity - otherWork)
@@ -449,28 +442,26 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
         }
         hasKnownOption = true;
         int64_t completion = 0;
-        const bool finite = detail::addThree(
-            release[task], option.duration, tail[task], completion);
+        const bool finite = detail::addThree(release[task], option.duration,
+                                             tail[task], completion);
         const bool impossibleByTime = finite && completion > upperBound;
 
         unsigned __int128 optionWork = 0;
         const bool optionWorkFinite =
             detail::multiplyWide(option.duration, option.area, optionWork);
         bool impossibleByWork = false;
-        if (enableResourceBounds && totalMinimumWorkFinite && optionWorkFinite) {
-          const unsigned __int128 otherWork =
-              totalMinimumWork - minWork[task];
-          impossibleByWork = otherWork > capacity ||
-                             optionWork > capacity - otherWork;
+        if (enableResourceBounds && totalMinimumWorkFinite &&
+            optionWorkFinite) {
+          const unsigned __int128 otherWork = totalMinimumWork - minWork[task];
+          impossibleByWork =
+              otherWork > capacity || optionWork > capacity - otherWork;
         }
-        const bool impossibleByWindow =
-            windowRejected[task][optionIndex] != 0;
-        if (impossibleByWindow &&
-            windowRejectedInContradiction !=
-                std::numeric_limits<uint64_t>::max())
+        const bool impossibleByWindow = windowRejected[task][optionIndex] != 0;
+        if (impossibleByWindow && windowRejectedInContradiction !=
+                                      std::numeric_limits<uint64_t>::max())
           ++windowRejectedInContradiction;
-        const bool rejected = impossibleByTime || impossibleByWork ||
-                              impossibleByWindow;
+        const bool rejected =
+            impossibleByTime || impossibleByWork || impossibleByWindow;
         optionRejected[task][optionIndex] = rejected ? 1 : 0;
         allKnownOptionsRejected = allKnownOptionsRejected && rejected;
       }
@@ -478,8 +469,7 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
         result.wholeGraphAboveBound = true;
         result.contradictionTask = task;
         if (windowRejectedInContradiction >
-            std::numeric_limits<uint64_t>::max() -
-                result.windowRejectedOptions)
+            std::numeric_limits<uint64_t>::max() - result.windowRejectedOptions)
           result.windowRejectedOptions = std::numeric_limits<uint64_t>::max();
         else
           result.windowRejectedOptions += windowRejectedInContradiction;
@@ -502,8 +492,7 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
           continue;
         }
         const bool rejected = optionRejected[task][optionIndex] != 0;
-        const bool impossibleByWindow =
-            windowRejected[task][optionIndex] != 0;
+        const bool impossibleByWindow = windowRejected[task][optionIndex] != 0;
         if (!rejected) {
           ++supportedAfter;
           continue;
@@ -516,14 +505,14 @@ inline ShapeDomainPropagationResult propagateShapeDomains(
           ++supportedAfter;
           continue;
         }
-        next[task].erase(std::remove_if(
-                             next[task].begin(), next[task].end(),
-                             [&](const ShapeDomainOption &candidate) {
-                               return candidate.originalOrdinal ==
-                                          option.originalOrdinal &&
-                                      candidate.supported;
-                             }),
-                         next[task].end());
+        next[task].erase(
+            std::remove_if(next[task].begin(), next[task].end(),
+                           [&](const ShapeDomainOption &candidate) {
+                             return candidate.originalOrdinal ==
+                                        option.originalOrdinal &&
+                                    candidate.supported;
+                           }),
+            next[task].end());
         --supportedBefore;
         changed = true;
         ++result.removedOptions;

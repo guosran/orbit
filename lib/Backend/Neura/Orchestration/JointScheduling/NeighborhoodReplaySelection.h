@@ -4,10 +4,10 @@
 #define AMOEBA_NEIGHBORHOOD_REPLAY_SELECTION_H
 
 #include "AnalyticalTaskCandidateCommon.h"
-#include "SpatialTaskCandidateSpace.h"
 #include "NeuraDialect/Architecture/Architecture.h"
-#include "mlir/IR/BuiltinOps.h"
+#include "SpatialTaskCandidateSpace.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace mlir::amoeba::neura::joint_scheduling {
@@ -42,10 +42,13 @@ inline bool writeNeighborhoodShapeSelection(ModuleOp module,
       {"grid_cols", int64_t(architecture.getMultiCgraColumns())},
       {"per_cgra_tile_rows", int64_t(architecture.getPerCgraRows())},
       {"per_cgra_tile_cols", int64_t(architecture.getPerCgraColumns())}};
-  return writeAtomically(path, [&](llvm::raw_ostream &stream) {
-    stream << llvm::json::Value(std::move(selection)) << "\n";
-    return true;
-  }, error);
+  return writeAtomically(
+      path,
+      [&](llvm::raw_ostream &stream) {
+        stream << llvm::json::Value(std::move(selection)) << "\n";
+        return true;
+      },
+      error);
 }
 } // namespace mlir::amoeba::neura::joint_scheduling
 #endif

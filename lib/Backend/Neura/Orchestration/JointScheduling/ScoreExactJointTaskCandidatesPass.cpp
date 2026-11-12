@@ -13,30 +13,30 @@
 #include "AnalyticalTaskCandidateCommon.h"
 #include "AnalyticalTaskCostCatalog.h"
 #include "Backend/Neura/NeuraBackendOptions.h"
-#include "NeuraDialect/Architecture/Architecture.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/JointSchedulingCandidateOrder.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "CommunicationExactScheduleSpace.h"
 #include "ExactScoreCache.h"
-#include "ShapeDomainBounds.h"
+#include "NeuraDialect/Architecture/Architecture.h"
 #include "ProductionFixedScheduleCommunication.h"
 #include "ProductionSchedulerAdapter.h"
+#include "ShapeDomainBounds.h"
 #include "SpatialTaskCandidateSpace.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
-#include "Backend/Neura/Orchestration/JointScheduling/JointSchedulingCandidateOrder.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Support/JSON.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -154,12 +154,11 @@ static TieRestrictedCriticalPathResult computeTieRestrictedCriticalPath(
       selectedShapes.size() != taskCount || selectedFlags.size() != taskCount ||
       predecessors.size() != taskCount || edgeLowerBounds.size() != taskCount ||
       counterWidth == 0 || incumbentOrdinal.empty() ||
-      llvm::any_of(incumbentOrdinal, [](char value) {
-        return value < '0' || value > '9';
-      }) || descriptor.candidateCount.empty() ||
-      llvm::any_of(descriptor.candidateCount, [](char value) {
-        return value < '0' || value > '9';
-      }))
+      llvm::any_of(incumbentOrdinal,
+                   [](char value) { return value < '0' || value > '9'; }) ||
+      descriptor.candidateCount.empty() ||
+      llvm::any_of(descriptor.candidateCount,
+                   [](char value) { return value < '0' || value > '9'; }))
     return result;
   if (llvm::APInt::getBitsNeeded(incumbentOrdinal, 10) > counterWidth ||
       llvm::APInt::getBitsNeeded(descriptor.candidateCount, 10) > counterWidth)
@@ -201,7 +200,8 @@ static TieRestrictedCriticalPathResult computeTieRestrictedCriticalPath(
     std::set<size_t> ordinals;
     for (const ShapeDomainOption &option : domains[task]) {
       if (option.originalOrdinal >= descriptor.shapesByTask[task].size() ||
-          option.duration < 0 || !ordinals.insert(option.originalOrdinal).second)
+          option.duration < 0 ||
+          !ordinals.insert(option.originalOrdinal).second)
         return result;
     }
     if (!selectedFlags[task])
@@ -349,8 +349,7 @@ static bool getProductionFixedPointIterations(func::FuncOp function,
   return true;
 }
 
-static std::optional<DispatchPolicy>
-parseDispatchPolicy(StringRef value) {
+static std::optional<DispatchPolicy> parseDispatchPolicy(StringRef value) {
   if (value == "fixed")
     return DispatchPolicy::Fixed;
   if (value == "all-ready")
@@ -360,26 +359,32 @@ parseDispatchPolicy(StringRef value) {
   return std::nullopt;
 }
 
-static StringRef scoreStartPolicy(StringRef temporalModel, StringRef scheduleSpace) {
+static StringRef scoreStartPolicy(StringRef temporalModel,
+                                  StringRef scheduleSpace) {
   if (scheduleSpace == "production-scheduler")
     return "production-spatial-temporal-scheduler";
   if (scheduleSpace != "exact")
     return "single-greedy-placement";
-  return temporalModel == "dispatch-order" ? "dependency-and-resource-ready" : "all-integer";
+  return temporalModel == "dispatch-order" ? "dependency-and-resource-ready"
+                                           : "all-integer";
 }
 
 static StringRef scoreTemporalScope(StringRef temporalModel) {
   if (temporalModel == "production-scheduler")
     return "production-task-scheduler-only";
-  return temporalModel == "dispatch-order" ? "task-dispatch-order-only" : "all-integer-diagnostic";
+  return temporalModel == "dispatch-order" ? "task-dispatch-order-only"
+                                           : "all-integer-diagnostic";
 }
 
-static StringRef scoreRankingCertificate(StringRef temporalModel, StringRef scheduleSpace) {
+static StringRef scoreRankingCertificate(StringRef temporalModel,
+                                         StringRef scheduleSpace) {
   if (scheduleSpace == "production-scheduler")
     return "proven-shape-space-under-production-scheduler";
   if (scheduleSpace != "exact")
     return "proven-shape-ranking-at-single-heuristic-placement";
-  return temporalModel == "dispatch-order" ? "proven-shape-location-dispatch-order-branch-and-bound" : "proven-shape-and-schedule-branch-and-bound";
+  return temporalModel == "dispatch-order"
+             ? "proven-shape-location-dispatch-order-branch-and-bound"
+             : "proven-shape-and-schedule-branch-and-bound";
 }
 
 static void addProductionCoverage(llvm::json::Object &record,
@@ -387,7 +392,8 @@ static void addProductionCoverage(llvm::json::Object &record,
                                   StringRef scheduleSpace,
                                   StringRef dispatchPolicy,
                                   func::FuncOp function) {
-  if (scheduleSpace != "production-scheduler") return;
+  if (scheduleSpace != "production-scheduler")
+    return;
   record["temporal_model"] = temporalModel.str();
   record["schedule_space"] = scheduleSpace.str();
   record["start_policy"] = scoreStartPolicy(temporalModel, scheduleSpace).str();
@@ -400,21 +406,23 @@ static void addProductionCoverage(llvm::json::Object &record,
   record["production_scheduler_contract"] = kProductionSchedulerContract.str();
   record["tie_key_policy"] = kProductionNumericTieKeyPolicy.str();
   record["dispatch_policy"] = dispatchPolicy.str();
-  record["dispatch_policy_scope"] = dispatchPolicy == "fixed"
-      ? "canonical-smallest-ready-task" : "production-critical-path-dependency-ready";
+  record["dispatch_policy_scope"] =
+      dispatchPolicy == "fixed" ? "canonical-smallest-ready-task"
+                                : "production-critical-path-dependency-ready";
   record["cycle_starts_are_search_dimensions"] = false;
   record["global_shape_location_temporal_space"] = false;
   record["placement_coverage_limited"] = true;
   record["location_coverage_limited"] = true;
   record["temporal_coverage_limited"] = true;
   record["orbit_4x4_pruning"] = false;
-  record["shape_domain_pruning"] = record.getBoolean("ranking_pruning").value_or(true)
-      ? "dependency-release-tail-cost-only" : "disabled";
+  record["shape_domain_pruning"] =
+      record.getBoolean("ranking_pruning").value_or(true)
+          ? "dependency-release-tail-cost-only"
+          : "disabled";
 }
 
-static bool isCanonicalFixedDispatch(
-    ArrayRef<unsigned> order,
-    ArrayRef<ExactScheduleTask> tasks) {
+static bool isCanonicalFixedDispatch(ArrayRef<unsigned> order,
+                                     ArrayRef<ExactScheduleTask> tasks) {
   std::vector<bool> scheduled(tasks.size(), false);
   for (unsigned current : order) {
     if (current >= tasks.size() || scheduled[current])
@@ -442,9 +450,9 @@ static bool isCanonicalFixedDispatch(
   return llvm::all_of(scheduled, [](bool value) { return value; });
 }
 
-static std::optional<std::string>
-getDecimal(const llvm::json::Object &object, StringRef key,
-           std::string &error) {
+static std::optional<std::string> getDecimal(const llvm::json::Object &object,
+                                             StringRef key,
+                                             std::string &error) {
   if (std::optional<int64_t> value = object.getInteger(key)) {
     if (*value < 0) {
       error = "negative factored count for " + key.str();
@@ -505,8 +513,8 @@ struct GlobalIncumbent {
   std::string architectureSchema;
   std::string costNamespace;
   std::string closurePath;
-  std::string keyPolicy =
-      "predicted_whole_program_cycles,semantic_graph_id,candidate_id,graph_variant_id";
+  std::string keyPolicy = "predicted_whole_program_cycles,semantic_graph_id,"
+                          "candidate_id,graph_variant_id";
   int64_t fifthCycles = 0;
   unsigned candidateCount = 0;
   std::string error;
@@ -618,8 +626,7 @@ static bool parsePositiveCycle(const llvm::json::Object &object,
   return true;
 }
 
-static bool jsonDecimalIsZero(const llvm::json::Object &object,
-                              StringRef key) {
+static bool jsonDecimalIsZero(const llvm::json::Object &object, StringRef key) {
   if (std::optional<int64_t> value = object.getInteger(key))
     return *value == 0;
   std::optional<StringRef> text = object.getString(key);
@@ -660,10 +667,9 @@ jsonDecimalValue(const llvm::json::Object &object, StringRef key) {
 // the materialized MLIR/facts artifacts as well as footer counters, so a stale
 // path-only certificate cannot become an incumbent for a different graph set.
 static bool loadLegalClosureGraphIds(
-  StringRef path, StringRef expectedFunction, StringRef expectedStage,
+    StringRef path, StringRef expectedFunction, StringRef expectedStage,
     std::map<std::string, ClosureGraphBinding> &graphBindings,
-    bool &closureComplete,
-    std::string &error) {
+    bool &closureComplete, std::string &error) {
   graphBindings.clear();
   closureComplete = false;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -718,13 +724,15 @@ static bool loadLegalClosureGraphIds(
     }
     if (!sawHeader) {
       if (*type != "header") {
-        return cacheParseFailure("incumbent closure does not start with a header");
+        return cacheParseFailure(
+            "incumbent closure does not start with a header");
       }
       std::optional<StringRef> status = object->getString("status");
       std::optional<bool> complete = object->getBoolean("complete");
       if (object->getString("function") !=
               std::optional<StringRef>(expectedFunction) ||
-          object->getString("stage") != std::optional<StringRef>(expectedStage) ||
+          object->getString("stage") !=
+              std::optional<StringRef>(expectedStage) ||
           !status || (*status != "complete" && *status != "incomplete") ||
           !complete || ((*status == "complete") != *complete)) {
         return cacheParseFailure(
@@ -735,7 +743,8 @@ static bool loadLegalClosureGraphIds(
       continue;
     }
     if (sawFooter) {
-      return cacheParseFailure("incumbent closure has records after its footer");
+      return cacheParseFailure(
+          "incumbent closure has records after its footer");
     }
     if (*type == "footer") {
       footer = *object;
@@ -747,8 +756,7 @@ static bool loadLegalClosureGraphIds(
     // Resource-bounded closure runs persist rejected/unknown attempts with a
     // graph record type but without structural_key.  They are blockers for
     // stage completeness, not legal graph members, and are ignored here.
-    if (object->getString("status") !=
-            std::optional<StringRef>("legal") ||
+    if (object->getString("status") != std::optional<StringRef>("legal") ||
         !object->getObject("structural_key"))
       continue;
     std::optional<StringRef> id = object->getString("graph_variant_id");
@@ -757,8 +765,8 @@ static bool loadLegalClosureGraphIds(
     std::optional<StringRef> pathField = object->getString("path");
     std::optional<StringRef> mlirPath = object->getString("mlir_path");
     std::optional<StringRef> factsPath = object->getString("facts_path");
-    if (!id || id->empty() || !pathField || pathField->empty() ||
-        !mlirPath || mlirPath->empty() || !factsPath || factsPath->empty() ||
+    if (!id || id->empty() || !pathField || pathField->empty() || !mlirPath ||
+        mlirPath->empty() || !factsPath || factsPath->empty() ||
         // These fields prove rewrite-space coverage, not feasibility of an
         // already materialized graph. An incomplete closure can still provide
         // a verified feasible incumbent. Complete-closure claims retain the
@@ -769,7 +777,8 @@ static bool loadLegalClosureGraphIds(
            !object->getBoolean("k_facts_complete").value_or(false)) ||
           (expectedStage == "full-joint" &&
            (!object->getBoolean("sibling_facts_complete").value_or(false) ||
-            !object->getBoolean("sibling_materialization_complete").value_or(false)))))) {
+            !object->getBoolean("sibling_materialization_complete")
+                 .value_or(false)))))) {
       return cacheParseFailure(
           "incumbent closure graph lacks complete persisted artifacts");
     }
@@ -791,8 +800,7 @@ static bool loadLegalClosureGraphIds(
     }
     std::string structuralText;
     llvm::raw_string_ostream structuralStream(structuralText);
-    llvm::json::Object structuralObject =
-        *object->getObject("structural_key");
+    llvm::json::Object structuralObject = *object->getObject("structural_key");
     structuralStream << llvm::json::Value(std::move(structuralObject));
     structuralStream.flush();
     if (structuralKeys.insert(std::move(structuralText)).second)
@@ -806,8 +814,8 @@ static bool loadLegalClosureGraphIds(
   std::optional<bool> footerComplete = footerObject.getBoolean("complete");
   const bool completeFooter =
       footerStatus && *footerStatus == "complete" && footerComplete &&
-      *footerComplete && footerObject.getBoolean("graph_scope_complete")
-          .value_or(false) &&
+      *footerComplete &&
+      footerObject.getBoolean("graph_scope_complete").value_or(false) &&
       !footerObject.getBoolean("resource_bound_reached").value_or(true) &&
       jsonDecimalIsZero(footerObject, "unknown_action_count") &&
       jsonDecimalIsZero(footerObject, "incomplete_facts_count");
@@ -819,15 +827,15 @@ static bool loadLegalClosureGraphIds(
       jsonDecimalValue(footerObject, "graph_count");
   std::optional<uint64_t> footerStructuralCount =
       jsonDecimalValue(footerObject, "unique_structural_keys");
-  if ((!completeFooter && !boundedFooter) ||
-      headerComplete != completeFooter || !footerGraphCount ||
-      *footerGraphCount != graphRows || !footerStructuralCount ||
-      *footerStructuralCount == 0) {
+  if ((!completeFooter && !boundedFooter) || headerComplete != completeFooter ||
+      !footerGraphCount || *footerGraphCount != graphRows ||
+      !footerStructuralCount || *footerStructuralCount == 0) {
     return cacheParseFailure(
         "incumbent closure footer is not a valid graph member proof");
   }
   if (graphBindings.empty())
-    return cacheParseFailure("incumbent closure contains no legal graph bindings");
+    return cacheParseFailure(
+        "incumbent closure contains no legal graph bindings");
   closureComplete = completeFooter;
   ClosureGraphParseCache replacement;
   replacement.initialized = true;
@@ -842,16 +850,12 @@ static bool loadLegalClosureGraphIds(
   return revalidateClosureGraphArtifacts(graphBindings, error);
 }
 
-static bool readStageManifestClosure(StringRef manifestPath,
-                                     StringRef expectedFunction,
-                                     StringRef expectedStage,
-                                     StringRef expectedRepository,
-                                     StringRef expectedCommit,
-                                     StringRef expectedArchitecture,
-                                     StringRef expectedArchitectureSchema,
-                                     StringRef expectedCostNamespace,
-                                     std::string &closurePath,
-                                     std::string &error) {
+static bool readStageManifestClosure(
+    StringRef manifestPath, StringRef expectedFunction, StringRef expectedStage,
+    StringRef expectedRepository, StringRef expectedCommit,
+    StringRef expectedArchitecture, StringRef expectedArchitectureSchema,
+    StringRef expectedCostNamespace, std::string &closurePath,
+    std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(manifestPath);
   if (!buffer) {
@@ -862,19 +866,22 @@ static bool readStageManifestClosure(StringRef manifestPath,
   llvm::Expected<llvm::json::Value> parsed =
       llvm::json::parse((*buffer)->getBuffer());
   if (!parsed) {
-    error = "invalid global stage manifest: " + llvm::toString(parsed.takeError());
+    error =
+        "invalid global stage manifest: " + llvm::toString(parsed.takeError());
     return false;
   }
   const llvm::json::Object *root = parsed->getAsObject();
-  if (!root || root->getString("schema") !=
-                   std::optional<StringRef>("orbit-global-stage-ranker-input-v1")) {
+  if (!root ||
+      root->getString("schema") !=
+          std::optional<StringRef>("orbit-global-stage-ranker-input-v1")) {
     error = "global stage manifest has the wrong schema";
     return false;
   }
   auto require = [&](StringRef key, StringRef expected) {
     return root->getString(key) == std::optional<StringRef>(expected);
   };
-  if (!require("function", expectedFunction) || !require("stage", expectedStage) ||
+  if (!require("function", expectedFunction) ||
+      !require("stage", expectedStage) ||
       !require("source_repository", expectedRepository) ||
       !require("source_commit", expectedCommit) ||
       !require("architecture_path", expectedArchitecture)) {
@@ -883,7 +890,8 @@ static bool readStageManifestClosure(StringRef manifestPath,
   }
   if (auto architectureSchema = root->getString("architecture_schema")) {
     if (*architectureSchema != expectedArchitectureSchema) {
-      error = "global stage manifest architecture schema disagrees with the score request";
+      error = "global stage manifest architecture schema disagrees with the "
+              "score request";
       return false;
     }
   }
@@ -891,7 +899,8 @@ static bool readStageManifestClosure(StringRef manifestPath,
     if (*costNamespace != expectedCostNamespace ||
         root->getString("cost_provenance_schema") !=
             std::optional<StringRef>("orbit-cost-provenance-v1")) {
-      error = "global stage manifest cost provenance disagrees with the score request";
+      error = "global stage manifest cost provenance disagrees with the score "
+              "request";
       return false;
     }
   }
@@ -928,23 +937,16 @@ static bool validateIncumbentBindings(
     const std::map<std::string, ClosureGraphBinding> &graphBindings,
     std::string &error);
 
-static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
-                                StringRef expectedStage,
-                                StringRef expectedRepository,
-                                StringRef expectedCommit,
-                                StringRef expectedArchitecture,
-                                StringRef expectedArchitectureSchema,
-                                StringRef expectedCostNamespace,
-                                StringRef stageManifestPath,
-                                func::FuncOp currentFunction,
-                                ArrayRef<TaskMetadata> currentTasks,
-                                const TaskShapeCostCache &currentCosts,
-                                StringRef currentCandidatePath,
-                                StringRef currentCostPath,
-                                StringRef expectedDispatchPolicy,
-                                StringRef expectedTemporalModel,
-                                StringRef expectedScheduleSpace,
-                                GlobalIncumbent &incumbent) {
+static bool loadGlobalIncumbent(
+    StringRef path, StringRef expectedFunction, StringRef expectedStage,
+    StringRef expectedRepository, StringRef expectedCommit,
+    StringRef expectedArchitecture, StringRef expectedArchitectureSchema,
+    StringRef expectedCostNamespace, StringRef stageManifestPath,
+    func::FuncOp currentFunction, ArrayRef<TaskMetadata> currentTasks,
+    const TaskShapeCostCache &currentCosts, StringRef currentCandidatePath,
+    StringRef currentCostPath, StringRef expectedDispatchPolicy,
+    StringRef expectedTemporalModel, StringRef expectedScheduleSpace,
+    GlobalIncumbent &incumbent) {
   incumbent.path = path.str();
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -1021,16 +1023,15 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
     int64_t cycles = 0;
     if (!candidateId || candidateId->empty() ||
         !parsePositiveCycle(*object, cycles)) {
-      incumbent.error = "global incumbent contains an invalid/duplicate candidate";
+      incumbent.error =
+          "global incumbent contains an invalid/duplicate candidate";
       return false;
     }
-    if (exactSchema &&
-        object->getBoolean("valid").value_or(false) == false) {
+    if (exactSchema && object->getBoolean("valid").value_or(false) == false) {
       incumbent.error = "global incumbent contains an uncertified score row";
       return false;
     }
-    if (globalSchema &&
-        !object->getBoolean("certified").value_or(false) &&
+    if (globalSchema && !object->getBoolean("certified").value_or(false) &&
         !object->getBoolean("feasible").value_or(false)) {
       incumbent.error = "global incumbent contains an uncertified selection";
       return false;
@@ -1055,8 +1056,7 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
         return false;
       }
       row.scorePath = scorePath->str();
-      const llvm::json::Object *scoreRecord =
-          object->getObject("score_record");
+      const llvm::json::Object *scoreRecord = object->getObject("score_record");
       if (!scoreRecord || !scoreRecord->getBoolean("valid").value_or(false) ||
           scoreRecord->getString("schema") !=
               std::optional<StringRef>("amoeba-exact-joint-task-scores-v1") ||
@@ -1068,12 +1068,14 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
           scoreRecord->getArray("task_costs")->empty() ||
           !scoreRecord->getArray("task_schedule") ||
           scoreRecord->getArray("task_schedule")->empty() ||
-          scoreRecord->getString("score_source") != std::optional<StringRef>(
-              "ml-ii-startup-plus-production-explicit-communication") ||
+          scoreRecord->getString("score_source") !=
+              std::optional<StringRef>(
+                  "ml-ii-startup-plus-production-explicit-communication") ||
           scoreRecord->getString("task_latency_provenance") !=
               std::optional<StringRef>(
                   "source-owned-ml-ii-startup-trip-count-contract")) {
-        incumbent.error = "global incumbent selection lacks a complete score proof";
+        incumbent.error =
+            "global incumbent selection lacks a complete score proof";
         return false;
       }
       row.scoreRecord = *scoreRecord;
@@ -1087,8 +1089,9 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
           object->getArray("task_costs")->empty() ||
           !object->getArray("task_schedule") ||
           object->getArray("task_schedule")->empty() ||
-          object->getString("score_source") != std::optional<StringRef>(
-              "ml-ii-startup-plus-production-explicit-communication") ||
+          object->getString("score_source") !=
+              std::optional<StringRef>(
+                  "ml-ii-startup-plus-production-explicit-communication") ||
           object->getString("task_latency_provenance") !=
               std::optional<StringRef>(
                   "source-owned-ml-ii-startup-trip-count-contract")) {
@@ -1101,7 +1104,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
   }
 
   if (!header || !footer || rows.size() < 5) {
-    incumbent.error = "global incumbent requires a header, footer and at least five rows";
+    incumbent.error =
+        "global incumbent requires a header, footer and at least five rows";
     return false;
   }
   const llvm::json::Object &headerObject = *header;
@@ -1116,7 +1120,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
     return true;
   };
   if (!requireHeader("function", expectedFunction, "function") ||
-      !requireHeader("source_repository", expectedRepository, "source repository") ||
+      !requireHeader("source_repository", expectedRepository,
+                     "source repository") ||
       !requireHeader("source_commit", expectedCommit, "source commit") ||
       !requireHeader("architecture_path", expectedArchitecture,
                      "architecture path"))
@@ -1139,7 +1144,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
       return false;
     }
   } else if (headerObject.getString("cost_provenance_schema")) {
-    incumbent.error = "global incumbent has cost provenance without a namespace";
+    incumbent.error =
+        "global incumbent has cost provenance without a namespace";
     return false;
   }
   const bool exactSchema = schema == "amoeba-exact-joint-task-scores-v1";
@@ -1157,12 +1163,11 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
   if (auto closure = headerObject.getString("graph_closure_record_path"))
     closurePath = closure->str();
   else if (!stageManifestPath.empty() &&
-           !readStageManifestClosure(stageManifestPath, expectedFunction,
-                                     expectedStage, expectedRepository,
-                                     expectedCommit, expectedArchitecture,
-                                     expectedArchitectureSchema,
-                                     expectedCostNamespace,
-                                     closurePath, incumbent.error))
+           !readStageManifestClosure(
+               stageManifestPath, expectedFunction, expectedStage,
+               expectedRepository, expectedCommit, expectedArchitecture,
+               expectedArchitectureSchema, expectedCostNamespace, closurePath,
+               incumbent.error))
     return false;
   if (closurePath.empty()) {
     incumbent.error = "global incumbent has no graph closure binding";
@@ -1177,7 +1182,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
   incumbent.evidenceClosureComplete = closureComplete;
   if (auto predictor = headerObject.getString("predictor_source")) {
     if (*predictor != "ml-ii-startup-predictor") {
-      incumbent.error = "global incumbent predictor source is not source-owned ML";
+      incumbent.error =
+          "global incumbent predictor source is not source-owned ML";
       return false;
     }
   } else {
@@ -1192,12 +1198,12 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
         return false;
       }
       row.graphVariantId = graph->str();
-      row.semanticGraphId = headerObject.getString("semantic_graph_id")
-                                .value_or(*graph)
-                                .str();
+      row.semanticGraphId =
+          headerObject.getString("semantic_graph_id").value_or(*graph).str();
     }
     if (!graphBindings.count(row.graphVariantId)) {
-      incumbent.error = "global incumbent candidate is outside the complete closure";
+      incumbent.error =
+          "global incumbent candidate is outside the complete closure";
       return false;
     }
   }
@@ -1261,7 +1267,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
   if (globalSeedFooter)
     incumbent.evidenceSeedOnly = true;
   if (exactSeedFooter && !headerObject.getString("stage")) {
-    incumbent.error = "global incumbent seed-only artifact has no stage identity";
+    incumbent.error =
+        "global incumbent seed-only artifact has no stage identity";
     return false;
   }
   if ((exactSeedFooter || globalSeedFooter) !=
@@ -1275,12 +1282,15 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
       certificate = std::nullopt;
     if (!exactSeedFooter &&
         (!certificate ||
-        (*certificate != "proven-shape-and-schedule-branch-and-bound" &&
-         *certificate != "exhaustive-shape-plus-bounded-exact-schedule" &&
-         *certificate != "proven-shape-location-dispatch-order-branch-and-bound" &&
-         *certificate != "proven-shape-ranking-at-single-heuristic-placement" &&
-         *certificate != "proven-shape-space-under-production-scheduler"))) {
-      incumbent.error = "global incumbent exact score has no accepted ranking certificate";
+         (*certificate != "proven-shape-and-schedule-branch-and-bound" &&
+          *certificate != "exhaustive-shape-plus-bounded-exact-schedule" &&
+          *certificate !=
+              "proven-shape-location-dispatch-order-branch-and-bound" &&
+          *certificate !=
+              "proven-shape-ranking-at-single-heuristic-placement" &&
+          *certificate != "proven-shape-space-under-production-scheduler"))) {
+      incumbent.error =
+          "global incumbent exact score has no accepted ranking certificate";
       return false;
     }
   } else if (!globalSeedFooter &&
@@ -1291,7 +1301,8 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
   if (exactSchema) {
     if (footerObject.getInteger("scored_count").value_or(-1) !=
         static_cast<int64_t>(rows.size())) {
-      incumbent.error = "exact incumbent footer counts disagree with score rows";
+      incumbent.error =
+          "exact incumbent footer counts disagree with score rows";
       return false;
     }
     if (exactSeedFooter) {
@@ -1302,15 +1313,16 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
             "seed-only incumbent footer does not account for all feasible rows";
         return false;
       }
-    } else if (footerObject.getInteger("unsupported_shape_candidates").value_or(-1) !=
-                   0 ||
-               footerObject.getInteger("unmeasured_shape_candidates").value_or(-1) !=
-                   0 ||
+    } else if (footerObject.getInteger("unsupported_shape_candidates")
+                       .value_or(-1) != 0 ||
+               footerObject.getInteger("unmeasured_shape_candidates")
+                       .value_or(-1) != 0 ||
                footerObject.getInteger("selected_count").value_or(5) !=
                    static_cast<int64_t>(rows.size())) {
       // Exact score files use scored_count and the full shape coverage fields;
       // selected_count is optional in older artifacts.
-      incumbent.error = "exact incumbent footer counts disagree with score rows";
+      incumbent.error =
+          "exact incumbent footer counts disagree with score rows";
       return false;
     }
   } else if (globalSeedFooter) {
@@ -1321,8 +1333,10 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
       return false;
     }
     std::string countError;
-    auto headerCount = getDecimal(headerObject, "scored_candidate_count", countError);
-    auto footerCount = getDecimal(footerObject, "scored_candidate_count", countError);
+    auto headerCount =
+        getDecimal(headerObject, "scored_candidate_count", countError);
+    auto footerCount =
+        getDecimal(footerObject, "scored_candidate_count", countError);
     if (!headerCount || !footerCount || *headerCount != *footerCount ||
         footerObject.getInteger("candidate_rows_considered").value_or(0) <
             static_cast<int64_t>(rows.size())) {
@@ -1331,8 +1345,10 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
     }
   } else {
     std::string countError;
-    auto headerCount = getDecimal(headerObject, "scored_candidate_count", countError);
-    auto footerCount = getDecimal(footerObject, "scored_candidate_count", countError);
+    auto headerCount =
+        getDecimal(headerObject, "scored_candidate_count", countError);
+    auto footerCount =
+        getDecimal(footerObject, "scored_candidate_count", countError);
     if (!headerCount || !footerCount || *headerCount != *footerCount) {
       incumbent.error = "global incumbent candidate counts disagree";
       return false;
@@ -1346,18 +1362,18 @@ static bool loadGlobalIncumbent(StringRef path, StringRef expectedFunction,
       return false;
     }
   }
-  std::sort(rows.begin(), rows.end(), [](const IncumbentRow &lhs,
-                                         const IncumbentRow &rhs) {
-    if (lhs.cycles != rhs.cycles)
-      return lhs.cycles < rhs.cycles;
-    if (lhs.semanticGraphId != rhs.semanticGraphId)
-      return lhs.semanticGraphId < rhs.semanticGraphId;
-    int candidateOrder =
-        compareProductionCandidateIds(lhs.candidateId, rhs.candidateId);
-    if (candidateOrder != 0)
-      return candidateOrder < 0;
-    return lhs.graphVariantId < rhs.graphVariantId;
-  });
+  std::sort(rows.begin(), rows.end(),
+            [](const IncumbentRow &lhs, const IncumbentRow &rhs) {
+              if (lhs.cycles != rhs.cycles)
+                return lhs.cycles < rhs.cycles;
+              if (lhs.semanticGraphId != rhs.semanticGraphId)
+                return lhs.semanticGraphId < rhs.semanticGraphId;
+              int candidateOrder = compareProductionCandidateIds(
+                  lhs.candidateId, rhs.candidateId);
+              if (candidateOrder != 0)
+                return candidateOrder < 0;
+              return lhs.graphVariantId < rhs.graphVariantId;
+            });
   incumbent.stage = expectedStage.str();
   incumbent.function = expectedFunction.str();
   incumbent.sourceRepository = expectedRepository.str();
@@ -1385,7 +1401,8 @@ static bool hasTrustedMlPredictorSource(StringRef path, std::string &error) {
   llvm::Expected<llvm::json::Value> parsed =
       llvm::json::parse((*buffer)->getBuffer());
   if (!parsed) {
-    error = "invalid cost catalogue JSON: " + llvm::toString(parsed.takeError());
+    error =
+        "invalid cost catalogue JSON: " + llvm::toString(parsed.takeError());
     return false;
   }
   const llvm::json::Object *root = parsed->getAsObject();
@@ -1395,7 +1412,8 @@ static bool hasTrustedMlPredictorSource(StringRef path, std::string &error) {
       metadata ? metadata->getString("predictor_source") : std::nullopt;
   if (!source || *source != kMlPredictorSource) {
     error = "exact joint ranking requires cost catalogue "
-            "predictor_source=\"" + kMlPredictorSource.str() +
+            "predictor_source=\"" +
+            kMlPredictorSource.str() +
             "\"; measured mapper caches and legacy unmarked catalogues "
             "cannot be reported as ML predictions";
     return false;
@@ -1425,10 +1443,12 @@ static bool isFactoredSpace(StringRef path) {
 // Parse and revalidate the exact factored shape descriptor emitted by
 // EnumerateAnalyticalTaskCandidatesPass.  In particular, no row prefix is
 // accepted as a substitute for the full Cartesian alphabet.
-static bool parseFactoredSpace(
-    StringRef path, func::FuncOp function, ArrayRef<TaskMetadata> metadata,
-    StringRef expectedGraphId, const ::mlir::neura::Architecture &architecture,
-    FactoredSpaceDescriptor &descriptor, std::string &error) {
+static bool parseFactoredSpace(StringRef path, func::FuncOp function,
+                               ArrayRef<TaskMetadata> metadata,
+                               StringRef expectedGraphId,
+                               const ::mlir::neura::Architecture &architecture,
+                               FactoredSpaceDescriptor &descriptor,
+                               std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
@@ -1491,13 +1511,15 @@ static bool parseFactoredSpace(
     return false;
   }
   if (*schema != kFactoredSpaceSchema || *representation != "factored" ||
-      !*exact || *functionName != function.getSymName() || expectedGraphId.empty() ||
-      *graphId != expectedGraphId || *scope != kFactoredSearchScope ||
-      *shapePolicy != kShapePolicy || *capacityPolicy != kSpatialCapacityPolicy ||
+      !*exact || *functionName != function.getSymName() ||
+      expectedGraphId.empty() || *graphId != expectedGraphId ||
+      *scope != kFactoredSearchScope || *shapePolicy != kShapePolicy ||
+      *capacityPolicy != kSpatialCapacityPolicy ||
       *pruning != kShapePruningPolicyNone || *maxChanged != -1 ||
       *maxCgras < 1 || *maxCgras > 4 || architecture.getMultiCgraRows() != 4 ||
       architecture.getMultiCgraColumns() != 4) {
-    error = "factored space does not match the complete 4x4/at-most-four-CGRA contract";
+    error = "factored space does not match the complete 4x4/at-most-four-CGRA "
+            "contract";
     return false;
   }
   if (factors->size() != metadata.size()) {
@@ -1524,7 +1546,8 @@ static bool parseFactoredSpace(
     auto taskName = factor->getString("task");
     auto tripCount = factor->getInteger("trip_count");
     const llvm::json::Array *shapes = factor->getArray("shapes");
-    if (!taskName || !tripCount || !shapes || *taskName != metadata[taskIndex].name ||
+    if (!taskName || !tripCount || !shapes ||
+        *taskName != metadata[taskIndex].name ||
         *tripCount != metadata[taskIndex].tripCount ||
         shapes->size() != expected.size()) {
       error = "factored task factor does not match canonical metadata";
@@ -1544,7 +1567,8 @@ static bool parseFactoredSpace(
       auto mapperCols = shape->getInteger("mapper_tile_cols");
       auto cgraCount = shape->getInteger("cgra_count");
       if (!rows || !cols || !mapperRows || !mapperCols || !cgraCount ||
-          *rows != expected[shapeIndex].rows || *cols != expected[shapeIndex].cols ||
+          *rows != expected[shapeIndex].rows ||
+          *cols != expected[shapeIndex].cols ||
           *mapperRows != expected[shapeIndex].mapperRows ||
           *mapperCols != expected[shapeIndex].mapperCols ||
           *cgraCount != expected[shapeIndex].cgraCount()) {
@@ -1580,15 +1604,17 @@ static bool parseFactoredSpace(
   return true;
 }
 
-static std::optional<int64_t>
-predictDuration(const TaskShapeCost &cost, int64_t tripCount, std::string &error) {
+static std::optional<int64_t> predictDuration(const TaskShapeCost &cost,
+                                              int64_t tripCount,
+                                              std::string &error) {
   if (!cost.supported)
     return std::nullopt;
   long double duration = static_cast<long double>(cost.startupCycles) +
                          static_cast<long double>(cost.predictedII) *
                              static_cast<long double>(tripCount - 1);
   if (!std::isfinite(duration) || duration <= 0.0L ||
-      duration > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+      duration >
+          static_cast<long double>(std::numeric_limits<int64_t>::max())) {
     error = "ML II/startup duration is outside the scheduler range";
     return std::nullopt;
   }
@@ -1601,7 +1627,7 @@ predictDuration(const TaskShapeCost &cost, int64_t tripCount, std::string &error
 }
 
 static llvm::json::Array makeTaskCosts(ArrayRef<TaskShapeChoice> choices,
-                                        ArrayRef<TaskShapeCost> costs) {
+                                       ArrayRef<TaskShapeCost> costs) {
   llvm::json::Array records;
   for (auto [index, choice] : llvm::enumerate(choices)) {
     llvm::json::Object record;
@@ -1659,9 +1685,9 @@ static bool makeExactScoreCacheKey(
     func::FuncOp function, ArrayRef<TaskMetadata> metadata,
     ArrayRef<std::vector<unsigned>> predecessors,
     const FactoredSpaceDescriptor &descriptor, const TaskShapeCostCache &costs,
-    StringRef candidateFile, StringRef costFile,
-    StringRef dispatchPolicy, StringRef temporalModel, StringRef scheduleSpace,
-    int64_t topK, int64_t maxShapeCandidates, int64_t maxExpandedNodes,
+    StringRef candidateFile, StringRef costFile, StringRef dispatchPolicy,
+    StringRef temporalModel, StringRef scheduleSpace, int64_t topK,
+    int64_t maxShapeCandidates, int64_t maxExpandedNodes,
     int64_t maxMilliseconds, int64_t maxMakespan, int64_t stateMemoCapacity,
     bool horizonProven, bool includeProductionSchedulerContract,
     std::string &key, std::string &error) {
@@ -1750,7 +1776,7 @@ static bool makeExactScoreCacheKey(
       includeProductionSchedulerContract) {
     int64_t fixedPointIterations = 0;
     if (!getProductionFixedPointIterations(function, fixedPointIterations,
-                                            error))
+                                           error))
       return false;
     appendExactCacheField(key, "production-scheduler-contract",
                           kProductionSchedulerContract);
@@ -1774,11 +1800,11 @@ static bool makeShapeFrontierBinding(
     StringRef candidateFile, StringRef costFile, StringRef dispatchPolicy,
     StringRef temporalModel, StringRef scheduleSpace, int64_t topK,
     int64_t maxMakespan, int64_t stateMemoCapacity, bool horizonProven,
-    StringRef sourceRepository, StringRef sourceCommit, StringRef graphVariantId,
-    StringRef stage, StringRef warmStartPath, StringRef globalIncumbentPath,
-    StringRef globalManifestPath, bool rankingPruning, bool graphBoundOnly,
-    bool seedOnly, bool canonicalIncumbentSeed, int64_t shardCount,
-    int64_t shardIndex,
+    StringRef sourceRepository, StringRef sourceCommit,
+    StringRef graphVariantId, StringRef stage, StringRef warmStartPath,
+    StringRef globalIncumbentPath, StringRef globalManifestPath,
+    bool rankingPruning, bool graphBoundOnly, bool seedOnly,
+    bool canonicalIncumbentSeed, int64_t shardCount, int64_t shardIndex,
     std::string &binding, std::string &error) {
   std::string scoreKey;
   if (!makeExactScoreCacheKey(
@@ -1823,9 +1849,8 @@ static bool makeShapeFrontierBinding(
   appendExactCacheOption(binding, "seed-only", seedOnly);
   appendExactCacheOption(binding, "canonical-incumbent-seed",
                          canonicalIncumbentSeed);
-  appendExactCacheField(
-      binding, "canonical-seed-continuation-contract",
-      "canonical-incumbent-seed-continuation-v1");
+  appendExactCacheField(binding, "canonical-seed-continuation-contract",
+                        "canonical-incumbent-seed-continuation-v1");
   appendExactCacheOption(binding, "shape-shard-count", shardCount);
   appendExactCacheOption(binding, "shape-shard-index", shardIndex);
   appendExactCacheField(binding, "candidate-file-path", candidateFile);
@@ -1963,8 +1988,8 @@ static bool readPeerScoreCommand(StringRef path, PeerScoreCommand &command,
       !getOption("candidates", command.candidatePath) ||
       !getOption("cost-file", command.costPath) ||
       !getOption("output", command.scorePath)) {
-    error =
-        "peer score command is missing module, architecture, input, or output binding";
+    error = "peer score command is missing module, architecture, input, or "
+            "output binding";
     return false;
   }
   return true;
@@ -2135,12 +2160,12 @@ static bool peerInputWasStableBeforeStart(StringRef path, double startedUnix,
     return false;
   }
   using namespace std::chrono;
-  const auto startedNanos = duration_cast<nanoseconds>(
-      duration<double>(startedUnix));
+  const auto startedNanos =
+      duration_cast<nanoseconds>(duration<double>(startedUnix));
   const llvm::sys::TimePoint<> startedTime(startedNanos);
   if (status.getLastModificationTime() > startedTime) {
-    error = "peer input was modified after score.command started: " +
-            path.str();
+    error =
+        "peer input was modified after score.command started: " + path.str();
     return false;
   }
   return true;
@@ -2168,8 +2193,8 @@ static bool readCostCatalogBinding(StringRef path, CostCatalogBinding &binding,
   auto requiredMetadata = [&](StringRef key, std::string &destination) {
     auto value = metadata->getString(key);
     if (!value || value->empty()) {
-      error = "cost catalogue metadata is missing " + key.str() + ": " +
-              path.str();
+      error =
+          "cost catalogue metadata is missing " + key.str() + ": " + path.str();
       return false;
     }
     destination = value->str();
@@ -2244,9 +2269,9 @@ static bool parseCandidateOrdinal(StringRef candidateId, StringRef label,
   StringRef normalized = suffix.ltrim('0');
   if (normalized.empty())
     normalized = "0";
-  if (suffix.empty() || llvm::any_of(suffix, [](char value) {
-        return value < '0' || value > '9';
-      }) ||
+  if (suffix.empty() ||
+      llvm::any_of(suffix,
+                   [](char value) { return value < '0' || value > '9'; }) ||
       compareDecimal(normalized, candidateCount) >= 0) {
     error = label.str() + " is outside the bound candidate descriptor";
     return false;
@@ -2264,10 +2289,11 @@ struct WarmStartShapeHint {
 // schedules, timing fields, and scheduler contract are deliberately ignored.
 // Decode each ordinal against the current factored alphabet so a row can never
 // smuggle in a partial or foreign tuple.
-static bool loadWarmStartShapeHints(
-    StringRef path, const FactoredSpaceDescriptor &descriptor,
-    unsigned counterWidth, std::vector<WarmStartShapeHint> &hints,
-    std::string &error) {
+static bool loadWarmStartShapeHints(StringRef path,
+                                    const FactoredSpaceDescriptor &descriptor,
+                                    unsigned counterWidth,
+                                    std::vector<WarmStartShapeHint> &hints,
+                                    std::string &error) {
   hints.clear();
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -2325,8 +2351,8 @@ static bool loadWarmStartShapeHints(
       return fail("score row has no shape_candidate_id");
     if (!parseCandidateOrdinal(*candidateId, "shape_candidate_id",
                                descriptor.candidateCount, error)) {
-      error = path.str() + ": line " + std::to_string(lineNumber) + ": " +
-              error;
+      error =
+          path.str() + ": line " + std::to_string(lineNumber) + ": " + error;
       return false;
     }
     constexpr StringLiteral prefix = "candidate-";
@@ -2346,8 +2372,7 @@ static bool loadWarmStartShapeHints(
       const size_t radix = descriptor.shapesByTask[taskIndex].size();
       if (radix == 0)
         return fail("current factored descriptor has an empty task alphabet");
-      const llvm::APInt radixValue(counterWidth,
-                                   static_cast<uint64_t>(radix));
+      const llvm::APInt radixValue(counterWidth, static_cast<uint64_t>(radix));
       const llvm::APInt remainder = remaining.urem(radixValue);
       if (remainder.getActiveBits() > 64)
         return fail("decoded shape index exceeds host index width");
@@ -2374,13 +2399,12 @@ static bool nearlyEqualCost(double lhs, double rhs) {
 
 static bool validateScoreRecordAgainstCatalog(
     const llvm::json::Object &record, StringRef label,
-    const FactoredSpaceDescriptor &descriptor,
-    ArrayRef<TaskMetadata> metadata, TaskShapeCostCache &costs,
-    std::string &error) {
+    const FactoredSpaceDescriptor &descriptor, ArrayRef<TaskMetadata> metadata,
+    TaskShapeCostCache &costs, std::string &error) {
   auto shapeCandidateId = record.getString("shape_candidate_id");
   if (!shapeCandidateId ||
-      !parseCandidateOrdinal(*shapeCandidateId, label, descriptor.candidateCount,
-                             error))
+      !parseCandidateOrdinal(*shapeCandidateId, label,
+                             descriptor.candidateCount, error))
     return false;
   const llvm::json::Array *taskCosts = record.getArray("task_costs");
   const llvm::json::Array *schedule = record.getArray("task_schedule");
@@ -2410,10 +2434,10 @@ static bool validateScoreRecordAgainstCatalog(
     auto startupCycles = taskCost->getNumber("startup_cycles");
     auto predictedDuration = taskCost->getNumber("predicted_duration");
     auto supportStatus = taskCost->getString("support_status");
-    if (!taskName || !mapperRows || !mapperCols || !tripCount ||
-        !predictedII || !startupCycles || !predictedDuration ||
-        !supportStatus || *mapperRows <= 0 || *mapperCols <= 0 ||
-        *tripCount <= 0 || *supportStatus != "supported") {
+    if (!taskName || !mapperRows || !mapperCols || !tripCount || !predictedII ||
+        !startupCycles || !predictedDuration || !supportStatus ||
+        *mapperRows <= 0 || *mapperCols <= 0 || *tripCount <= 0 ||
+        *supportStatus != "supported") {
       error = label.str() + " has an incomplete task cost row";
       return false;
     }
@@ -2514,9 +2538,11 @@ static bool loadShapeFrontierSnapshot(
             buffer.getError().message();
     return false;
   }
-  llvm::Expected<llvm::json::Value> parsed = llvm::json::parse((*buffer)->getBuffer());
+  llvm::Expected<llvm::json::Value> parsed =
+      llvm::json::parse((*buffer)->getBuffer());
   if (!parsed) {
-    error = "invalid shape frontier JSON: " + llvm::toString(parsed.takeError());
+    error =
+        "invalid shape frontier JSON: " + llvm::toString(parsed.takeError());
     return false;
   }
   const llvm::json::Object *root = parsed->getAsObject();
@@ -2528,11 +2554,11 @@ static bool loadShapeFrontierSnapshot(
           std::optional<StringRef>("shape-frontier") ||
       root->getString("schema") !=
           std::optional<StringRef>("amoeba-shape-frontier-v1") ||
-      root->getString("status") !=
-          std::optional<StringRef>("incomplete") ||
+      root->getString("status") != std::optional<StringRef>("incomplete") ||
       root->getString("phase") != std::optional<StringRef>("shape-search") ||
       root->getBoolean("resume_eligible") != std::optional<bool>(true)) {
-    error = "shape frontier is not an eligible incomplete source-owned snapshot";
+    error =
+        "shape frontier is not an eligible incomplete source-owned snapshot";
     return false;
   }
   auto bindingPath = root->getString("binding_witness_path");
@@ -2566,7 +2592,8 @@ static bool loadShapeFrontierSnapshot(
       !requireStaticString("schedule_space", expectedScheduleSpace) ||
       !requireStaticString("production_scheduler_contract",
                            kProductionSchedulerContract)) {
-    error = "shape frontier static option fields differ from current invocation";
+    error =
+        "shape frontier static option fields differ from current invocation";
     return false;
   }
   auto canonicalSeedEnabled =
@@ -2577,7 +2604,7 @@ static bool loadShapeFrontierSnapshot(
       *canonicalSeedEnabled != expectedCanonicalIncumbentSeed ||
       !canonicalSeedContinuation ||
       (*canonicalSeedContinuation !=
-           (expectedCanonicalIncumbentSeed ? "complete" : "disabled"))) {
+       (expectedCanonicalIncumbentSeed ? "complete" : "disabled"))) {
     error =
         "shape frontier canonical incumbent seed binding/continuation state "
         "does not match current options";
@@ -2611,16 +2638,15 @@ static bool loadShapeFrontierSnapshot(
   }
   auto implementation = root->getString("implementation_contract");
   if (!implementation ||
-      *implementation !=
-          "score-exact-joint-task-candidates-frontier-v1") {
+      *implementation != "score-exact-joint-task-candidates-frontier-v1") {
     error = "shape frontier implementation contract is unsupported";
     return false;
   }
   auto reason = root->getString("reason");
-  if (!reason || (*reason != "periodic" && *reason != "before-child" &&
-                  *reason != "max-shape-candidates" &&
-                  *reason != "max-expanded-nodes" &&
-                  *reason != "max-milliseconds")) {
+  if (!reason ||
+      (*reason != "periodic" && *reason != "before-child" &&
+       *reason != "max-shape-candidates" && *reason != "max-expanded-nodes" &&
+       *reason != "max-milliseconds")) {
     error = "shape frontier has an unsupported checkpoint reason";
     return false;
   }
@@ -2633,8 +2659,7 @@ static bool loadShapeFrontierSnapshot(
   std::set<unsigned> seenTasks;
   for (const llvm::json::Value &value : *decisionOrder) {
     std::optional<int64_t> task = value.getAsInteger();
-    if (!task || *task < 0 ||
-        static_cast<size_t>(*task) >= metadata.size() ||
+    if (!task || *task < 0 || static_cast<size_t>(*task) >= metadata.size() ||
         !seenTasks.insert(static_cast<unsigned>(*task)).second) {
       error = "shape frontier decision order is not a permutation";
       return false;
@@ -2677,10 +2702,9 @@ static bool loadShapeFrontierSnapshot(
       error = "shape frontier frame index overflows host width";
       return false;
     }
-    snapshot.frames.push_back({static_cast<size_t>(depth),
-                               static_cast<unsigned>(task),
-                               static_cast<size_t>(chosen), next,
-                               ordinal->str()});
+    snapshot.frames.push_back(
+        {static_cast<size_t>(depth), static_cast<unsigned>(task),
+         static_cast<size_t>(chosen), next, ordinal->str()});
   }
 
   auto ranked = root->getArray("ranked");
@@ -2724,15 +2748,15 @@ static bool loadShapeFrontierSnapshot(
         *recordCycles != *cycles ||
         *recordShape != "candidate-" + shapeOrdinal->str() ||
         *recordCandidate != *candidateId ||
-        *candidateId != "shape-" + shapeOrdinal->str() + "/schedule-" +
-                             *scheduleOrdinal) {
+        *candidateId !=
+            "shape-" + shapeOrdinal->str() + "/schedule-" + *scheduleOrdinal) {
       error = "shape frontier ranked row identity/cycle fields disagree";
       return false;
     }
     llvm::json::Object recordCopy = *record;
-    if (!validateScoreRecordAgainstCatalog(
-            recordCopy, "shape frontier ranked row", descriptor, metadata,
-            costs, error))
+    if (!validateScoreRecordAgainstCatalog(recordCopy,
+                                           "shape frontier ranked row",
+                                           descriptor, metadata, costs, error))
       return false;
     snapshot.ranked.push_back({key->str(), shapeOrdinal->str(), schedule,
                                *cycles, std::move(recordCopy)});
@@ -2829,13 +2853,12 @@ static bool loadShapeFrontierSnapshot(
 // rounded ML II/startup duration used by the scorer.
 static bool validateScoreRecordCommunication(
     const llvm::json::Object &record, StringRef label,
-    const FactoredSpaceDescriptor &descriptor,
-    ArrayRef<TaskMetadata> metadata,
+    const FactoredSpaceDescriptor &descriptor, ArrayRef<TaskMetadata> metadata,
     const std::vector<std::vector<unsigned>> &predecessors,
     TaskShapeCostCache &costs,
     ProductionFixedScheduleCommunication &communication,
-    func::FuncOp sourceFunction, StringRef scheduleSpace, StringRef dispatchPolicy,
-    std::string &error) {
+    func::FuncOp sourceFunction, StringRef scheduleSpace,
+    StringRef dispatchPolicy, std::string &error) {
   const llvm::json::Array *taskCosts = record.getArray("task_costs");
   const llvm::json::Array *schedule = record.getArray("task_schedule");
   const llvm::json::Array *dispatchOrder = record.getArray("dispatch_order");
@@ -2875,7 +2898,8 @@ static bool validateScoreRecordCommunication(
     }
     auto taskIt = taskIndices.find(taskName->str());
     if (taskIt == taskIndices.end() || taskCostSeen[taskIt->second]) {
-      error = label.str() + " task costs do not exactly cover communication tasks";
+      error =
+          label.str() + " task costs do not exactly cover communication tasks";
       return false;
     }
     const unsigned taskIndex = taskIt->second;
@@ -2920,7 +2944,8 @@ static bool validateScoreRecordCommunication(
     auto col = placement ? placement->getInteger("col") : std::nullopt;
     auto rows = placement ? placement->getInteger("rows") : std::nullopt;
     auto cols = placement ? placement->getInteger("cols") : std::nullopt;
-    auto start = placement ? placement->getInteger("start_cycle") : std::nullopt;
+    auto start =
+        placement ? placement->getInteger("start_cycle") : std::nullopt;
     auto end = placement ? placement->getInteger("end_cycle") : std::nullopt;
     if (!placement || !taskName || !row || !col || !rows || !cols || !start ||
         !end) {
@@ -2978,33 +3003,43 @@ static bool validateScoreRecordCommunication(
     SmallVector<TaskShapeChoice> choices;
     SmallVector<int64_t> durations;
     for (unsigned index = 0; index < tasks.size(); ++index) {
-      auto shape = llvm::find_if(descriptor.shapesByTask[index], [&](const RectShape &s) {
-        return s.rows == tasks[index].rows && s.cols == tasks[index].cols;
-      });
+      auto shape = llvm::find_if(
+          descriptor.shapesByTask[index], [&](const RectShape &s) {
+            return s.rows == tasks[index].rows && s.cols == tasks[index].cols;
+          });
       if (shape == descriptor.shapesByTask[index].end()) {
         error = label.str() + " production shape is absent from its descriptor";
         return false;
       }
-      choices.push_back({metadata[index].name, metadata[index].tripCount, *shape});
+      choices.push_back(
+          {metadata[index].name, metadata[index].tripCount, *shape});
       durations.push_back(tasks[index].duration);
     }
     ProductionScheduledResult actual;
     auto candidate = record.getString("shape_candidate_id");
     if (!candidate || !scheduleWithAmoebaProductionPass(
-            sourceFunction->getParentOfType<ModuleOp>(), sourceFunction,
-            choices, durations, *candidate, dispatchPolicy == "fixed", actual, error))
+                          sourceFunction->getParentOfType<ModuleOp>(),
+                          sourceFunction, choices, durations, *candidate,
+                          dispatchPolicy == "fixed", actual, error))
       return false;
-    if (actual.order != order || actual.placements.size() != placements.size() ||
-        record.getInteger("predicted_whole_program_cycles") != std::optional<int64_t>(actual.makespan) ||
-        record.getInteger("replayed_communication_edges") != std::optional<int64_t>(actual.replayedEdges)) {
+    if (actual.order != order ||
+        actual.placements.size() != placements.size() ||
+        record.getInteger("predicted_whole_program_cycles") !=
+            std::optional<int64_t>(actual.makespan) ||
+        record.getInteger("replayed_communication_edges") !=
+            std::optional<int64_t>(actual.replayedEdges)) {
       error = label.str() + " production scheduler replay disagrees with score";
       return false;
     }
     for (const auto &expected : placements) {
-      auto found = llvm::find_if(actual.placements, [&](const auto &p) { return p.task == expected.task; });
+      auto found = llvm::find_if(actual.placements, [&](const auto &p) {
+        return p.task == expected.task;
+      });
       if (found == actual.placements.end() || found->row != expected.row ||
-          found->col != expected.col || found->start != expected.start || found->end != expected.end) {
-        error = label.str() + " production scheduler replay placement disagrees with score";
+          found->col != expected.col || found->start != expected.start ||
+          found->end != expected.end) {
+        error = label.str() +
+                " production scheduler replay placement disagrees with score";
         return false;
       }
     }
@@ -3013,8 +3048,8 @@ static bool validateScoreRecordCommunication(
   FixedScheduleScore replay = verifyAndScoreFixedSchedule(
       4, 4, tasks, placements, order, communication);
   if (!replay.valid) {
-    error = label.str() + " communication replay rejected the schedule: " +
-            replay.rejection;
+    error = label.str() +
+            " communication replay rejected the schedule: " + replay.rejection;
     return false;
   }
   auto predicted = record.getInteger("predicted_whole_program_cycles");
@@ -3042,8 +3077,8 @@ static bool buildIncumbentBindingsKey(
     StringRef temporalModel, StringRef scheduleSpace,
     ArrayRef<IncumbentRow> rows,
     const std::map<std::string, ClosureGraphBinding> &graphBindings,
-    const std::map<std::string, std::string> &scorePaths,
-    std::string &key, std::string &error) {
+    const std::map<std::string, std::string> &scorePaths, std::string &key,
+    std::string &error) {
   key.clear();
   appendExactCacheField(key, "contract", "validated-incumbent-bindings-v1");
   appendExactCacheField(key, "function", currentFunction.getSymName());
@@ -3053,7 +3088,7 @@ static bool buildIncumbentBindingsKey(
   if (scheduleSpace == "production-scheduler") {
     int64_t fixedPointIterations = 0;
     if (!getProductionFixedPointIterations(currentFunction,
-                                            fixedPointIterations, error))
+                                           fixedPointIterations, error))
       return false;
     appendExactCacheField(key, "production-scheduler-contract",
                           kProductionSchedulerContract);
@@ -3062,14 +3097,17 @@ static bool buildIncumbentBindingsKey(
   }
   // sourceGraphId belongs to the current graph, and is not compared against
   // the peer graph. Include precisely the common catalogue binding instead.
-  for (StringRef field : {StringRef(binding.nameSpace), StringRef(binding.model),
-       StringRef(binding.modelSchema), StringRef(binding.featureContractId),
-       StringRef(binding.featureExtractor), StringRef(binding.predictorSource),
-       StringRef(binding.provenanceSchema), StringRef(binding.architectureSchema),
-       StringRef(binding.architecturePath), StringRef(binding.sourceRepository),
-       StringRef(binding.sourceCommit), currentCosts.nameSpace(),
-       currentCosts.architectureSchema(), currentCosts.architecturePath(),
-       currentCosts.sourceRepository(), currentCosts.sourceCommit()})
+  for (StringRef field :
+       {StringRef(binding.nameSpace), StringRef(binding.model),
+        StringRef(binding.modelSchema), StringRef(binding.featureContractId),
+        StringRef(binding.featureExtractor), StringRef(binding.predictorSource),
+        StringRef(binding.provenanceSchema),
+        StringRef(binding.architectureSchema),
+        StringRef(binding.architecturePath),
+        StringRef(binding.sourceRepository), StringRef(binding.sourceCommit),
+        currentCosts.nameSpace(), currentCosts.architectureSchema(),
+        currentCosts.architecturePath(), currentCosts.sourceRepository(),
+        currentCosts.sourceCommit()})
     appendExactCacheField(key, "binding", field);
   for (const IncumbentRow &row : rows) {
     appendExactCacheField(key, "graph", row.graphVariantId);
@@ -3111,15 +3149,17 @@ static bool buildIncumbentBindingsKey(
       error = "incumbent cache input lacks finite score-start provenance";
       return false;
     }
-    for (StringRef input : {StringRef(command.architecturePath),
-         StringRef(command.modulePath), StringRef(command.candidatePath),
-         StringRef(command.costPath), StringRef(graph.factsPath)})
+    for (StringRef input :
+         {StringRef(command.architecturePath), StringRef(command.modulePath),
+          StringRef(command.candidatePath), StringRef(command.costPath),
+          StringRef(graph.factsPath)})
       if (!peerInputWasStableBeforeStart(input, *command.startedUnix, error))
         return false;
-    for (StringRef input : {StringRef(commandPath), StringRef(entry.second),
-         StringRef(command.architecturePath), StringRef(command.modulePath),
-         StringRef(command.candidatePath), StringRef(command.costPath),
-         StringRef(graph.mlirPath), StringRef(graph.factsPath)}) {
+    for (StringRef input :
+         {StringRef(commandPath), StringRef(entry.second),
+          StringRef(command.architecturePath), StringRef(command.modulePath),
+          StringRef(command.candidatePath), StringRef(command.costPath),
+          StringRef(graph.mlirPath), StringRef(graph.factsPath)}) {
       std::string bytes;
       if (!readExactCacheInput(input, bytes, error))
         return false;
@@ -3153,7 +3193,8 @@ static bool validateIncumbentBindings(
   }
   std::map<std::string, std::string> scorePaths;
   for (const IncumbentRow &row : rows) {
-    auto [entry, inserted] = scorePaths.emplace(row.graphVariantId, row.scorePath);
+    auto [entry, inserted] =
+        scorePaths.emplace(row.graphVariantId, row.scorePath);
     if (!inserted && entry->second != row.scorePath) {
       error = "one incumbent graph names multiple score-command witnesses";
       return false;
@@ -3162,13 +3203,14 @@ static bool validateIncumbentBindings(
   int64_t expectedFixedPointIterations = 0;
   if (expectedScheduleSpace == "production-scheduler" &&
       !getProductionFixedPointIterations(currentFunction,
-                                          expectedFixedPointIterations, error))
+                                         expectedFixedPointIterations, error))
     return false;
 
   std::string validationKey;
   if (!buildIncumbentBindingsKey(currentFunction, currentCosts, currentBinding,
-      expectedDispatchPolicy, expectedTemporalModel, expectedScheduleSpace,
-      rows, graphBindings, scorePaths, validationKey, error))
+                                 expectedDispatchPolicy, expectedTemporalModel,
+                                 expectedScheduleSpace, rows, graphBindings,
+                                 scorePaths, validationKey, error))
     return false;
   if (validationKey == validatedIncumbentBindingsKey)
     return true;
@@ -3194,8 +3236,7 @@ static bool validateIncumbentBindings(
     llvm::sys::path::remove_filename(commandPath);
     llvm::sys::path::append(commandPath, "score.command.json");
     if (!llvm::sys::fs::exists(commandPath)) {
-      error = "incumbent score.command.json is unavailable beside " +
-              scorePath;
+      error = "incumbent score.command.json is unavailable beside " + scorePath;
       return false;
     }
     PeerScoreCommand command;
@@ -3220,17 +3261,23 @@ static bool validateIncumbentBindings(
         commandScoreHeader.getBoolean("seed_only").value_or(false) ||
         commandScoreFooter.getString("status") ==
             std::optional<StringRef>("seed-only");
-    if (!requirePeerString(commandScoreHeader, "schedule_space", expectedScheduleSpace, error) ||
-        !requirePeerString(commandScoreHeader, "dispatch_policy", expectedDispatchPolicy, error) ||
-        !requirePeerString(commandScoreHeader, "start_policy", scoreStartPolicy(expectedTemporalModel, expectedScheduleSpace), error) ||
-        !requirePeerString(commandScoreHeader, "temporal_search_scope", scoreTemporalScope(expectedTemporalModel), error))
+    if (!requirePeerString(commandScoreHeader, "schedule_space",
+                           expectedScheduleSpace, error) ||
+        !requirePeerString(commandScoreHeader, "dispatch_policy",
+                           expectedDispatchPolicy, error) ||
+        !requirePeerString(
+            commandScoreHeader, "start_policy",
+            scoreStartPolicy(expectedTemporalModel, expectedScheduleSpace),
+            error) ||
+        !requirePeerString(commandScoreHeader, "temporal_search_scope",
+                           scoreTemporalScope(expectedTemporalModel), error))
       return false;
     if (expectedScheduleSpace == "production-scheduler") {
       for (const llvm::json::Object *record :
            {&commandScoreHeader, &commandScoreFooter}) {
         if (!requirePeerInteger(*record,
-                "production_fixed_point_max_iterations",
-                expectedFixedPointIterations, error))
+                                "production_fixed_point_max_iterations",
+                                expectedFixedPointIterations, error))
           return false;
         // The v2 score writer initially emitted the effective 64-round
         // budget without the optional contract string. This is the only
@@ -3245,7 +3292,8 @@ static bool validateIncumbentBindings(
       }
     }
     if (scoreSeedOnly != commandSeedOnly) {
-      error = "incumbent score seed-only status disagrees with score.command.json";
+      error =
+          "incumbent score seed-only status disagrees with score.command.json";
       return false;
     }
     if (!samePath(command.scorePath, scorePath) ||
@@ -3256,9 +3304,12 @@ static bool validateIncumbentBindings(
                         currentCosts.sourceRepository(), error) ||
         !samePeerOption(command, "source-git-commit",
                         currentCosts.sourceCommit(), error) ||
-        !samePeerOption(command, "dispatch-policy", expectedDispatchPolicy, error) ||
-        !samePeerOption(command, "schedule-space", expectedScheduleSpace, error) ||
-        !samePeerOption(command, "temporal-model", expectedTemporalModel, error))
+        !samePeerOption(command, "dispatch-policy", expectedDispatchPolicy,
+                        error) ||
+        !samePeerOption(command, "schedule-space", expectedScheduleSpace,
+                        error) ||
+        !samePeerOption(command, "temporal-model", expectedTemporalModel,
+                        error))
       return false;
     if (!commandSeedOnly &&
         (!samePeerOption(command, "max-expanded-nodes",
@@ -3279,11 +3330,10 @@ static bool validateIncumbentBindings(
       error = "incumbent score command lacks successful start/exit provenance";
       return false;
     }
-    for (StringRef input : {StringRef(command.architecturePath),
-                            StringRef(command.modulePath),
-                            StringRef(command.candidatePath),
-                            StringRef(command.costPath),
-                            StringRef(graph.factsPath)})
+    for (StringRef input :
+         {StringRef(command.architecturePath), StringRef(command.modulePath),
+          StringRef(command.candidatePath), StringRef(command.costPath),
+          StringRef(graph.factsPath)})
       if (!peerInputWasStableBeforeStart(input, *command.startedUnix, error))
         return false;
 
@@ -3300,7 +3350,7 @@ static bool validateIncumbentBindings(
     if (expectedScheduleSpace == "production-scheduler") {
       int64_t peerIterations = 0;
       if (!getProductionFixedPointIterations(*peerFunction, peerIterations,
-                                              error))
+                                             error))
         return false;
       if (peerIterations != expectedFixedPointIterations) {
         error = "incumbent peer/current production fixed-point budgets differ";
@@ -3314,9 +3364,8 @@ static bool validateIncumbentBindings(
     const ::mlir::neura::Architecture &architecture =
         ::mlir::neura::getArchitecture();
     FactoredSpaceDescriptor peerDescriptor;
-    if (!parseFactoredSpace(command.candidatePath, *peerFunction,
-                            *peerMetadata, graphId, architecture,
-                            peerDescriptor, error))
+    if (!parseFactoredSpace(command.candidatePath, *peerFunction, *peerMetadata,
+                            graphId, architecture, peerDescriptor, error))
       return false;
     TaskShapeCostCache peerCosts;
     if (!peerCosts.load(command.costPath, currentFunction.getSymName(),
@@ -3336,8 +3385,9 @@ static bool validateIncumbentBindings(
 
     std::string peerGraphError;
     FailureOr<TaskEdgeGraph> peerGraph = buildTaskEdgeGraph(
-        *peerFunction, TaskEdgeGraphOptions{/*require_payload=*/true,
-                                            /*read_control_predecessors=*/true},
+        *peerFunction,
+        TaskEdgeGraphOptions{/*require_payload=*/true,
+                             /*read_control_predecessors=*/true},
         peerGraphError);
     if (failed(peerGraph)) {
       error = "cannot build incumbent communication graph: " + peerGraphError;
@@ -3361,8 +3411,9 @@ static bool validateIncumbentBindings(
       peerTaskOperations[index] = task.getOperation();
       peerOperationIndex[task.getOperation()] = index;
     }
-    if (llvm::any_of(peerTaskOperations,
-                     [](Operation *operation) { return operation == nullptr; })) {
+    if (llvm::any_of(peerTaskOperations, [](Operation *operation) {
+          return operation == nullptr;
+        })) {
       error = "incumbent communication graph omits a task operation";
       return false;
     }
@@ -3427,13 +3478,14 @@ static bool validateIncumbentBindings(
         return false;
       }
       if (!validateScoreRecordAgainstCatalog(
-              record, "incumbent candidate " + row.candidateId,
-              peerDescriptor, *peerMetadata, peerCosts, error))
+              record, "incumbent candidate " + row.candidateId, peerDescriptor,
+              *peerMetadata, peerCosts, error))
         return false;
       if (!validateScoreRecordCommunication(
               record, "incumbent candidate " + row.candidateId, peerDescriptor,
               *peerMetadata, peerPredecessors, peerCosts, peerCommunication,
-              *peerFunction, expectedScheduleSpace, expectedDispatchPolicy, error))
+              *peerFunction, expectedScheduleSpace, expectedDispatchPolicy,
+              error))
         return false;
     }
   }
@@ -3441,8 +3493,9 @@ static bool validateIncumbentBindings(
   // file changes cannot attach a successful proof to pre-validation bytes.
   std::string confirmedKey;
   if (!buildIncumbentBindingsKey(currentFunction, currentCosts, currentBinding,
-      expectedDispatchPolicy, expectedTemporalModel, expectedScheduleSpace,
-      rows, graphBindings, scorePaths, confirmedKey, error))
+                                 expectedDispatchPolicy, expectedTemporalModel,
+                                 expectedScheduleSpace, rows, graphBindings,
+                                 scorePaths, confirmedKey, error))
     return false;
   if (validationKey != confirmedKey) {
     error = "incumbent inputs changed during validation";
@@ -3457,9 +3510,9 @@ static PeerProbeStatus importCompletePeerScore(
     StringRef currentCandidate, StringRef currentCost,
     StringRef currentArchitecture, StringRef sourceRepository,
     StringRef sourceCommit, StringRef dispatchPolicy, StringRef temporalModel,
-    StringRef scheduleSpace, StringRef currentCandidateCount,
-    int64_t topK, int64_t maxExpandedNodes, int64_t maxMilliseconds,
-    int64_t maxMakespan, int64_t maxCgrasPerTask, int64_t stateMemoCapacity,
+    StringRef scheduleSpace, StringRef currentCandidateCount, int64_t topK,
+    int64_t maxExpandedNodes, int64_t maxMilliseconds, int64_t maxMakespan,
+    int64_t maxCgrasPerTask, int64_t stateMemoCapacity,
     StringRef currentSourceGraphId, ExactScoreCacheLease &cache,
     std::string &error) {
   const std::string peerDirectory =
@@ -3497,8 +3550,10 @@ static PeerProbeStatus importCompletePeerScore(
   }
   if (!command.startedUnix || !std::isfinite(*command.startedUnix) ||
       *command.startedUnix < 0.0 ||
-      *command.startedUnix > std::chrono::duration<double>(
-          std::chrono::system_clock::now().time_since_epoch()).count()) {
+      *command.startedUnix >
+          std::chrono::duration<double>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count()) {
     error = "peer score command has no started_unix provenance";
     return PeerProbeStatus::Rejected;
   }
@@ -3513,10 +3568,9 @@ static PeerProbeStatus importCompletePeerScore(
       !sameFileBytes(command.architecturePath, currentArchitecture, error) ||
       !peerFunctionMatches(function, command.modulePath, error))
     return PeerProbeStatus::Rejected;
-  for (StringRef input : {StringRef(command.modulePath),
-                          StringRef(command.architecturePath),
-                          StringRef(command.candidatePath),
-                          StringRef(command.costPath)}) {
+  for (StringRef input :
+       {StringRef(command.modulePath), StringRef(command.architecturePath),
+        StringRef(command.candidatePath), StringRef(command.costPath)}) {
     if (!peerInputWasStableBeforeStart(input, *command.startedUnix, error))
       return PeerProbeStatus::Rejected;
   }
@@ -3573,12 +3627,15 @@ static PeerProbeStatus importCompletePeerScore(
       !requirePeerString(header, "source_commit", sourceCommit, error) ||
       !requirePeerInteger(header, "top_k", topK, error) ||
       !requirePeerInteger(header, "max_makespan", maxMakespan, error) ||
-      !requirePeerInteger(header, "state_memo_capacity",
-                          stateMemoCapacity, error) ||
+      !requirePeerInteger(header, "state_memo_capacity", stateMemoCapacity,
+                          error) ||
       !requirePeerInteger(header, "max_cgras_per_task", maxCgrasPerTask,
                           error) ||
-      !requirePeerString(header, "start_policy", scoreStartPolicy(temporalModel, scheduleSpace), error) ||
-      !requirePeerString(header, "temporal_search_scope", scoreTemporalScope(temporalModel), error) ||
+      !requirePeerString(header, "start_policy",
+                         scoreStartPolicy(temporalModel, scheduleSpace),
+                         error) ||
+      !requirePeerString(header, "temporal_search_scope",
+                         scoreTemporalScope(temporalModel), error) ||
       !requirePeerString(header, "communication_mode", "explicit", error) ||
       !requirePeerBool(header, "cycle_starts_are_search_dimensions", false,
                        error) ||
@@ -3598,8 +3655,8 @@ static PeerProbeStatus importCompletePeerScore(
       !requirePeerString(footer, "dispatch_policy", dispatchPolicy, error) ||
       !requirePeerString(footer, "schedule_space", scheduleSpace, error) ||
       !requirePeerInteger(footer, "top_k_requested", topK, error) ||
-      !requirePeerInteger(footer, "state_memo_capacity",
-                          stateMemoCapacity, error) ||
+      !requirePeerInteger(footer, "state_memo_capacity", stateMemoCapacity,
+                          error) ||
       !requirePeerBool(footer, "horizon_proven", true, error) ||
       !requirePeerBool(footer, "production_ready", false, error))
     return PeerProbeStatus::Rejected;
@@ -3608,7 +3665,8 @@ static PeerProbeStatus importCompletePeerScore(
        !requirePeerInteger(footer, "production_fixed_point_max_iterations",
                            expectedProductionFixedPointIterations, error)))
     return PeerProbeStatus::Rejected;
-  const std::string expectedCertificate = scoreRankingCertificate(temporalModel, scheduleSpace).str();
+  const std::string expectedCertificate =
+      scoreRankingCertificate(temporalModel, scheduleSpace).str();
   if (!requirePeerString(footer, "ranking_certificate", expectedCertificate,
                          error))
     return PeerProbeStatus::Rejected;
@@ -3639,10 +3697,10 @@ static bool writePeerProbeOutput(
         header["max_cgras_per_task"] =
             static_cast<int64_t>(descriptor.maxCgrasPerTask);
         header["communication_mode"] = "explicit";
-        header["start_policy"] = scoreStartPolicy(temporalModel, scheduleSpace).str();
+        header["start_policy"] =
+            scoreStartPolicy(temporalModel, scheduleSpace).str();
         header["schedule_space"] = scheduleSpace.str();
-        header["placement_coverage_limited"] =
-            scheduleSpace != "exact";
+        header["placement_coverage_limited"] = scheduleSpace != "exact";
         header["production_ready"] = false;
         header["predictor_status"] = "exploratory";
         header["state_memo_requested"] = scheduleSpace == "exact";
@@ -3650,7 +3708,8 @@ static bool writePeerProbeOutput(
         header["dispatch_policy"] = dispatchPolicy.str();
         header["max_makespan"] = 0;
         header["horizon_proven"] = false;
-        header["global_shape_location_temporal_space"] = scheduleSpace != "production-scheduler";
+        header["global_shape_location_temporal_space"] =
+            scheduleSpace != "production-scheduler";
         header["temporal_search_scope"] =
             scoreTemporalScope(temporalModel).str();
         header["cycle_starts_are_search_dimensions"] =
@@ -3669,15 +3728,16 @@ static bool writePeerProbeOutput(
         header["score_cache_peer_imported"] = false;
         header["score_cache_peer_pending"] = peerStatus == "pending";
         header["score_cache_peer_status"] = peerStatus.str();
-        addProductionCoverage(header, temporalModel, scheduleSpace, dispatchPolicy, function);
+        addProductionCoverage(header, temporalModel, scheduleSpace,
+                              dispatchPolicy, function);
         writeJsonLine(stream, std::move(header));
 
         llvm::json::Object footer;
         footer["record_type"] = "footer";
         footer["schema"] = "amoeba-exact-joint-task-scores-v1";
         footer["scored_count"] = 0;
-        footer["status"] = peerStatus == "pending" ? "peer_pending"
-                                                     : "peer_rejected";
+        footer["status"] =
+            peerStatus == "pending" ? "peer_pending" : "peer_rejected";
         footer["incomplete"] = true;
         footer["reason"] = reason.str();
         footer["candidate_count"] = descriptor.candidateCount;
@@ -3705,7 +3765,8 @@ static bool writePeerProbeOutput(
         footer["score_cache_peer_imported"] = false;
         footer["score_cache_peer_pending"] = peerStatus == "pending";
         footer["score_cache_peer_status"] = peerStatus.str();
-        addProductionCoverage(footer, temporalModel, scheduleSpace, dispatchPolicy, function);
+        addProductionCoverage(footer, temporalModel, scheduleSpace,
+                              dispatchPolicy, function);
         writeJsonLine(stream, std::move(footer));
         return true;
       },
@@ -3713,9 +3774,9 @@ static bool writePeerProbeOutput(
 }
 
 struct ScoreExactJointTaskCandidatesPass
-    : PassWrapper<ScoreExactJointTaskCandidatesPass,
-                  OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScoreExactJointTaskCandidatesPass)
+    : PassWrapper<ScoreExactJointTaskCandidatesPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      ScoreExactJointTaskCandidatesPass)
 
   ScoreExactJointTaskCandidatesPass() = default;
   ScoreExactJointTaskCandidatesPass(
@@ -3735,18 +3796,20 @@ struct ScoreExactJointTaskCandidatesPass
   Option<std::string> costFile{*this, "cost-file", llvm::cl::init("")};
   Option<std::string> outputFile{*this, "output", llvm::cl::init("")};
   Option<int64_t> topK{*this, "top-k", llvm::cl::init(5)};
-  Option<int64_t> maxShapeCandidates{
-      *this, "max-shape-candidates", llvm::cl::init(0)};
-  Option<int64_t> maxExpandedNodes{
-      *this, "max-expanded-nodes", llvm::cl::init(1000000)};
+  Option<int64_t> maxShapeCandidates{*this, "max-shape-candidates",
+                                     llvm::cl::init(0)};
+  Option<int64_t> maxExpandedNodes{*this, "max-expanded-nodes",
+                                   llvm::cl::init(1000000)};
   Option<int64_t> maxMilliseconds{*this, "max-milliseconds", llvm::cl::init(0)};
   Option<int64_t> maxMakespan{*this, "max-makespan", llvm::cl::init(0)};
-  Option<int64_t> stateMemoCapacity{
-      *this, "state-memo-capacity", llvm::cl::init(100000)};
-  Option<std::string> dispatchPolicy{
-      *this, "dispatch-policy", llvm::cl::init("all-ready")};
-  Option<std::string> temporalModel{*this, "temporal-model", llvm::cl::init("dispatch-order")};
-  Option<std::string> scheduleSpace{*this, "schedule-space", llvm::cl::init("exact")};
+  Option<int64_t> stateMemoCapacity{*this, "state-memo-capacity",
+                                    llvm::cl::init(100000)};
+  Option<std::string> dispatchPolicy{*this, "dispatch-policy",
+                                     llvm::cl::init("all-ready")};
+  Option<std::string> temporalModel{*this, "temporal-model",
+                                    llvm::cl::init("dispatch-order")};
+  Option<std::string> scheduleSpace{*this, "schedule-space",
+                                    llvm::cl::init("exact")};
   // Emit a bounded set of C++-replayed feasible rows for use as a global
   // incumbent.  This mode is intentionally incomplete and never certifies a
   // local top-five or the enclosing graph space.
@@ -3754,26 +3817,30 @@ struct ScoreExactJointTaskCandidatesPass
   Option<bool> rankingPruning{*this, "ranking-pruning", llvm::cl::init(true)};
   // Exact contiguous partitions preserve original shape ordinals. They are
   // coverage partitions, never candidate limits or legality cuts.
-  Option<int64_t> shapeShardCount{*this, "shape-shard-count", llvm::cl::init(1)};
-  Option<int64_t> shapeShardIndex{*this, "shape-shard-index", llvm::cl::init(0)};
+  Option<int64_t> shapeShardCount{*this, "shape-shard-count",
+                                  llvm::cl::init(1)};
+  Option<int64_t> shapeShardIndex{*this, "shape-shard-index",
+                                  llvm::cl::init(0)};
   // Post-enumeration graph screening reuses the exact scorer's provenance
   // checks and optimistic graph bound, without seeds or joint traversal.
   Option<bool> graphBoundOnly{*this, "graph-bound-only", llvm::cl::init(false)};
   Option<bool> horizonProven{*this, "horizon-proven", llvm::cl::init(false)};
-  Option<std::string> graphVariantId{*this, "graph-variant-id", llvm::cl::init("")};
-  Option<std::string> sourceRepository{
-      *this, "source-git-repository", llvm::cl::init("")};
-  Option<std::string> sourceCommit{*this, "source-git-commit", llvm::cl::init("")};
+  Option<std::string> graphVariantId{*this, "graph-variant-id",
+                                     llvm::cl::init("")};
+  Option<std::string> sourceRepository{*this, "source-git-repository",
+                                       llvm::cl::init("")};
+  Option<std::string> sourceCommit{*this, "source-git-commit",
+                                   llvm::cl::init("")};
   // When present, this is a C++-verified incumbent from another graph of the
   // same program/stage/architecture.  An empty option preserves the existing
   // per-graph search exactly.
   Option<std::string> stage{*this, "stage", llvm::cl::init("")};
-  Option<std::string> globalIncumbentFile{
-      *this, "global-incumbent", llvm::cl::init("")};
-  Option<std::string> globalStageManifestFile{
-      *this, "global-stage-manifest", llvm::cl::init("")};
-  Option<std::string> scoreCacheDirectory{
-      *this, "score-cache-dir", llvm::cl::init("")};
+  Option<std::string> globalIncumbentFile{*this, "global-incumbent",
+                                          llvm::cl::init("")};
+  Option<std::string> globalStageManifestFile{*this, "global-stage-manifest",
+                                              llvm::cl::init("")};
+  Option<std::string> scoreCacheDirectory{*this, "score-cache-dir",
+                                          llvm::cl::init("")};
   // Old production score entries did not record the fixed-point budget.  A
   // missing budget is reusable only when this explicit compatibility option
   // declares the known legacy upper bound; it is never guessed silently.
@@ -3781,31 +3848,31 @@ struct ScoreExactJointTaskCandidatesPass
       *this, "legacy-production-cache-max-iterations", llvm::cl::init(-1)};
   Option<std::string> scoreCachePeerDirectory{
       *this, "score-cache-peer-directory", llvm::cl::init("")};
-  Option<bool> scoreCachePeerProbe{
-      *this, "score-cache-peer-probe", llvm::cl::init(false)};
+  Option<bool> scoreCachePeerProbe{*this, "score-cache-peer-probe",
+                                   llvm::cl::init(false)};
   // A prior score/checkpoint may seed current production scheduling with
   // shape ordinals.  It is intentionally excluded from the score-cache key:
   // hints affect only search order, never the meaning of a cached result.
-  Option<std::string> warmStartShapes{
-      *this, "warm-start-shapes", llvm::cl::init("")};
+  Option<std::string> warmStartShapes{*this, "warm-start-shapes",
+                                      llvm::cl::init("")};
   // A frontier snapshot is a source-owned continuation token for the exact
   // production shape DFS.  It is deliberately separate from the legacy
   // top-five checkpoint and warm-start rows: neither of those files records
   // which subtrees have already been visited.
-  Option<std::string> shapeFrontierSnapshot{
-      *this, "shape-frontier-snapshot", llvm::cl::init("")};
-  Option<std::string> resumeShapeFrontier{
-      *this, "resume-shape-frontier", llvm::cl::init("")};
+  Option<std::string> shapeFrontierSnapshot{*this, "shape-frontier-snapshot",
+                                            llvm::cl::init("")};
+  Option<std::string> resumeShapeFrontier{*this, "resume-shape-frontier",
+                                          llvm::cl::init("")};
   // Zero keeps the feature opt-in.  Positive values checkpoint after this
   // many shape DFS nodes; the budget is a cadence, not a search limit.
-  Option<int64_t> frontierCheckpointEvery{
-      *this, "frontier-checkpoint-every", llvm::cl::init(0)};
+  Option<int64_t> frontierCheckpointEvery{*this, "frontier-checkpoint-every",
+                                          llvm::cl::init(0)};
 
   // Optional feasible seeds improve the cycle/numeric-ordinal incumbent.
   // Every trial still invokes the production scheduler; this changes search
   // order only and never removes a shape or certifies a partial traversal.
-  Option<bool> canonicalIncumbentSeed{
-      *this, "canonical-incumbent-seed", llvm::cl::init(false)};
+  Option<bool> canonicalIncumbentSeed{*this, "canonical-incumbent-seed",
+                                      llvm::cl::init(false)};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -3819,7 +3886,8 @@ struct ScoreExactJointTaskCandidatesPass
     func::FuncOp function = *selected;
     const bool productionScheduler = scheduleSpace == "production-scheduler";
     if (canonicalIncumbentSeed.getValue() && !productionScheduler) {
-      module.emitError("canonical-incumbent-seed requires production-scheduler");
+      module.emitError(
+          "canonical-incumbent-seed requires production-scheduler");
       return signalPassFailure();
     }
     const std::optional<DispatchPolicy> parsedDispatchPolicy =
@@ -3839,15 +3907,22 @@ struct ScoreExactJointTaskCandidatesPass
          legacyProductionCacheMaxIterations.getValue() != 64) ||
         shapeShardCount.getValue() <= 0 || shapeShardIndex.getValue() < 0 ||
         shapeShardIndex.getValue() >= shapeShardCount.getValue() ||
-        (!rankingPruning.getValue() && (!productionScheduler || seedOnly.getValue() ||
-          graphBoundOnly.getValue() || !globalIncumbentFile.getValue().empty())) ||
-        (shapeShardCount.getValue() > 1 && (rankingPruning.getValue() || !productionScheduler)) ||
-        (temporalModel == "all-integer-diagnostic" && maxMakespan.getValue() == 0) ||
-        (temporalModel != "dispatch-order" && temporalModel != "all-integer-diagnostic" && temporalModel != "production-scheduler")
-        || (productionScheduler != (temporalModel == "production-scheduler")) ||
+        (!rankingPruning.getValue() &&
+         (!productionScheduler || seedOnly.getValue() ||
+          graphBoundOnly.getValue() ||
+          !globalIncumbentFile.getValue().empty())) ||
+        (shapeShardCount.getValue() > 1 &&
+         (rankingPruning.getValue() || !productionScheduler)) ||
+        (temporalModel == "all-integer-diagnostic" &&
+         maxMakespan.getValue() == 0) ||
+        (temporalModel != "dispatch-order" &&
+         temporalModel != "all-integer-diagnostic" &&
+         temporalModel != "production-scheduler") ||
+        (productionScheduler != (temporalModel == "production-scheduler")) ||
         (productionScheduler && maxMakespan.getValue() != 0) ||
-        sourceRepository.getValue().empty() || sourceCommit.getValue().empty() ||
-        graphVariantId.getValue().empty() || !isFactoredSpace(candidateFile) ||
+        sourceRepository.getValue().empty() ||
+        sourceCommit.getValue().empty() || graphVariantId.getValue().empty() ||
+        !isFactoredSpace(candidateFile) ||
         (!globalIncumbentFile.getValue().empty() && stage.getValue().empty()) ||
         (!globalStageManifestFile.getValue().empty() &&
          globalIncumbentFile.getValue().empty()) ||
@@ -3873,15 +3948,17 @@ struct ScoreExactJointTaskCandidatesPass
         (seedOnly.getValue() && stage.getValue().empty()) ||
         (graphBoundOnly.getValue() &&
          (seedOnly.getValue() || globalIncumbentFile.getValue().empty())) ||
-        !parsedDispatchPolicy || (scheduleSpace != "exact" &&
-                                  scheduleSpace != "heuristic-placement" &&
-                                  scheduleSpace != "production-scheduler") ||
+        !parsedDispatchPolicy ||
+        (scheduleSpace != "exact" && scheduleSpace != "heuristic-placement" &&
+         scheduleSpace != "production-scheduler") ||
         (parsedDispatchPolicy &&
-         (productionScheduler ? *parsedDispatchPolicy == DispatchPolicy::AllReady
-                              : *parsedDispatchPolicy == DispatchPolicy::CriticalPath))) {
-      function.emitError() << "exact joint ranking requires a factored candidate "
-                              "space, positive top-k/budgets/horizon, and "
-                              "explicit provenance";
+         (productionScheduler
+              ? *parsedDispatchPolicy == DispatchPolicy::AllReady
+              : *parsedDispatchPolicy == DispatchPolicy::CriticalPath))) {
+      function.emitError()
+          << "exact joint ranking requires a factored candidate "
+             "space, positive top-k/budgets/horizon, and "
+             "explicit provenance";
       return signalPassFailure();
     }
     const DispatchPolicy selectedDispatchPolicy = *parsedDispatchPolicy;
@@ -3918,8 +3995,9 @@ struct ScoreExactJointTaskCandidatesPass
       return signalPassFailure();
     }
     TaskShapeCostCache costs;
-    if (!costs.load(costFile, function.getSymName(), *metadata, sourceRepository,
-                    sourceCommit, ::mlir::amoeba::getNeuraArchitectureSpecFile(),
+    if (!costs.load(costFile, function.getSymName(), *metadata,
+                    sourceRepository, sourceCommit,
+                    ::mlir::amoeba::getNeuraArchitectureSpecFile(),
                     graphVariantId, error)) {
       function.emitError() << error;
       return signalPassFailure();
@@ -3949,13 +4027,10 @@ struct ScoreExactJointTaskCandidatesPass
       const llvm::APInt warmFullShapeCount(shapeOrdinalWidth,
                                            descriptor.candidateCount, 10);
       const llvm::APInt warmShardCount(
-          shapeOrdinalWidth,
-          static_cast<uint64_t>(shapeShardCount.getValue()));
+          shapeOrdinalWidth, static_cast<uint64_t>(shapeShardCount.getValue()));
       const llvm::APInt warmShardIndex(
-          shapeOrdinalWidth,
-          static_cast<uint64_t>(shapeShardIndex.getValue()));
-      const llvm::APInt warmShardBase =
-          warmFullShapeCount.udiv(warmShardCount);
+          shapeOrdinalWidth, static_cast<uint64_t>(shapeShardIndex.getValue()));
+      const llvm::APInt warmShardBase = warmFullShapeCount.udiv(warmShardCount);
       const llvm::APInt warmShardRemainder =
           warmFullShapeCount.urem(warmShardCount);
       const llvm::APInt warmShardBegin =
@@ -3963,9 +4038,9 @@ struct ScoreExactJointTaskCandidatesPass
           (warmShardIndex.ult(warmShardRemainder) ? warmShardIndex
                                                   : warmShardRemainder);
       const llvm::APInt warmShardSize =
-          warmShardBase + llvm::APInt(
-                              shapeOrdinalWidth,
-                              warmShardIndex.ult(warmShardRemainder) ? 1 : 0);
+          warmShardBase +
+          llvm::APInt(shapeOrdinalWidth,
+                      warmShardIndex.ult(warmShardRemainder) ? 1 : 0);
       const llvm::APInt warmShardEnd = warmShardBegin + warmShardSize;
       for (const WarmStartShapeHint &hint : warmStartHints) {
         if (hint.ordinal.ult(warmShardBegin) ||
@@ -3982,15 +4057,13 @@ struct ScoreExactJointTaskCandidatesPass
                                  (*metadata)[task].tripCount, shape};
           const TaskShapeCost *cost = costs.get(choice, error);
           if (!cost) {
-            function.emitError()
-                << "warm-start shape " << hint.canonicalOrdinal
-                << " has no current cost row: " << error;
+            function.emitError() << "warm-start shape " << hint.canonicalOrdinal
+                                 << " has no current cost row: " << error;
             return signalPassFailure();
           }
           if (!cost->supported) {
-            function.emitError()
-                << "warm-start shape " << hint.canonicalOrdinal
-                << " uses an unsupported current shape cost";
+            function.emitError() << "warm-start shape " << hint.canonicalOrdinal
+                                 << " uses an unsupported current shape cost";
             return signalPassFailure();
           }
           if (!predictDuration(*cost, choice.tripCount, error)) {
@@ -4009,17 +4082,18 @@ struct ScoreExactJointTaskCandidatesPass
               globalIncumbentFile.getValue(), function.getSymName(),
               stage.getValue(), costs.sourceRepository(), costs.sourceCommit(),
               costs.architecturePath(), costs.architectureSchema(),
-              costs.nameSpace(), globalStageManifestFile.getValue(),
-              function, *metadata, costs, candidateFile, costFile,
-              dispatchPolicy, temporalModel, scheduleSpace, globalIncumbent)) {
+              costs.nameSpace(), globalStageManifestFile.getValue(), function,
+              *metadata, costs, candidateFile, costFile, dispatchPolicy,
+              temporalModel, scheduleSpace, globalIncumbent)) {
         function.emitError() << globalIncumbent.error;
         return signalPassFailure();
       }
     }
 
     FailureOr<TaskEdgeGraph> graph = buildTaskEdgeGraph(
-        function, TaskEdgeGraphOptions{/*require_payload=*/true,
-                                       /*read_control_predecessors=*/true},
+        function,
+        TaskEdgeGraphOptions{/*require_payload=*/true,
+                             /*read_control_predecessors=*/true},
         error);
     if (failed(graph)) {
       function.emitError() << error;
@@ -4043,7 +4117,8 @@ struct ScoreExactJointTaskCandidatesPass
       taskOperations[index] = task.getOperation();
       operationIndex[task.getOperation()] = index;
     }
-    if (llvm::any_of(taskOperations, [](Operation *op) { return op == nullptr; })) {
+    if (llvm::any_of(taskOperations,
+                     [](Operation *op) { return op == nullptr; })) {
       function.emitError() << "edge graph does not cover all task metadata";
       return signalPassFailure();
     }
@@ -4052,7 +4127,8 @@ struct ScoreExactJointTaskCandidatesPass
     for (TaskEdge edge : graph->getEdges()) {
       auto producer = operationIndex.find(edge.producer.getOperation());
       auto consumer = operationIndex.find(edge.consumer.getOperation());
-      if (producer == operationIndex.end() || consumer == operationIndex.end()) {
+      if (producer == operationIndex.end() ||
+          consumer == operationIndex.end()) {
         function.emitError() << "edge endpoint is absent from task index";
         return signalPassFailure();
       }
@@ -4061,16 +4137,16 @@ struct ScoreExactJointTaskCandidatesPass
         continue;
       list.push_back(producer->second);
     }
-    const bool frontierRequested =
-        !shapeFrontierSnapshot.getValue().empty() ||
-        !resumeShapeFrontier.getValue().empty();
+    const bool frontierRequested = !shapeFrontierSnapshot.getValue().empty() ||
+                                   !resumeShapeFrontier.getValue().empty();
     const std::string frontierInputPath = resumeShapeFrontier.getValue();
     const std::string frontierOutputPath =
         !shapeFrontierSnapshot.getValue().empty()
             ? shapeFrontierSnapshot.getValue()
             : resumeShapeFrontier.getValue();
     const std::string frontierInputBindingPath =
-        frontierInputPath.empty() ? std::string() : frontierInputPath + ".binding";
+        frontierInputPath.empty() ? std::string()
+                                  : frontierInputPath + ".binding";
     const std::string frontierOutputBindingPath =
         frontierOutputPath.empty() ? std::string()
                                    : frontierOutputPath + ".binding";
@@ -4092,21 +4168,20 @@ struct ScoreExactJointTaskCandidatesPass
       if (!frontierInputPath.empty()) {
         std::string persistedBinding;
         if (!readExactCacheInput(frontierInputBindingPath, persistedBinding,
-                                 error) || persistedBinding != frontierBinding) {
+                                 error) ||
+            persistedBinding != frontierBinding) {
           if (error.empty())
             error = "shape frontier binding witness differs byte-for-byte";
           function.emitError() << error;
           return signalPassFailure();
         }
         ShapeFrontierSnapshot parsedFrontier;
-        if (!loadShapeFrontierSnapshot(frontierInputPath, frontierBinding,
-                                       descriptor, *metadata, costs,
-                                       function.getSymName(), graphVariantId,
-                                       sourceRepository, sourceCommit,
-                                       dispatchPolicy, temporalModel,
-                                       scheduleSpace, topK.getValue(),
-                                       canonicalIncumbentSeed.getValue(),
-                                       parsedFrontier, error)) {
+        if (!loadShapeFrontierSnapshot(
+                frontierInputPath, frontierBinding, descriptor, *metadata,
+                costs, function.getSymName(), graphVariantId, sourceRepository,
+                sourceCommit, dispatchPolicy, temporalModel, scheduleSpace,
+                topK.getValue(), canonicalIncumbentSeed.getValue(),
+                parsedFrontier, error)) {
           function.emitError() << error;
           return signalPassFailure();
         }
@@ -4152,8 +4227,8 @@ struct ScoreExactJointTaskCandidatesPass
       std::string legacyCacheKey;
       std::string cacheError;
       if (!makeExactScoreCacheKey(
-              function, *metadata, predecessors, descriptor, costs, candidateFile,
-              costFile, dispatchPolicy, temporalModel,
+              function, *metadata, predecessors, descriptor, costs,
+              candidateFile, costFile, dispatchPolicy, temporalModel,
               scheduleSpace, topK, maxShapeCandidates, maxExpandedNodes,
               maxMilliseconds, maxMakespan, stateMemoCapacity, horizonProven,
               /*includeProductionSchedulerContract=*/true, cacheKey,
@@ -4176,14 +4251,14 @@ struct ScoreExactJointTaskCandidatesPass
                      /*includeProductionSchedulerContract=*/false,
                      legacyCacheKey, cacheError)) {
         if (scoreCachePeerProbe.getValue()) {
-          function.emitError()
-              << "score-cache-peer-probe cannot establish the legacy cache key: "
-              << cacheError;
+          function.emitError() << "score-cache-peer-probe cannot establish the "
+                                  "legacy cache key: "
+                               << cacheError;
           return signalPassFailure();
         }
-        function.emitRemark()
-            << "legacy exact score cache migration bypassed while building key: "
-            << cacheError;
+        function.emitRemark() << "legacy exact score cache migration bypassed "
+                                 "while building key: "
+                              << cacheError;
       } else {
         ExactScoreCacheMigrationOptions migration;
         migration.legacyKey = legacyCacheKey;
@@ -4198,58 +4273,60 @@ struct ScoreExactJointTaskCandidatesPass
           migration.explicitLegacyMaxIterations =
               legacyProductionCacheMaxIterations.getValue();
           migration.proofReason =
-              "complete-production-certificate; no failed production tuple; deterministic scheduler accepts first legal convergence/cycle before upper bound; all other exact-key bytes equal";
+              "complete-production-certificate; no failed production tuple; "
+              "deterministic scheduler accepts first legal convergence/cycle "
+              "before upper bound; all other exact-key bytes equal";
         }
         if (!scoreCache.begin(scoreCacheDirectory, cacheKey,
-                             costs.architecturePath(), graphVariantId,
-                             costs.sourceGraphId(), stage.getValue(), outputFile,
-                             migration, cacheError)) {
-        if (scoreCachePeerProbe.getValue()) {
-          function.emitError()
-              << "score-cache-peer-probe cannot acquire the exact cache lease: "
-              << cacheError;
-          return signalPassFailure();
-        }
-        function.emitRemark() << "exact score cache bypassed: " << cacheError;
-      } else if (scoreCache.hit()) {
-        scoreCacheHit = true;
-        scoreCacheMigrated = scoreCache.migrated();
-        return;
-      } else if (scoreCachePeerRequested) {
-        PeerProbeStatus peerStatus = importCompletePeerScore(
-            function, scoreCachePeerDirectory, graphVariantId, candidateFile,
-            costFile, costs.architecturePath(), sourceRepository, sourceCommit,
-            dispatchPolicy, temporalModel, scheduleSpace,
-            descriptor.candidateCount, topK, maxExpandedNodes, maxMilliseconds,
-            maxMakespan, descriptor.maxCgrasPerTask, stateMemoCapacity,
-            costs.sourceGraphId(), scoreCache, scoreCachePeerError);
-        if (peerStatus == PeerProbeStatus::Imported) {
-          scoreCacheHit = true;
-          scoreCachePeerImported = true;
-          scoreCachePeerStatus = "imported-complete";
-          return;
-        }
-        scoreCachePeerPending = peerStatus == PeerProbeStatus::Pending;
-        scoreCachePeerStatus =
-            scoreCachePeerPending ? "pending" : "rejected";
-        function.emitRemark() << "exact score cache peer not imported ("
-                              << scoreCachePeerStatus << "): "
-                              << scoreCachePeerError;
-        if (scoreCachePeerProbe.getValue()) {
-          scoreCache.discard();
-          std::string probeError;
-          if (!writePeerProbeOutput(
-                  function, descriptor, costs, graphVariantId, outputFile,
-                  scoreCacheRequested, scoreCachePeerRequested,
-                  scoreCachePeerStatus, scoreCachePeerError, dispatchPolicy,
-                  temporalModel, scheduleSpace, topK, stateMemoCapacity,
-                  probeError)) {
-            function.emitError() << probeError;
+                              costs.architecturePath(), graphVariantId,
+                              costs.sourceGraphId(), stage.getValue(),
+                              outputFile, migration, cacheError)) {
+          if (scoreCachePeerProbe.getValue()) {
+            function.emitError() << "score-cache-peer-probe cannot acquire the "
+                                    "exact cache lease: "
+                                 << cacheError;
             return signalPassFailure();
           }
+          function.emitRemark() << "exact score cache bypassed: " << cacheError;
+        } else if (scoreCache.hit()) {
+          scoreCacheHit = true;
+          scoreCacheMigrated = scoreCache.migrated();
           return;
+        } else if (scoreCachePeerRequested) {
+          PeerProbeStatus peerStatus = importCompletePeerScore(
+              function, scoreCachePeerDirectory, graphVariantId, candidateFile,
+              costFile, costs.architecturePath(), sourceRepository,
+              sourceCommit, dispatchPolicy, temporalModel, scheduleSpace,
+              descriptor.candidateCount, topK, maxExpandedNodes,
+              maxMilliseconds, maxMakespan, descriptor.maxCgrasPerTask,
+              stateMemoCapacity, costs.sourceGraphId(), scoreCache,
+              scoreCachePeerError);
+          if (peerStatus == PeerProbeStatus::Imported) {
+            scoreCacheHit = true;
+            scoreCachePeerImported = true;
+            scoreCachePeerStatus = "imported-complete";
+            return;
+          }
+          scoreCachePeerPending = peerStatus == PeerProbeStatus::Pending;
+          scoreCachePeerStatus = scoreCachePeerPending ? "pending" : "rejected";
+          function.emitRemark()
+              << "exact score cache peer not imported (" << scoreCachePeerStatus
+              << "): " << scoreCachePeerError;
+          if (scoreCachePeerProbe.getValue()) {
+            scoreCache.discard();
+            std::string probeError;
+            if (!writePeerProbeOutput(
+                    function, descriptor, costs, graphVariantId, outputFile,
+                    scoreCacheRequested, scoreCachePeerRequested,
+                    scoreCachePeerStatus, scoreCachePeerError, dispatchPolicy,
+                    temporalModel, scheduleSpace, topK, stateMemoCapacity,
+                    probeError)) {
+              function.emitError() << probeError;
+              return signalPassFailure();
+            }
+            return;
+          }
         }
-      }
       }
     } else if (scoreCachePeerRequested) {
       scoreCachePeerStatus = "cache-disabled";
@@ -4261,7 +4338,8 @@ struct ScoreExactJointTaskCandidatesPass
       function.emitRemark()
           << "score-cache-peer-directory requires score-cache-dir";
     }
-    auto network = createInterTaskNetworkCommunicationModel(function, 4, 4, error);
+    auto network =
+        createInterTaskNetworkCommunicationModel(function, 4, 4, error);
     if (failed(network)) {
       function.emitError() << error;
       return signalPassFailure();
@@ -4270,14 +4348,20 @@ struct ScoreExactJointTaskCandidatesPass
                                                        taskOperations);
 
     const unsigned counterWidth = shapeOrdinalWidth;
-    const llvm::APInt fullShapeCount(counterWidth, descriptor.candidateCount, 10);
-    const llvm::APInt shardCount(counterWidth, static_cast<uint64_t>(shapeShardCount.getValue()));
-    const llvm::APInt shardIndex(counterWidth, static_cast<uint64_t>(shapeShardIndex.getValue()));
+    const llvm::APInt fullShapeCount(counterWidth, descriptor.candidateCount,
+                                     10);
+    const llvm::APInt shardCount(
+        counterWidth, static_cast<uint64_t>(shapeShardCount.getValue()));
+    const llvm::APInt shardIndex(
+        counterWidth, static_cast<uint64_t>(shapeShardIndex.getValue()));
     const llvm::APInt shardBase = fullShapeCount.udiv(shardCount);
     const llvm::APInt shardRemainder = fullShapeCount.urem(shardCount);
-    const llvm::APInt shardBegin = shardBase * shardIndex +
+    const llvm::APInt shardBegin =
+        shardBase * shardIndex +
         (shardIndex.ult(shardRemainder) ? shardIndex : shardRemainder);
-    const llvm::APInt shardSize = shardBase + llvm::APInt(counterWidth, shardIndex.ult(shardRemainder) ? 1 : 0);
+    const llvm::APInt shardSize =
+        shardBase +
+        llvm::APInt(counterWidth, shardIndex.ult(shardRemainder) ? 1 : 0);
     const llvm::APInt shardEnd = shardBegin + shardSize;
     uint64_t partitionSkippedSubtrees = 0;
     llvm::APInt visitedShapes(counterWidth, 0);
@@ -4290,7 +4374,8 @@ struct ScoreExactJointTaskCandidatesPass
     uint64_t outOfBoundsRejectedBranches = 0;
     uint64_t schedulePaths = 0;
     uint64_t globalCutoffFilteredScheduleCallbacks = 0;
-    uint64_t boundRejectedBranches = 0, seedSchedules = 0, expandedShapeNodes = 0;
+    uint64_t boundRejectedBranches = 0, seedSchedules = 0,
+             expandedShapeNodes = 0;
     uint64_t geometryTimeBoundRejectedBranches = 0;
     // These counters cover only the additional fixed-prefix invocation of
     // the source-owned shape-domain necessary-condition helper.  They are
@@ -4299,8 +4384,7 @@ struct ScoreExactJointTaskCandidatesPass
     uint64_t prefixWindowBoundRejected = 0;
     uint64_t canonicalSeedSchedulerCalls = 0;
     uint64_t canonicalSeedAccepted = 0;
-    bool canonicalSeedContinuationComplete =
-        !canonicalIncumbentSeed.getValue();
+    bool canonicalSeedContinuationComplete = !canonicalIncumbentSeed.getValue();
     uint64_t tieRestrictedCpBoundCalls = 0;
     uint64_t tieRestrictedCpBoundPruned = 0;
     uint64_t tieRestrictedCpNoEligible = 0;
@@ -4359,14 +4443,15 @@ struct ScoreExactJointTaskCandidatesPass
 
     auto retain = [&](RankedSchedule candidate) {
       ranked.push_back(std::move(candidate));
-      llvm::sort(ranked, [](const RankedSchedule &lhs, const RankedSchedule &rhs) {
-        if (lhs.cycles != rhs.cycles)
-          return lhs.cycles < rhs.cycles;
-        int shapeOrder = compareDecimal(lhs.shapeOrdinal, rhs.shapeOrdinal);
-        if (shapeOrder != 0)
-          return shapeOrder < 0;
-        return lhs.scheduleOrdinal < rhs.scheduleOrdinal;
-      });
+      llvm::sort(
+          ranked, [](const RankedSchedule &lhs, const RankedSchedule &rhs) {
+            if (lhs.cycles != rhs.cycles)
+              return lhs.cycles < rhs.cycles;
+            int shapeOrder = compareDecimal(lhs.shapeOrdinal, rhs.shapeOrdinal);
+            if (shapeOrder != 0)
+              return shapeOrder < 0;
+            return lhs.scheduleOrdinal < rhs.scheduleOrdinal;
+          });
       if (ranked.size() > static_cast<size_t>(topK.getValue()))
         ranked.pop_back();
     };
@@ -4390,20 +4475,17 @@ struct ScoreExactJointTaskCandidatesPass
             << "shape frontier resource limit max-shape-candidates was lowered";
         return signalPassFailure();
       }
-      if (maxExpandedNodes.getValue() <
-          loadedFrontier->savedMaxExpandedNodes ||
+      if (maxExpandedNodes.getValue() < loadedFrontier->savedMaxExpandedNodes ||
           (loadedFrontier->savedMaxMilliseconds > 0 &&
            maxMilliseconds.getValue() > 0 &&
-           maxMilliseconds.getValue() <
-               loadedFrontier->savedMaxMilliseconds)) {
-        function.emitError()
-            << "shape frontier resource limit was lowered";
+           maxMilliseconds.getValue() < loadedFrontier->savedMaxMilliseconds)) {
+        function.emitError() << "shape frontier resource limit was lowered";
         return signalPassFailure();
       }
       llvm::APInt restoredVisited(counterWidth, loadedFrontier->visitedShapes,
                                   10);
-      llvm::APInt restoredBound(counterWidth,
-                                loadedFrontier->boundPrunedShapes, 10);
+      llvm::APInt restoredBound(counterWidth, loadedFrontier->boundPrunedShapes,
+                                10);
       if (restoredVisited.ugt(shardSize)) {
         function.emitError()
             << "shape frontier visited count exceeds current shard";
@@ -4414,8 +4496,8 @@ struct ScoreExactJointTaskCandidatesPass
           restoredVisited.uge(llvm::APInt(
               counterWidth,
               static_cast<uint64_t>(maxShapeCandidates.getValue())))) {
-        function.emitError()
-            << "shape frontier max-shape-candidates budget cannot make progress";
+        function.emitError() << "shape frontier max-shape-candidates budget "
+                                "cannot make progress";
         return signalPassFailure();
       }
       if (loadedFrontier->reason == "max-expanded-nodes" &&
@@ -4451,218 +4533,290 @@ struct ScoreExactJointTaskCandidatesPass
     auto lastCheckpoint = begun;
     auto checkpoint = [&]() {
       std::string checkpointError;
-      if (!writeAtomically(outputFile.getValue() + ".checkpoint.jsonl", [&](llvm::raw_ostream &stream) {
-        llvm::json::Object header;
-        header["record_type"] = "header"; header["schema"] = "amoeba-exact-joint-task-scores-v1";
-        header["function"] = function.getSymName().str(); header["graph_variant_id"] = graphVariantId.getValue();
-        header["source_repository"] = costs.sourceRepository().str(); header["source_commit"] = costs.sourceCommit().str();
-        header["source_graph_id"] = costs.sourceGraphId().str(); header["architecture_path"] = costs.architecturePath().str();
-        header["architecture_schema"] = costs.architectureSchema().str();
-        header["cost_namespace"] = costs.nameSpace().str();
-        header["cost_provenance_schema"] = "orbit-cost-provenance-v1";
-        if (!stage.getValue().empty()) header["stage"] = stage.getValue();
-        header["global_cutoff_requested"] = globalIncumbent.requested;
-        if (globalIncumbent.requested) {
-          header["global_cutoff_cycles"] = globalIncumbent.fifthCycles;
-          header["global_cutoff_evidence_path"] = globalIncumbent.path;
-        }
-        header["communication_mode"] = "explicit"; header["predictor_source"] = kMlPredictorSource.str();
-        header["representation"] = "factored-plus-exact-schedule"; header["candidate_count"] = descriptor.candidateCount;
-        header["warm_start_shapes_requested"] = !warmStartShapes.getValue().empty();
-        putDecimal(header, "warm_start_shape_hint_count",
-                   std::to_string(warmStartHints.size()));
-        putDecimal(header, "warm_start_shape_hint_replayed",
-                   std::to_string(warmStartHintsReplayed));
-        header["warm_start_shape_hint_replay_failed"] = warmStartReplayFailed;
-        if (!warmStartShapes.getValue().empty())
-          header["warm_start_shapes_path"] = warmStartShapes.getValue();
-        header["top_k"] = topK.getValue(); header["grid_rows"] = 4; header["grid_cols"] = 4;
-        header["max_cgras_per_task"] = static_cast<int64_t>(descriptor.maxCgrasPerTask);
-        header["start_policy"] = scoreStartPolicy(temporalModel, scheduleSpace).str();
-        header["dispatch_policy"] = dispatchPolicy.getValue(); header["max_makespan"] = maxMakespan.getValue();
-        header["scheduler_backend"] = productionScheduler ? "orchestrate-tasks-on-accelerators" : "orbit-exact-enumerator";
-        header["orbit_4x4_pruning"] = !productionScheduler;
-        header["schedule_space"] = scheduleSpace.getValue(); header["placement_coverage_limited"] = scheduleSpace != "exact";
-        header["production_ready"] = false; header["horizon_proven"] = false;
-        header["state_memo_requested"] = scheduleSpace == "exact";
-        header["state_memo_capacity"] = stateMemoCapacity.getValue();
-        header["state_memo_external_cutoff_monotonic"] =
-            scheduleSpace == "exact";
-        header["global_shape_location_temporal_space"] = scheduleSpace != "production-scheduler";
-        header["temporal_search_scope"] = scoreTemporalScope(temporalModel).str();
-        header["cycle_starts_are_search_dimensions"] = temporalModel == "all-integer-diagnostic";
-        header["shape_domain_pruning"] =
-            productionScheduler ? "dependency-release-tail-cost-only"
-                                : "dependency-release-tail-and-energetic-work";
-        header["shape_domain_status"] = shapeDomainStatus;
-        header["shape_domain_bound_cycles"] = shapeDomainBound;
-        header["shape_domain_fixed_point_iterations"] =
-            static_cast<int64_t>(shapeDomainIterations);
-        header["shape_domain_window_rejected_options"] =
-            static_cast<int64_t>(shapeDomainWindowRejectedOptions);
-        llvm::json::Array domainSummary;
-        for (unsigned task = 0; task < shapeDomains.size(); ++task) {
-          llvm::json::Object item;
-          item["task"] = (*metadata)[task].name;
-          item["original_shape_count"] = static_cast<int64_t>(
-              descriptor.shapesByTask[task].size());
-          item["retained_shape_count"] =
-              static_cast<int64_t>(shapeDomains[task].size());
-          int64_t minimumArea = std::numeric_limits<int64_t>::max();
-          int64_t maximumArea = 0;
-          llvm::json::Array retained;
-          for (size_t ordinal : shapeDomains[task]) {
-            const RectShape &shape = descriptor.shapesByTask[task][ordinal];
-            const int64_t area = shape.cgraCount();
-            minimumArea = std::min(minimumArea, area);
-            maximumArea = std::max(maximumArea, area);
-            llvm::json::Object shapeRecord;
-            shapeRecord["original_shape_ordinal"] =
-                static_cast<int64_t>(ordinal);
-            shapeRecord["rows"] = shape.rows;
-            shapeRecord["cols"] = shape.cols;
-            shapeRecord["mapper_tile_rows"] = shape.mapperRows;
-            shapeRecord["mapper_tile_cols"] = shape.mapperCols;
-            shapeRecord["cgra_count"] = area;
-            retained.push_back(std::move(shapeRecord));
-          }
-          item["retained_shapes"] = std::move(retained);
-          item["retained_area_min"] =
-              minimumArea == std::numeric_limits<int64_t>::max()
-                  ? 0
-                  : minimumArea;
-          item["retained_area_max"] = maximumArea;
-          domainSummary.push_back(std::move(item));
-        }
-        header["shape_domain_summary"] = std::move(domainSummary);
-        header["ranking_pruning"] = rankingPruning.getValue();
-        header["tie_restricted_cp_scope"] =
-            "local-equal-cycle-canonical-ordinal";
-        putDecimal(header, "tie_restricted_cp_bound_calls",
-                   std::to_string(tieRestrictedCpBoundCalls));
-        putDecimal(header, "tie_restricted_cp_bound_pruned",
-                   std::to_string(tieRestrictedCpBoundPruned));
-        putDecimal(header, "tie_restricted_cp_no_eligible",
-                   std::to_string(tieRestrictedCpNoEligible));
-        putDecimal(header, "tie_restricted_cp_invalid",
-                   std::to_string(tieRestrictedCpInvalid));
-        header["shape_shard_count"] = shapeShardCount.getValue();
-        header["shape_shard_index"] = shapeShardIndex.getValue();
-        putDecimal(header, "shape_partition_begin", exactShapeIndexString(shardBegin));
-        putDecimal(header, "shape_partition_end", exactShapeIndexString(shardEnd));
-        putDecimal(header, "shape_partition_candidate_count", exactShapeIndexString(shardSize));
-        putDecimal(header, "partition_skipped_subtrees", std::to_string(partitionSkippedSubtrees));
-        header["elapsed_seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
-        addProductionCoverage(header, temporalModel, scheduleSpace, dispatchPolicy, function);
-        writeJsonLine(stream, std::move(header));
-        for (const auto &entry : ranked) writeJsonLine(stream, llvm::json::Object(entry.record));
-        llvm::json::Object footer;
-        footer["record_type"] = "footer"; footer["schema"] = "amoeba-exact-joint-task-scores-v1";
-        footer["status"] = "bounded_incomplete"; footer["incomplete"] = true;
-        footer["reason"] = "search-in-progress"; footer["top_k_certified"] = false;
-        footer["scored_count"] = static_cast<int64_t>(ranked.size()); footer["top_k_requested"] = topK.getValue();
-        footer["warm_start_shapes_requested"] = !warmStartShapes.getValue().empty();
-        putDecimal(footer, "warm_start_shape_hint_count",
-                   std::to_string(warmStartHints.size()));
-        putDecimal(footer, "warm_start_shape_hint_replayed",
-                   std::to_string(warmStartHintsReplayed));
-        footer["warm_start_shape_hint_replay_failed"] = warmStartReplayFailed;
-        putDecimal(footer, "geometry_time_bound_rejected_branches", std::to_string(geometryTimeBoundRejectedBranches));
-        putDecimal(footer, "prefix_window_bound_calls",
-                   std::to_string(prefixWindowBoundCalls));
-        putDecimal(footer, "prefix_window_bound_rejected",
-                   std::to_string(prefixWindowBoundRejected));
-        footer["tie_restricted_cp_scope"] =
-            "local-equal-cycle-canonical-ordinal";
-        putDecimal(footer, "tie_restricted_cp_bound_calls",
-                   std::to_string(tieRestrictedCpBoundCalls));
-        putDecimal(footer, "tie_restricted_cp_bound_pruned",
-                   std::to_string(tieRestrictedCpBoundPruned));
-        putDecimal(footer, "tie_restricted_cp_no_eligible",
-                   std::to_string(tieRestrictedCpNoEligible));
-        putDecimal(footer, "tie_restricted_cp_invalid",
-                   std::to_string(tieRestrictedCpInvalid));
-        footer["ranking_certificate"] = "best-found-uncertified";
-        putDecimal(footer, "production_scheduler_calls", std::to_string(productionSchedulerCalls));
-        footer["canonical_incumbent_seed_enabled"] =
-            canonicalIncumbentSeed.getValue();
-        footer["canonical_seed_continuation_state"] =
-            canonicalIncumbentSeed.getValue()
-                ? (canonicalSeedContinuationComplete ? "complete"
-                                                      : "incomplete")
-                : "disabled";
-        footer["canonical_seed_scheduler_calls"] =
-            static_cast<int64_t>(canonicalSeedSchedulerCalls);
-        footer["canonical_seed_accepted"] =
-            static_cast<int64_t>(canonicalSeedAccepted);
-        footer["orbit_4x4_pruning"] = !productionScheduler;
-        footer["state_memo_requested"] = scheduleSpace == "exact";
-        footer["state_memo_enabled"] = stateMemoEnabled;
-        footer["state_memo_canonical_state_available"] =
-            stateMemoCanonicalStateAvailable;
-        footer["state_memo_external_cutoff_monotonic"] =
-            scheduleSpace == "exact";
-        footer["state_memo_cutoff_violation"] = stateMemoCutoffViolation;
-        footer["state_memo_capacity"] = stateMemoCapacity.getValue();
-        footer["state_memo_entries"] = static_cast<int64_t>(stateMemoEntries);
-        footer["state_memo_hits"] = static_cast<int64_t>(stateMemoHits);
-        footer["state_memo_pruned_subtrees"] =
-            static_cast<int64_t>(stateMemoPrunedSubtrees);
-        footer["state_memo_capacity_skips"] =
-            static_cast<int64_t>(stateMemoCapacitySkips);
-        footer["optimistic_ends_memo_enabled"] = optimisticEndsMemoEnabled;
-        putDecimal(footer, "optimistic_ends_computations", std::to_string(optimisticEndsComputations));
-        putDecimal(footer, "optimistic_ends_memo_hits", std::to_string(optimisticEndsMemoHits));
-        putDecimal(footer, "optimistic_ends_memo_entries", std::to_string(optimisticEndsMemoEntries));
-        putDecimal(footer, "optimistic_ends_memo_capacity_skips", std::to_string(optimisticEndsMemoCapacitySkips));
-        putDecimal(footer, "candidate_count", descriptor.candidateCount);
-        putDecimal(footer, "shape_candidates_visited", exactShapeIndexString(visitedShapes));
-        putDecimal(footer, "domain_pruned_shape_candidates",
-                   exactShapeIndexString(domainPrunedShapes));
-        putDecimal(footer, "bound_pruned_shape_candidates", exactShapeIndexString(boundPrunedShapes));
-        footer["shape_domain_status"] = shapeDomainStatus;
-        footer["shape_domain_bound_cycles"] = shapeDomainBound;
-        footer["shape_domain_fixed_point_iterations"] =
-            static_cast<int64_t>(shapeDomainIterations);
-        footer["shape_domain_window_rejected_options"] =
-            static_cast<int64_t>(shapeDomainWindowRejectedOptions);
-        putDecimal(footer, "global_cutoff_pruned_shape_candidates",
-                   exactShapeIndexString(globalBoundPrunedShapes));
-        footer["global_cutoff_requested"] = globalIncumbent.requested;
-        footer["global_cutoff_proven"] = false;
-        putDecimal(footer, "global_cutoff_filtered_schedule_callbacks",
-                   std::to_string(globalCutoffFilteredScheduleCallbacks));
-        putDecimal(footer, "expanded_schedule_nodes", std::to_string(expandedNodes));
-        footer["ranking_pruning"] = rankingPruning.getValue();
-        footer["shape_shard_count"] = shapeShardCount.getValue();
-        footer["shape_shard_index"] = shapeShardIndex.getValue();
-        putDecimal(footer, "shape_partition_begin", exactShapeIndexString(shardBegin));
-        putDecimal(footer, "shape_partition_end", exactShapeIndexString(shardEnd));
-        putDecimal(footer, "shape_partition_candidate_count", exactShapeIndexString(shardSize));
-        putDecimal(footer, "partition_skipped_subtrees", std::to_string(partitionSkippedSubtrees));
-        footer["elapsed_seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
-        addProductionCoverage(footer, temporalModel, scheduleSpace, dispatchPolicy, function);
-        writeJsonLine(stream, std::move(footer));
-        return true;
-      }, checkpointError)) llvm::errs() << "checkpoint write failed: " << checkpointError << "\n";
-      llvm::errs() << "[JointScheduling] shape tuples=" << exactShapeIndexString(visitedShapes)
-                   << " proven-pruned=" << exactShapeIndexString(boundPrunedShapes)
-                   << " schedule nodes=" << expandedNodes << " topK=" << ranked.size()
+      if (!writeAtomically(
+              outputFile.getValue() + ".checkpoint.jsonl",
+              [&](llvm::raw_ostream &stream) {
+                llvm::json::Object header;
+                header["record_type"] = "header";
+                header["schema"] = "amoeba-exact-joint-task-scores-v1";
+                header["function"] = function.getSymName().str();
+                header["graph_variant_id"] = graphVariantId.getValue();
+                header["source_repository"] = costs.sourceRepository().str();
+                header["source_commit"] = costs.sourceCommit().str();
+                header["source_graph_id"] = costs.sourceGraphId().str();
+                header["architecture_path"] = costs.architecturePath().str();
+                header["architecture_schema"] =
+                    costs.architectureSchema().str();
+                header["cost_namespace"] = costs.nameSpace().str();
+                header["cost_provenance_schema"] = "orbit-cost-provenance-v1";
+                if (!stage.getValue().empty())
+                  header["stage"] = stage.getValue();
+                header["global_cutoff_requested"] = globalIncumbent.requested;
+                if (globalIncumbent.requested) {
+                  header["global_cutoff_cycles"] = globalIncumbent.fifthCycles;
+                  header["global_cutoff_evidence_path"] = globalIncumbent.path;
+                }
+                header["communication_mode"] = "explicit";
+                header["predictor_source"] = kMlPredictorSource.str();
+                header["representation"] = "factored-plus-exact-schedule";
+                header["candidate_count"] = descriptor.candidateCount;
+                header["warm_start_shapes_requested"] =
+                    !warmStartShapes.getValue().empty();
+                putDecimal(header, "warm_start_shape_hint_count",
+                           std::to_string(warmStartHints.size()));
+                putDecimal(header, "warm_start_shape_hint_replayed",
+                           std::to_string(warmStartHintsReplayed));
+                header["warm_start_shape_hint_replay_failed"] =
+                    warmStartReplayFailed;
+                if (!warmStartShapes.getValue().empty())
+                  header["warm_start_shapes_path"] = warmStartShapes.getValue();
+                header["top_k"] = topK.getValue();
+                header["grid_rows"] = 4;
+                header["grid_cols"] = 4;
+                header["max_cgras_per_task"] =
+                    static_cast<int64_t>(descriptor.maxCgrasPerTask);
+                header["start_policy"] =
+                    scoreStartPolicy(temporalModel, scheduleSpace).str();
+                header["dispatch_policy"] = dispatchPolicy.getValue();
+                header["max_makespan"] = maxMakespan.getValue();
+                header["scheduler_backend"] =
+                    productionScheduler ? "orchestrate-tasks-on-accelerators"
+                                        : "orbit-exact-enumerator";
+                header["orbit_4x4_pruning"] = !productionScheduler;
+                header["schedule_space"] = scheduleSpace.getValue();
+                header["placement_coverage_limited"] = scheduleSpace != "exact";
+                header["production_ready"] = false;
+                header["horizon_proven"] = false;
+                header["state_memo_requested"] = scheduleSpace == "exact";
+                header["state_memo_capacity"] = stateMemoCapacity.getValue();
+                header["state_memo_external_cutoff_monotonic"] =
+                    scheduleSpace == "exact";
+                header["global_shape_location_temporal_space"] =
+                    scheduleSpace != "production-scheduler";
+                header["temporal_search_scope"] =
+                    scoreTemporalScope(temporalModel).str();
+                header["cycle_starts_are_search_dimensions"] =
+                    temporalModel == "all-integer-diagnostic";
+                header["shape_domain_pruning"] =
+                    productionScheduler
+                        ? "dependency-release-tail-cost-only"
+                        : "dependency-release-tail-and-energetic-work";
+                header["shape_domain_status"] = shapeDomainStatus;
+                header["shape_domain_bound_cycles"] = shapeDomainBound;
+                header["shape_domain_fixed_point_iterations"] =
+                    static_cast<int64_t>(shapeDomainIterations);
+                header["shape_domain_window_rejected_options"] =
+                    static_cast<int64_t>(shapeDomainWindowRejectedOptions);
+                llvm::json::Array domainSummary;
+                for (unsigned task = 0; task < shapeDomains.size(); ++task) {
+                  llvm::json::Object item;
+                  item["task"] = (*metadata)[task].name;
+                  item["original_shape_count"] = static_cast<int64_t>(
+                      descriptor.shapesByTask[task].size());
+                  item["retained_shape_count"] =
+                      static_cast<int64_t>(shapeDomains[task].size());
+                  int64_t minimumArea = std::numeric_limits<int64_t>::max();
+                  int64_t maximumArea = 0;
+                  llvm::json::Array retained;
+                  for (size_t ordinal : shapeDomains[task]) {
+                    const RectShape &shape =
+                        descriptor.shapesByTask[task][ordinal];
+                    const int64_t area = shape.cgraCount();
+                    minimumArea = std::min(minimumArea, area);
+                    maximumArea = std::max(maximumArea, area);
+                    llvm::json::Object shapeRecord;
+                    shapeRecord["original_shape_ordinal"] =
+                        static_cast<int64_t>(ordinal);
+                    shapeRecord["rows"] = shape.rows;
+                    shapeRecord["cols"] = shape.cols;
+                    shapeRecord["mapper_tile_rows"] = shape.mapperRows;
+                    shapeRecord["mapper_tile_cols"] = shape.mapperCols;
+                    shapeRecord["cgra_count"] = area;
+                    retained.push_back(std::move(shapeRecord));
+                  }
+                  item["retained_shapes"] = std::move(retained);
+                  item["retained_area_min"] =
+                      minimumArea == std::numeric_limits<int64_t>::max()
+                          ? 0
+                          : minimumArea;
+                  item["retained_area_max"] = maximumArea;
+                  domainSummary.push_back(std::move(item));
+                }
+                header["shape_domain_summary"] = std::move(domainSummary);
+                header["ranking_pruning"] = rankingPruning.getValue();
+                header["tie_restricted_cp_scope"] =
+                    "local-equal-cycle-canonical-ordinal";
+                putDecimal(header, "tie_restricted_cp_bound_calls",
+                           std::to_string(tieRestrictedCpBoundCalls));
+                putDecimal(header, "tie_restricted_cp_bound_pruned",
+                           std::to_string(tieRestrictedCpBoundPruned));
+                putDecimal(header, "tie_restricted_cp_no_eligible",
+                           std::to_string(tieRestrictedCpNoEligible));
+                putDecimal(header, "tie_restricted_cp_invalid",
+                           std::to_string(tieRestrictedCpInvalid));
+                header["shape_shard_count"] = shapeShardCount.getValue();
+                header["shape_shard_index"] = shapeShardIndex.getValue();
+                putDecimal(header, "shape_partition_begin",
+                           exactShapeIndexString(shardBegin));
+                putDecimal(header, "shape_partition_end",
+                           exactShapeIndexString(shardEnd));
+                putDecimal(header, "shape_partition_candidate_count",
+                           exactShapeIndexString(shardSize));
+                putDecimal(header, "partition_skipped_subtrees",
+                           std::to_string(partitionSkippedSubtrees));
+                header["elapsed_seconds"] =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - begun)
+                        .count();
+                addProductionCoverage(header, temporalModel, scheduleSpace,
+                                      dispatchPolicy, function);
+                writeJsonLine(stream, std::move(header));
+                for (const auto &entry : ranked)
+                  writeJsonLine(stream, llvm::json::Object(entry.record));
+                llvm::json::Object footer;
+                footer["record_type"] = "footer";
+                footer["schema"] = "amoeba-exact-joint-task-scores-v1";
+                footer["status"] = "bounded_incomplete";
+                footer["incomplete"] = true;
+                footer["reason"] = "search-in-progress";
+                footer["top_k_certified"] = false;
+                footer["scored_count"] = static_cast<int64_t>(ranked.size());
+                footer["top_k_requested"] = topK.getValue();
+                footer["warm_start_shapes_requested"] =
+                    !warmStartShapes.getValue().empty();
+                putDecimal(footer, "warm_start_shape_hint_count",
+                           std::to_string(warmStartHints.size()));
+                putDecimal(footer, "warm_start_shape_hint_replayed",
+                           std::to_string(warmStartHintsReplayed));
+                footer["warm_start_shape_hint_replay_failed"] =
+                    warmStartReplayFailed;
+                putDecimal(footer, "geometry_time_bound_rejected_branches",
+                           std::to_string(geometryTimeBoundRejectedBranches));
+                putDecimal(footer, "prefix_window_bound_calls",
+                           std::to_string(prefixWindowBoundCalls));
+                putDecimal(footer, "prefix_window_bound_rejected",
+                           std::to_string(prefixWindowBoundRejected));
+                footer["tie_restricted_cp_scope"] =
+                    "local-equal-cycle-canonical-ordinal";
+                putDecimal(footer, "tie_restricted_cp_bound_calls",
+                           std::to_string(tieRestrictedCpBoundCalls));
+                putDecimal(footer, "tie_restricted_cp_bound_pruned",
+                           std::to_string(tieRestrictedCpBoundPruned));
+                putDecimal(footer, "tie_restricted_cp_no_eligible",
+                           std::to_string(tieRestrictedCpNoEligible));
+                putDecimal(footer, "tie_restricted_cp_invalid",
+                           std::to_string(tieRestrictedCpInvalid));
+                footer["ranking_certificate"] = "best-found-uncertified";
+                putDecimal(footer, "production_scheduler_calls",
+                           std::to_string(productionSchedulerCalls));
+                footer["canonical_incumbent_seed_enabled"] =
+                    canonicalIncumbentSeed.getValue();
+                footer["canonical_seed_continuation_state"] =
+                    canonicalIncumbentSeed.getValue()
+                        ? (canonicalSeedContinuationComplete ? "complete"
+                                                             : "incomplete")
+                        : "disabled";
+                footer["canonical_seed_scheduler_calls"] =
+                    static_cast<int64_t>(canonicalSeedSchedulerCalls);
+                footer["canonical_seed_accepted"] =
+                    static_cast<int64_t>(canonicalSeedAccepted);
+                footer["orbit_4x4_pruning"] = !productionScheduler;
+                footer["state_memo_requested"] = scheduleSpace == "exact";
+                footer["state_memo_enabled"] = stateMemoEnabled;
+                footer["state_memo_canonical_state_available"] =
+                    stateMemoCanonicalStateAvailable;
+                footer["state_memo_external_cutoff_monotonic"] =
+                    scheduleSpace == "exact";
+                footer["state_memo_cutoff_violation"] =
+                    stateMemoCutoffViolation;
+                footer["state_memo_capacity"] = stateMemoCapacity.getValue();
+                footer["state_memo_entries"] =
+                    static_cast<int64_t>(stateMemoEntries);
+                footer["state_memo_hits"] = static_cast<int64_t>(stateMemoHits);
+                footer["state_memo_pruned_subtrees"] =
+                    static_cast<int64_t>(stateMemoPrunedSubtrees);
+                footer["state_memo_capacity_skips"] =
+                    static_cast<int64_t>(stateMemoCapacitySkips);
+                footer["optimistic_ends_memo_enabled"] =
+                    optimisticEndsMemoEnabled;
+                putDecimal(footer, "optimistic_ends_computations",
+                           std::to_string(optimisticEndsComputations));
+                putDecimal(footer, "optimistic_ends_memo_hits",
+                           std::to_string(optimisticEndsMemoHits));
+                putDecimal(footer, "optimistic_ends_memo_entries",
+                           std::to_string(optimisticEndsMemoEntries));
+                putDecimal(footer, "optimistic_ends_memo_capacity_skips",
+                           std::to_string(optimisticEndsMemoCapacitySkips));
+                putDecimal(footer, "candidate_count",
+                           descriptor.candidateCount);
+                putDecimal(footer, "shape_candidates_visited",
+                           exactShapeIndexString(visitedShapes));
+                putDecimal(footer, "domain_pruned_shape_candidates",
+                           exactShapeIndexString(domainPrunedShapes));
+                putDecimal(footer, "bound_pruned_shape_candidates",
+                           exactShapeIndexString(boundPrunedShapes));
+                footer["shape_domain_status"] = shapeDomainStatus;
+                footer["shape_domain_bound_cycles"] = shapeDomainBound;
+                footer["shape_domain_fixed_point_iterations"] =
+                    static_cast<int64_t>(shapeDomainIterations);
+                footer["shape_domain_window_rejected_options"] =
+                    static_cast<int64_t>(shapeDomainWindowRejectedOptions);
+                putDecimal(footer, "global_cutoff_pruned_shape_candidates",
+                           exactShapeIndexString(globalBoundPrunedShapes));
+                footer["global_cutoff_requested"] = globalIncumbent.requested;
+                footer["global_cutoff_proven"] = false;
+                putDecimal(
+                    footer, "global_cutoff_filtered_schedule_callbacks",
+                    std::to_string(globalCutoffFilteredScheduleCallbacks));
+                putDecimal(footer, "expanded_schedule_nodes",
+                           std::to_string(expandedNodes));
+                footer["ranking_pruning"] = rankingPruning.getValue();
+                footer["shape_shard_count"] = shapeShardCount.getValue();
+                footer["shape_shard_index"] = shapeShardIndex.getValue();
+                putDecimal(footer, "shape_partition_begin",
+                           exactShapeIndexString(shardBegin));
+                putDecimal(footer, "shape_partition_end",
+                           exactShapeIndexString(shardEnd));
+                putDecimal(footer, "shape_partition_candidate_count",
+                           exactShapeIndexString(shardSize));
+                putDecimal(footer, "partition_skipped_subtrees",
+                           std::to_string(partitionSkippedSubtrees));
+                footer["elapsed_seconds"] =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - begun)
+                        .count();
+                addProductionCoverage(footer, temporalModel, scheduleSpace,
+                                      dispatchPolicy, function);
+                writeJsonLine(stream, std::move(footer));
+                return true;
+              },
+              checkpointError))
+        llvm::errs() << "checkpoint write failed: " << checkpointError << "\n";
+      llvm::errs() << "[JointScheduling] shape tuples="
+                   << exactShapeIndexString(visitedShapes) << " proven-pruned="
+                   << exactShapeIndexString(boundPrunedShapes)
+                   << " schedule nodes=" << expandedNodes
+                   << " topK=" << ranked.size()
                    << (ranked.empty() ? 0 : ranked.front().cycles) << "\n";
       lastCheckpoint = std::chrono::steady_clock::now();
     };
     // Query every task/mapper shape once, before any bound-based pruning.
     // Unknown cost support is a coverage blocker, never a legality proof.
-    std::vector<std::vector<int64_t>> edgeLowerBound(metadata->size(), std::vector<int64_t>(metadata->size(), 0));
+    std::vector<std::vector<int64_t>> edgeLowerBound(
+        metadata->size(), std::vector<int64_t>(metadata->size(), 0));
     for (unsigned i = 0; i < metadata->size(); ++i)
       for (unsigned p : predecessors[i])
-        if (!communication.getTransferLowerBound(p, i, edgeLowerBound[i][p], error)) {
-          function.emitError() << error; return signalPassFailure();
+        if (!communication.getTransferLowerBound(p, i, edgeLowerBound[i][p],
+                                                 error)) {
+          function.emitError() << error;
+          return signalPassFailure();
         }
     std::vector<std::vector<int64_t>> durations(metadata->size());
     std::vector<std::vector<uint8_t>> supportedShapes(metadata->size());
-    std::vector<int64_t> minimumDuration(metadata->size(), std::numeric_limits<int64_t>::max());
-    std::vector<unsigned __int128> minimumWork(metadata->size(), ~static_cast<unsigned __int128>(0));
+    std::vector<int64_t> minimumDuration(metadata->size(),
+                                         std::numeric_limits<int64_t>::max());
+    std::vector<unsigned __int128> minimumWork(
+        metadata->size(), ~static_cast<unsigned __int128>(0));
     std::vector<std::vector<size_t>> preferredShapes(metadata->size());
     SmallVector<size_t> fastest;
     for (unsigned i = 0; i < metadata->size(); ++i) {
@@ -4670,24 +4824,36 @@ struct ScoreExactJointTaskCandidatesPass
         TaskShapeChoice choice{(*metadata)[i].name, (*metadata)[i].tripCount,
                                descriptor.shapesByTask[i][j]};
         const TaskShapeCost *cost = costs.get(choice, error);
-        if (!cost) { function.emitError() << error; return signalPassFailure(); }
-        auto duration = cost->supported ? predictDuration(*cost, choice.tripCount, error)
-                                       : std::optional<int64_t>(std::numeric_limits<int64_t>::max());
-        if (!duration) { function.emitError() << error; return signalPassFailure(); }
-        if (!cost->supported) firstBlockingReason = "unsupported-task-shape-cost";
+        if (!cost) {
+          function.emitError() << error;
+          return signalPassFailure();
+        }
+        auto duration =
+            cost->supported
+                ? predictDuration(*cost, choice.tripCount, error)
+                : std::optional<int64_t>(std::numeric_limits<int64_t>::max());
+        if (!duration) {
+          function.emitError() << error;
+          return signalPassFailure();
+        }
+        if (!cost->supported)
+          firstBlockingReason = "unsupported-task-shape-cost";
         durations[i].push_back(*duration);
         supportedShapes[i].push_back(cost->supported ? 1 : 0);
-        shapeDomainOptions[i].push_back(
-            ShapeDomainOption{j, *duration,
-                              static_cast<unsigned>(choice.shape.cgraCount()),
-                              cost->supported});
+        shapeDomainOptions[i].push_back(ShapeDomainOption{
+            j, *duration, static_cast<unsigned>(choice.shape.cgraCount()),
+            cost->supported});
         shapeDomains[i].push_back(j);
         minimumDuration[i] = std::min(minimumDuration[i], *duration);
-        minimumWork[i] = std::min(minimumWork[i], static_cast<unsigned __int128>(*duration) * choice.shape.cgraCount());
+        minimumWork[i] =
+            std::min(minimumWork[i], static_cast<unsigned __int128>(*duration) *
+                                         choice.shape.cgraCount());
         preferredShapes[i].push_back(j);
       }
       std::stable_sort(preferredShapes[i].begin(), preferredShapes[i].end(),
-          [&](size_t a, size_t b) { return durations[i][a] < durations[i][b]; });
+                       [&](size_t a, size_t b) {
+                         return durations[i][a] < durations[i][b];
+                       });
       if (llvm::any_of(supportedShapes[i],
                        [](uint8_t supported) { return supported == 0; })) {
         minimumDuration[i] = 0;
@@ -4698,8 +4864,8 @@ struct ScoreExactJointTaskCandidatesPass
     // Original suffix counts preserve the stable factored candidate ordinal.
     // A separate surviving-domain suffix is used only for exact proof counts
     // after shape-domain propagation.
-    std::vector<llvm::APInt> originalSuffixCounts(
-        metadata->size() + 1, llvm::APInt(counterWidth, 1));
+    std::vector<llvm::APInt> originalSuffixCounts(metadata->size() + 1,
+                                                  llvm::APInt(counterWidth, 1));
     // This is an optimistic graph-wide lower bound: it uses the fastest
     // supported duration for every task and the communication model's proven
     // edge lower bounds, while ignoring placement/resource contention.  It is
@@ -4757,8 +4923,8 @@ struct ScoreExactJointTaskCandidatesPass
           const unsigned __int128 roundedWork = roundedNumerator / 16;
           if (roundedWork <= static_cast<unsigned __int128>(
                                  std::numeric_limits<int64_t>::max()))
-            graphLowerBound = std::max(
-                graphLowerBound, static_cast<int64_t>(roundedWork));
+            graphLowerBound =
+                std::max(graphLowerBound, static_cast<int64_t>(roundedWork));
         }
       }
     }
@@ -4770,273 +4936,295 @@ struct ScoreExactJointTaskCandidatesPass
     uint64_t lastFrontierCheckpointNodes = expandedShapeNodes;
     auto scoreTuple = [&](const llvm::APInt &shapeOrdinal,
                           ArrayRef<size_t> shapeIndices) -> bool {
-          if (!warmingUp && maxShapeCandidates.getValue() > 0 &&
-              visitedShapes.uge(llvm::APInt(
-                  counterWidth, static_cast<uint64_t>(maxShapeCandidates)))) {
-            interrupted = true;
-            interruptionReason = "max-shape-candidates";
-            if (writeFrontierSnapshot)
-              writeFrontierSnapshot(interruptionReason);
-            return false;
-          }
-          if (maxMilliseconds.getValue() > 0 &&
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - begun)
-                      .count() >= maxMilliseconds.getValue()) {
-            interrupted = true;
-            interruptionReason = "max-milliseconds";
-            if (writeFrontierSnapshot)
-              writeFrontierSnapshot(interruptionReason);
-            return false;
-          }
-          if (!warmingUp) ++visitedShapes;
+      if (!warmingUp && maxShapeCandidates.getValue() > 0 &&
+          visitedShapes.uge(llvm::APInt(
+              counterWidth, static_cast<uint64_t>(maxShapeCandidates)))) {
+        interrupted = true;
+        interruptionReason = "max-shape-candidates";
+        if (writeFrontierSnapshot)
+          writeFrontierSnapshot(interruptionReason);
+        return false;
+      }
+      if (maxMilliseconds.getValue() > 0 &&
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - begun)
+                  .count() >= maxMilliseconds.getValue()) {
+        interrupted = true;
+        interruptionReason = "max-milliseconds";
+        if (writeFrontierSnapshot)
+          writeFrontierSnapshot(interruptionReason);
+        return false;
+      }
+      if (!warmingUp)
+        ++visitedShapes;
 
-          SmallVector<TaskShapeChoice> choices;
-          SmallVector<TaskShapeCost> shapeCosts;
-          choices.reserve(metadata->size());
-          shapeCosts.reserve(metadata->size());
-          std::vector<ExactScheduleTask> exactTasks;
-          exactTasks.reserve(metadata->size());
-          bool unsupportedShape = false;
-          for (auto [taskIndex, shapeIndex] : llvm::enumerate(shapeIndices)) {
-            const RectShape &shape = descriptor.shapesByTask[taskIndex][shapeIndex];
-            TaskShapeChoice choice{(*metadata)[taskIndex].name,
-                                   (*metadata)[taskIndex].tripCount, shape};
-            const TaskShapeCost *cost = costs.get(choice, error);
-            if (!cost) {
-              fatalError = true;
-              return false;
-            }
-            if (!cost->supported) {
-              unsupportedShape = true;
-              if (firstBlockingReason.empty())
-                firstBlockingReason = "unsupported-task-shape-cost";
-              continue;
-            }
-            auto duration = predictDuration(*cost, choice.tripCount, error);
-            if (!duration) {
-              fatalError = true;
-              return false;
-            }
-            choices.push_back(choice);
-            shapeCosts.push_back(*cost);
-            ExactScheduleTask item;
-            item.name = choice.task;
-            item.rows = static_cast<int>(shape.rows);
-            item.cols = static_cast<int>(shape.cols);
-            item.duration = *duration;
-            item.predecessors = predecessors[taskIndex];
-            exactTasks.push_back(std::move(item));
-          }
-          if (unsupportedShape) {
-            if (!warmingUp) ++unsupportedShapes;
-            return true;
-          }
-          if (choices.size() != metadata->size()) {
-            fatalError = true;
-            error = "exact ranker did not construct one choice per task";
-            return false;
-          }
-          if (!warmingUp) ++validShapes;
+      SmallVector<TaskShapeChoice> choices;
+      SmallVector<TaskShapeCost> shapeCosts;
+      choices.reserve(metadata->size());
+      shapeCosts.reserve(metadata->size());
+      std::vector<ExactScheduleTask> exactTasks;
+      exactTasks.reserve(metadata->size());
+      bool unsupportedShape = false;
+      for (auto [taskIndex, shapeIndex] : llvm::enumerate(shapeIndices)) {
+        const RectShape &shape = descriptor.shapesByTask[taskIndex][shapeIndex];
+        TaskShapeChoice choice{(*metadata)[taskIndex].name,
+                               (*metadata)[taskIndex].tripCount, shape};
+        const TaskShapeCost *cost = costs.get(choice, error);
+        if (!cost) {
+          fatalError = true;
+          return false;
+        }
+        if (!cost->supported) {
+          unsupportedShape = true;
+          if (firstBlockingReason.empty())
+            firstBlockingReason = "unsupported-task-shape-cost";
+          continue;
+        }
+        auto duration = predictDuration(*cost, choice.tripCount, error);
+        if (!duration) {
+          fatalError = true;
+          return false;
+        }
+        choices.push_back(choice);
+        shapeCosts.push_back(*cost);
+        ExactScheduleTask item;
+        item.name = choice.task;
+        item.rows = static_cast<int>(shape.rows);
+        item.cols = static_cast<int>(shape.cols);
+        item.duration = *duration;
+        item.predecessors = predecessors[taskIndex];
+        exactTasks.push_back(std::move(item));
+      }
+      if (unsupportedShape) {
+        if (!warmingUp)
+          ++unsupportedShapes;
+        return true;
+      }
+      if (choices.size() != metadata->size()) {
+        fatalError = true;
+        error = "exact ranker did not construct one choice per task";
+        return false;
+      }
+      if (!warmingUp)
+        ++validShapes;
 
-          const std::string shapeId = exactShapeIndexString(shapeOrdinal);
-          auto emitSchedule = [&](const std::vector<ExactSchedulePlacement> &schedule,
-                  const std::vector<unsigned> &order,
-                  const FixedScheduleScore &score) {
-                if (!productionScheduler && selectedDispatchPolicy == DispatchPolicy::Fixed &&
-                    !isCanonicalFixedDispatch(order, exactTasks))
-                  return;
-                std::string scheduleKey = shapeId;
-                for (const auto &p : schedule)
-                  scheduleKey += ";" + std::to_string(p.task) + ":" + std::to_string(p.row) + "," + std::to_string(p.col) + "@" + std::to_string(p.start) + "-" + std::to_string(p.end);
-                for (unsigned task : order) scheduleKey += "/" + std::to_string(task);
-                if (warmingUp) warmupKeys.insert(scheduleKey);
-                else if (warmupKeys.count(scheduleKey)) return;
-                if (globalIncumbent.requested &&
-                    score.predictedMakespan > globalIncumbent.fifthCycles) {
-                  ++globalCutoffFilteredScheduleCallbacks;
-                  return;
-                }
-                ++schedulePaths;
-                llvm::json::Object record;
-                record["record_type"] = "score";
-                record["valid"] = true;
-                record["scheduler_backend"] = productionScheduler ? "orchestrate-tasks-on-accelerators" : "orbit-exact-enumerator";
-                record["schema"] = "amoeba-exact-joint-task-scores-v1";
-                const uint64_t scheduleOrdinal = scheduleSerial++;
-                record["candidate_id"] = "shape-" + shapeId + "/schedule-" +
-                                         std::to_string(scheduleOrdinal);
-                record["shape_candidate_id"] = "candidate-" + shapeId;
-                record["predicted_whole_program_cycles"] =
-                    score.predictedMakespan;
-                record["score_source"] =
-                    "ml-ii-startup-plus-production-explicit-communication";
-                record["task_latency_provenance"] =
-                    "source-owned-ml-ii-startup-trip-count-contract";
-                if (replayingWarmStartHint)
-                  record["warm_start_replayed_with_current_scheduler"] = true;
-                record["task_costs"] = makeTaskCosts(choices, shapeCosts);
-                llvm::json::Array entries;
-                for (const auto &placement : schedule) {
-                  llvm::json::Object entry;
-                  entry["task"] = exactTasks[placement.task].name;
-                  entry["row"] = placement.row;
-                  entry["col"] = placement.col;
-                  entry["rows"] = exactTasks[placement.task].rows;
-                  entry["cols"] = exactTasks[placement.task].cols;
-                  entry["start_cycle"] = placement.start;
-                  entry["end_cycle"] = placement.end;
-                  entry["idle_cycles"] = placement.idleCycles;
-                  entries.push_back(std::move(entry));
-                }
-                record["task_schedule"] = std::move(entries);
-                llvm::json::Array orderRecords;
-                std::string key = "shape-" + shapeId + "/schedule-" +
-                                  std::to_string(scheduleOrdinal);
-                for (unsigned task : order) {
-                  orderRecords.push_back(exactTasks[task].name);
-
-                }
-                record["dispatch_order"] = std::move(orderRecords);
-                record["replayed_communication_edges"] =
-                    static_cast<int64_t>(score.replayedEdges);
-                retain({std::move(key), shapeId, scheduleOrdinal,
-                        score.predictedMakespan, std::move(record)});
-              };
-          if (productionScheduler) {
-            // Warmup tuples are actual pass results and need not be scheduled twice.
-            if (productionSolvedShapes.count(shapeId))
-              return true;
-            SmallVector<int64_t> predictedDurations;
-            for (const auto &task : exactTasks)
-              predictedDurations.push_back(task.duration);
-            ProductionScheduledResult scheduled;
-            ++productionSchedulerCalls;
-            if (!scheduleWithAmoebaProductionPass(module, function, choices,
-                    predictedDurations, "candidate-" + shapeId,
-                    selectedDispatchPolicy == DispatchPolicy::Fixed,
-                    scheduled, error)) {
-              interrupted = true;
-              interruptionReason = error.empty() ? "production-scheduler-failed" : error;
-              failedProductionCandidateId = "candidate-" + shapeId;
-              failedProductionWarmup = warmingUp;
-              failedProductionChoices = choices;
-              failedProductionCosts = shapeCosts;
-              return false;
+      const std::string shapeId = exactShapeIndexString(shapeOrdinal);
+      auto emitSchedule =
+          [&](const std::vector<ExactSchedulePlacement> &schedule,
+              const std::vector<unsigned> &order,
+              const FixedScheduleScore &score) {
+            if (!productionScheduler &&
+                selectedDispatchPolicy == DispatchPolicy::Fixed &&
+                !isCanonicalFixedDispatch(order, exactTasks))
+              return;
+            std::string scheduleKey = shapeId;
+            for (const auto &p : schedule)
+              scheduleKey +=
+                  ";" + std::to_string(p.task) + ":" + std::to_string(p.row) +
+                  "," + std::to_string(p.col) + "@" + std::to_string(p.start) +
+                  "-" + std::to_string(p.end);
+            for (unsigned task : order)
+              scheduleKey += "/" + std::to_string(task);
+            if (warmingUp)
+              warmupKeys.insert(scheduleKey);
+            else if (warmupKeys.count(scheduleKey))
+              return;
+            if (globalIncumbent.requested &&
+                score.predictedMakespan > globalIncumbent.fifthCycles) {
+              ++globalCutoffFilteredScheduleCallbacks;
+              return;
             }
-            productionSolvedShapes.insert(shapeId);
-            if (warmingUp) {
-              ++seedSchedules;
-              frontierWarmupSolvedShapes.insert(shapeId);
+            ++schedulePaths;
+            llvm::json::Object record;
+            record["record_type"] = "score";
+            record["valid"] = true;
+            record["scheduler_backend"] =
+                productionScheduler ? "orchestrate-tasks-on-accelerators"
+                                    : "orbit-exact-enumerator";
+            record["schema"] = "amoeba-exact-joint-task-scores-v1";
+            const uint64_t scheduleOrdinal = scheduleSerial++;
+            record["candidate_id"] = "shape-" + shapeId + "/schedule-" +
+                                     std::to_string(scheduleOrdinal);
+            record["shape_candidate_id"] = "candidate-" + shapeId;
+            record["predicted_whole_program_cycles"] = score.predictedMakespan;
+            record["score_source"] =
+                "ml-ii-startup-plus-production-explicit-communication";
+            record["task_latency_provenance"] =
+                "source-owned-ml-ii-startup-trip-count-contract";
+            if (replayingWarmStartHint)
+              record["warm_start_replayed_with_current_scheduler"] = true;
+            record["task_costs"] = makeTaskCosts(choices, shapeCosts);
+            llvm::json::Array entries;
+            for (const auto &placement : schedule) {
+              llvm::json::Object entry;
+              entry["task"] = exactTasks[placement.task].name;
+              entry["row"] = placement.row;
+              entry["col"] = placement.col;
+              entry["rows"] = exactTasks[placement.task].rows;
+              entry["cols"] = exactTasks[placement.task].cols;
+              entry["start_cycle"] = placement.start;
+              entry["end_cycle"] = placement.end;
+              entry["idle_cycles"] = placement.idleCycles;
+              entries.push_back(std::move(entry));
             }
-            FixedScheduleScore score;
-            score.predictedMakespan = scheduled.makespan;
-            score.replayedEdges = scheduled.replayedEdges;
-            emitSchedule(scheduled.placements, scheduled.order, score);
-            return true;
-          }
-          uint64_t remainingNodes =
-              expandedNodes >= static_cast<uint64_t>(maxExpandedNodes)
-                  ? 0
-                  : static_cast<uint64_t>(maxExpandedNodes) - expandedNodes - std::min(
-                        expandedShapeNodes, static_cast<uint64_t>(maxExpandedNodes) - expandedNodes);
-          if (remainingNodes == 0) {
-            interrupted = true;
-            interruptionReason = "max-expanded-nodes";
-            return false;
-          }
-          uint64_t remainingMs = 0;
-          if (maxMilliseconds.getValue() > 0) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - begun).count();
-            if (elapsed >= maxMilliseconds.getValue()) {
-              interrupted = true;
-              interruptionReason = "max-milliseconds";
-              return false;
+            record["task_schedule"] = std::move(entries);
+            llvm::json::Array orderRecords;
+            std::string key = "shape-" + shapeId + "/schedule-" +
+                              std::to_string(scheduleOrdinal);
+            for (unsigned task : order) {
+              orderRecords.push_back(exactTasks[task].name);
             }
-            remainingMs = static_cast<uint64_t>(maxMilliseconds - elapsed);
-          }
-          ExactScheduleLimits limits{remainingNodes, remainingMs};
-          limits.rankingTopK = topK.getValue();
-          limits.seedIncumbents = true;
-          limits.seedPreferences = scheduleSpace == "heuristic-placement" ? 1 : 16;
-          // The production score pass owns the non-increasing shape/top-K
-          // cutoff.  Warmup and the single-placement diagnostic do not enable
-          // state reuse; the optional communication API also fails closed.
-          limits.enableStateMemo =
-              !warmingUp && scheduleSpace == "exact" &&
-              communication.supportsCanonicalReservationState();
-          limits.stateMemoCapacity =
-              static_cast<uint64_t>(stateMemoCapacity.getValue());
-          limits.externalUpperBoundMonotonic = limits.enableStateMemo;
-          ExactScheduleResult result;
-          CommunicationScheduleCertificate certificate;
-          bool accepted = enumerateCommunicationScheduleSpace(
-              4, 4, exactTasks, limits,
-              (warmingUp || scheduleSpace == "heuristic-placement")
-                  ? CommunicationStartPolicy::SeedOnly
-                  : (temporalModel == "dispatch-order" ? CommunicationStartPolicy::OrderDerived : CommunicationStartPolicy::AllInteger),
-              maxMakespan, communication,
-              emitSchedule,
-              result, certificate, error,
-              selectedDispatchPolicy == DispatchPolicy::Fixed
-                  ? CommunicationDispatchPolicy::CanonicalSmallestReady
-                  : CommunicationDispatchPolicy::AllReady,
-              [&]() {
-                int64_t cutoff = maxMakespan.getValue() > 0
-                                     ? maxMakespan.getValue()
-                                     : std::numeric_limits<int64_t>::max();
-                if (ranked.size() >= static_cast<size_t>(topK.getValue())) {
-                  // The local bound retains the established deterministic
-                  // shape/schedule tie policy.  A global incumbent has no
-                  // graph-local candidate key, so it is inclusive: cycles
-                  // equal to the fifth incumbent are always searched.
-                  const int64_t localCutoff =
-                      ranked.back().cycles -
-                      (compareDecimal(shapeId, ranked.back().shapeOrdinal) >= 0
-                           ? 1
-                           : 0);
-                  cutoff = std::min(cutoff, localCutoff);
-                }
-                if (globalIncumbent.requested)
-                  cutoff = std::min(cutoff, globalIncumbent.fifthCycles);
-                return cutoff;
-              });
-          addCounter(expandedNodes, result.expandedNodes);
-          addCounter(boundRejectedBranches, result.boundRejectedBranches);
-          addCounter(geometryTimeBoundRejectedBranches, result.geometryTimeBoundRejectedBranches);
-          addCounter(seedSchedules, result.seedSchedules);
-          addCounter(overlapRejectedBranches, result.overlapRejectedBranches);
-          addCounter(outOfBoundsRejectedBranches,
-                     result.outOfBoundsRejectedBranches);
-          addCounter(stateMemoEntries, result.stateMemoEntries);
-          addCounter(stateMemoHits, result.stateMemoHits);
-          addCounter(stateMemoPrunedSubtrees, result.stateMemoPrunedSubtrees);
-          addCounter(stateMemoCapacitySkips, result.stateMemoCapacitySkips);
-          addCounter(optimisticEndsComputations, result.optimisticEndsMemoComputations);
-          addCounter(optimisticEndsMemoHits, result.optimisticEndsMemoHits);
-          addCounter(optimisticEndsMemoEntries, result.optimisticEndsMemoEntries);
-          addCounter(optimisticEndsMemoCapacitySkips, result.optimisticEndsMemoCapacitySkips);
-          optimisticEndsMemoEnabled =
-              optimisticEndsMemoEnabled || result.optimisticEndsMemoEnabled;
-          stateMemoEnabled = stateMemoEnabled || result.stateMemoEnabled;
-          stateMemoCanonicalStateAvailable =
-              stateMemoCanonicalStateAvailable ||
-              result.stateMemoCanonicalStateAvailable;
-          stateMemoCutoffViolation =
-              stateMemoCutoffViolation || result.stateMemoCutoffViolation;
-          if (!accepted) {
-            interrupted = true;
-            interruptionReason = error.empty() ? "communication-search-failed" : error;
-            return false;
-          }
-          if (!result.complete) {
-            interrupted = true;
-            interruptionReason = result.reason.empty() ? "schedule-budget" : result.reason;
-            return false;
-          }
+            record["dispatch_order"] = std::move(orderRecords);
+            record["replayed_communication_edges"] =
+                static_cast<int64_t>(score.replayedEdges);
+            retain({std::move(key), shapeId, scheduleOrdinal,
+                    score.predictedMakespan, std::move(record)});
+          };
+      if (productionScheduler) {
+        // Warmup tuples are actual pass results and need not be scheduled
+        // twice.
+        if (productionSolvedShapes.count(shapeId))
           return true;
-        };
+        SmallVector<int64_t> predictedDurations;
+        for (const auto &task : exactTasks)
+          predictedDurations.push_back(task.duration);
+        ProductionScheduledResult scheduled;
+        ++productionSchedulerCalls;
+        if (!scheduleWithAmoebaProductionPass(
+                module, function, choices, predictedDurations,
+                "candidate-" + shapeId,
+                selectedDispatchPolicy == DispatchPolicy::Fixed, scheduled,
+                error)) {
+          interrupted = true;
+          interruptionReason =
+              error.empty() ? "production-scheduler-failed" : error;
+          failedProductionCandidateId = "candidate-" + shapeId;
+          failedProductionWarmup = warmingUp;
+          failedProductionChoices = choices;
+          failedProductionCosts = shapeCosts;
+          return false;
+        }
+        productionSolvedShapes.insert(shapeId);
+        if (warmingUp) {
+          ++seedSchedules;
+          frontierWarmupSolvedShapes.insert(shapeId);
+        }
+        FixedScheduleScore score;
+        score.predictedMakespan = scheduled.makespan;
+        score.replayedEdges = scheduled.replayedEdges;
+        emitSchedule(scheduled.placements, scheduled.order, score);
+        return true;
+      }
+      uint64_t remainingNodes =
+          expandedNodes >= static_cast<uint64_t>(maxExpandedNodes)
+              ? 0
+              : static_cast<uint64_t>(maxExpandedNodes) - expandedNodes -
+                    std::min(expandedShapeNodes,
+                             static_cast<uint64_t>(maxExpandedNodes) -
+                                 expandedNodes);
+      if (remainingNodes == 0) {
+        interrupted = true;
+        interruptionReason = "max-expanded-nodes";
+        return false;
+      }
+      uint64_t remainingMs = 0;
+      if (maxMilliseconds.getValue() > 0) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - begun)
+                           .count();
+        if (elapsed >= maxMilliseconds.getValue()) {
+          interrupted = true;
+          interruptionReason = "max-milliseconds";
+          return false;
+        }
+        remainingMs = static_cast<uint64_t>(maxMilliseconds - elapsed);
+      }
+      ExactScheduleLimits limits{remainingNodes, remainingMs};
+      limits.rankingTopK = topK.getValue();
+      limits.seedIncumbents = true;
+      limits.seedPreferences = scheduleSpace == "heuristic-placement" ? 1 : 16;
+      // The production score pass owns the non-increasing shape/top-K
+      // cutoff.  Warmup and the single-placement diagnostic do not enable
+      // state reuse; the optional communication API also fails closed.
+      limits.enableStateMemo =
+          !warmingUp && scheduleSpace == "exact" &&
+          communication.supportsCanonicalReservationState();
+      limits.stateMemoCapacity =
+          static_cast<uint64_t>(stateMemoCapacity.getValue());
+      limits.externalUpperBoundMonotonic = limits.enableStateMemo;
+      ExactScheduleResult result;
+      CommunicationScheduleCertificate certificate;
+      bool accepted = enumerateCommunicationScheduleSpace(
+          4, 4, exactTasks, limits,
+          (warmingUp || scheduleSpace == "heuristic-placement")
+              ? CommunicationStartPolicy::SeedOnly
+              : (temporalModel == "dispatch-order"
+                     ? CommunicationStartPolicy::OrderDerived
+                     : CommunicationStartPolicy::AllInteger),
+          maxMakespan, communication, emitSchedule, result, certificate, error,
+          selectedDispatchPolicy == DispatchPolicy::Fixed
+              ? CommunicationDispatchPolicy::CanonicalSmallestReady
+              : CommunicationDispatchPolicy::AllReady,
+          [&]() {
+            int64_t cutoff = maxMakespan.getValue() > 0
+                                 ? maxMakespan.getValue()
+                                 : std::numeric_limits<int64_t>::max();
+            if (ranked.size() >= static_cast<size_t>(topK.getValue())) {
+              // The local bound retains the established deterministic
+              // shape/schedule tie policy.  A global incumbent has no
+              // graph-local candidate key, so it is inclusive: cycles
+              // equal to the fifth incumbent are always searched.
+              const int64_t localCutoff =
+                  ranked.back().cycles -
+                  (compareDecimal(shapeId, ranked.back().shapeOrdinal) >= 0
+                       ? 1
+                       : 0);
+              cutoff = std::min(cutoff, localCutoff);
+            }
+            if (globalIncumbent.requested)
+              cutoff = std::min(cutoff, globalIncumbent.fifthCycles);
+            return cutoff;
+          });
+      addCounter(expandedNodes, result.expandedNodes);
+      addCounter(boundRejectedBranches, result.boundRejectedBranches);
+      addCounter(geometryTimeBoundRejectedBranches,
+                 result.geometryTimeBoundRejectedBranches);
+      addCounter(seedSchedules, result.seedSchedules);
+      addCounter(overlapRejectedBranches, result.overlapRejectedBranches);
+      addCounter(outOfBoundsRejectedBranches,
+                 result.outOfBoundsRejectedBranches);
+      addCounter(stateMemoEntries, result.stateMemoEntries);
+      addCounter(stateMemoHits, result.stateMemoHits);
+      addCounter(stateMemoPrunedSubtrees, result.stateMemoPrunedSubtrees);
+      addCounter(stateMemoCapacitySkips, result.stateMemoCapacitySkips);
+      addCounter(optimisticEndsComputations,
+                 result.optimisticEndsMemoComputations);
+      addCounter(optimisticEndsMemoHits, result.optimisticEndsMemoHits);
+      addCounter(optimisticEndsMemoEntries, result.optimisticEndsMemoEntries);
+      addCounter(optimisticEndsMemoCapacitySkips,
+                 result.optimisticEndsMemoCapacitySkips);
+      optimisticEndsMemoEnabled =
+          optimisticEndsMemoEnabled || result.optimisticEndsMemoEnabled;
+      stateMemoEnabled = stateMemoEnabled || result.stateMemoEnabled;
+      stateMemoCanonicalStateAvailable =
+          stateMemoCanonicalStateAvailable ||
+          result.stateMemoCanonicalStateAvailable;
+      stateMemoCutoffViolation =
+          stateMemoCutoffViolation || result.stateMemoCutoffViolation;
+      if (!accepted) {
+        interrupted = true;
+        interruptionReason =
+            error.empty() ? "communication-search-failed" : error;
+        return false;
+      }
+      if (!result.complete) {
+        interrupted = true;
+        interruptionReason =
+            result.reason.empty() ? "schedule-budget" : result.reason;
+        return false;
+      }
+      return true;
+    };
     // Replay only the current tuple ordinals from the immutable hint file.
     // scoreTuple invokes the production adapter and current cost catalogue,
     // so an old row can improve the incumbent but can never certify itself.
@@ -5093,7 +5281,7 @@ struct ScoreExactJointTaskCandidatesPass
       // never fall back to an old hint's score or continue as if it succeeded.
       checkpoint();
     } else if (globalIncumbent.requested &&
-        graphLowerBound > globalIncumbent.fifthCycles) {
+               graphLowerBound > globalIncumbent.fifthCycles) {
       // Every legal shape/schedule has the same optimistic dependency/work
       // lower bound above the incumbent.  The complete Cartesian space is
       // therefore pruned by proof, without manufacturing a local top five.
@@ -5126,8 +5314,7 @@ struct ScoreExactJointTaskCandidatesPass
         // existing cost/provenance gates have passed.
         globalGraphPruned = true;
         globalShapeDomainContradiction = true;
-        globalShapeDomainContradictionTask =
-            propagation.contradictionTask;
+        globalShapeDomainContradictionTask = propagation.contradictionTask;
         globalCutoffProof = true;
         globalCutoffProofKind =
             "shape-domain-necessary-condition-contradiction";
@@ -5186,13 +5373,14 @@ struct ScoreExactJointTaskCandidatesPass
         !ranked.empty()) {
       warmingUp = true;
       for (unsigned task = 0; task < metadata->size() && traversed; ++task) {
-        const llvm::APInt incumbent(counterWidth, ranked.front().shapeOrdinal, 10);
+        const llvm::APInt incumbent(counterWidth, ranked.front().shapeOrdinal,
+                                    10);
         SmallVector<size_t> tuple;
         tuple.reserve(metadata->size());
         for (unsigned index = 0; index < metadata->size(); ++index) {
           llvm::APInt digit = incumbent.udiv(originalSuffixCounts[index + 1]);
-          digit = digit.urem(llvm::APInt(counterWidth,
-                                        descriptor.shapesByTask[index].size()));
+          digit = digit.urem(
+              llvm::APInt(counterWidth, descriptor.shapesByTask[index].size()));
           tuple.push_back(static_cast<size_t>(digit.getZExtValue()));
         }
         const size_t oldDigit = tuple[task];
@@ -5205,7 +5393,8 @@ struct ScoreExactJointTaskCandidatesPass
             ordinal += originalSuffixCounts[index + 1] * tuple[index];
           const uint64_t previousCalls = productionSchedulerCalls;
           traversed = scoreTuple(ordinal, tuple);
-          canonicalSeedSchedulerCalls += productionSchedulerCalls - previousCalls;
+          canonicalSeedSchedulerCalls +=
+              productionSchedulerCalls - previousCalls;
           if (!traversed)
             break;
           if (ranked.front().shapeOrdinal == exactShapeIndexString(ordinal)) {
@@ -5224,7 +5413,8 @@ struct ScoreExactJointTaskCandidatesPass
     // local fifth and an externally verified global incumbent as the domain
     // propagation bound.  This only narrows the traversal alphabet; it does
     // not change candidate ordinals or the exact scheduler's legality checks.
-    if (rankingPruning.getValue() && traversed && !globalGraphPruned && !graphBoundOnly.getValue() &&
+    if (rankingPruning.getValue() && traversed && !globalGraphPruned &&
+        !graphBoundOnly.getValue() &&
         (ranked.size() >= static_cast<size_t>(topK.getValue()) ||
          globalIncumbent.requested)) {
       shapeDomainBound =
@@ -5243,8 +5433,7 @@ struct ScoreExactJointTaskCandidatesPass
       shapeDomainWindowRejectedOptions = propagation.windowRejectedOptions;
       if (!propagation.graphAcyclic) {
         shapeDomainStatus = "dependency-graph-unavailable";
-      } else if (globalIncumbent.valid &&
-                 globalIncumbent.requested &&
+      } else if (globalIncumbent.valid && globalIncumbent.requested &&
                  firstBlockingReason.empty() &&
                  propagation.wholeGraphAboveBound &&
                  propagation.contradictionTask !=
@@ -5309,7 +5498,8 @@ struct ScoreExactJointTaskCandidatesPass
         minimumWork[task] = 0;
       }
       std::stable_sort(preferredShapes[task].begin(),
-                       preferredShapes[task].end(), [&](size_t lhs, size_t rhs) {
+                       preferredShapes[task].end(),
+                       [&](size_t lhs, size_t rhs) {
                          if (durations[task][lhs] != durations[task][rhs])
                            return durations[task][lhs] < durations[task][rhs];
                          return lhs < rhs;
@@ -5327,9 +5517,9 @@ struct ScoreExactJointTaskCandidatesPass
     for (unsigned task = 0; task < metadata->size(); ++task)
       decisionOrder[task] = task;
     bool nonCanonicalDecisionOrder = false;
-    const bool mayReorderProductionShapes =
-        productionScheduler && rankingPruning.getValue() &&
-        shapeShardCount.getValue() == 1;
+    const bool mayReorderProductionShapes = productionScheduler &&
+                                            rankingPruning.getValue() &&
+                                            shapeShardCount.getValue() == 1;
     if (mayReorderProductionShapes && metadata->size() > 1) {
       const unsigned taskCount = metadata->size();
       std::vector<std::vector<unsigned>> successors(taskCount);
@@ -5382,21 +5572,21 @@ struct ScoreExactJointTaskCandidatesPass
           for (unsigned predecessor : predecessors[task]) {
             const int64_t predecessorEnd = saturatingAdd(
                 earliestStart[predecessor], minimumTaskDuration[predecessor]);
-            earliestStart[task] = std::max(
-                earliestStart[task],
-                saturatingAdd(predecessorEnd, edgeLowerBound[task][predecessor]));
+            earliestStart[task] =
+                std::max(earliestStart[task],
+                         saturatingAdd(predecessorEnd,
+                                       edgeLowerBound[task][predecessor]));
           }
         }
         std::vector<int64_t> criticalPathTail(taskCount, 0);
-        for (auto it = topologicalOrder.rbegin();
-             it != topologicalOrder.rend(); ++it) {
+        for (auto it = topologicalOrder.rbegin(); it != topologicalOrder.rend();
+             ++it) {
           const unsigned task = *it;
           int64_t successorPath = 0;
           for (unsigned successor : successors[task])
             successorPath = std::max(
-                successorPath,
-                saturatingAdd(edgeLowerBound[successor][task],
-                              criticalPathTail[successor]));
+                successorPath, saturatingAdd(edgeLowerBound[successor][task],
+                                             criticalPathTail[successor]));
           criticalPathTail[task] =
               saturatingAdd(minimumTaskDuration[task], successorPath);
         }
@@ -5425,8 +5615,7 @@ struct ScoreExactJointTaskCandidatesPass
             if (!supportedShapes[task][ordinal])
               continue;
             const int64_t duration = durations[task][ordinal];
-            if (duration < 0 ||
-                duration == std::numeric_limits<int64_t>::max())
+            if (duration < 0 || duration == std::numeric_limits<int64_t>::max())
               continue;
             fastest = std::min(fastest, duration);
             slowest = std::max(slowest, duration);
@@ -5434,23 +5623,22 @@ struct ScoreExactJointTaskCandidatesPass
           if (fastest != std::numeric_limits<int64_t>::max() &&
               slowest >= fastest)
             spread = slowest - fastest;
-          keys.push_back({end,
-                          graphCriticalPath >= end ? graphCriticalPath - end
-                                                    : 0,
-                          spread, criticalPathTail[task], task});
+          keys.push_back(
+              {end, graphCriticalPath >= end ? graphCriticalPath - end : 0,
+               spread, criticalPathTail[task], task});
         }
-        std::stable_sort(keys.begin(), keys.end(), [](const DecisionKey &lhs,
-                                                       const DecisionKey &rhs) {
-          if (lhs.throughTaskPath != rhs.throughTaskPath)
-            return lhs.throughTaskPath > rhs.throughTaskPath;
-          if (lhs.slack != rhs.slack)
-            return lhs.slack < rhs.slack;
-          if (lhs.durationSpread != rhs.durationSpread)
-            return lhs.durationSpread > rhs.durationSpread;
-          if (lhs.criticalPathTail != rhs.criticalPathTail)
-            return lhs.criticalPathTail > rhs.criticalPathTail;
-          return lhs.task < rhs.task;
-        });
+        std::stable_sort(keys.begin(), keys.end(),
+                         [](const DecisionKey &lhs, const DecisionKey &rhs) {
+                           if (lhs.throughTaskPath != rhs.throughTaskPath)
+                             return lhs.throughTaskPath > rhs.throughTaskPath;
+                           if (lhs.slack != rhs.slack)
+                             return lhs.slack < rhs.slack;
+                           if (lhs.durationSpread != rhs.durationSpread)
+                             return lhs.durationSpread > rhs.durationSpread;
+                           if (lhs.criticalPathTail != rhs.criticalPathTail)
+                             return lhs.criticalPathTail > rhs.criticalPathTail;
+                           return lhs.task < rhs.task;
+                         });
         for (unsigned depth = 0; depth < taskCount; ++depth)
           decisionOrder[depth] = keys[depth].task;
         for (unsigned depth = 0; depth < taskCount; ++depth) {
@@ -5463,8 +5651,8 @@ struct ScoreExactJointTaskCandidatesPass
     }
     // The surviving suffix count is used only for proof accounting.  Shape
     // ordinals still use originalSuffixCounts below.
-    std::vector<llvm::APInt> domainSuffixCounts(
-        metadata->size() + 1, llvm::APInt(counterWidth, 1));
+    std::vector<llvm::APInt> domainSuffixCounts(metadata->size() + 1,
+                                                llvm::APInt(counterWidth, 1));
     for (size_t depth = metadata->size(); depth > 0; --depth)
       domainSuffixCounts[depth - 1] =
           domainSuffixCounts[depth] *
@@ -5472,8 +5660,8 @@ struct ScoreExactJointTaskCandidatesPass
     llvm::APInt totalShapeCount(counterWidth, descriptor.candidateCount, 10);
     llvm::APInt survivingShapeCount = domainSuffixCounts.front();
     domainPrunedShapes = totalShapeCount.uge(survivingShapeCount)
-                              ? totalShapeCount - survivingShapeCount
-                              : llvm::APInt(counterWidth, 0);
+                             ? totalShapeCount - survivingShapeCount
+                             : llvm::APInt(counterWidth, 0);
     if (!globalGraphPruned) {
       boundPrunedShapes = domainPrunedShapes;
       if (globalIncumbent.requested &&
@@ -5498,15 +5686,15 @@ struct ScoreExactJointTaskCandidatesPass
           return formatted;
         };
         function.emitError()
-            << "shape frontier decision order differs from current scheduler facts"
+            << "shape frontier decision order differs from current scheduler "
+               "facts"
             << " saved=" << formatDecisionOrder(loadedFrontier->decisionOrder)
             << " current=" << formatDecisionOrder(decisionOrder);
         return signalPassFailure();
       }
       llvm::APInt expectedOrdinal(counterWidth, 0);
       for (size_t depth = 0; depth < loadedFrontier->frames.size(); ++depth) {
-        const ShapeFrontierFrameSnapshot &frame =
-            loadedFrontier->frames[depth];
+        const ShapeFrontierFrameSnapshot &frame = loadedFrontier->frames[depth];
         if (depth > 0) {
           const unsigned selectedTask = decisionOrder[depth - 1];
           if (!llvm::is_contained(preferredShapes[selectedTask],
@@ -5515,8 +5703,8 @@ struct ScoreExactJointTaskCandidatesPass
                 << "shape frontier selected shape is outside current domain";
             return signalPassFailure();
           }
-          expectedOrdinal += originalSuffixCounts[selectedTask + 1] *
-                             frame.chosenIndex;
+          expectedOrdinal +=
+              originalSuffixCounts[selectedTask + 1] * frame.chosenIndex;
         } else if (frame.chosenIndex != 0) {
           function.emitError() << "shape frontier root has a nonzero choice";
           return signalPassFailure();
@@ -5530,8 +5718,8 @@ struct ScoreExactJointTaskCandidatesPass
               << depth << " task=" << frame.task << " expected-task="
               << (depth < metadata->size() ? decisionOrder[depth]
                                            : metadata->size())
-              << " ordinal=" << frame.ordinal << " expected-ordinal="
-              << exactShapeIndexString(expectedOrdinal);
+              << " ordinal=" << frame.ordinal
+              << " expected-ordinal=" << exactShapeIndexString(expectedOrdinal);
           return signalPassFailure();
         }
         if (depth < metadata->size()) {
@@ -5552,9 +5740,8 @@ struct ScoreExactJointTaskCandidatesPass
         return true;
       if (canonicalIncumbentSeed.getValue() &&
           !canonicalSeedContinuationComplete) {
-        error =
-            "cannot write shape frontier before canonical incumbent seed "
-            "continuation is complete";
+        error = "cannot write shape frontier before canonical incumbent seed "
+                "continuation is complete";
         fatalError = true;
         return false;
       }
@@ -5577,7 +5764,8 @@ struct ScoreExactJointTaskCandidatesPass
       root["dispatch_policy"] = dispatchPolicy.getValue();
       root["temporal_model"] = temporalModel.getValue();
       root["schedule_space"] = scheduleSpace.getValue();
-      root["production_scheduler_contract"] = kProductionSchedulerContract.str();
+      root["production_scheduler_contract"] =
+          kProductionSchedulerContract.str();
       root["canonical_incumbent_seed_enabled"] =
           canonicalIncumbentSeed.getValue();
       root["canonical_seed_continuation_state"] =
@@ -5589,9 +5777,8 @@ struct ScoreExactJointTaskCandidatesPass
       putDecimal(root, "canonical_seed_accepted",
                  std::to_string(canonicalSeedAccepted));
       putDecimal(root, "canonical_seed_next_task",
-                 std::to_string(canonicalIncumbentSeed.getValue()
-                                    ? metadata->size()
-                                    : 0));
+                 std::to_string(
+                     canonicalIncumbentSeed.getValue() ? metadata->size() : 0));
       putDecimal(root, "canonical_seed_next_smaller", "0");
       llvm::json::Array order;
       for (unsigned task : decisionOrder)
@@ -5637,9 +5824,10 @@ struct ScoreExactJointTaskCandidatesPass
         llvm::json::Object row;
         row["key"] = entry.key;
         row["shape_ordinal"] = entry.shapeOrdinal;
-        putDecimal(row, "schedule_ordinal", std::to_string(entry.scheduleOrdinal));
+        putDecimal(row, "schedule_ordinal",
+                   std::to_string(entry.scheduleOrdinal));
         row["candidate_id"] = "shape-" + entry.shapeOrdinal + "/schedule-" +
-                               std::to_string(entry.scheduleOrdinal);
+                              std::to_string(entry.scheduleOrdinal);
         row["cycles"] = entry.cycles;
         llvm::json::Object record = entry.record;
         row["record"] = std::move(record);
@@ -5677,15 +5865,16 @@ struct ScoreExactJointTaskCandidatesPass
       return true;
     };
     auto shapeBoundExceeds = [&](const llvm::APInt &ordinal) {
-      if (!rankingPruning.getValue()) return false;
+      if (!rankingPruning.getValue())
+        return false;
       globalCutoffShapePruned = false;
       const bool haveLocalBound =
           ranked.size() >= static_cast<size_t>(topK.getValue());
       if (!haveLocalBound && !globalIncumbent.requested)
         return false;
-      const int64_t localBound =
-          haveLocalBound ? ranked.back().cycles
-                         : std::numeric_limits<int64_t>::max();
+      const int64_t localBound = haveLocalBound
+                                     ? ranked.back().cycles
+                                     : std::numeric_limits<int64_t>::max();
       std::vector<int64_t> ends(metadata->size(), -1);
       std::vector<bool> endsFinite(metadata->size(), true);
       auto selectedOption = [&](unsigned i) {
@@ -5702,12 +5891,12 @@ struct ScoreExactJointTaskCandidatesPass
                    : minimumDuration[i];
       };
       auto selectedWork = [&](unsigned i) {
-        return selectedShapeFlags[i]
-                   ? optimisticShapeWork(selectedOption(i))
-                   : minimumWork[i];
+        return selectedShapeFlags[i] ? optimisticShapeWork(selectedOption(i))
+                                     : minimumWork[i];
       };
       std::function<int64_t(unsigned)> earliest = [&](unsigned i) {
-        if (ends[i] >= 0) return ends[i];
+        if (ends[i] >= 0)
+          return ends[i];
         int64_t start = 0;
         for (unsigned p : predecessors[i]) {
           int64_t end = earliest(p), delay = edgeLowerBound[i][p];
@@ -5732,9 +5921,8 @@ struct ScoreExactJointTaskCandidatesPass
       bool canImproveTie = false;
       if (haveLocalBound) {
         if (!nonCanonicalDecisionOrder) {
-          canImproveTie = compareDecimal(
-                              exactShapeIndexString(ordinal),
-                              ranked.back().shapeOrdinal) < 0;
+          canImproveTie = compareDecimal(exactShapeIndexString(ordinal),
+                                         ranked.back().shapeOrdinal) < 0;
         } else {
           // An arbitrary decision prefix does not make `ordinal` a canonical
           // prefix.  Complete it with the smallest surviving ordinal of each
@@ -5748,9 +5936,9 @@ struct ScoreExactJointTaskCandidatesPass
             minimumCompletion +=
                 originalSuffixCounts[task + 1] * minimumOrdinal;
           }
-          canImproveTie = compareDecimal(
-                              exactShapeIndexString(minimumCompletion),
-                              ranked.back().shapeOrdinal) < 0;
+          canImproveTie =
+              compareDecimal(exactShapeIndexString(minimumCompletion),
+                             ranked.back().shapeOrdinal) < 0;
         }
       }
       bool localRejected = false;
@@ -5817,8 +6005,8 @@ struct ScoreExactJointTaskCandidatesPass
       // A shape whose optimistic bound equals the fifth cycle count remains
       // in the search so equal-cycle candidates and their stable keys survive.
       if (!productionScheduler && workFinite && globalIncumbent.requested &&
-          work > static_cast<unsigned __int128>(globalIncumbent.fifthCycles) *
-                     16)
+          work >
+              static_cast<unsigned __int128>(globalIncumbent.fifthCycles) * 16)
         globalRejected = true;
 
       // Run the energetic release/deadline-window proof on a private snapshot
@@ -5830,20 +6018,21 @@ struct ScoreExactJointTaskCandidatesPass
       const bool haveGlobalWitness =
           globalIncumbent.requested && globalIncumbent.valid;
       const bool havePrefixWitness = haveLocalBound || haveGlobalWitness;
-      const int64_t globalBound =
-          haveGlobalWitness ? globalIncumbent.fifthCycles
-                            : std::numeric_limits<int64_t>::max();
+      const int64_t globalBound = haveGlobalWitness
+                                      ? globalIncumbent.fifthCycles
+                                      : std::numeric_limits<int64_t>::max();
       const int64_t prefixBound =
           havePrefixWitness
               ? std::min(haveLocalBound ? localBound : globalBound,
-                         haveGlobalWitness ? globalBound
-                                           : std::numeric_limits<int64_t>::max())
+                         haveGlobalWitness
+                             ? globalBound
+                             : std::numeric_limits<int64_t>::max())
               : 0;
       const bool prefixBoundFinite =
           havePrefixWitness && prefixBound > 0 &&
           prefixBound != std::numeric_limits<int64_t>::max();
-      if (!productionScheduler && !localRejected && !globalRejected && prefixBoundFinite &&
-          decisionPrefix.size() < metadata->size() &&
+      if (!productionScheduler && !localRejected && !globalRejected &&
+          prefixBoundFinite && decisionPrefix.size() < metadata->size() &&
           !decisionPrefix.empty()) {
         std::vector<std::vector<ShapeDomainOption>> prefixDomains =
             shapeDomainOptions;
@@ -5867,9 +6056,10 @@ struct ScoreExactJointTaskCandidatesPass
         if (prefixSnapshotValid) {
           ++prefixWindowBoundCalls;
           ShapeDomainPropagationResult prefixPropagation =
-              propagateShapeDomains(prefixDomains, predecessors,
-                                    edgeLowerBound, prefixBound,
-                                    /*gridArea=*/16, /*enableResourceBounds=*/!productionScheduler);
+              propagateShapeDomains(
+                  prefixDomains, predecessors, edgeLowerBound, prefixBound,
+                  /*gridArea=*/16,
+                  /*enableResourceBounds=*/!productionScheduler);
           if (prefixPropagation.wholeGraphAboveBound &&
               prefixPropagation.contradictionTask !=
                   std::numeric_limits<uint64_t>::max()) {
@@ -5890,151 +6080,156 @@ struct ScoreExactJointTaskCandidatesPass
     };
     std::function<bool(size_t, const llvm::APInt &)> visitShapes =
         [&](size_t depth, const llvm::APInt &ordinal) {
-      if (!nonCanonicalDecisionOrder && shapeShardCount.getValue() > 1 &&
-          (ordinal.uge(shardEnd) ||
-           (ordinal + originalSuffixCounts[depth]).ule(shardBegin))) {
-        ++partitionSkippedSubtrees;
-        return true;
-      }
-      size_t resumeChoice = 0;
-      bool restoredFrame = false;
-      if (frontierResumeActive) {
-        // A checkpoint records the active stack, not the child currently
-        // being entered.  Descending one level beyond that stack is the
-        // legitimate continuation of its saved next choice.
-        if (depth >= savedFrontierFrames.size()) {
-          frontierResumeActive = false;
-        } else {
-          bool matches = true;
-          const ShapeFrontierFrameSnapshot &saved = savedFrontierFrames[depth];
-          const unsigned expectedTask =
-              depth < metadata->size() ? decisionOrder[depth]
-                                       : metadata->size();
-          const size_t expectedChoice =
-              depth == 0 ? 0 : selectedShapes[decisionOrder[depth - 1]];
-          matches = saved.depth == depth && saved.task == expectedTask &&
-                    saved.chosenIndex == expectedChoice &&
-                    saved.ordinal == exactShapeIndexString(ordinal);
-          if (matches) {
-            resumeChoice = static_cast<size_t>(saved.nextChoice);
-            restoredFrame = true;
+          if (!nonCanonicalDecisionOrder && shapeShardCount.getValue() > 1 &&
+              (ordinal.uge(shardEnd) ||
+               (ordinal + originalSuffixCounts[depth]).ule(shardBegin))) {
+            ++partitionSkippedSubtrees;
+            return true;
           }
-          if (!matches) {
-            // The loader already checked this prefix against the current
-            // descriptor.  A mismatch here means the runtime reconstruction
-            // diverged from the authenticated snapshot; restarting at the
-            // root would silently duplicate or skip subtrees, so fail closed.
-            error = "shape frontier runtime frame diverged from authenticated "
-                    "prefix at depth=" + std::to_string(depth) +
+          size_t resumeChoice = 0;
+          bool restoredFrame = false;
+          if (frontierResumeActive) {
+            // A checkpoint records the active stack, not the child currently
+            // being entered.  Descending one level beyond that stack is the
+            // legitimate continuation of its saved next choice.
+            if (depth >= savedFrontierFrames.size()) {
+              frontierResumeActive = false;
+            } else {
+              bool matches = true;
+              const ShapeFrontierFrameSnapshot &saved =
+                  savedFrontierFrames[depth];
+              const unsigned expectedTask = depth < metadata->size()
+                                                ? decisionOrder[depth]
+                                                : metadata->size();
+              const size_t expectedChoice =
+                  depth == 0 ? 0 : selectedShapes[decisionOrder[depth - 1]];
+              matches = saved.depth == depth && saved.task == expectedTask &&
+                        saved.chosenIndex == expectedChoice &&
+                        saved.ordinal == exactShapeIndexString(ordinal);
+              if (matches) {
+                resumeChoice = static_cast<size_t>(saved.nextChoice);
+                restoredFrame = true;
+              }
+              if (!matches) {
+                // The loader already checked this prefix against the current
+                // descriptor.  A mismatch here means the runtime reconstruction
+                // diverged from the authenticated snapshot; restarting at the
+                // root would silently duplicate or skip subtrees, so fail
+                // closed.
+                error =
+                    "shape frontier runtime frame diverged from authenticated "
+                    "prefix at depth=" +
+                    std::to_string(depth) +
                     " ordinal=" + exactShapeIndexString(ordinal);
-            fatalError = true;
-            return false;
+                fatalError = true;
+                return false;
+              }
+            }
           }
-        }
-      }
-      ShapeFrontierFrameSnapshot frame;
-      frame.depth = depth;
-      frame.task = depth < metadata->size() ? decisionOrder[depth]
-                                            : metadata->size();
-      frame.chosenIndex = depth == 0 ? 0 : selectedShapes[decisionOrder[depth - 1]];
-      frame.nextChoice = resumeChoice;
-      frame.ordinal = exactShapeIndexString(ordinal);
-      frontierStack.push_back(frame);
-      auto popFrame = [&]() { frontierStack.pop_back(); };
-      if (!restoredFrame) {
-        if (std::chrono::steady_clock::now() - lastCheckpoint >=
-            std::chrono::seconds(60))
-          checkpoint();
-        ++expandedShapeNodes;
-        if (frontierCheckpointEvery.getValue() > 0 &&
-            (expandedShapeNodes - lastFrontierCheckpointNodes >=
-             static_cast<uint64_t>(frontierCheckpointEvery.getValue()))) {
-          if (!writeFrontierSnapshot("periodic")) {
-            interrupted = true;
-            interruptionReason = "frontier-write-failed";
+          ShapeFrontierFrameSnapshot frame;
+          frame.depth = depth;
+          frame.task = depth < metadata->size() ? decisionOrder[depth]
+                                                : metadata->size();
+          frame.chosenIndex =
+              depth == 0 ? 0 : selectedShapes[decisionOrder[depth - 1]];
+          frame.nextChoice = resumeChoice;
+          frame.ordinal = exactShapeIndexString(ordinal);
+          frontierStack.push_back(frame);
+          auto popFrame = [&]() { frontierStack.pop_back(); };
+          if (!restoredFrame) {
+            if (std::chrono::steady_clock::now() - lastCheckpoint >=
+                std::chrono::seconds(60))
+              checkpoint();
+            ++expandedShapeNodes;
+            if (frontierCheckpointEvery.getValue() > 0 &&
+                (expandedShapeNodes - lastFrontierCheckpointNodes >=
+                 static_cast<uint64_t>(frontierCheckpointEvery.getValue()))) {
+              if (!writeFrontierSnapshot("periodic")) {
+                interrupted = true;
+                interruptionReason = "frontier-write-failed";
+                popFrame();
+                return false;
+              }
+              lastFrontierCheckpointNodes = expandedShapeNodes;
+            }
+            if (expandedShapeNodes + expandedNodes >=
+                static_cast<uint64_t>(maxExpandedNodes)) {
+              interrupted = true;
+              interruptionReason = "max-expanded-nodes";
+              writeFrontierSnapshot(interruptionReason);
+              popFrame();
+              return false;
+            }
+            if (maxMilliseconds > 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - begun)
+                        .count() >= maxMilliseconds) {
+              interrupted = true;
+              interruptionReason = "max-milliseconds";
+              writeFrontierSnapshot(interruptionReason);
+              popFrame();
+              return false;
+            }
+          }
+          if (!restoredFrame && shapeBoundExceeds(ordinal)) {
+            const llvm::APInt pruned = domainSuffixCounts[depth];
+            boundPrunedShapes += pruned;
+            if (globalCutoffShapePruned)
+              globalBoundPrunedShapes += pruned;
             popFrame();
-            return false;
+            return true;
           }
-          lastFrontierCheckpointNodes = expandedShapeNodes;
-        }
-        if (expandedShapeNodes + expandedNodes >=
-            static_cast<uint64_t>(maxExpandedNodes)) {
-          interrupted = true;
-          interruptionReason = "max-expanded-nodes";
-          writeFrontierSnapshot(interruptionReason);
-          popFrame();
-          return false;
-        }
-        if (maxMilliseconds > 0 &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - begun)
-                    .count() >= maxMilliseconds) {
-          interrupted = true;
-          interruptionReason = "max-milliseconds";
-          writeFrontierSnapshot(interruptionReason);
-          popFrame();
-          return false;
-        }
-      }
-      if (!restoredFrame && shapeBoundExceeds(ordinal)) {
-        const llvm::APInt pruned = domainSuffixCounts[depth];
-        boundPrunedShapes += pruned;
-        if (globalCutoffShapePruned)
-          globalBoundPrunedShapes += pruned;
-        popFrame();
-        return true;
-      }
-      if (depth == metadata->size()) {
-        bool keepGoing = scoreTuple(ordinal, selectedShapes);
-        const bool resumableStop =
-            interruptionReason == "max-shape-candidates" ||
-            interruptionReason == "max-milliseconds" ||
-            interruptionReason == "max-expanded-nodes";
-        if (!keepGoing && resumableStop && writeFrontierSnapshot)
-          writeFrontierSnapshot(interruptionReason);
-        popFrame();
-        return keepGoing;
-      }
-      const unsigned task = decisionOrder[depth];
-      for (size_t position = resumeChoice;
-           position < preferredShapes[task].size(); ++position) {
-        const size_t index = preferredShapes[task][position];
-        selectedShapes[task] = index;
-        selectedShapeFlags[task] = 1;
-        decisionPrefix.push_back(task);
-        frontierStack.back().nextChoice = position;
-        if (frontierCheckpointEvery.getValue() > 0 &&
-            (expandedShapeNodes - lastFrontierCheckpointNodes >=
-             static_cast<uint64_t>(frontierCheckpointEvery.getValue()))) {
-          if (!writeFrontierSnapshot("before-child")) {
-            interrupted = true;
-            interruptionReason = "frontier-write-failed";
+          if (depth == metadata->size()) {
+            bool keepGoing = scoreTuple(ordinal, selectedShapes);
+            const bool resumableStop =
+                interruptionReason == "max-shape-candidates" ||
+                interruptionReason == "max-milliseconds" ||
+                interruptionReason == "max-expanded-nodes";
+            if (!keepGoing && resumableStop && writeFrontierSnapshot)
+              writeFrontierSnapshot(interruptionReason);
+            popFrame();
+            return keepGoing;
+          }
+          const unsigned task = decisionOrder[depth];
+          for (size_t position = resumeChoice;
+               position < preferredShapes[task].size(); ++position) {
+            const size_t index = preferredShapes[task][position];
+            selectedShapes[task] = index;
+            selectedShapeFlags[task] = 1;
+            decisionPrefix.push_back(task);
+            frontierStack.back().nextChoice = position;
+            if (frontierCheckpointEvery.getValue() > 0 &&
+                (expandedShapeNodes - lastFrontierCheckpointNodes >=
+                 static_cast<uint64_t>(frontierCheckpointEvery.getValue()))) {
+              if (!writeFrontierSnapshot("before-child")) {
+                interrupted = true;
+                interruptionReason = "frontier-write-failed";
+                decisionPrefix.pop_back();
+                selectedShapeFlags[task] = 0;
+                popFrame();
+                return false;
+              }
+              lastFrontierCheckpointNodes = expandedShapeNodes;
+            }
+            bool keepGoing = visitShapes(
+                depth + 1, ordinal + originalSuffixCounts[task + 1] * index);
             decisionPrefix.pop_back();
             selectedShapeFlags[task] = 0;
-            popFrame();
-            return false;
+            frontierStack.back().nextChoice = position + 1;
+            if (!keepGoing) {
+              popFrame();
+              return false;
+            }
+            // The authenticated prefix has now been replayed successfully.  Any
+            // later sibling is a fresh subtree after the checkpoint, so its
+            // frame is allowed to diverge from the saved prefix and must not be
+            // mistaken for a corrupted snapshot.
+            if (restoredFrame)
+              frontierResumeActive = false;
           }
-          lastFrontierCheckpointNodes = expandedShapeNodes;
-        }
-        bool keepGoing = visitShapes(
-            depth + 1, ordinal + originalSuffixCounts[task + 1] * index);
-        decisionPrefix.pop_back();
-        selectedShapeFlags[task] = 0;
-        frontierStack.back().nextChoice = position + 1;
-        if (!keepGoing) {
           popFrame();
-          return false;
-        }
-        // The authenticated prefix has now been replayed successfully.  Any
-        // later sibling is a fresh subtree after the checkpoint, so its
-        // frame is allowed to diverge from the saved prefix and must not be
-        // mistaken for a corrupted snapshot.
-        if (restoredFrame)
-          frontierResumeActive = false;
-      }
-      popFrame();
-      return true;
-    };
+          return true;
+        };
     if (traversed && !globalGraphPruned && !seedOnlyTraversal &&
         !graphBoundOnly.getValue())
       traversed = visitShapes(0, llvm::APInt(counterWidth, 0));
@@ -6054,8 +6249,11 @@ struct ScoreExactJointTaskCandidatesPass
     }
     // Five feasible candidates at or below H prove that schedules finishing
     // after H cannot enter this top five; no caller assertion is required.
-    const bool horizonCertified = productionScheduler || temporalModel == "dispatch-order" || horizonProven.getValue() ||
-        (ranked.size() >= static_cast<size_t>(topK.getValue()) && ranked.back().cycles <= maxMakespan);
+    const bool horizonCertified =
+        productionScheduler || temporalModel == "dispatch-order" ||
+        horizonProven.getValue() ||
+        (ranked.size() >= static_cast<size_t>(topK.getValue()) &&
+         ranked.back().cycles <= maxMakespan);
 
     if (!horizonCertified && !interrupted) {
       interruptionReason = "max-makespan-not-proven";
@@ -6065,17 +6263,20 @@ struct ScoreExactJointTaskCandidatesPass
     if (!firstBlockingReason.empty())
       interruptionReason = firstBlockingReason;
     if (globalIncumbent.requested)
-      globalCutoffProof =
-          traversed && !interrupted && firstBlockingReason.empty() &&
-          unsupportedShapes == 0 && !stateMemoCutoffViolation;
-    const bool partitionFinished = traversed && !interrupted && firstBlockingReason.empty() && visitedShapes == shardSize;
-    const bool complete = shapeShardCount.getValue() == 1 && !interrupted && firstBlockingReason.empty() && horizonCertified &&
+      globalCutoffProof = traversed && !interrupted &&
+                          firstBlockingReason.empty() &&
+                          unsupportedShapes == 0 && !stateMemoCutoffViolation;
+    const bool partitionFinished = traversed && !interrupted &&
+                                   firstBlockingReason.empty() &&
+                                   visitedShapes == shardSize;
+    const bool complete = shapeShardCount.getValue() == 1 && !interrupted &&
+                          firstBlockingReason.empty() && horizonCertified &&
                           unsupportedShapes == 0 &&
                           ranked.size() >= static_cast<size_t>(topK.getValue());
-    const bool globallyComplete = globalIncumbent.requested &&
-                                  globalCutoffProof;
-    const bool outputComplete = !seedOnly.getValue() &&
-                                (complete || globallyComplete);
+    const bool globallyComplete =
+        globalIncumbent.requested && globalCutoffProof;
+    const bool outputComplete =
+        !seedOnly.getValue() && (complete || globallyComplete);
     const bool globallyCutoffResult = globallyComplete && !complete;
 
     if (!writeAtomically(
@@ -6086,8 +6287,9 @@ struct ScoreExactJointTaskCandidatesPass
               header["schema"] = "amoeba-exact-joint-task-scores-v1";
               header["graph_bound_only"] = graphBoundOnly.getValue();
               header["graph_bound_basis"] =
-                  productionScheduler ? "cached-cost-critical-path"
-                                      : "cached-cost-critical-path-and-minimum-cgra-cycle-work";
+                  productionScheduler
+                      ? "cached-cost-critical-path"
+                      : "cached-cost-critical-path-and-minimum-cgra-cycle-work";
               header["function"] = function.getSymName().str();
               header["representation"] = "factored-plus-exact-schedule";
               header["candidate_count"] = descriptor.candidateCount;
@@ -6108,10 +6310,11 @@ struct ScoreExactJointTaskCandidatesPass
               header["shape_frontier_restored_scheduler_calls"] =
                   static_cast<int64_t>(frontierRestoredSchedulerCalls);
               header["shape_frontier_scheduler_calls_this_run"] =
-                  static_cast<int64_t>(
-                      productionSchedulerCalls >= frontierRestoredSchedulerCalls
-                          ? productionSchedulerCalls - frontierRestoredSchedulerCalls
-                          : 0);
+                  static_cast<int64_t>(productionSchedulerCalls >=
+                                               frontierRestoredSchedulerCalls
+                                           ? productionSchedulerCalls -
+                                                 frontierRestoredSchedulerCalls
+                                           : 0);
               header["shape_frontier_restored_expanded_shape_nodes"] =
                   static_cast<int64_t>(frontierRestoredExpandedShapeNodes);
               header["shape_frontier_contract"] =
@@ -6121,7 +6324,7 @@ struct ScoreExactJointTaskCandidatesPass
               header["canonical_seed_continuation_state"] =
                   canonicalIncumbentSeed.getValue()
                       ? (canonicalSeedContinuationComplete ? "complete"
-                                                            : "incomplete")
+                                                           : "incomplete")
                       : "disabled";
               header["canonical_seed_scheduler_calls"] =
                   static_cast<int64_t>(canonicalSeedSchedulerCalls);
@@ -6138,13 +6341,15 @@ struct ScoreExactJointTaskCandidatesPass
               header["max_cgras_per_task"] =
                   static_cast<int64_t>(descriptor.maxCgrasPerTask);
               header["communication_mode"] = "explicit";
-              header["start_policy"] = scoreStartPolicy(temporalModel, scheduleSpace).str();
-              header["scheduler_backend"] = productionScheduler ? "orchestrate-tasks-on-accelerators" : "orbit-exact-enumerator";
-        header["orbit_4x4_pruning"] = !productionScheduler;
-        header["schedule_space"] = scheduleSpace.getValue();
+              header["start_policy"] =
+                  scoreStartPolicy(temporalModel, scheduleSpace).str();
+              header["scheduler_backend"] =
+                  productionScheduler ? "orchestrate-tasks-on-accelerators"
+                                      : "orbit-exact-enumerator";
+              header["orbit_4x4_pruning"] = !productionScheduler;
+              header["schedule_space"] = scheduleSpace.getValue();
               if (productionScheduler)
-                header["tie_key_policy"] =
-                    kProductionNumericTieKeyPolicy.str();
+                header["tie_key_policy"] = kProductionNumericTieKeyPolicy.str();
               header["placement_coverage_limited"] = scheduleSpace != "exact";
               header["production_ready"] = false;
               header["predictor_status"] = "exploratory";
@@ -6156,16 +6361,22 @@ struct ScoreExactJointTaskCandidatesPass
               header["dispatch_policy_scope"] =
                   selectedDispatchPolicy == DispatchPolicy::Fixed
                       ? "canonical-smallest-ready-task"
-                      : productionScheduler ? "production-critical-path-dependency-ready"
-                                            : "all-ready-task-orders";
+                  : productionScheduler
+                      ? "production-critical-path-dependency-ready"
+                      : "all-ready-task-orders";
               header["max_makespan"] = maxMakespan.getValue();
-              header["horizon_proven"] = !seedOnly.getValue() && horizonCertified;
-              header["global_shape_location_temporal_space"] = scheduleSpace != "production-scheduler";
-        header["temporal_search_scope"] = scoreTemporalScope(temporalModel).str();
-        header["cycle_starts_are_search_dimensions"] = temporalModel == "all-integer-diagnostic";
+              header["horizon_proven"] =
+                  !seedOnly.getValue() && horizonCertified;
+              header["global_shape_location_temporal_space"] =
+                  scheduleSpace != "production-scheduler";
+              header["temporal_search_scope"] =
+                  scoreTemporalScope(temporalModel).str();
+              header["cycle_starts_are_search_dimensions"] =
+                  temporalModel == "all-integer-diagnostic";
               header["shape_domain_pruning"] =
-                  productionScheduler ? "dependency-release-tail-cost-only"
-                                : "dependency-release-tail-and-energetic-work";
+                  productionScheduler
+                      ? "dependency-release-tail-cost-only"
+                      : "dependency-release-tail-and-energetic-work";
               header["shape_domain_status"] = shapeDomainStatus;
               header["shape_domain_bound_cycles"] = shapeDomainBound;
               header["shape_domain_fixed_point_iterations"] =
@@ -6176,8 +6387,8 @@ struct ScoreExactJointTaskCandidatesPass
               for (unsigned task = 0; task < shapeDomains.size(); ++task) {
                 llvm::json::Object item;
                 item["task"] = (*metadata)[task].name;
-                item["original_shape_count"] = static_cast<int64_t>(
-                    descriptor.shapesByTask[task].size());
+                item["original_shape_count"] =
+                    static_cast<int64_t>(descriptor.shapesByTask[task].size());
                 item["retained_shape_count"] =
                     static_cast<int64_t>(shapeDomains[task].size());
                 int64_t minimumArea = std::numeric_limits<int64_t>::max();
@@ -6249,15 +6460,23 @@ struct ScoreExactJointTaskCandidatesPass
                          std::to_string(tieRestrictedCpNoEligible));
               putDecimal(header, "tie_restricted_cp_invalid",
                          std::to_string(tieRestrictedCpInvalid));
-        header["shape_shard_count"] = shapeShardCount.getValue();
-        header["shape_shard_index"] = shapeShardIndex.getValue();
-        putDecimal(header, "shape_partition_begin", exactShapeIndexString(shardBegin));
-        putDecimal(header, "shape_partition_end", exactShapeIndexString(shardEnd));
-        putDecimal(header, "shape_partition_candidate_count", exactShapeIndexString(shardSize));
-        putDecimal(header, "partition_skipped_subtrees", std::to_string(partitionSkippedSubtrees));
-        header["elapsed_seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
-        addProductionCoverage(header, temporalModel, scheduleSpace, dispatchPolicy, function);
-        writeJsonLine(stream, std::move(header));
+              header["shape_shard_count"] = shapeShardCount.getValue();
+              header["shape_shard_index"] = shapeShardIndex.getValue();
+              putDecimal(header, "shape_partition_begin",
+                         exactShapeIndexString(shardBegin));
+              putDecimal(header, "shape_partition_end",
+                         exactShapeIndexString(shardEnd));
+              putDecimal(header, "shape_partition_candidate_count",
+                         exactShapeIndexString(shardSize));
+              putDecimal(header, "partition_skipped_subtrees",
+                         std::to_string(partitionSkippedSubtrees));
+              header["elapsed_seconds"] =
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - begun)
+                      .count();
+              addProductionCoverage(header, temporalModel, scheduleSpace,
+                                    dispatchPolicy, function);
+              writeJsonLine(stream, std::move(header));
               for (RankedSchedule &entry : ranked)
                 writeJsonLine(stream, std::move(entry.record));
               llvm::json::Object footer;
@@ -6279,10 +6498,11 @@ struct ScoreExactJointTaskCandidatesPass
               footer["shape_frontier_restored_scheduler_calls"] =
                   static_cast<int64_t>(frontierRestoredSchedulerCalls);
               footer["shape_frontier_scheduler_calls_this_run"] =
-                  static_cast<int64_t>(
-                      productionSchedulerCalls >= frontierRestoredSchedulerCalls
-                          ? productionSchedulerCalls - frontierRestoredSchedulerCalls
-                          : 0);
+                  static_cast<int64_t>(productionSchedulerCalls >=
+                                               frontierRestoredSchedulerCalls
+                                           ? productionSchedulerCalls -
+                                                 frontierRestoredSchedulerCalls
+                                           : 0);
               footer["shape_frontier_restored_expanded_shape_nodes"] =
                   static_cast<int64_t>(frontierRestoredExpandedShapeNodes);
               footer["shape_frontier_contract"] =
@@ -6292,28 +6512,34 @@ struct ScoreExactJointTaskCandidatesPass
                 footer["shape_frontier_binding_witness_path"] =
                     frontierOutputBindingPath;
               }
-              footer["status"] = seedOnly.getValue()
-                                      ? "seed-only"
-                                      : outputComplete
-                                      ? (globallyComplete && !complete
-                                             ? "globally-pruned"
-                                             : "complete")
-                                      : (shapeShardCount.getValue() > 1 && partitionFinished
-                                             ? "partition-complete"
-                                             : graphBoundOnly.getValue() &&
-                                         firstBlockingReason.empty()
-                                             ? "bound-only-retained"
-                                             : "bounded_incomplete");
+              footer["status"] =
+                  seedOnly.getValue() ? "seed-only"
+                  : outputComplete
+                      ? (globallyComplete && !complete ? "globally-pruned"
+                                                       : "complete")
+                      : (shapeShardCount.getValue() > 1 && partitionFinished
+                             ? "partition-complete"
+                         : graphBoundOnly.getValue() &&
+                                 firstBlockingReason.empty()
+                             ? "bound-only-retained"
+                             : "bounded_incomplete");
               footer["graph_bound_only"] = graphBoundOnly.getValue();
               footer["incomplete"] = seedOnly.getValue() || !outputComplete;
-              footer["reason"] = seedOnly.getValue() ? "seed-only-requested" :
-                  outputComplete ? "" :
-                  (shapeShardCount.getValue() > 1 && partitionFinished ? "complete-shape-partition" : interruptionReason.empty() ? "fewer-than-top-k" : interruptionReason);
+              footer["reason"] =
+                  seedOnly.getValue() ? "seed-only-requested"
+                  : outputComplete
+                      ? ""
+                      : (shapeShardCount.getValue() > 1 && partitionFinished
+                             ? "complete-shape-partition"
+                         : interruptionReason.empty() ? "fewer-than-top-k"
+                                                      : interruptionReason);
               if (!failedProductionCandidateId.empty()) {
-                footer["failed_production_shape_candidate_id"] = failedProductionCandidateId;
-                footer["failed_production_phase"] = failedProductionWarmup ? "warmup" : "search";
-                footer["failed_production_task_costs"] =
-                    makeTaskCosts(failedProductionChoices, failedProductionCosts);
+                footer["failed_production_shape_candidate_id"] =
+                    failedProductionCandidateId;
+                footer["failed_production_phase"] =
+                    failedProductionWarmup ? "warmup" : "search";
+                footer["failed_production_task_costs"] = makeTaskCosts(
+                    failedProductionChoices, failedProductionCosts);
               }
               footer["seed_only"] = seedOnly.getValue();
               footer["feasible_only"] = seedOnly.getValue();
@@ -6321,28 +6547,33 @@ struct ScoreExactJointTaskCandidatesPass
                   seedOnly.getValue() ? static_cast<int64_t>(ranked.size()) : 0;
               putDecimal(footer, "candidate_count", descriptor.candidateCount);
               putDecimal(footer, "shape_candidates_visited",
-                          exactShapeIndexString(visitedShapes));
+                         exactShapeIndexString(visitedShapes));
               putDecimal(footer, "valid_shape_candidates",
-                          exactShapeIndexString(validShapes));
+                         exactShapeIndexString(validShapes));
               putDecimal(footer, "domain_pruned_shape_candidates",
                          exactShapeIndexString(domainPrunedShapes));
-              llvm::APInt totalShapeCount(counterWidth, descriptor.candidateCount, 10);
+              llvm::APInt totalShapeCount(counterWidth,
+                                          descriptor.candidateCount, 10);
               llvm::APInt unmeasuredShapes =
                   totalShapeCount.uge(visitedShapes + boundPrunedShapes)
                       ? totalShapeCount - visitedShapes - boundPrunedShapes
                       : llvm::APInt(counterWidth, 0);
               putDecimal(footer, "unmeasured_shape_candidates",
                          exactShapeIndexString(unmeasuredShapes));
-              putDecimal(footer, "bound_pruned_shape_candidates", exactShapeIndexString(boundPrunedShapes));
+              putDecimal(footer, "bound_pruned_shape_candidates",
+                         exactShapeIndexString(boundPrunedShapes));
               footer["shape_domain_status"] = shapeDomainStatus;
               footer["shape_domain_bound_cycles"] = shapeDomainBound;
               footer["shape_domain_fixed_point_iterations"] =
                   static_cast<int64_t>(shapeDomainIterations);
               footer["shape_domain_window_rejected_options"] =
                   static_cast<int64_t>(shapeDomainWindowRejectedOptions);
-              putDecimal(footer, "expanded_shape_nodes", std::to_string(expandedShapeNodes));
-              putDecimal(footer, "bound_rejected_schedule_branches", std::to_string(boundRejectedBranches));
-              putDecimal(footer, "geometry_time_bound_rejected_branches", std::to_string(geometryTimeBoundRejectedBranches));
+              putDecimal(footer, "expanded_shape_nodes",
+                         std::to_string(expandedShapeNodes));
+              putDecimal(footer, "bound_rejected_schedule_branches",
+                         std::to_string(boundRejectedBranches));
+              putDecimal(footer, "geometry_time_bound_rejected_branches",
+                         std::to_string(geometryTimeBoundRejectedBranches));
               putDecimal(footer, "prefix_window_bound_calls",
                          std::to_string(prefixWindowBoundCalls));
               putDecimal(footer, "prefix_window_bound_rejected",
@@ -6357,13 +6588,14 @@ struct ScoreExactJointTaskCandidatesPass
                          std::to_string(tieRestrictedCpNoEligible));
               putDecimal(footer, "tie_restricted_cp_invalid",
                          std::to_string(tieRestrictedCpInvalid));
-              putDecimal(footer, "seed_schedules", std::to_string(seedSchedules));
+              putDecimal(footer, "seed_schedules",
+                         std::to_string(seedSchedules));
               footer["canonical_incumbent_seed_enabled"] =
                   canonicalIncumbentSeed.getValue();
               footer["canonical_seed_continuation_state"] =
                   canonicalIncumbentSeed.getValue()
                       ? (canonicalSeedContinuationComplete ? "complete"
-                                                            : "incomplete")
+                                                           : "incomplete")
                       : "disabled";
               footer["canonical_seed_scheduler_calls"] =
                   static_cast<int64_t>(canonicalSeedSchedulerCalls);
@@ -6378,8 +6610,7 @@ struct ScoreExactJointTaskCandidatesPass
                   stateMemoCanonicalStateAvailable;
               footer["state_memo_external_cutoff_monotonic"] =
                   scheduleSpace == "exact";
-              footer["state_memo_cutoff_violation"] =
-                  stateMemoCutoffViolation;
+              footer["state_memo_cutoff_violation"] = stateMemoCutoffViolation;
               footer["state_memo_capacity"] = stateMemoCapacity.getValue();
               footer["state_memo_entries"] =
                   static_cast<int64_t>(stateMemoEntries);
@@ -6388,11 +6619,16 @@ struct ScoreExactJointTaskCandidatesPass
                   static_cast<int64_t>(stateMemoPrunedSubtrees);
               footer["state_memo_capacity_skips"] =
                   static_cast<int64_t>(stateMemoCapacitySkips);
-              footer["optimistic_ends_memo_enabled"] = optimisticEndsMemoEnabled;
-              putDecimal(footer, "optimistic_ends_computations", std::to_string(optimisticEndsComputations));
-              putDecimal(footer, "optimistic_ends_memo_hits", std::to_string(optimisticEndsMemoHits));
-              putDecimal(footer, "optimistic_ends_memo_entries", std::to_string(optimisticEndsMemoEntries));
-              putDecimal(footer, "optimistic_ends_memo_capacity_skips", std::to_string(optimisticEndsMemoCapacitySkips));
+              footer["optimistic_ends_memo_enabled"] =
+                  optimisticEndsMemoEnabled;
+              putDecimal(footer, "optimistic_ends_computations",
+                         std::to_string(optimisticEndsComputations));
+              putDecimal(footer, "optimistic_ends_memo_hits",
+                         std::to_string(optimisticEndsMemoHits));
+              putDecimal(footer, "optimistic_ends_memo_entries",
+                         std::to_string(optimisticEndsMemoEntries));
+              putDecimal(footer, "optimistic_ends_memo_capacity_skips",
+                         std::to_string(optimisticEndsMemoCapacitySkips));
               footer["unsupported_shape_candidates"] =
                   static_cast<int64_t>(unsupportedShapes);
               footer["global_cutoff_requested"] = globalIncumbent.requested;
@@ -6450,21 +6686,25 @@ struct ScoreExactJointTaskCandidatesPass
               footer["dispatch_policy_scope"] =
                   selectedDispatchPolicy == DispatchPolicy::Fixed
                       ? "canonical-smallest-ready-task"
-                      : productionScheduler ? "production-critical-path-dependency-ready"
-                                            : "all-ready-task-orders";
-              footer["horizon_proven"] = !seedOnly.getValue() && horizonCertified;
+                  : productionScheduler
+                      ? "production-critical-path-dependency-ready"
+                      : "all-ready-task-orders";
+              footer["horizon_proven"] =
+                  !seedOnly.getValue() && horizonCertified;
               footer["top_k_requested"] = topK.getValue();
               footer["top_k_certified"] = !seedOnly.getValue() && complete;
               footer["ranking_certificate"] =
                   seedOnly.getValue() ? "feasible-seed-only"
-                  : complete ? scoreRankingCertificate(temporalModel, scheduleSpace).str()
-                           : globallyComplete ? "proven-global-incumbent-cycle-cutoff"
-                           : "best-found-uncertified";
-              putDecimal(footer, "production_scheduler_calls", std::to_string(productionSchedulerCalls));
+                  : complete
+                      ? scoreRankingCertificate(temporalModel, scheduleSpace)
+                            .str()
+                  : globallyComplete ? "proven-global-incumbent-cycle-cutoff"
+                                     : "best-found-uncertified";
+              putDecimal(footer, "production_scheduler_calls",
+                         std::to_string(productionSchedulerCalls));
               footer["orbit_4x4_pruning"] = !productionScheduler;
               if (productionScheduler)
-                footer["tie_key_policy"] =
-                    kProductionNumericTieKeyPolicy.str();
+                footer["tie_key_policy"] = kProductionNumericTieKeyPolicy.str();
               footer["score_cache_enabled"] = scoreCacheRequested;
               footer["score_cache_disabled_for_global_cutoff"] =
                   scoreCacheDisabledForGlobalCutoff;
@@ -6487,15 +6727,23 @@ struct ScoreExactJointTaskCandidatesPass
               }
               footer["shortlist"] = std::move(shortlist);
               footer["ranking_pruning"] = rankingPruning.getValue();
-        footer["shape_shard_count"] = shapeShardCount.getValue();
-        footer["shape_shard_index"] = shapeShardIndex.getValue();
-        putDecimal(footer, "shape_partition_begin", exactShapeIndexString(shardBegin));
-        putDecimal(footer, "shape_partition_end", exactShapeIndexString(shardEnd));
-        putDecimal(footer, "shape_partition_candidate_count", exactShapeIndexString(shardSize));
-        putDecimal(footer, "partition_skipped_subtrees", std::to_string(partitionSkippedSubtrees));
-        footer["elapsed_seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
-        addProductionCoverage(footer, temporalModel, scheduleSpace, dispatchPolicy, function);
-        writeJsonLine(stream, std::move(footer));
+              footer["shape_shard_count"] = shapeShardCount.getValue();
+              footer["shape_shard_index"] = shapeShardIndex.getValue();
+              putDecimal(footer, "shape_partition_begin",
+                         exactShapeIndexString(shardBegin));
+              putDecimal(footer, "shape_partition_end",
+                         exactShapeIndexString(shardEnd));
+              putDecimal(footer, "shape_partition_candidate_count",
+                         exactShapeIndexString(shardSize));
+              putDecimal(footer, "partition_skipped_subtrees",
+                         std::to_string(partitionSkippedSubtrees));
+              footer["elapsed_seconds"] =
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - begun)
+                      .count();
+              addProductionCoverage(footer, temporalModel, scheduleSpace,
+                                    dispatchPolicy, function);
+              writeJsonLine(stream, std::move(footer));
               return true;
             },
             error)) {
@@ -6505,8 +6753,8 @@ struct ScoreExactJointTaskCandidatesPass
     if (complete && scoreCache.owner()) {
       std::string cacheError;
       if (!scoreCache.publish(outputFile, cacheError))
-        function.emitRemark() << "exact score cache publication skipped: "
-                              << cacheError;
+        function.emitRemark()
+            << "exact score cache publication skipped: " << cacheError;
     } else if (!complete && scoreCache.owner()) {
       scoreCache.discard();
     }

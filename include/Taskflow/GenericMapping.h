@@ -1,8 +1,8 @@
 #ifndef ORBIT_TASKFLOW_GENERIC_MAPPING_H
 #define ORBIT_TASKFLOW_GENERIC_MAPPING_H
 #include "Taskflow/GenericAnalysis.h"
-#include "Taskflow/StaticMapping.h"
 #include "Taskflow/ProgramMapping.h"
+#include "Taskflow/StaticMapping.h"
 namespace orbit::taskflow {
 // Search choices are separate from source access/dependence facts and from
 // the AIR resource bindings below. Indices refer to analyzed source objects.
@@ -11,9 +11,11 @@ namespace orbit::taskflow {
 struct ProgramResidencyGroup {
   std::vector<size_t> tasks, retainedStorages;
   bool operator==(const ProgramResidencyGroup &other) const {
-    return tasks==other.tasks && retainedStorages==other.retainedStorages;
+    return tasks == other.tasks && retainedStorages == other.retainedStorages;
   }
-  bool operator!=(const ProgramResidencyGroup &other) const {return !(*this==other);}
+  bool operator!=(const ProgramResidencyGroup &other) const {
+    return !(*this == other);
+  }
 };
 struct ProgramMappingChoice {
   // Empty realization/grouping are accepted only as syntactic adapter-auto
@@ -33,12 +35,14 @@ struct ProgramMappingChoice {
   // Empty vectors preserve the legacy ungrouped source action.
   std::vector<size_t> taskGroup, retainedStorages;
   // Scoped decisions. Legacy fields above denote one group when this is empty.
-  // A logical storage may also have consumers outside its local residency scope.
+  // A logical storage may also have consumers outside its local residency
+  // scope.
   std::vector<ProgramResidencyGroup> residencyGroups;
 };
 std::vector<ProgramMappingChoice>
-discoverGenericMappingChoices(const GenericAnalysis &,size_t maxResidencyProposals=8,
-                              size_t maxResidencyGroups=4);
+discoverGenericMappingChoices(const GenericAnalysis &,
+                              size_t maxResidencyProposals = 8,
+                              size_t maxResidencyGroups = 4);
 struct GenericTaskImplementation {
   size_t task = 0;
   std::string kind = "scalar";
@@ -69,10 +73,10 @@ struct GenericTileRetention {
   int64_t initializerTask = -1;
 };
 struct GenericResidencyScope {
-  size_t beginPhase=0, endPhase=0;
+  size_t beginPhase = 0, endPhase = 0;
   std::vector<size_t> tasks, retainedStorages, boundaryExports;
   // Selected implementation lifetime contract, not a semantic source edge.
-  std::string inputReleasePolicy="group-tail"; // group-tail | last-reader
+  std::string inputReleasePolicy = "group-tail"; // group-tail | last-reader
 };
 struct GenericTransfer {
   size_t storage = 0;
@@ -98,11 +102,12 @@ struct GenericAIRChannelAllocation {
 // Optional direct-AIR cost facts and provider. These do not alter compute
 // semantics or the existing CGRA model. Operation keys are "name:dtype".
 struct GenericCostFeatures {
-  // Hash of the complete checked execution plan with all price metadata removed.
+  // Hash of the complete checked execution plan with all price metadata
+  // removed.
   std::string executionFingerprint;
   // Source SSA/access family with static extents/names erased, not a price key.
   std::string regionFamilyFingerprint, architectureFingerprint;
-  std::map<std::string,int64_t> values, operations;
+  std::map<std::string, int64_t> values, operations;
   std::vector<std::string> sourceFingerprints, implementations;
 };
 struct GenericDirectAIRCost {
@@ -124,10 +129,11 @@ struct GenericMemoryBinding {
 };
 struct GenericTargetCapabilities {
   int64_t capacityBytes = 24576;
-  int64_t maxGroupInputs=2,maxGroupOutputs=2;
-  bool acquireAllInputsAtGroupEntry=true;
-  std::vector<int64_t> tileAlignment{1,8,1};
-  std::vector<GenericTaskImplementation> implementations{{0,"scalar",-1,1},{0,"scalar-product-vector-add-f32",-1,8}};
+  int64_t maxGroupInputs = 2, maxGroupOutputs = 2;
+  bool acquireAllInputsAtGroupEntry = true;
+  std::vector<int64_t> tileAlignment{1, 8, 1};
+  std::vector<GenericTaskImplementation> implementations{
+      {0, "scalar", -1, 1}, {0, "scalar-product-vector-add-f32", -1, 8}};
   std::string identity;
 };
 bool configureGenericMemory(const llvm::json::Value &, int64_t capacity,
@@ -135,10 +141,14 @@ bool configureGenericMemory(const llvm::json::Value &, int64_t capacity,
 bool checkGenericMemory(const GenericMemoryBinding &, int64_t capacity,
                         std::string &error);
 bool getGenericTargetCapabilities(const llvm::json::Value &,
-    GenericTargetCapabilities &, std::string &error);
+                                  GenericTargetCapabilities &,
+                                  std::string &error);
 llvm::json::Value serializeGenericMemory(const GenericMemoryBinding &);
-llvm::json::Value serializeGenericCapabilities(const GenericTargetCapabilities &);
-bool checkGenericCapabilities(const GenericMemoryBinding &, const GenericTargetCapabilities &, std::string &error);
+llvm::json::Value
+serializeGenericCapabilities(const GenericTargetCapabilities &);
+bool checkGenericCapabilities(const GenericMemoryBinding &,
+                              const GenericTargetCapabilities &,
+                              std::string &error);
 struct GenericMappingPlan {
   GenericMemoryBinding memoryBinding;
   GenericTargetCapabilities targetCapabilities;
@@ -170,14 +180,20 @@ struct GenericMappingPlan {
          theoreticalPerByteMs = 0;
   std::string costProvenance = "unknown: direct AIR path not calibrated";
 };
-// Resolved scope queries are shared with lowering; no backend placement inference.
-const GenericResidencyScope *genericResidencyScope(const GenericMappingPlan &,size_t phase);
-bool genericLocallyRetained(const GenericMappingPlan &,size_t phase,size_t storage);
-std::vector<ProgramResidencyGroup> genericResidencyGroups(const ProgramMappingChoice &);
+// Resolved scope queries are shared with lowering; no backend placement
+// inference.
+const GenericResidencyScope *genericResidencyScope(const GenericMappingPlan &,
+                                                   size_t phase);
+bool genericLocallyRetained(const GenericMappingPlan &, size_t phase,
+                            size_t storage);
+std::vector<ProgramResidencyGroup>
+genericResidencyGroups(const ProgramMappingChoice &);
 // Monotonic process/thread-local diagnostics only. They neither select plans
 // nor alter candidate/cache identities. Snapshot deltas count actual entries,
 // including the planner's internal final checker invocation.
-struct GenericMappingStatistics { uint64_t plannerCalls=0, checkerCalls=0, costProviderCalls=0; };
+struct GenericMappingStatistics {
+  uint64_t plannerCalls = 0, checkerCalls = 0, costProviderCalls = 0;
+};
 GenericMappingStatistics genericMappingStatistics();
 // Shared by the two native complete-cost providers; no nested double charge.
 void recordGenericMappingCostProviderCall();
@@ -190,16 +206,19 @@ llvm::json::Value serializeGenericMapping(const GenericAnalysis &,
                                           const GenericMappingPlan &);
 // Native facts only; no fitting and no target queries. Full-call composite
 // estimates must never be added to separately charged compute/link estimates.
-bool collectGenericCostFeatures(const GenericAnalysis &, const GenericMappingPlan &,
+bool collectGenericCostFeatures(const GenericAnalysis &,
+                                const GenericMappingPlan &,
                                 GenericCostFeatures &, std::string &error);
 llvm::json::Value serializeGenericCostFeatures(const GenericCostFeatures &);
 bool evaluateGenericDirectAIRCost(const GenericCostFeatures &,
-    const llvm::json::Value &model, const llvm::json::Value &target,
-    GenericDirectAIRCost &, std::string &error);
+                                  const llvm::json::Value &model,
+                                  const llvm::json::Value &target,
+                                  GenericDirectAIRCost &, std::string &error);
 // Native adapters for the shared version/copy model; no operator recognition.
 bool deriveGenericPhaseRegions(const GenericAnalysis &, GenericTilePhase &,
                                int64_t &bytes, std::string &error);
-void collectGenericAllocations(const GenericAnalysis &, const GenericMappingPlan &,
+void collectGenericAllocations(const GenericAnalysis &,
+                               const GenericMappingPlan &,
                                std::vector<MappingAllocation> &);
 // Compatibility importer only: promote explicit source interface metadata to
 // native function arguments. Never used by native MLIR analysis/code

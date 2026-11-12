@@ -33,12 +33,14 @@ inline LogicalResult prepareMapperCounterBounds(func::FuncOp wrapper) {
         literal = producer->getAttrOfType<IntegerAttr>("value");
       if (literal) {
         if (!bound.getType().isIndex() || !literal.getType().isIndex()) {
-          counter.emitError("mapper counter literal and operand must have index type");
+          counter.emitError(
+              "mapper counter literal and operand must have index type");
           invalid = true;
           return;
         }
         if (!literal.getValue().isSignedIntN(64)) {
-          counter.emitError("mapper counter literal exceeds signed 64-bit bounds");
+          counter.emitError(
+              "mapper counter literal exceeds signed 64-bit bounds");
           invalid = true;
           return;
         }

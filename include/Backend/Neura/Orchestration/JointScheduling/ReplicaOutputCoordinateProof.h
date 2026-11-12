@@ -15,8 +15,8 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
@@ -33,7 +33,8 @@ struct ReplicaOutputCoordinateProof {
   // sentinel in the legacy counter-map vectors so existing callers can still
   // compare the complete rank-sized map; outputConstantAxes carries the
   // authenticated value for those sentinel entries.
-  static constexpr unsigned kConstantAxis = std::numeric_limits<unsigned>::max();
+  static constexpr unsigned kConstantAxis =
+      std::numeric_limits<unsigned>::max();
 
   bool proven = false;
   bool selectedAxisIndependent = false;
@@ -43,8 +44,7 @@ struct ReplicaOutputCoordinateProof {
   SmallVector<unsigned> outputCounterAxes;
   SmallVector<SmallVector<unsigned>> outputAccessCounterAxes;
   SmallVector<std::optional<int64_t>> outputConstantAxes;
-  SmallVector<SmallVector<std::optional<int64_t>>>
-      outputAccessConstantAxes;
+  SmallVector<SmallVector<std::optional<int64_t>>> outputAccessConstantAxes;
   SmallVector<unsigned> auxiliaryInputIndices;
   SmallVector<int64_t> taskLowers;
   SmallVector<int64_t> taskUppers;
@@ -95,7 +95,7 @@ inline bool fitsUnsignedWidth(int64_t value, uint64_t width) {
 }
 
 inline std::optional<int64_t> integerAttributeValue(IntegerAttr attribute,
-                                                     Type type) {
+                                                    Type type) {
   const llvm::APInt &value = attribute.getValue();
   if (isa<IndexType>(type)) {
     if (!value.isSignedIntN(64))
@@ -138,12 +138,12 @@ input0StaticIndexBound(mlir::func::FuncOp function,
       function->getAttrOfType<IntegerAttr>("amoeba.input0_caller_static_bound");
   auto caller =
       function->getAttrOfType<StringAttr>("amoeba.input0_caller_function");
-  auto evidence = function->getAttrOfType<StringAttr>(
-      "amoeba.input0_caller_evidence_path");
+  auto evidence =
+      function->getAttrOfType<StringAttr>("amoeba.input0_caller_evidence_path");
   auto proofMode = function->getAttrOfType<StringAttr>(
       "amoeba.input0_caller_noalias_proof_mode");
-  std::string boundName = "amoeba.static_bound.arg." +
-                          std::to_string(argument.getArgNumber());
+  std::string boundName =
+      "amoeba.static_bound.arg." + std::to_string(argument.getArgNumber());
   auto sourceBound = function->getAttrOfType<IntegerAttr>(boundName);
   if (!callerBound || !caller || caller.getValue().empty() || !evidence ||
       evidence.getValue().empty() || !proofMode ||
@@ -161,8 +161,9 @@ input0StaticIndexBound(mlir::func::FuncOp function,
   return callerBound.getInt();
 }
 
-inline std::optional<int64_t> checkedStaticIntegerBinary(
-    mlir::Operation *operation, int64_t lhs, int64_t rhs, bool subtract) {
+inline std::optional<int64_t>
+checkedStaticIntegerBinary(mlir::Operation *operation, int64_t lhs, int64_t rhs,
+                           bool subtract) {
   using namespace mlir;
   if (!operation || operation->getNumOperands() != 2 ||
       operation->getNumResults() != 1)
@@ -269,8 +270,8 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
     // each path so two alternatives that forward the same literal (through
     // distinct grant_predicate operations) still authenticate as one value.
     llvm::SmallDenseSet<Value, 16> firstVisiting = visiting;
-    auto first = staticIndex(definition->getOperand(0), task, kernel,
-                             firstVisiting);
+    auto first =
+        staticIndex(definition->getOperand(0), task, kernel, firstVisiting);
     if (!first)
       return std::nullopt;
     for (Value operand : definition->getOperands().drop_front()) {
@@ -307,8 +308,8 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
       auto constant = staticIndex(operand, task, kernel, visiting);
       if (!constant)
         return std::nullopt;
-      constants.push_back(IntegerAttr::get(IndexType::get(value.getContext()),
-                                           *constant));
+      constants.push_back(
+          IntegerAttr::get(IndexType::get(value.getContext()), *constant));
     }
     SmallVector<Attribute> folded;
     if (failed(apply.getAffineMap().constantFold(constants, folded)) ||
@@ -322,18 +323,16 @@ staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
   return std::nullopt;
 }
 
-inline std::optional<int64_t>
-staticIndex(mlir::Value value, mlir::taskflow::TaskflowTaskOp task,
-            mlir::neura::KernelOp kernel = {}) {
+inline std::optional<int64_t> staticIndex(mlir::Value value,
+                                          mlir::taskflow::TaskflowTaskOp task,
+                                          mlir::neura::KernelOp kernel = {}) {
   llvm::SmallDenseSet<mlir::Value, 16> visiting;
   return staticIndex(value, task, kernel, visiting);
 }
 
-inline std::optional<int64_t>
-staticCounterAttribute(mlir::Operation *operation, llvm::StringRef name,
-                       mlir::Value fallback,
-                       mlir::taskflow::TaskflowTaskOp task,
-                       mlir::neura::KernelOp kernel) {
+inline std::optional<int64_t> staticCounterAttribute(
+    mlir::Operation *operation, llvm::StringRef name, mlir::Value fallback,
+    mlir::taskflow::TaskflowTaskOp task, mlir::neura::KernelOp kernel) {
   using namespace mlir;
   std::optional<int64_t> attributeValue;
   if (Attribute attribute = operation->getAttr(name)) {
@@ -343,8 +342,7 @@ staticCounterAttribute(mlir::Operation *operation, llvm::StringRef name,
       auto input = parseInputReference(attribute);
       if (!input || *input >= kernel.getInputs().size())
         return std::nullopt;
-      attributeValue =
-          staticIndex(kernel.getInputs()[*input], task, kernel);
+      attributeValue = staticIndex(kernel.getInputs()[*input], task, kernel);
       if (!attributeValue)
         return std::nullopt;
     }
@@ -365,9 +363,9 @@ staticCounterAttribute(mlir::Operation *operation, llvm::StringRef name,
   return operandValue;
 }
 
-inline std::optional<unsigned>
-resolveKernelInput(mlir::Value value, mlir::neura::KernelOp kernel,
-                  unsigned depth = 0) {
+inline std::optional<unsigned> resolveKernelInput(mlir::Value value,
+                                                  mlir::neura::KernelOp kernel,
+                                                  unsigned depth = 0) {
   using namespace mlir;
   if (!value || depth >= 32)
     return std::nullopt;
@@ -391,9 +389,9 @@ resolveKernelInput(mlir::Value value, mlir::neura::KernelOp kernel,
   return std::nullopt;
 }
 
-inline std::optional<unsigned>
-accessInput(mlir::Operation *operation, mlir::Value base,
-            mlir::neura::KernelOp kernel) {
+inline std::optional<unsigned> accessInput(mlir::Operation *operation,
+                                           mlir::Value base,
+                                           mlir::neura::KernelOp kernel) {
   bool isLoad = isa<::mlir::neura::LoadIndexedOp>(operation);
   bool isStore = isa<::mlir::neura::StoreIndexedOp>(operation);
   if (isa<mlir::memref::LoadOp, mlir::memref::StoreOp>(operation))
@@ -406,10 +404,10 @@ accessInput(mlir::Operation *operation, mlir::Value base,
   // a folded data value (not a base), but it must still be syntactically and
   // numerically valid when present; malformed or out-of-range references are
   // never ignored.
-  StringRef expectedName = isLoad ? StringRef("lhs_value")
-                                 : StringRef("rhs_value");
-  StringRef oppositeName = isLoad ? StringRef("rhs_value")
-                                  : StringRef("lhs_value");
+  StringRef expectedName =
+      isLoad ? StringRef("lhs_value") : StringRef("rhs_value");
+  StringRef oppositeName =
+      isLoad ? StringRef("rhs_value") : StringRef("lhs_value");
   auto parseFolded = [&](StringRef name) -> std::optional<unsigned> {
     Attribute attribute = operation->getAttr(name);
     if (!attribute)
@@ -444,8 +442,7 @@ accessInput(mlir::Operation *operation, mlir::Value base,
 }
 
 inline std::optional<unsigned>
-counterRoute(mlir::Value value,
-             llvm::ArrayRef<mlir::neura::CounterOp> counters,
+counterRoute(mlir::Value value, llvm::ArrayRef<mlir::neura::CounterOp> counters,
              unsigned depth = 0) {
   using namespace mlir;
   if (!value || depth >= 32)
@@ -494,10 +491,10 @@ inline bool provesDistinctStorage(mlir::Value lhs, mlir::Value rhs) {
     return false;
   Operation *lhsDefinition = lhs.getDefiningOp();
   Operation *rhsDefinition = rhs.getDefiningOp();
-  bool lhsAllocation = lhsDefinition &&
-                       isa<memref::AllocOp, memref::AllocaOp>(lhsDefinition);
-  bool rhsAllocation = rhsDefinition &&
-                       isa<memref::AllocOp, memref::AllocaOp>(rhsDefinition);
+  bool lhsAllocation =
+      lhsDefinition && isa<memref::AllocOp, memref::AllocaOp>(lhsDefinition);
+  bool rhsAllocation =
+      rhsDefinition && isa<memref::AllocOp, memref::AllocaOp>(rhsDefinition);
   if (lhsAllocation && rhsAllocation)
     return lhsDefinition != rhsDefinition;
   if (lhsAllocation && isNoAliasFunctionArgument(rhs))
@@ -588,7 +585,8 @@ callerShape(mlir::Value value, unsigned depth = 0) {
                    (write - producer.getDoneWrites().begin())) {
       return std::nullopt;
     }
-    return callerShape(producer->getOperand(argument.getArgNumber()), depth + 1);
+    return callerShape(producer->getOperand(argument.getArgNumber()),
+                       depth + 1);
   }
   // Private, statically allocated intermediates carry their storage extent
   // directly in the allocation type. The current output rectangle is still
@@ -597,9 +595,10 @@ callerShape(mlir::Value value, unsigned depth = 0) {
       value.getDefiningOp<memref::AllocaOp>()) {
     auto type = dyn_cast<MemRefType>(value.getType());
     if (type && type.hasStaticShape() &&
-        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
+        llvm::all_of(type.getShape(),
+                     [](int64_t extent) { return extent > 0; }))
       return llvm::SmallVector<int64_t>(type.getShape().begin(),
-                                       type.getShape().end());
+                                        type.getShape().end());
     return std::nullopt;
   }
   auto argument = dyn_cast<BlockArgument>(value);
@@ -609,16 +608,17 @@ callerShape(mlir::Value value, unsigned depth = 0) {
   if (!function || argument.getOwner() != &function.getBody().front())
     return std::nullopt;
   Attribute attr = function.getArgAttr(argument.getArgNumber(),
-                                      "amoeba.logical_transfer_shape");
+                                       "amoeba.logical_transfer_shape");
   // A fully static function-argument type independently fixes its storage
   // capacity. Dynamic arguments still require the explicit caller contract;
   // a malformed present contract must not fall back to the type.
   if (!attr) {
     auto type = dyn_cast<MemRefType>(argument.getType());
     if (type && type.hasStaticShape() &&
-        llvm::all_of(type.getShape(), [](int64_t extent) { return extent > 0; }))
+        llvm::all_of(type.getShape(),
+                     [](int64_t extent) { return extent > 0; }))
       return llvm::SmallVector<int64_t>(type.getShape().begin(),
-                                      type.getShape().end());
+                                        type.getShape().end());
     return std::nullopt;
   }
   if (auto dense = dyn_cast_or_null<DenseI64ArrayAttr>(attr))
@@ -671,8 +671,7 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
   using namespace mlir;
   using namespace detail;
   ReplicaOutputCoordinateProof proof;
-  if (!task || !task.getBody().hasOneBlock() ||
-      task.getWillWrites().empty() ||
+  if (!task || !task.getBody().hasOneBlock() || task.getWillWrites().empty() ||
       task.getOriginalWriteMemrefs().size() != task.getWillWrites().size() ||
       outputWriteIndex >= task.getWillWrites().size()) {
     proofFail(proof, "requires a valid Taskflow output and write provenance");
@@ -687,8 +686,8 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     proofFail(proof, "output state/storage rank is not supported");
     return proof;
   }
-  for (auto [index, otherRoot] : llvm::enumerate(
-           task.getOriginalWriteMemrefs())) {
+  for (auto [index, otherRoot] :
+       llvm::enumerate(task.getOriginalWriteMemrefs())) {
     if (index == outputWriteIndex)
       continue;
     if (!provesDistinctStorage(outputRoot, otherRoot)) {
@@ -714,8 +713,7 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     }
     return true;
   };
-  if (!staticDimensionsAgree(outputType) ||
-      !staticDimensionsAgree(rootType)) {
+  if (!staticDimensionsAgree(outputType) || !staticDimensionsAgree(rootType)) {
     proofFail(proof,
               "logical transfer shape disagrees with a static memref extent");
     return proof;
@@ -742,12 +740,11 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     auto lower = staticIndex(counter.getLowerBound(), task);
     auto upper = staticIndex(counter.getUpperBound(), task);
     auto step = staticIndex(counter.getStep(), task);
-    bool parentOK = index == 0
-                        ? !counter.getParentIndex()
-                        : counter.getParentIndex() ==
-                              taskCounters[index - 1].getCounterIndex();
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *upper <= *lower || *step != 1 || !parentOK) {
+    bool parentOK = index == 0 ? !counter.getParentIndex()
+                               : counter.getParentIndex() ==
+                                     taskCounters[index - 1].getCounterIndex();
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *upper <= *lower || *step != 1 || !parentOK) {
       proofFail(proof, "Taskflow counter IDs, parent chain, or bounds invalid");
       return proof;
     }
@@ -770,30 +767,30 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
   for (Operation &operation : kernel.getBody().front())
     if (auto counter = dyn_cast<::mlir::neura::CounterOp>(&operation))
       kernelCounters.push_back(counter);
-  llvm::sort(kernelCounters, [](::mlir::neura::CounterOp lhs,
-                                ::mlir::neura::CounterOp rhs) {
-    auto lhsId = lhs->getAttrOfType<IntegerAttr>("counter_id");
-    auto rhsId = rhs->getAttrOfType<IntegerAttr>("counter_id");
-    if (!lhsId || !rhsId)
-      return static_cast<bool>(lhsId);
-    return lhsId.getInt() < rhsId.getInt();
-  });
+  llvm::sort(kernelCounters,
+             [](::mlir::neura::CounterOp lhs, ::mlir::neura::CounterOp rhs) {
+               auto lhsId = lhs->getAttrOfType<IntegerAttr>("counter_id");
+               auto rhsId = rhs->getAttrOfType<IntegerAttr>("counter_id");
+               if (!lhsId || !rhsId)
+                 return static_cast<bool>(lhsId);
+               return lhsId.getInt() < rhsId.getInt();
+             });
   if (kernelCounters.size() != taskCounters.size()) {
     proofFail(proof, "Taskflow and Neura counter counts differ");
     return proof;
   }
   for (auto [index, counter] : llvm::enumerate(kernelCounters)) {
     auto id = counter->getAttrOfType<IntegerAttr>("counter_id");
-    auto lower = staticCounterAttribute(counter.getOperation(),
-                                        "lower_bound_value",
-                                        counter.getLowerBound(), task, kernel);
-    auto upper = staticCounterAttribute(counter.getOperation(),
-                                        "upper_bound_value",
-                                        counter.getUpperBound(), task, kernel);
+    auto lower =
+        staticCounterAttribute(counter.getOperation(), "lower_bound_value",
+                               counter.getLowerBound(), task, kernel);
+    auto upper =
+        staticCounterAttribute(counter.getOperation(), "upper_bound_value",
+                               counter.getUpperBound(), task, kernel);
     auto step = staticCounterAttribute(counter.getOperation(), "step_value",
                                        counter.getStep(), task, kernel);
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *lower != proof.taskLowers[index] ||
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *lower != proof.taskLowers[index] ||
         *upper != proof.taskUppers[index] || *step != 1) {
       proofFail(proof, "Neura counter bounds do not match Taskflow bounds");
       return proof;
@@ -806,10 +803,10 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
                                  task.getWillWrites().size() +
                                  task.getValueInputs().size();
   if (task.getBody().front().getNumArguments() != expectedBodyArguments) {
-    proofFail(proof, "replica-coordinate-body-args: " +
-                         std::to_string(task.getBody().front().getNumArguments()) +
-                         ", expected " + std::to_string(expectedBodyArguments) +
-                         ")");
+    proofFail(proof,
+              "replica-coordinate-body-args: " +
+                  std::to_string(task.getBody().front().getNumArguments()) +
+                  ", expected " + std::to_string(expectedBodyArguments) + ")");
     return proof;
   }
   if (task.getWillReads().size() != task.getOriginalReadMemrefs().size()) {
@@ -891,9 +888,8 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       auto route = counterRoute(index, kernelCounters);
       if (route) {
         if (!used.insert(*route).second) {
-          proofFail(proof,
-                    "output index routes are not distinct authenticated "
-                    "counters");
+          proofFail(proof, "output index routes are not distinct authenticated "
+                           "counters");
           return;
         }
         mapping.push_back(*route);
@@ -1026,7 +1022,8 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       if (*input != proof.outputInput) {
         if (outputInputIndices.contains(*input))
           return;
-        proofFail(proof, "auxiliary memref store is outside the read-only contract");
+        proofFail(proof,
+                  "auxiliary memref store is outside the read-only contract");
         return;
       }
       checkOutputIndices(operation, store.getIndices());
@@ -1054,7 +1051,8 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     if (counter == ReplicaOutputCoordinateProof::kConstantAxis) {
       if (dimension >= proof.outputConstantAxes.size() ||
           !proof.outputConstantAxes[dimension]) {
-        proofFail(proof, "constant output dimension lacks an authenticated value");
+        proofFail(proof,
+                  "constant output dimension lacks an authenticated value");
         return proof;
       }
       proof.producedLowers[dimension] = *proof.outputConstantAxes[dimension];
@@ -1067,8 +1065,7 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     }
     int64_t lower = proof.taskLowers[counter];
     int64_t upper = proof.taskUppers[counter];
-    if (lower < 0 || upper <= lower ||
-        upper > proof.callerShape[dimension]) {
+    if (lower < 0 || upper <= lower || upper > proof.callerShape[dimension]) {
       proofFail(proof, "produced output region exceeds caller shape");
       return proof;
     }
@@ -1107,11 +1104,9 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
       return proof;
     }
     for (auto [dimension, value] : llvm::enumerate(declared)) {
-      bool isUnmapped =
-          value == std::numeric_limits<int64_t>::min();
+      bool isUnmapped = value == std::numeric_limits<int64_t>::min();
       if (isUnmapped != !proof.outputConstantAxes[dimension] ||
-          (!isUnmapped &&
-           value != *proof.outputConstantAxes[dimension])) {
+          (!isUnmapped && value != *proof.outputConstantAxes[dimension])) {
         proofFail(proof,
                   "declared output constant map does not match IR proof");
         return proof;
@@ -1123,8 +1118,8 @@ analyzeReplicaOutputCoordinates(mlir::taskflow::TaskflowTaskOp task,
     if (auto outputAxisAttr = task->getAttrOfType<IntegerAttr>(
             "amoeba.replica.output_shard_axis"))
       axis = outputAxisAttr.getInt();
-    else if (auto legacyShardAxisAttr = task->getAttrOfType<IntegerAttr>(
-                 "amoeba.replica.shard_axis"))
+    else if (auto legacyShardAxisAttr =
+                 task->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis"))
       axis = legacyShardAxisAttr.getInt();
   }
   if (axis >= 0) {

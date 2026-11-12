@@ -42,8 +42,8 @@ inline constexpr llvm::StringLiteral kSupportedShapeBootstrapPolicy =
     "minimum-area-supported-model-shape-v1";
 inline constexpr double kFormalMax4ModelCeilingII = 20.0;
 inline constexpr std::array<std::pair<int64_t, int64_t>, 8>
-    kFormalMax4CostShapes = {{{4, 4}, {4, 8}, {8, 4}, {4, 12},
-                              {12, 4}, {4, 16}, {8, 8}, {16, 4}}};
+    kFormalMax4CostShapes = {
+        {{4, 4}, {4, 8}, {8, 4}, {4, 12}, {12, 4}, {4, 16}, {8, 8}, {16, 4}}};
 
 // Stores one predictor result. Unsupported queries remain explicit catalogue
 // entries so every candidate can be visited and audited.
@@ -74,8 +74,7 @@ using CostQueryKey = std::tuple<std::string, int64_t, int64_t>;
 // and oriented mapper dimensions bind the spatial query.  A task's trip count
 // is not included because the predictor returns the per-iteration II/startup
 // pair; the scorer applies each task's current trip count afterward.
-using PredictionCacheKey =
-    std::tuple<std::string, int64_t, int64_t>;
+using PredictionCacheKey = std::tuple<std::string, int64_t, int64_t>;
 
 // Loads one complete external predictor catalogue and memoizes lookups by the
 // stable (source task, oriented mapper shape) identity. The per-task query

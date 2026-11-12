@@ -85,7 +85,7 @@ struct FissionPlan {
 static std::optional<int64_t> constantIndex(Value value, TaskflowTaskOp task) {
   DenseSet<Value> active;
   return mlir::amoeba::neura::joint_scheduling::sourceStaticIndex(value, task,
-                                                                active);
+                                                                  active);
 }
 
 // The source capture is pending until the fixed Taskflow-to-Neura lowering
@@ -93,9 +93,10 @@ static std::optional<int64_t> constantIndex(Value value, TaskflowTaskOp task) {
 // capture only when its represented axes are independently rederived from the
 // exact Taskflow counter bounds that remain in both children. Internal axes
 // and already-bound certificates are outside this canonical source form.
-static LogicalResult validatePendingSourceIterationDomain(
-    TaskflowTaskOp task, ArrayRef<TaskflowCounterOp> counters,
-    std::string &error) {
+static LogicalResult
+validatePendingSourceIterationDomain(TaskflowTaskOp task,
+                                     ArrayRef<TaskflowCounterOp> counters,
+                                     std::string &error) {
   bool hasDomain = task->hasAttr(kSourceIterationDomainAttr);
   bool hasPending = task->hasAttr(kSourceIterationCapturePendingAttr);
   if (!hasDomain && !hasPending)
@@ -112,8 +113,9 @@ static LogicalResult validatePendingSourceIterationDomain(
   }
 
   FailureOr<mlir::amoeba::neura::joint_scheduling::SourceIterationDomainInfo>
-      source = mlir::amoeba::neura::joint_scheduling::parseSourceIterationDomain(
-          task, error);
+      source =
+          mlir::amoeba::neura::joint_scheduling::parseSourceIterationDomain(
+              task, error);
   if (failed(source))
     return failure();
   auto &info = *source;
@@ -132,8 +134,7 @@ static LogicalResult validatePendingSourceIterationDomain(
     std::optional<int64_t> step = constantIndex(counter.getStep(), task);
     const auto &axis = info.axes[index];
     if (!lower || !upper || !step || *step <= 0 || *upper <= *lower ||
-        (*lower < 0 &&
-         *upper > std::numeric_limits<int64_t>::max() + *lower)) {
+        (*lower < 0 && *upper > std::numeric_limits<int64_t>::max() + *lower)) {
       error = "fission cannot rederive a static captured Taskflow counter axis";
       return failure();
     }
@@ -174,7 +175,6 @@ static bool isStructuralOrSafeTaskAttribute(NamedAttribute attribute) {
 }
 
 static bool isStorableScalar(Type type) { return type.isIntOrIndexOrFloat(); }
-
 
 static Value canonicalStorageRoot(Value value) {
   DenseSet<Operation *> visited;
@@ -281,7 +281,8 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
     return failure();
   }
   if (!task.getDoneReads().empty() || task.getWillWrites().empty() ||
-      task.getDoneWrites().size() != task.getWillWrites().size() || !task.getValueOutputs().empty() ||
+      task.getDoneWrites().size() != task.getWillWrites().size() ||
+      !task.getValueOutputs().empty() ||
       task.getOriginalWriteMemrefs().size() != task.getWillWrites().size() ||
       task.getOriginalReadMemrefs().size() != task.getWillReads().size()) {
     error = "fission requires tensor write results, matching read/write "
@@ -334,9 +335,11 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
       plan.hyperblock.getBody().front().getTerminator());
   if (!hyperYield || !plan.hyperblock->use_empty() ||
       plan.hyperblock.getNumResults() != plan.hyperblock.getIterArgs().size() ||
-      hyperYield.getIterArgsNext().size() != plan.hyperblock.getIterArgs().size() ||
+      hyperYield.getIterArgsNext().size() !=
+          plan.hyperblock.getIterArgs().size() ||
       !llvm::equal(hyperYield.getResults(), hyperYield.getIterArgsNext())) {
-    error = "fission requires internal recurrence results identical to next-state values";
+    error = "fission requires internal recurrence results identical to "
+            "next-state values";
     return failure();
   }
   Block &taskBody = task.getBody().front();
@@ -346,9 +349,10 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
   if (taskBody.getNumArguments() != expectedArguments ||
       !plan.taskYield.getDoneReads().empty() ||
       plan.taskYield.getDoneWrites().size() != task.getWillWrites().size() ||
-      !llvm::equal(plan.taskYield.getDoneWrites(),
-                   taskBody.getArguments().slice(task.getWillReads().size(),
-                                                task.getWillWrites().size())) ||
+      !llvm::equal(
+          plan.taskYield.getDoneWrites(),
+          taskBody.getArguments().slice(task.getWillReads().size(),
+                                        task.getWillWrites().size())) ||
       !plan.taskYield.getValueResults().empty()) {
     error = "fission requires task operands and yield to directly mirror "
             "tensor state";
@@ -384,30 +388,41 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
   // no predicate, side effect or recurrence update is dropped.
   for (Operation &operation : hyperblockBody.without_terminator()) {
     auto conditional = dyn_cast<scf::IfOp>(&operation);
-    if (!conditional) continue;
+    if (!conditional)
+      continue;
     auto compare = conditional.getCondition().getDefiningOp<arith::CmpIOp>();
     if (plan.initialization || conditional.getNumResults() ||
         !conditional.getElseRegion().empty() || !compare ||
         !compare.getResult().hasOneUse() ||
         !llvm::all_of(compare.getOperands(), [&](Value value) {
           return scaffoldConstants.contains(value) ||
-                 llvm::is_contained(hyperblockBody.getArguments().take_front(plan.counters.size()), value);
+                 llvm::is_contained(hyperblockBody.getArguments().take_front(
+                                        plan.counters.size()),
+                                    value);
         })) {
-      error = "fission cannot partition conditional effects outside a counter-only output reset";
+      error = "fission cannot partition conditional effects outside a "
+              "counter-only output reset";
       return failure();
     }
-    for (Operation &effect : conditional.getThenRegion().front().without_terminator()) {
+    for (Operation &effect :
+         conditional.getThenRegion().front().without_terminator()) {
       auto store = dyn_cast<memref::StoreOp>(&effect);
-      auto outputs = taskBody.getArguments().slice(task.getWillReads().size(), task.getWillWrites().size());
-      auto stored = store ? dyn_cast<BlockArgument>(store.getValueToStore()) : BlockArgument();
+      auto outputs = taskBody.getArguments().slice(task.getWillReads().size(),
+                                                   task.getWillWrites().size());
+      auto stored = store ? dyn_cast<BlockArgument>(store.getValueToStore())
+                          : BlockArgument();
       if (!store || !llvm::is_contained(outputs, store.getMemRef()) ||
           !(scaffoldConstants.contains(store.getValueToStore()) ||
             (stored && stored.getOwner() == &taskBody &&
-             stored.getArgNumber() >= task.getWillReads().size() + task.getWillWrites().size())) ||
+             stored.getArgNumber() >=
+                 task.getWillReads().size() + task.getWillWrites().size())) ||
           !llvm::all_of(store.getIndices(), [&](Value index) {
-            return llvm::is_contained(hyperblockBody.getArguments().take_front(plan.counters.size()), index);
+            return llvm::is_contained(
+                hyperblockBody.getArguments().take_front(plan.counters.size()),
+                index);
           })) {
-        error = "fission conditional reset must only store invariant initial values to declared outputs";
+        error = "fission conditional reset must only store invariant initial "
+                "values to declared outputs";
         return failure();
       }
     }
@@ -423,7 +438,8 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
   }
   for (Operation &operation : hyperblockBody.without_terminator()) {
     if (&operation == plan.initialization.getOperation() ||
-        &operation == plan.initializationCondition.getOperation()) continue;
+        &operation == plan.initializationCondition.getOperation())
+      continue;
     if (operation.getNumRegions() != 0 ||
         (!isa<memref::LoadOp, memref::StoreOp>(&operation) &&
          (!isPure(&operation) || !isMemoryEffectFree(&operation)))) {
@@ -444,15 +460,22 @@ static FailureOr<FissionPlan> analyzeFission(TaskflowTaskOp task,
                                                    task.getWillWrites().size());
       // A permutation is injective over the original Cartesian counter domain
       // and preserves source indices verbatim (e.g. Radar's output[j][i]).
-      DenseSet<Value> indexSet(store.getIndices().begin(), store.getIndices().end());
+      DenseSet<Value> indexSet(store.getIndices().begin(),
+                               store.getIndices().end());
       if (!llvm::is_contained(outputs, store.getMemRef()) ||
           store.getIndices().empty() ||
           indexSet.size() != store.getIndices().size() ||
-          !llvm::all_of(store.getIndices(), [&](Value index) {
-            return llvm::is_contained(hyperblockBody.getArguments().take_front(plan.counters.size()), index);
-          }) ||
-          (plan.hyperblock.getIterArgs().empty() && indexSet.size() != plan.counters.size())) {
-        error = "fission requires stores to declared outputs indexed by a permutation of counters";
+          !llvm::all_of(store.getIndices(),
+                        [&](Value index) {
+                          return llvm::is_contained(
+                              hyperblockBody.getArguments().take_front(
+                                  plan.counters.size()),
+                              index);
+                        }) ||
+          (plan.hyperblock.getIterArgs().empty() &&
+           indexSet.size() != plan.counters.size())) {
+        error = "fission requires stores to declared outputs indexed by a "
+                "permutation of counters";
         return failure();
       }
     }
@@ -573,7 +596,8 @@ static LogicalResult validatePartition(FissionPlan &plan,
   SmallVector<int> outputOwners(plan.task.getWillWrites().size(), -1);
   for (auto [index, node] : llvm::enumerate(plan.nodes)) {
     auto store = dyn_cast<memref::StoreOp>(node);
-    if (!store) continue;
+    if (!store)
+      continue;
     unsigned output = cast<BlockArgument>(store.getMemRef()).getArgNumber() -
                       plan.task.getWillReads().size();
     int owner = isLeft[index] ? 0 : 1;
@@ -612,7 +636,8 @@ static LogicalResult validatePartition(FissionPlan &plan,
     }
   // Loop-carried cycles must stay wholly within one stage. In particular a
   // left-to-right cut is not sufficient proof for a reverse recurrence edge.
-  auto yield = cast<TaskflowHyperblockYieldOp>(plan.hyperblock.getBody().front().getTerminator());
+  auto yield = cast<TaskflowHyperblockYieldOp>(
+      plan.hyperblock.getBody().front().getTerminator());
   for (auto [index, next] : llvm::enumerate(yield.getIterArgsNext())) {
     auto producer = plan.producers.find(next);
     if (producer == plan.producers.end()) {
@@ -620,10 +645,12 @@ static LogicalResult validatePartition(FissionPlan &plan,
       return failure();
     }
     bool owner = isLeft[producer->second];
-    Value carried = plan.hyperblock.getBody().front().getArgument(plan.counters.size() + index);
+    Value carried = plan.hyperblock.getBody().front().getArgument(
+        plan.counters.size() + index);
     for (OpOperand &use : carried.getUses()) {
       auto found = llvm::find(plan.nodes, use.getOwner());
-      if (found == plan.nodes.end() || isLeft[std::distance(plan.nodes.begin(), found)] != owner) {
+      if (found == plan.nodes.end() ||
+          isLeft[std::distance(plan.nodes.begin(), found)] != owner) {
         error = "fission partition crosses a loop-carried dependence";
         return failure();
       }
@@ -635,17 +662,22 @@ static LogicalResult validatePartition(FissionPlan &plan,
   for (auto [index, node] : llvm::enumerate(plan.nodes))
     for (Value operand : node->getOperands()) {
       auto argument = dyn_cast<BlockArgument>(operand);
-      if (!argument || argument.getOwner() != &taskBody) continue;
+      if (!argument || argument.getOwner() != &taskBody)
+        continue;
       unsigned ordinal = argument.getArgNumber();
       if (ordinal >= plan.task.getWillReads().size() &&
-          ordinal < plan.task.getWillReads().size() + plan.task.getWillWrites().size() &&
-          outputOwners[ordinal - plan.task.getWillReads().size()] != (isLeft[index] ? 0 : 1)) {
-        error = "fission stage references an output owned by the other partition";
+          ordinal < plan.task.getWillReads().size() +
+                        plan.task.getWillWrites().size() &&
+          outputOwners[ordinal - plan.task.getWillReads().size()] !=
+              (isLeft[index] ? 0 : 1)) {
+        error =
+            "fission stage references an output owned by the other partition";
         return failure();
       }
     }
   if (plan.interfaceValues.empty() && plan.prefixOutputs.empty()) {
-    error = "fission cut has neither a live DFG edge nor an independently owned output";
+    error = "fission cut has neither a live DFG edge nor an independently "
+            "owned output";
     return failure();
   }
   return success();
@@ -654,9 +686,9 @@ static LogicalResult validatePartition(FissionPlan &plan,
 static void setLineage(TaskflowTaskOp source, TaskflowTaskOp target,
                        OpBuilder &builder, ArrayRef<unsigned> leftNodes,
                        unsigned partIndex) {
-  for (StringRef name : {kDlpReplicableAttr, kRuntimeManageableAttr,
-                         kSourceIterationDomainAttr,
-                         kSourceIterationCapturePendingAttr})
+  for (StringRef name :
+       {kDlpReplicableAttr, kRuntimeManageableAttr, kSourceIterationDomainAttr,
+        kSourceIterationCapturePendingAttr})
     if (Attribute value = source->getAttr(name))
       target->setAttr(name, value);
   target->setAttr(kParentTaskAttr, builder.getStringAttr(source.getTaskName()));
@@ -690,7 +722,8 @@ createHyperblock(FissionPlan &plan, ArrayRef<TaskflowCounterOp> counters,
   SmallVector<Value> initial;
   SmallVector<Type> results;
   for (unsigned index : carries) {
-    initial.push_back(mapping.lookupOrDefault(plan.hyperblock.getIterArgs()[index]));
+    initial.push_back(
+        mapping.lookupOrDefault(plan.hyperblock.getIterArgs()[index]));
     results.push_back(plan.hyperblock.getResult(index).getType());
   }
   auto hyperblock = builder.create<TaskflowHyperblockOp>(
@@ -698,8 +731,10 @@ createHyperblock(FissionPlan &plan, ArrayRef<TaskflowCounterOp> counters,
   Block *body = &hyperblock.getBody().emplaceBlock();
   SmallVector<BlockArgument> arguments;
   auto sourceArguments = plan.hyperblock.getBody().front().getArguments();
-  llvm::append_range(arguments, sourceArguments.take_front(plan.counters.size()));
-  for (unsigned index : carries) arguments.push_back(sourceArguments[plan.counters.size() + index]);
+  llvm::append_range(arguments,
+                     sourceArguments.take_front(plan.counters.size()));
+  for (unsigned index : carries)
+    arguments.push_back(sourceArguments[plan.counters.size() + index]);
   for (BlockArgument sourceArgument : arguments) {
     BlockArgument argument =
         body->addArgument(sourceArgument.getType(), plan.task.getLoc());
@@ -717,7 +752,8 @@ static TaskflowTaskOp createStage(FissionPlan &plan, OpBuilder &builder,
   auto &owned = isPrefix ? plan.prefixOutputs : plan.suffixOutputs;
   SmallVector<Value> reads, originalReads, writes, originalWrites;
   if (!isPrefix) {
-    llvm::append_range(reads, prefix.getDoneWrites().take_front(temporaries.size()));
+    llvm::append_range(reads,
+                       prefix.getDoneWrites().take_front(temporaries.size()));
     llvm::append_range(originalReads, temporaries);
   }
   llvm::append_range(reads, plan.task.getWillReads());
@@ -731,28 +767,34 @@ static TaskflowTaskOp createStage(FissionPlan &plan, OpBuilder &builder,
     originalWrites.push_back(plan.task.getOriginalWriteMemrefs()[index]);
   }
   SmallVector<Type> resultTypes;
-  for (Value write : writes) resultTypes.push_back(write.getType());
+  for (Value write : writes)
+    resultTypes.push_back(write.getType());
   auto stage = builder.create<TaskflowTaskOp>(
       plan.task.getLoc(), TypeRange{}, resultTypes, TypeRange{}, reads, writes,
-      plan.task.getValueInputs(), builder.getStringAttr(
-          (Twine(plan.task.getTaskName()) + (isPrefix ? ".split.0" : ".split.1")).str()),
+      plan.task.getValueInputs(),
+      builder.getStringAttr((Twine(plan.task.getTaskName()) +
+                             (isPrefix ? ".split.0" : ".split.1"))
+                                .str()),
       originalReads, originalWrites);
   Block *body = new Block();
   stage.getBody().push_back(body);
   SmallVector<Value> operands(reads);
   llvm::append_range(operands, writes);
   llvm::append_range(operands, plan.task.getValueInputs());
-  for (Value operand : operands) body->addArgument(operand.getType(), plan.task.getLoc());
+  for (Value operand : operands)
+    body->addArgument(operand.getType(), plan.task.getLoc());
   IRMapping mapping;
   Block &source = plan.task.getBody().front();
   unsigned inputOffset = isPrefix ? 0 : temporaries.size();
   for (unsigned index = 0; index < plan.task.getWillReads().size(); ++index)
-    mapping.map(source.getArgument(index), body->getArgument(inputOffset + index));
+    mapping.map(source.getArgument(index),
+                body->getArgument(inputOffset + index));
   unsigned writeOffset = reads.size() + (isPrefix ? temporaries.size() : 0);
   for (auto [position, index] : llvm::enumerate(owned))
     mapping.map(source.getArgument(plan.task.getWillReads().size() + index),
                 body->getArgument(writeOffset + position));
-  unsigned sourceValues = plan.task.getWillReads().size() + plan.task.getWillWrites().size();
+  unsigned sourceValues =
+      plan.task.getWillReads().size() + plan.task.getWillWrites().size();
   for (unsigned index = 0; index < plan.task.getValueInputs().size(); ++index)
     mapping.map(source.getArgument(sourceValues + index),
                 body->getArgument(reads.size() + writes.size() + index));
@@ -760,23 +802,30 @@ static TaskflowTaskOp createStage(FissionPlan &plan, OpBuilder &builder,
   SmallVector<TaskflowCounterOp> counters;
   cloneScaffold(plan, stage, mapping, counters, bodyBuilder);
   auto &carries = isPrefix ? plan.prefixCarries : plan.suffixCarries;
-  auto hyperblock = createHyperblock(plan, counters, mapping, bodyBuilder, carries);
+  auto hyperblock =
+      createHyperblock(plan, counters, mapping, bodyBuilder, carries);
   Block &hyperblockBody = hyperblock.getBody().front();
   OpBuilder kernelBuilder = OpBuilder::atBlockEnd(&hyperblockBody);
   if (plan.initialization) {
-    Operation *compare = kernelBuilder.clone(*plan.initializationCondition, mapping);
-    auto conditional = kernelBuilder.create<scf::IfOp>(plan.task.getLoc(), compare->getResult(0), false);
+    Operation *compare =
+        kernelBuilder.clone(*plan.initializationCondition, mapping);
+    auto conditional = kernelBuilder.create<scf::IfOp>(
+        plan.task.getLoc(), compare->getResult(0), false);
     OpBuilder resetBuilder = conditional.getThenBodyBuilder();
-    for (Operation &effect : plan.initialization.getThenRegion().front().without_terminator()) {
+    for (Operation &effect :
+         plan.initialization.getThenRegion().front().without_terminator()) {
       auto store = cast<memref::StoreOp>(effect);
-      unsigned output = cast<BlockArgument>(store.getMemRef()).getArgNumber() - plan.task.getWillReads().size();
-      if (llvm::is_contained(owned, output)) resetBuilder.clone(effect, mapping);
+      unsigned output = cast<BlockArgument>(store.getMemRef()).getArgNumber() -
+                        plan.task.getWillReads().size();
+      if (llvm::is_contained(owned, output))
+        resetBuilder.clone(effect, mapping);
     }
   }
   if (!isPrefix)
     for (auto [index, interfaceValue] : llvm::enumerate(plan.interfaceValues)) {
       Value loaded = kernelBuilder.create<memref::LoadOp>(
-          plan.task.getLoc(), body->getArgument(index), hyperblockBody.getArguments().take_front(plan.counters.size()));
+          plan.task.getLoc(), body->getArgument(index),
+          hyperblockBody.getArguments().take_front(plan.counters.size()));
       mapping.map(interfaceValue, loaded);
     }
   for (unsigned index : isPrefix ? plan.leftNodes : plan.rightNodes)
@@ -785,16 +834,22 @@ static TaskflowTaskOp createStage(FissionPlan &plan, OpBuilder &builder,
     for (auto [index, interfaceValue] : llvm::enumerate(plan.interfaceValues))
       kernelBuilder.create<memref::StoreOp>(
           plan.task.getLoc(), mapping.lookup(interfaceValue),
-          body->getArgument(reads.size() + index), hyperblockBody.getArguments().take_front(plan.counters.size()));
-  auto originalYield = cast<TaskflowHyperblockYieldOp>(plan.hyperblock.getBody().front().getTerminator());
+          body->getArgument(reads.size() + index),
+          hyperblockBody.getArguments().take_front(plan.counters.size()));
+  auto originalYield = cast<TaskflowHyperblockYieldOp>(
+      plan.hyperblock.getBody().front().getTerminator());
   SmallVector<Value> next;
-  for (unsigned index : carries) next.push_back(mapping.lookupOrDefault(originalYield.getIterArgsNext()[index]));
-  kernelBuilder.create<TaskflowHyperblockYieldOp>(plan.task.getLoc(), next, next);
+  for (unsigned index : carries)
+    next.push_back(
+        mapping.lookupOrDefault(originalYield.getIterArgsNext()[index]));
+  kernelBuilder.create<TaskflowHyperblockYieldOp>(plan.task.getLoc(), next,
+                                                  next);
   bodyBuilder.setInsertionPointToEnd(body);
   SmallVector<Value> yields;
   for (unsigned index = 0; index < writes.size(); ++index)
     yields.push_back(body->getArgument(reads.size() + index));
-  bodyBuilder.create<TaskflowYieldOp>(plan.task.getLoc(), ValueRange{}, yields, ValueRange{});
+  bodyBuilder.create<TaskflowYieldOp>(plan.task.getLoc(), ValueRange{}, yields,
+                                      ValueRange{});
   setLineage(plan.task, stage, builder, plan.leftNodes, isPrefix ? 0 : 1);
   return stage;
 }
@@ -821,12 +876,14 @@ static LogicalResult rewriteFission(FissionPlan &plan, func::FuncOp function) {
         builder.create<memref::AllocOp>(plan.task.getLoc(), type));
   }
   TaskflowTaskOp prefix = createStage(plan, builder, temporaries, {}, true);
-  TaskflowTaskOp suffix = createStage(plan, builder, temporaries, prefix, false);
+  TaskflowTaskOp suffix =
+      createStage(plan, builder, temporaries, prefix, false);
   for (auto [position, index] : llvm::enumerate(plan.prefixOutputs))
     plan.task.getDoneWrites()[index].replaceAllUsesWith(
         prefix.getDoneWrites()[temporaries.size() + position]);
   for (auto [position, index] : llvm::enumerate(plan.suffixOutputs))
-    plan.task.getDoneWrites()[index].replaceAllUsesWith(suffix.getDoneWrites()[position]);
+    plan.task.getDoneWrites()[index].replaceAllUsesWith(
+        suffix.getDoneWrites()[position]);
   plan.task.erase();
   return success();
 }
@@ -1031,8 +1088,9 @@ struct FissionTaskPass
     return "Split a canonical hyperblock DFG through static cut tensors";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    func::FuncDialect, memref::MemRefDialect, scf::SCFDialect>();
+    registry
+        .insert<affine::AffineDialect, arith::ArithDialect, func::FuncDialect,
+                memref::MemRefDialect, scf::SCFDialect>();
   }
   Option<std::string> taskName{*this, "task-name",
                                llvm::cl::desc("Exact Taskflow task name"),

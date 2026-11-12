@@ -26,35 +26,81 @@ namespace mapper_features {
 namespace {
 
 constexpr const char *kOperationTypes[] = {
-    "<pad>",          "<unknown>",       "<pe>",
-    "constant",       "grant_once",      "grant_always",
-    "grant_predicate", "loop_control",   "phi",
-    "phi_start",      "add",             "sub",
-    "mul",             "div",             "rem",
-    "fadd",            "fsub",            "fmul",
-    "fdiv",            "fmul_fadd",      "fadd_fadd",
-    "vfmul",           "or",              "and",
-    "xor",             "not",             "shl",
-    "icmp",            "fcmp",            "sel",
-    "cast",            "sext",            "zext",
-    "alloca",          "gep",             "load",
-    "store",           "memset",          "load_indexed",
-    "store_indexed",   "data_mov",        "ctrl_mov",
-    "reserve",         "yield",           "return",
-    "counter",         "fneg",            "fmax",
-    "fmin",            "gather",          "br",
-    "return_void",     "return_value",    "vmul",
-    "vadd",            "vfadd",           "vector_reduce_add",
-    "mul_add",         "extract_predicate", "true_steer",
-    "false_steer",     "carry",           "merge",
-    "invariant",       "fused_op",
+    "<pad>",
+    "<unknown>",
+    "<pe>",
+    "constant",
+    "grant_once",
+    "grant_always",
+    "grant_predicate",
+    "loop_control",
+    "phi",
+    "phi_start",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "fadd",
+    "fsub",
+    "fmul",
+    "fdiv",
+    "fmul_fadd",
+    "fadd_fadd",
+    "vfmul",
+    "or",
+    "and",
+    "xor",
+    "not",
+    "shl",
+    "icmp",
+    "fcmp",
+    "sel",
+    "cast",
+    "sext",
+    "zext",
+    "alloca",
+    "gep",
+    "load",
+    "store",
+    "memset",
+    "load_indexed",
+    "store_indexed",
+    "data_mov",
+    "ctrl_mov",
+    "reserve",
+    "yield",
+    "return",
+    "counter",
+    "fneg",
+    "fmax",
+    "fmin",
+    "gather",
+    "br",
+    "return_void",
+    "return_value",
+    "vmul",
+    "vadd",
+    "vfadd",
+    "vector_reduce_add",
+    "mul_add",
+    "extract_predicate",
+    "true_steer",
+    "false_steer",
+    "carry",
+    "merge",
+    "invariant",
+    "fused_op",
 };
 
 constexpr std::size_t kOperationTypeCount =
     sizeof(kOperationTypes) / sizeof(kOperationTypes[0]);
 
 constexpr const char *kTransparentOperations[] = {
-    "data_mov", "ctrl_mov", "reserve", "yield",
+    "data_mov",
+    "ctrl_mov",
+    "reserve",
+    "yield",
 };
 
 constexpr const char *kMemoryOperations[] = {
@@ -64,20 +110,51 @@ constexpr const char *kMemoryOperations[] = {
 constexpr const char *kPointerOperations[] = {"alloca", "gep"};
 
 constexpr const char *kControlOperations[] = {
-    "grant_predicate", "loop_control", "phi", "phi_start", "not", "icmp",
-    "fcmp", "sel", "counter", "extract_predicate", "true_steer",
-    "false_steer", "carry", "merge", "invariant",
+    "grant_predicate",
+    "loop_control",
+    "phi",
+    "phi_start",
+    "not",
+    "icmp",
+    "fcmp",
+    "sel",
+    "counter",
+    "extract_predicate",
+    "true_steer",
+    "false_steer",
+    "carry",
+    "merge",
+    "invariant",
 };
 
 constexpr std::array<std::pair<int, int>, 16> kMapperShapes = {{
-    {4, 4},   {4, 8},   {8, 4},   {4, 12},  {12, 4},  {4, 16},
-    {8, 8},   {16, 4},  {8, 12},  {12, 8},  {8, 16},  {16, 8},
-    {12, 12}, {12, 16}, {16, 12}, {16, 16},
+    {4, 4},
+    {4, 8},
+    {8, 4},
+    {4, 12},
+    {12, 4},
+    {4, 16},
+    {8, 8},
+    {16, 4},
+    {8, 12},
+    {12, 8},
+    {8, 16},
+    {16, 8},
+    {12, 12},
+    {12, 16},
+    {16, 12},
+    {16, 16},
 }};
 
 constexpr std::array<std::pair<int, int>, 8> kPerCgra2x2MapperShapes = {{
-    {2, 2}, {2, 4}, {4, 2}, {2, 6},
-    {6, 2}, {2, 8}, {8, 2}, {4, 4},
+    {2, 2},
+    {2, 4},
+    {4, 2},
+    {2, 6},
+    {6, 2},
+    {2, 8},
+    {8, 2},
+    {4, 4},
 }};
 
 bool inSet(llvm::StringRef value, const char *const *values,
@@ -193,9 +270,9 @@ bool isReturnLine(const std::string &line, std::string &rest) {
 
 std::vector<std::string>
 meaningfulRoots(const std::string &value,
-               const std::map<std::string, std::string> &kinds,
-               const std::map<std::string, std::vector<std::string>> &operands,
-               std::set<std::string> seen = {}) {
+                const std::map<std::string, std::string> &kinds,
+                const std::map<std::string, std::vector<std::string>> &operands,
+                std::set<std::string> seen = {}) {
   auto kind = kinds.find(value);
   if (kind == kinds.end())
     return {};
@@ -223,8 +300,7 @@ struct TopologySummary {
   int maxIndegree = 0;
 };
 
-TopologySummary forwardTopology(
-    int nodeCount, const std::vector<Edge> &edges) {
+TopologySummary forwardTopology(int nodeCount, const std::vector<Edge> &edges) {
   std::vector<std::vector<int>> parents(static_cast<std::size_t>(nodeCount));
   std::vector<std::vector<int>> children(static_cast<std::size_t>(nodeCount));
   for (Edge edge : edges) {
@@ -250,8 +326,8 @@ TopologySummary forwardTopology(
   for (const auto &values : children)
     summary.sinks += values.empty();
   for (const auto &values : parents)
-    summary.maxIndegree = std::max(summary.maxIndegree,
-                                   static_cast<int>(values.size()));
+    summary.maxIndegree =
+        std::max(summary.maxIndegree, static_cast<int>(values.size()));
   return summary;
 }
 
@@ -264,74 +340,91 @@ bool containsEdge(const std::vector<Edge> &edges, Edge wanted) {
 template <std::size_t Width, std::size_t ShapeCount>
 std::array<std::string, Width> buildMapperFeatureNames(
     const std::array<std::pair<int, int>, ShapeCount> &shapes) {
-    std::array<std::string, Width> result{};
-    std::size_t index = 0;
-    for (const char *operation : kOperationTypes)
-      result[index++] = std::string("log_count_") + operation;
-    constexpr const char *kNodeNames[] = {
-        "normalized_indegree", "normalized_outdegree", "normalized_asap",
-        "normalized_reverse_depth", "normalized_slack",
-        "normalized_position", "is_source", "is_sink", "is_memory",
-        "is_pointer", "is_control", "is_materialized", "is_data_movement",
-        "is_recurrence_cycle",
-    };
-    for (const char *name : kNodeNames)
-      result[index++] = std::string("mean_") + name;
-    for (const char *name : kNodeNames)
-      result[index++] = std::string("max_") + name;
-    constexpr const char *kGraphNames[] = {
-        "log_node_count", "log_raw_edge_count", "log_semantic_edge_count",
-    };
-    for (const char *name : kGraphNames)
-      result[index++] = name;
-    constexpr const char *kTopologyNames[] = {
-        "log_materialized_node_count", "log_movement_node_count",
-        "log_forward_depth", "log_semantic_forward_depth",
-        "log_max_forward_width", "normalized_max_forward_width",
-        "log_source_count", "log_sink_count", "log_max_indegree",
-        "log_max_outdegree", "raw_edge_density", "semantic_edge_density",
-        "log_recurrence_node_count",
-    };
-    for (const char *name : kTopologyNames)
-      result[index++] = name;
-    constexpr const char *kContextNames[] = {
-        "normalized_rows", "normalized_columns", "normalized_tiles",
-        "log_aspect_ratio", "normalized_links", "normalized_bisection_links",
-        "normalized_rec_mii", "normalized_res_mii", "normalized_lower_bound",
-    };
-    for (const char *name : kContextNames)
-      result[index++] = name;
-    for (auto shape : shapes)
-      result[index++] = "shape_" + std::to_string(shape.first) + "x" +
-                        std::to_string(shape.second);
-    constexpr const char *kContextTail[] = {
-        "log_nodes_per_tile", "log_materialized_nodes_per_tile",
-        "log_raw_edges_per_link", "log_semantic_edges_per_link",
-        "forward_depth_per_max_dimension", "forward_width_per_tile",
-    };
-    for (const char *name : kContextTail)
-      result[index++] = name;
-    constexpr const char *kPressureNames[] = {
-        "mapper_bucket_width_per_tile", "mapper_bucket_width_per_tile_ii",
-        "recurrence_nodes_per_tile", "fanin_collision_pressure",
-        "fanout_collision_pressure", "route_edge_pressure",
-    };
-    for (const char *name : kPressureNames)
-      result[index++] = name;
-    constexpr const char *kTraversalNames[] = {
-        "forward_depth_per_rows", "forward_depth_per_columns",
-        "semantic_depth_per_rows", "semantic_depth_per_columns",
-        "mapper_bucket_width_per_rows", "mapper_bucket_width_per_columns",
-        "mapper_bucket_degree_pressure",
-        "mapper_bucket_fanin_collision_pressure",
-        "mapper_bucket_fanout_collision_pressure",
-        "mapper_bucket_quadratic_occupancy",
-    };
-    for (const char *name : kTraversalNames)
-      result[index++] = name;
-    if (index != Width)
-      std::abort();
-    return result;
+  std::array<std::string, Width> result{};
+  std::size_t index = 0;
+  for (const char *operation : kOperationTypes)
+    result[index++] = std::string("log_count_") + operation;
+  constexpr const char *kNodeNames[] = {
+      "normalized_indegree", "normalized_outdegree",
+      "normalized_asap",     "normalized_reverse_depth",
+      "normalized_slack",    "normalized_position",
+      "is_source",           "is_sink",
+      "is_memory",           "is_pointer",
+      "is_control",          "is_materialized",
+      "is_data_movement",    "is_recurrence_cycle",
+  };
+  for (const char *name : kNodeNames)
+    result[index++] = std::string("mean_") + name;
+  for (const char *name : kNodeNames)
+    result[index++] = std::string("max_") + name;
+  constexpr const char *kGraphNames[] = {
+      "log_node_count",
+      "log_raw_edge_count",
+      "log_semantic_edge_count",
+  };
+  for (const char *name : kGraphNames)
+    result[index++] = name;
+  constexpr const char *kTopologyNames[] = {
+      "log_materialized_node_count",
+      "log_movement_node_count",
+      "log_forward_depth",
+      "log_semantic_forward_depth",
+      "log_max_forward_width",
+      "normalized_max_forward_width",
+      "log_source_count",
+      "log_sink_count",
+      "log_max_indegree",
+      "log_max_outdegree",
+      "raw_edge_density",
+      "semantic_edge_density",
+      "log_recurrence_node_count",
+  };
+  for (const char *name : kTopologyNames)
+    result[index++] = name;
+  constexpr const char *kContextNames[] = {
+      "normalized_rows",    "normalized_columns", "normalized_tiles",
+      "log_aspect_ratio",   "normalized_links",   "normalized_bisection_links",
+      "normalized_rec_mii", "normalized_res_mii", "normalized_lower_bound",
+  };
+  for (const char *name : kContextNames)
+    result[index++] = name;
+  for (auto shape : shapes)
+    result[index++] = "shape_" + std::to_string(shape.first) + "x" +
+                      std::to_string(shape.second);
+  constexpr const char *kContextTail[] = {
+      "log_nodes_per_tile",
+      "log_materialized_nodes_per_tile",
+      "log_raw_edges_per_link",
+      "log_semantic_edges_per_link",
+      "forward_depth_per_max_dimension",
+      "forward_width_per_tile",
+  };
+  for (const char *name : kContextTail)
+    result[index++] = name;
+  constexpr const char *kPressureNames[] = {
+      "mapper_bucket_width_per_tile", "mapper_bucket_width_per_tile_ii",
+      "recurrence_nodes_per_tile",    "fanin_collision_pressure",
+      "fanout_collision_pressure",    "route_edge_pressure",
+  };
+  for (const char *name : kPressureNames)
+    result[index++] = name;
+  constexpr const char *kTraversalNames[] = {
+      "forward_depth_per_rows",
+      "forward_depth_per_columns",
+      "semantic_depth_per_rows",
+      "semantic_depth_per_columns",
+      "mapper_bucket_width_per_rows",
+      "mapper_bucket_width_per_columns",
+      "mapper_bucket_degree_pressure",
+      "mapper_bucket_fanin_collision_pressure",
+      "mapper_bucket_fanout_collision_pressure",
+      "mapper_bucket_quadratic_occupancy",
+  };
+  for (const char *name : kTraversalNames)
+    result[index++] = name;
+  if (index != Width)
+    std::abort();
+  return result;
 }
 
 const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
@@ -343,8 +436,7 @@ const std::array<std::string, kFeatureWidth> &mapperFeatureNames() {
 const std::array<std::string, kPerCgra2x2FeatureWidth> &
 perCgra2x2MapperFeatureNames() {
   static const std::array<std::string, kPerCgra2x2FeatureWidth> names =
-      buildMapperFeatureNames<kPerCgra2x2FeatureWidth>(
-          kPerCgra2x2MapperShapes);
+      buildMapperFeatureNames<kPerCgra2x2FeatureWidth>(kPerCgra2x2MapperShapes);
   return names;
 }
 
@@ -363,9 +455,9 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
   std::size_t lineStart = 0;
   while (lineStart <= source.size()) {
     const std::size_t lineEnd = source.find('\n', lineStart);
-    std::string line = source.substr(
-        lineStart, lineEnd == std::string::npos ? std::string::npos
-                                                : lineEnd - lineStart);
+    std::string line = source.substr(lineStart, lineEnd == std::string::npos
+                                                    ? std::string::npos
+                                                    : lineEnd - lineStart);
     if (!line.empty() && line.back() == '\r')
       line.pop_back();
     std::string value;
@@ -424,8 +516,9 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
   }
   for (const std::string &kind : observedKinds) {
     if (!isSupportedOperation(kind)) {
-      error = "Neura DFG contains operations outside the 156-feature contract: " +
-              kind;
+      error =
+          "Neura DFG contains operations outside the 156-feature contract: " +
+          kind;
       return false;
     }
   }
@@ -442,7 +535,8 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
       continue;
     for (const std::string &operand : foundOperands->second) {
       auto sourceIndex = index.find(operand);
-      if (sourceIndex != index.end() && sourceIndex->second != targetIndex->second)
+      if (sourceIndex != index.end() &&
+          sourceIndex->second != targetIndex->second)
         rawEdgeSet.emplace(sourceIndex->second, targetIndex->second);
     }
   }
@@ -469,7 +563,8 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
       continue;
     auto targetIndex = index.find(target);
     for (const std::string &operand : foundOperands->second) {
-      for (const std::string &root : meaningfulRoots(operand, kinds, operands)) {
+      for (const std::string &root :
+           meaningfulRoots(operand, kinds, operands)) {
         auto sourceIndex = index.find(root);
         if (sourceIndex != index.end() && targetIndex != index.end() &&
             sourceIndex->second != targetIndex->second)
@@ -484,7 +579,8 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
       for (const std::string &target : materialized) {
         auto foundOperands = operands.find(target);
         if (foundOperands == operands.end() ||
-            std::find(foundOperands->second.begin(), foundOperands->second.end(),
+            std::find(foundOperands->second.begin(),
+                      foundOperands->second.end(),
                       reserve) == foundOperands->second.end())
           continue;
         for (const std::string &root : roots) {
@@ -523,7 +619,8 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
   std::vector<int> reverseDepth(static_cast<std::size_t>(nodeCount), 1);
   for (int node = nodeCount - 1; node >= 0; --node)
     for (int child : children[node])
-      reverseDepth[node] = std::max(reverseDepth[node], reverseDepth[child] + 1);
+      reverseDepth[node] =
+          std::max(reverseDepth[node], reverseDepth[child] + 1);
   const int makespan = *std::max_element(asap.begin(), asap.end());
   std::vector<int> alap(static_cast<std::size_t>(nodeCount), 0);
   for (int node = 0; node < nodeCount; ++node)
@@ -589,7 +686,8 @@ bool parseRouteExpandedDFG(llvm::StringRef text, RouteExpandedGraph &graph,
       hasMovement |= row[12] > 0.5;
     for (Edge edge : graph.semanticEdges) {
       if (containsEdge(graph.edges, edge)) {
-        error = "Neura DFG is not route-expanded; semantic edge bypasses data_mov";
+        error =
+            "Neura DFG is not route-expanded; semantic edge bypasses data_mov";
         return false;
       }
     }
@@ -608,8 +706,8 @@ static bool computeMapperFeaturesForProtocol(
     llvm::ArrayRef<std::pair<int, int>> supportedShapes, double maxRows,
     double maxColumns, double maxTiles, double maxDirectedLinks,
     double maxBisectionLinks, double mapperIICeiling,
-    double lowerBoundSearchCeiling,
-    std::array<double, Width> &features, std::string &error) {
+    double lowerBoundSearchCeiling, std::array<double, Width> &features,
+    std::string &error) {
   auto validShape = [&] {
     return std::find(supportedShapes.begin(), supportedShapes.end(),
                      std::pair<int, int>{rows, columns}) !=
@@ -657,15 +755,15 @@ static bool computeMapperFeaturesForProtocol(
   }
   const int nodeCountInt = static_cast<int>(nodeCount);
   for (Edge edge : graph.edges) {
-    if (edge.first < 0 || edge.second < 0 ||
-        edge.first >= nodeCountInt || edge.second >= nodeCountInt) {
+    if (edge.first < 0 || edge.second < 0 || edge.first >= nodeCountInt ||
+        edge.second >= nodeCountInt) {
       error = "DFG edge endpoint is outside the node range";
       return false;
     }
   }
   for (Edge edge : graph.semanticEdges) {
-    if (edge.first < 0 || edge.second < 0 ||
-        edge.first >= nodeCountInt || edge.second >= nodeCountInt) {
+    if (edge.first < 0 || edge.second < 0 || edge.first >= nodeCountInt ||
+        edge.second >= nodeCountInt) {
       error = "semantic DFG edge endpoint is outside the node range";
       return false;
     }
@@ -725,9 +823,8 @@ static bool computeMapperFeaturesForProtocol(
               static_cast<int>(materialized[static_cast<std::size_t>(user)]));
     reverseMaterializedDepth[static_cast<std::size_t>(node)] = reverseDepth;
   }
-  const int maximumReverseDepth =
-      *std::max_element(reverseMaterializedDepth.begin(),
-                        reverseMaterializedDepth.end());
+  const int maximumReverseDepth = *std::max_element(
+      reverseMaterializedDepth.begin(), reverseMaterializedDepth.end());
   std::vector<int> bucketWidths(
       static_cast<std::size_t>(maximumReverseDepth + 1), 0);
   std::vector<std::vector<int>> bucketNodes(
@@ -773,13 +870,12 @@ static bool computeMapperFeaturesForProtocol(
 
   const double tiles = static_cast<double>(rows * columns);
   const double links = static_cast<double>(
-      2 * (rows * std::max(0, columns - 1) +
-           columns * std::max(0, rows - 1)));
+      2 * (rows * std::max(0, columns - 1) + columns * std::max(0, rows - 1)));
   const double bisectionLinks =
       tiles == 1.0 ? 0.0 : 2.0 * static_cast<double>(std::min(rows, columns));
   const double routedCapacity = std::max(1.0, links * lowerBound);
-  const double possibleEdges = static_cast<double>(std::max<std::size_t>(
-      1, nodeCount * (nodeCount - 1)));
+  const double possibleEdges = static_cast<double>(
+      std::max<std::size_t>(1, nodeCount * (nodeCount - 1)));
   std::size_t index = 0;
   auto push = [&](double value) {
     if (index < Width)
@@ -836,21 +932,18 @@ static bool computeMapperFeaturesForProtocol(
   push(static_cast<double>(graph.edges.size()) / routedCapacity);
   push(static_cast<double>(rawTopology.depth) / static_cast<double>(rows));
   push(static_cast<double>(rawTopology.depth) / static_cast<double>(columns));
-  push(static_cast<double>(semanticTopology.depth) /
-       static_cast<double>(rows));
+  push(static_cast<double>(semanticTopology.depth) / static_cast<double>(rows));
   push(static_cast<double>(semanticTopology.depth) /
        static_cast<double>(columns));
   push(static_cast<double>(maximumBucketWidth) / static_cast<double>(rows));
-  push(static_cast<double>(maximumBucketWidth) /
-       static_cast<double>(columns));
+  push(static_cast<double>(maximumBucketWidth) / static_cast<double>(columns));
   push(static_cast<double>(bucketDegree) / routedCapacity);
   push(bucketFaninCollisions / routedCapacity);
   push(bucketFanoutCollisions / routedCapacity);
   double bucketQuadraticOccupancy = 0.0;
   for (int width : bucketWidths)
     bucketQuadraticOccupancy += static_cast<double>(width) * width;
-  push(bucketQuadraticOccupancy /
-       std::max(1.0, tiles * tiles * lowerBound));
+  push(bucketQuadraticOccupancy / std::max(1.0, tiles * tiles * lowerBound));
 
   if (index != Width) {
     error = "internal mapper feature contract width mismatch";
@@ -874,10 +967,12 @@ bool computeMapperFeatures(const RouteExpandedGraph &graph, int rows,
       16.0, 256.0, 224.0, 16.0, 20.0, 20.0, features.values, error);
 }
 
-bool computePerCgra2x2MapperFeatures(
-    const RouteExpandedGraph &graph, int rows, int columns, double recMii,
-    double resMii, double lowerBound, PerCgra2x2FeatureVector &features,
-    std::string &error, PerCgra2x2MapperFeatureInterval interval) {
+bool computePerCgra2x2MapperFeatures(const RouteExpandedGraph &graph, int rows,
+                                     int columns, double recMii, double resMii,
+                                     double lowerBound,
+                                     PerCgra2x2FeatureVector &features,
+                                     std::string &error,
+                                     PerCgra2x2MapperFeatureInterval interval) {
   double lowerBoundSearchCeiling = 20.0;
   switch (interval) {
   case PerCgra2x2MapperFeatureInterval::Training20:
@@ -891,9 +986,9 @@ bool computePerCgra2x2MapperFeatures(
     return false;
   }
   return computeMapperFeaturesForProtocol(
-      graph, rows, columns, recMii, resMii, lowerBound,
-      kPerCgra2x2MapperShapes, 8.0, 8.0, 16.0, 48.0, 8.0, 20.0,
-      lowerBoundSearchCeiling, features.values, error);
+      graph, rows, columns, recMii, resMii, lowerBound, kPerCgra2x2MapperShapes,
+      8.0, 8.0, 16.0, 48.0, 8.0, 20.0, lowerBoundSearchCeiling, features.values,
+      error);
 }
 
 } // namespace mapper_features

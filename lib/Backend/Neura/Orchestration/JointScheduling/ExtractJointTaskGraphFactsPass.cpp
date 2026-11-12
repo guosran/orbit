@@ -7,12 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "AnalyticalTaskCandidateCommon.h"
-#include "ClosureLegalityPreflight.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
+#include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskGraphRewriteLegality.h"
+#include "ClosureLegalityPreflight.h"
 #include "NeuraDialect/NeuraOps.h"
-#include "Backend/Neura/Orchestration/JointScheduling/ReplicaOutputCoordinateProof.h"
 #include "TaskflowDialect/TaskflowOps.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -89,8 +89,8 @@ struct EdgeFact {
 constexpr StringLiteral kSemanticIncomingEdgesAttr =
     "amoeba.semantic.incoming_edges";
 
-static std::optional<int64_t>
-constantIndexImpl(Value value, DenseSet<Value> &visiting) {
+static std::optional<int64_t> constantIndexImpl(Value value,
+                                                DenseSet<Value> &visiting) {
   if (!value || !visiting.insert(value).second)
     return std::nullopt;
 
@@ -151,8 +151,7 @@ constantIndexImpl(Value value, DenseSet<Value> &visiting) {
       if (argument.getOwner() != &function.getBody().front())
         return std::nullopt;
       std::string attribute =
-          "amoeba.static_bound.arg." +
-          std::to_string(argument.getArgNumber());
+          "amoeba.static_bound.arg." + std::to_string(argument.getArgNumber());
       if (auto bound = function->getAttrOfType<IntegerAttr>(attribute))
         return bound.getInt() > 0 ? std::optional<int64_t>(bound.getInt())
                                   : std::nullopt;
@@ -235,8 +234,7 @@ static bool representsOriginalStorage(Value value, Value storage) {
   auto originalWrites = producer.getOriginalWriteMemrefs();
   if (doneWrites.size() != originalWrites.size())
     return false;
-  for (auto [doneWrite, originalWrite] :
-       llvm::zip(doneWrites, originalWrites))
+  for (auto [doneWrite, originalWrite] : llvm::zip(doneWrites, originalWrites))
     if (doneWrite == value && originalWrite == storage)
       return true;
   return false;
@@ -256,8 +254,7 @@ static bool taskBodyValueRepresentsStorage(Value value, TaskflowTaskOp task,
   return false;
 }
 
-static std::optional<unsigned>
-parseKernelInputReference(Attribute attribute) {
+static std::optional<unsigned> parseKernelInputReference(Attribute attribute) {
   auto text = dyn_cast_or_null<StringAttr>(attribute);
   if (!text)
     return std::nullopt;
@@ -288,12 +285,11 @@ static bool valueReferencesKernelInput(Value value, unsigned inputIndex,
       if (auto reference =
               parseKernelInputReference(definition->getAttr("value")))
         result = *reference == inputIndex;
-    } else if (name == "neura.grant_predicate" ||
-               name == "neura.ctrl_mov" || name == "neura.cast") {
+    } else if (name == "neura.grant_predicate" || name == "neura.ctrl_mov" ||
+               name == "neura.cast") {
       result = definition->getNumOperands() >= 1 &&
-               valueReferencesKernelInput(definition->getOperand(0),
-                                          inputIndex, kernel, visiting,
-                                          depth + 1);
+               valueReferencesKernelInput(definition->getOperand(0), inputIndex,
+                                          kernel, visiting, depth + 1);
     } else if (name == "neura.phi" || name == "neura.sel") {
       unsigned first = name == "neura.sel" ? 1u : 0u;
       result = first < definition->getNumOperands();
@@ -303,9 +299,9 @@ static bool valueReferencesKernelInput(Value value, unsigned inputIndex,
       for (unsigned operand = first;
            result && operand < definition->getNumOperands(); ++operand) {
         DenseSet<Value> armVisiting = visiting;
-        result = valueReferencesKernelInput(
-            definition->getOperand(operand), inputIndex, kernel,
-            armVisiting, depth + 1);
+        result = valueReferencesKernelInput(definition->getOperand(operand),
+                                            inputIndex, kernel, armVisiting,
+                                            depth + 1);
       }
     }
   }
@@ -337,8 +333,7 @@ static bool reachesValue(Value value, Value target, DenseSet<Value> &visited,
   if (name == "neura.grant_predicate" || name == "neura.ctrl_mov" ||
       name == "neura.cast") {
     return definition->getNumOperands() >= 1 &&
-           reachesValue(definition->getOperand(0), target, visited,
-                        depth + 1);
+           reachesValue(definition->getOperand(0), target, visited, depth + 1);
   }
   if (name == "neura.phi") {
     for (Value operand : definition->getOperands())
@@ -355,8 +350,7 @@ static bool reachesValue(Value value, Value target, DenseSet<Value> &visited,
 }
 
 static std::optional<int64_t>
-sourceConstantIndex(Value value, DenseSet<Value> &visited,
-                    unsigned depth = 0) {
+sourceConstantIndex(Value value, DenseSet<Value> &visited, unsigned depth = 0) {
   if (!value || depth >= 16 || !visited.insert(value).second)
     return std::nullopt;
   if (auto literal = constantIndex(value))
@@ -389,7 +383,8 @@ sourceConstantIndex(Value value, DenseSet<Value> &visited,
       return std::nullopt;
     unsigned first = name == "neura.sel" ? 1u : 0u;
     std::optional<int64_t> common;
-    for (unsigned index = first; index < definition->getNumOperands(); ++index) {
+    for (unsigned index = first; index < definition->getNumOperands();
+         ++index) {
       // Each phi arm is an independent forwarding path. Reuse the parent
       // cycle set, but do not let visiting a shared constant on one arm make
       // the same constant on another arm look cyclic.
@@ -436,18 +431,19 @@ static SourceIndexRole sourceIndexRole(Value value, Value m, Value n, Value k,
     if (definition->getNumOperands() < 1)
       return SourceIndexRole::Unknown;
     DenseSet<Value> operandVisited = visited;
-    return sourceIndexRole(definition->getOperand(0), m, n, k,
-                           operandVisited, depth + 1);
+    return sourceIndexRole(definition->getOperand(0), m, n, k, operandVisited,
+                           depth + 1);
   }
   if (name == "neura.phi" || name == "neura.sel") {
     if (definition->getNumOperands() < (name == "neura.sel" ? 3u : 1u))
       return SourceIndexRole::Unknown;
     unsigned first = name == "neura.sel" ? 1u : 0u;
     SourceIndexRole common = SourceIndexRole::Unknown;
-    for (unsigned index = first; index < definition->getNumOperands(); ++index) {
+    for (unsigned index = first; index < definition->getNumOperands();
+         ++index) {
       DenseSet<Value> branchVisited = visited;
-      SourceIndexRole branch = sourceIndexRole(
-          definition->getOperand(index), m, n, k, branchVisited, depth + 1);
+      SourceIndexRole branch = sourceIndexRole(definition->getOperand(index), m,
+                                               n, k, branchVisited, depth + 1);
       if (branch == SourceIndexRole::Unknown)
         return SourceIndexRole::Unknown;
       if (common == SourceIndexRole::Unknown)
@@ -516,8 +512,8 @@ static bool isKZeroGuarded(Value value, Value m, Value n, Value k) {
          isKZeroPredicate(definition->getOperand(1), m, n, k);
 }
 
-static bool isOrderedCrossCellIndexVector(ValueRange indices, Value m,
-                                           Value n, Value k) {
+static bool isOrderedCrossCellIndexVector(ValueRange indices, Value m, Value n,
+                                          Value k) {
   bool hasK = false;
   bool hasOuter = false;
   for (Value index : indices) {
@@ -557,8 +553,7 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     // Compare both the task-level value and its declared source storage. A
     // second SSA value that resolves to the same output buffer is an alias,
     // not a second independent input, and is rejected below.
-    if (read == outputRoot ||
-        representsOriginalStorage(read, outputStorage) ||
+    if (read == outputRoot || representsOriginalStorage(read, outputStorage) ||
         task.getOriginalReadMemrefs()[index] == outputStorage)
       ++outputReadCount;
   }
@@ -566,7 +561,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     return MemoryFeedbackKind::None;
 
   SmallVector<TaskflowCounterOp> taskCounters;
-  task.walk([&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
+  task.walk(
+      [&](TaskflowCounterOp counter) { taskCounters.push_back(counter); });
   if (taskCounters.size() != 3)
     return MemoryFeedbackKind::None;
   for (auto [index, counter] : llvm::enumerate(taskCounters)) {
@@ -575,15 +571,14 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     auto upper = constantIndex(counter.getUpperBound());
     auto step = constantIndex(counter.getStep());
     auto hierarchy = counter->getAttrOfType<StringAttr>("counter_hierarchy");
-    StringRef expectedHierarchy = index == 0 ? "root" :
-                                  (index == 1 ? "relay" : "leaf");
-    bool parentOK = index == 0
-                        ? !counter.getParentIndex()
-                        : counter.getParentIndex() ==
-                              taskCounters[index - 1].getCounterIndex();
-    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower ||
-        !upper || !step || *lower != 0 || *upper <= *lower || *step != 1 ||
-        !hierarchy || hierarchy.getValue() != expectedHierarchy || !parentOK)
+    StringRef expectedHierarchy =
+        index == 0 ? "root" : (index == 1 ? "relay" : "leaf");
+    bool parentOK = index == 0 ? !counter.getParentIndex()
+                               : counter.getParentIndex() ==
+                                     taskCounters[index - 1].getCounterIndex();
+    if (!id || id.getInt() != static_cast<int64_t>(index) || !lower || !upper ||
+        !step || *lower != 0 || *upper <= *lower || *step != 1 || !hierarchy ||
+        hierarchy.getValue() != expectedHierarchy || !parentOK)
       return MemoryFeedbackKind::None;
   }
 
@@ -594,7 +589,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     return MemoryFeedbackKind::None;
   neura::KernelOp kernel = kernels.front();
   SmallVector<neura::CounterOp> kernelCounters;
-  kernel.walk([&](neura::CounterOp counter) { kernelCounters.push_back(counter); });
+  kernel.walk(
+      [&](neura::CounterOp counter) { kernelCounters.push_back(counter); });
   if (kernelCounters.size() != 3)
     return MemoryFeedbackKind::None;
   for (auto [index, counter] : llvm::enumerate(kernelCounters)) {
@@ -603,8 +599,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     // the Neura counter still has an SSA bound operand, prove that operand
     // itself and compare it with the Taskflow counter; otherwise a stale
     // optional attribute could certify a different loop extent.
-    auto resolveCounterBound = [&](Value operand, StringRef attrName)
-        -> std::optional<int64_t> {
+    auto resolveCounterBound =
+        [&](Value operand, StringRef attrName) -> std::optional<int64_t> {
       std::optional<int64_t> actual;
       if (operand)
         actual = constantIndex(operand);
@@ -612,8 +608,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
       std::optional<int64_t> folded;
       if (auto integer = counter->getAttrOfType<IntegerAttr>(attrName))
         folded = integer.getInt();
-      else if (auto reference = parseKernelInputReference(
-                   counter->getAttr(attrName))) {
+      else if (auto reference =
+                   parseKernelInputReference(counter->getAttr(attrName))) {
         if (*reference < kernel.getInputs().size())
           folded = constantIndex(kernel.getInputs()[*reference]);
       }
@@ -632,8 +628,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     std::optional<int64_t> step =
         resolveCounterBound(counter.getStep(), "step_value");
     auto hierarchy = counter.getCounterHierarchyAttr();
-    StringRef expectedHierarchy = index == 0 ? "root" :
-                                  (index == 1 ? "relay" : "leaf");
+    StringRef expectedHierarchy =
+        index == 0 ? "root" : (index == 1 ? "relay" : "leaf");
     auto taskUpper = constantIndex(taskCounters[index].getUpperBound());
     bool hierarchyOK = hierarchy && hierarchy.getValue() == expectedHierarchy;
     // Converted source graphs encode symbolic kernel bounds as StringAttr
@@ -737,14 +733,12 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
     else if (isKZeroGuarded(store.getValue(), m, n, k))
       ++initialStoreCount;
   }
-  bool storeShapeOK =
-      (outputStores.size() == 1 && recurrenceStoreCount == 1 &&
-       initialStoreCount == 0) ||
-      (outputStores.size() == 2 && recurrenceStoreCount == 1 &&
-       initialStoreCount == 1);
+  bool storeShapeOK = (outputStores.size() == 1 && recurrenceStoreCount == 1 &&
+                       initialStoreCount == 0) ||
+                      (outputStores.size() == 2 && recurrenceStoreCount == 1 &&
+                       initialStoreCount == 1);
   if (invalidIndexedAccess || outputLoads.empty() || outputLoads.size() > 2 ||
-      !storeShapeOK ||
-      nonOutputStores > 1 || !sawMultiply)
+      !storeShapeOK || nonOutputStores > 1 || !sawMultiply)
     return MemoryFeedbackKind::None;
 
   bool sawMatchingAccumulator = false;
@@ -797,9 +791,8 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
   // LU's second output load reads output[leaf, root], so it cannot be
   // replicated or reduced as an unordered partial. It is still a legal
   // sequential K state machine when the original counter order is retained.
-  return sawCrossCellLoad && sawSubtract
-             ? MemoryFeedbackKind::OrderedCrossCell
-             : MemoryFeedbackKind::None;
+  return sawCrossCellLoad && sawSubtract ? MemoryFeedbackKind::OrderedCrossCell
+                                         : MemoryFeedbackKind::None;
 }
 
 // K actions require a reduction proof, rather than merely a third tensor
@@ -808,14 +801,14 @@ static MemoryFeedbackKind classifyMemoryFeedback(TaskflowTaskOp task) {
 // a loop-carried kernel value; the last counter is then the K extent. Any
 // unresolved candidate is reported as incomplete by the caller.
 static KReductionProof proveKReduction(TaskflowTaskOp task) {
-  if (auto range = task->getAttrOfType<DenseI64ArrayAttr>(
-          "amoeba.semantic.K_range")) {
+  if (auto range =
+          task->getAttrOfType<DenseI64ArrayAttr>("amoeba.semantic.K_range")) {
     if (range.size() == 2 && range[0] < range[1])
       return {true, range[1] - range[0]};
     return {true, std::nullopt};
   }
-  if (auto range = task->getAttrOfType<DenseI64ArrayAttr>(
-          "amoeba.semantic.k_range")) {
+  if (auto range =
+          task->getAttrOfType<DenseI64ArrayAttr>("amoeba.semantic.k_range")) {
     if (range.size() == 2 && range[0] < range[1])
       return {true, range[1] - range[0]};
     return {true, std::nullopt};
@@ -890,8 +883,7 @@ static KReductionProof proveKReduction(TaskflowTaskOp task) {
               if (upper > lower)
                 return {true, upper - lower};
             }
-            return {true, std::nullopt,
-                    "memory-feedback-K-bound-unproven"};
+            return {true, std::nullopt, "memory-feedback-K-bound-unproven"};
           }
           return {true, std::nullopt,
                   "memory-carried-read-write-feedback-needs-K-proof"};
@@ -991,7 +983,7 @@ collectFactOnlyMetadata(func::FuncOp function, std::string &error) {
   if (tasks.empty() && error.empty())
     error = "function contains no taskflow.task operations";
   return error.empty() ? FailureOr<SmallVector<TaskMetadata>>(std::move(tasks))
-                        : FailureOr<SmallVector<TaskMetadata>>(failure());
+                       : FailureOr<SmallVector<TaskMetadata>>(failure());
 }
 
 static FailureOr<SmallVector<EdgeFact, 0>>
@@ -1092,10 +1084,11 @@ static bool validateSemanticIncomingEdges(
       StringRef role;
       StringRef scope;
       StringRef kind;
-      if (!parseSemanticIncomingEdge(string.getValue(), sourceName, role,
-                                     scope, kind)) {
-        error = "amoeba.semantic.incoming_edges entries must have the form "
-                "source|role|scope or source|role|scope|kind with non-empty fields";
+      if (!parseSemanticIncomingEdge(string.getValue(), sourceName, role, scope,
+                                     kind)) {
+        error =
+            "amoeba.semantic.incoming_edges entries must have the form "
+            "source|role|scope or source|role|scope|kind with non-empty fields";
         return false;
       }
       auto sourceIds = taskNameIds.lookup(sourceName);
@@ -1111,8 +1104,7 @@ static bool validateSemanticIncomingEdges(
       SmallVector<unsigned> matches;
       for (auto [edgeIndex, edge] : llvm::enumerate(edges))
         if (edge.target == target && edge.source == source &&
-            edge.origin == "taskflow" &&
-            (kind.empty() || edge.kind == kind))
+            edge.origin == "taskflow" && (kind.empty() || edge.kind == kind))
           matches.push_back(edgeIndex);
       if (matches.empty()) {
         error = "semantic incoming edge does not match an actual Taskflow "
@@ -1989,8 +1981,7 @@ siblingMaterializationStatus(TaskflowTaskOp first, TaskflowTaskOp second) {
     for (Operation &operation : task.getBody().front())
       if (auto kernel = dyn_cast<neura::KernelOp>(&operation))
         taskKernels.push_back(kernel);
-    if (taskKernels.size() != 1 ||
-        !taskKernels.front().getBody().hasOneBlock())
+    if (taskKernels.size() != 1 || !taskKernels.front().getBody().hasOneBlock())
       return {"unknown", "post_neura_kernel_contract_unproven"};
     neura::KernelOp kernel = taskKernels.front();
     if (!kernel.getIterArgsInit().empty() || !kernel.getOutputs().empty())
@@ -2001,17 +1992,13 @@ siblingMaterializationStatus(TaskflowTaskOp first, TaskflowTaskOp second) {
   return {"unknown", "post_neura_materializer_dry_run_required"};
 }
 
-static json::Object fusionAction(StringRef mode, StringRef first,
-                                 StringRef second,
-                                 StringRef status = "unknown",
-                                 StringRef reason =
-                                     "post_neura_materializer_dry_run_required") {
-  return json::Object{{"kind", "fusion"},
-                      {"mode", mode},
-                      {"first_task", first},
-                      {"second_task", second},
-                      {"status", status},
-                      {"reason", reason}};
+static json::Object
+fusionAction(StringRef mode, StringRef first, StringRef second,
+             StringRef status = "unknown",
+             StringRef reason = "post_neura_materializer_dry_run_required") {
+  return json::Object{{"kind", "fusion"},    {"mode", mode},
+                      {"first_task", first}, {"second_task", second},
+                      {"status", status},    {"reason", reason}};
 }
 
 static json::Object siblingFusionCandidate(TaskflowTaskOp first,
@@ -2020,14 +2007,13 @@ static json::Object siblingFusionCandidate(TaskflowTaskOp first,
                                            StringRef secondName) {
   SiblingMaterializationStatus materialization =
       siblingMaterializationStatus(first, second);
-  return json::Object{
-      {"first_task", firstName},
-      {"second_task", secondName},
-      {"proof", "source-owned-sibling-contract"},
-      {"source_status", "legal"},
-      {"materialization_status", materialization.status},
-      {"status", materialization.status},
-      {"reason", materialization.reason}};
+  return json::Object{{"first_task", firstName},
+                      {"second_task", secondName},
+                      {"proof", "source-owned-sibling-contract"},
+                      {"source_status", "legal"},
+                      {"materialization_status", materialization.status},
+                      {"status", materialization.status},
+                      {"reason", materialization.reason}};
 }
 
 static json::Object cotilingAction(StringRef producer, StringRef consumer,
@@ -2131,12 +2117,12 @@ static std::optional<json::Object> tileDescriptor(TaskflowTaskOp task) {
 
 // Post-Neura tiling has its own metadata contract. It does not carry the
 // pre-Neura tile's input/output region descriptors or step.
-static std::optional<json::Object>
-neuraTileDescriptor(TaskflowTaskOp task, std::string &error) {
+static std::optional<json::Object> neuraTileDescriptor(TaskflowTaskOp task,
+                                                       std::string &error) {
   bool hasMetadata = false;
   for (NamedAttribute attribute : task->getAttrs())
-    hasMetadata |= attribute.getName().strref().starts_with(
-        "amoeba.neura.tiling.");
+    hasMetadata |=
+        attribute.getName().strref().starts_with("amoeba.neura.tiling.");
   if (!hasMetadata)
     return std::nullopt;
 
@@ -2170,23 +2156,23 @@ neuraTileDescriptor(TaskflowTaskOp task, std::string &error) {
 // The graph structural key must distinguish retained from forwarded
 // post-Neura fusion.  Those modes have different memory effects even when
 // their Taskflow edges are otherwise identical.
-static std::optional<json::Object>
-neuraFusionDescriptor(TaskflowTaskOp task, std::string &error) {
+static std::optional<json::Object> neuraFusionDescriptor(TaskflowTaskOp task,
+                                                         std::string &error) {
   bool hasMetadata = false;
   for (NamedAttribute attribute : task->getAttrs())
-    hasMetadata |= attribute.getName().strref().starts_with(
-        "amoeba.neura.fusion.");
+    hasMetadata |=
+        attribute.getName().strref().starts_with("amoeba.neura.fusion.");
   if (!hasMetadata)
     return std::nullopt;
   auto mode = task->getAttrOfType<StringAttr>("amoeba.neura.fusion.mode");
-  auto loads = task->getAttrOfType<IntegerAttr>(
-      "amoeba.neura.fusion.eliminated_loads");
-  auto stores = task->getAttrOfType<IntegerAttr>(
-      "amoeba.neura.fusion.eliminated_stores");
-  auto siblingFirst = task->getAttrOfType<StringAttr>(
-      "amoeba.neura.fusion.sibling_first");
-  auto siblingSecond = task->getAttrOfType<StringAttr>(
-      "amoeba.neura.fusion.sibling_second");
+  auto loads =
+      task->getAttrOfType<IntegerAttr>("amoeba.neura.fusion.eliminated_loads");
+  auto stores =
+      task->getAttrOfType<IntegerAttr>("amoeba.neura.fusion.eliminated_stores");
+  auto siblingFirst =
+      task->getAttrOfType<StringAttr>("amoeba.neura.fusion.sibling_first");
+  auto siblingSecond =
+      task->getAttrOfType<StringAttr>("amoeba.neura.fusion.sibling_second");
   if (!mode || !loads || !stores) {
     error = "incomplete or invalid amoeba.neura.fusion metadata";
     return std::nullopt;
@@ -2195,9 +2181,9 @@ neuraFusionDescriptor(TaskflowTaskOp task, std::string &error) {
     // Sibling fusion can share any number of equivalent reads, but it keeps
     // both tasks' output stores. The source-owned canonical replay verifies
     // the exact eliminated-load count before this metadata is used as proof.
-    if (loads.getInt() < 0 || stores.getInt() != 0 ||
-        !siblingFirst || !siblingSecond ||
-        siblingFirst.getValue().empty() || siblingSecond.getValue().empty() ||
+    if (loads.getInt() < 0 || stores.getInt() != 0 || !siblingFirst ||
+        !siblingSecond || siblingFirst.getValue().empty() ||
+        siblingSecond.getValue().empty() ||
         siblingFirst.getValue() == siblingSecond.getValue()) {
       error = "incomplete or invalid sibling amoeba.neura.fusion metadata";
       return std::nullopt;
@@ -2350,11 +2336,14 @@ struct ExtractJointTaskGraphFactsPass
         taskRecord["resource_cgra_shape"] = shape.getValue().str();
       if (auto count = task.op->getAttrOfType<IntegerAttr>("cgra_count"))
         taskRecord["resource_cgra_count"] = count.getInt();
-      if (auto replicas = task.op->getAttrOfType<IntegerAttr>("active_replicas"))
+      if (auto replicas =
+              task.op->getAttrOfType<IntegerAttr>("active_replicas"))
         taskRecord["resource_active_replicas"] = replicas.getInt();
-      if (auto shape = task.op->getAttrOfType<StringAttr>("composed_cgra_shape"))
+      if (auto shape =
+              task.op->getAttrOfType<StringAttr>("composed_cgra_shape"))
         taskRecord["resource_composed_cgra_shape"] = shape.getValue().str();
-      if (auto count = task.op->getAttrOfType<IntegerAttr>("composed_cgra_count"))
+      if (auto count =
+              task.op->getAttrOfType<IntegerAttr>("composed_cgra_count"))
         taskRecord["resource_composed_cgra_count"] = count.getInt();
       taskRecord["source_iteration_domain_status"] =
           task.sourceIterationDomainStatus;
@@ -2386,13 +2375,12 @@ struct ExtractJointTaskGraphFactsPass
         // Radar's legacy shard_axis is explicitly a counter axis.
         auto outputAxis = task.op->getAttrOfType<IntegerAttr>(
             "amoeba.replica.output_shard_axis");
-        auto counterAxis = task.op->getAttrOfType<IntegerAttr>(
-            "amoeba.replica.shard_axis");
+        auto counterAxis =
+            task.op->getAttrOfType<IntegerAttr>("amoeba.replica.shard_axis");
         bool invalidAxisMetadata =
             (task.op->hasAttr("amoeba.replica.output_shard_axis") &&
              !outputAxis) ||
-            (task.op->hasAttr("amoeba.replica.shard_axis") &&
-             !counterAxis) ||
+            (task.op->hasAttr("amoeba.replica.shard_axis") && !counterAxis) ||
             (outputAxis && !counterAxis);
         if (outputAxis)
           requestedAxis = outputAxis.getInt();
@@ -2407,8 +2395,8 @@ struct ExtractJointTaskGraphFactsPass
         }
         if (outputProof.proven && outputAxis && counterAxis) {
           if (requestedAxis < 0 ||
-              requestedAxis >= static_cast<int64_t>(
-                                   outputProof.outputCounterAxes.size()) ||
+              requestedAxis >=
+                  static_cast<int64_t>(outputProof.outputCounterAxes.size()) ||
               outputProof.outputCounterAxes[requestedAxis] ==
                   ReplicaOutputCoordinateProof::kConstantAxis ||
               outputProof.outputCounterAxes[requestedAxis] !=
@@ -2424,7 +2412,8 @@ struct ExtractJointTaskGraphFactsPass
           for (unsigned counter : outputProof.outputCounterAxes)
             mapping.push_back(static_cast<int64_t>(counter));
           json::Array accesses;
-          for (ArrayRef<unsigned> access : outputProof.outputAccessCounterAxes) {
+          for (ArrayRef<unsigned> access :
+               outputProof.outputAccessCounterAxes) {
             SmallVector<int64_t> encoded;
             for (unsigned counter : access)
               encoded.push_back(static_cast<int64_t>(counter));
@@ -2508,14 +2497,12 @@ struct ExtractJointTaskGraphFactsPass
       }
       if (neuraFusion)
         taskRecord["neura_fusion"] = std::move(*neuraFusion);
-      ClosureStrictKClassification strictK =
-          classifyClosureKLegality(task.op);
+      ClosureStrictKClassification strictK = classifyClosureKLegality(task.op);
       ClosureDimensionFacts localLegality =
           inspectClosureTask(task.op, &strictK);
       json::Object localLegalityRecord{
           {"output_rank_proven", localLegality.outputRankKnown},
-          {"output_rank",
-           localLegality.outputRank},
+          {"output_rank", localLegality.outputRank},
           {"k_candidate", localLegality.kCandidate},
           {"k_extent_proven", localLegality.kExtentKnown},
           {"cross_cell_k_order", localLegality.crossCellK}};
@@ -2537,9 +2524,10 @@ struct ExtractJointTaskGraphFactsPass
           taskRecord["k_extent_proven"] = strictK.extent;
         } else {
           kReductionFactsComplete = false;
-          std::string reason = strictK.reason.empty()
-                                   ? "potential-reduction-without-proven-K-extent"
-                                   : strictK.reason;
+          std::string reason =
+              strictK.reason.empty()
+                  ? "potential-reduction-without-proven-K-extent"
+                  : strictK.reason;
           taskRecord["k_reduction_unproven_reason"] = reason;
           kReductionUnprovenTasks.push_back(
               json::Object{{"task_name", task.name}, {"reason", reason}});
@@ -2584,9 +2572,8 @@ struct ExtractJointTaskGraphFactsPass
           structuralDimensions.push_back(upper - lower);
       json::Object structuralNode{
           {"static_dims", std::move(structuralDimensions)},
-          {"trip_count", task.tripCountKnown
-                              ? json::Value(task.tripCount)
-                              : json::Value(nullptr)},
+          {"trip_count", task.tripCountKnown ? json::Value(task.tripCount)
+                                             : json::Value(nullptr)},
           {"input_bindings", std::move(inputBindings)}};
       structuralNode["trip_count_known"] = task.tripCountKnown;
       structuralNode["source_iteration_domain_status"] =
@@ -2672,9 +2659,8 @@ struct ExtractJointTaskGraphFactsPass
              secondIndex < metadata->size(); ++secondIndex) {
           TaskflowTaskOp first = (*metadata)[firstIndex].op;
           TaskflowTaskOp second = (*metadata)[secondIndex].op;
-          json::Object scanned{
-              {"first_task", (*metadata)[firstIndex].name},
-              {"second_task", (*metadata)[secondIndex].name}};
+          json::Object scanned{{"first_task", (*metadata)[firstIndex].name},
+                               {"second_task", (*metadata)[secondIndex].name}};
           if (failed(loopDomain(first)) || failed(loopDomain(second))) {
             siblingFusionFactsComplete = false;
             siblingFusionMaterializationComplete = false;
@@ -2713,77 +2699,78 @@ struct ExtractJointTaskGraphFactsPass
       for (size_t firstIndex = 0; firstIndex < metadata->size(); ++firstIndex)
         for (size_t secondIndex = firstIndex + 1;
              secondIndex < metadata->size(); ++secondIndex) {
-        TaskflowTaskOp first = (*metadata)[firstIndex].op;
-        TaskflowTaskOp second = (*metadata)[secondIndex].op;
-        ++consideredFusion;
-        bool producerConsumer = directProducerConsumer(first, second);
-        if (producerConsumer) {
-          ++acceptedFusion;
-          actions.push_back(fusionAction("producer_consumer",
-                                         (*metadata)[firstIndex].name,
-                                         (*metadata)[secondIndex].name));
-        } else {
-          ++fusionRejections["producer_consumer_contract_rejected"];
-        }
-        ++consideredFusion;
-        bool siblings = independentSiblings(first, second);
-        if (siblings) {
-          ++acceptedFusion;
-          actions.push_back(fusionAction("sibling",
-                                         (*metadata)[firstIndex].name,
-                                         (*metadata)[secondIndex].name));
-        } else {
-          ++fusionRejections["sibling_contract_rejected"];
-        }
-        std::optional<DirectRawConnection> rawConnection =
-            directRawProducerConsumer(first, second);
-        FailureOr<CanonicalTask> firstCanonical = canonicalTask(first);
-        FailureOr<CanonicalTask> secondCanonical = canonicalTask(second);
-        // Equal factors do not require equal loop bounds. Interior stencil
-        // domains intentionally differ from their producers, and layout
-        // changes can map a producer dimension to a differently numbered
-        // consumer counter. After both rewrites, the typed-edge builder proves
-        // exact read/write intersections or conservatively expands the join.
-        size_t producerAxes =
-            succeeded(firstCanonical) ? firstCanonical->counters.size() : 0;
-        size_t consumerAxes =
-            succeeded(secondCanonical) ? secondCanonical->counters.size() : 0;
-        for (size_t producerAxis = 0; producerAxis < producerAxes;
-             ++producerAxis)
-          for (size_t consumerAxis = 0; consumerAxis < consumerAxes;
-               ++consumerAxis) {
-            ++consideredCotiling;
-            std::string rejectionReason;
-            if (!rawConnection) {
-              rejectionReason = "no_direct_raw_connection";
-            } else if (!tilingContract(first, *firstCanonical, producerAxis,
-                                       &rejectionReason)) {
-              rejectionReason = "producer_" + rejectionReason;
-            } else if (!tilingContract(second, *secondCanonical, consumerAxis,
-                                       &rejectionReason)) {
-              rejectionReason = "consumer_" + rejectionReason;
-            } else if (cotilingAxisCompatibility(
-                           first, *firstCanonical, producerAxis, second,
-                           *secondCanonical, consumerAxis, *rawConnection) ==
-                       CotilingAxisCompatibility::Incompatible) {
-              rejectionReason = "shared_storage_axis_mismatch";
-            }
-            if (!rejectionReason.empty()) {
-              ++cotilingRejections[rejectionReason];
-              continue;
-            }
-            ++acceptedCotiling;
-            int64_t producerExtent = firstCanonical->upper[producerAxis] -
-                                     firstCanonical->lower[producerAxis];
-            int64_t consumerExtent = secondCanonical->upper[consumerAxis] -
-                                     secondCanonical->lower[consumerAxis];
-            int64_t limit = std::min({static_cast<int64_t>(maxTileFactor),
-                                      producerExtent, consumerExtent});
-            for (int64_t factor = 2; factor <= limit; ++factor)
-              actions.push_back(cotilingAction(
-                  (*metadata)[firstIndex].name, (*metadata)[secondIndex].name,
-                  producerAxis, consumerAxis, factor));
+          TaskflowTaskOp first = (*metadata)[firstIndex].op;
+          TaskflowTaskOp second = (*metadata)[secondIndex].op;
+          ++consideredFusion;
+          bool producerConsumer = directProducerConsumer(first, second);
+          if (producerConsumer) {
+            ++acceptedFusion;
+            actions.push_back(fusionAction("producer_consumer",
+                                           (*metadata)[firstIndex].name,
+                                           (*metadata)[secondIndex].name));
+          } else {
+            ++fusionRejections["producer_consumer_contract_rejected"];
           }
+          ++consideredFusion;
+          bool siblings = independentSiblings(first, second);
+          if (siblings) {
+            ++acceptedFusion;
+            actions.push_back(fusionAction("sibling",
+                                           (*metadata)[firstIndex].name,
+                                           (*metadata)[secondIndex].name));
+          } else {
+            ++fusionRejections["sibling_contract_rejected"];
+          }
+          std::optional<DirectRawConnection> rawConnection =
+              directRawProducerConsumer(first, second);
+          FailureOr<CanonicalTask> firstCanonical = canonicalTask(first);
+          FailureOr<CanonicalTask> secondCanonical = canonicalTask(second);
+          // Equal factors do not require equal loop bounds. Interior stencil
+          // domains intentionally differ from their producers, and layout
+          // changes can map a producer dimension to a differently numbered
+          // consumer counter. After both rewrites, the typed-edge builder
+          // proves exact read/write intersections or conservatively expands the
+          // join.
+          size_t producerAxes =
+              succeeded(firstCanonical) ? firstCanonical->counters.size() : 0;
+          size_t consumerAxes =
+              succeeded(secondCanonical) ? secondCanonical->counters.size() : 0;
+          for (size_t producerAxis = 0; producerAxis < producerAxes;
+               ++producerAxis)
+            for (size_t consumerAxis = 0; consumerAxis < consumerAxes;
+                 ++consumerAxis) {
+              ++consideredCotiling;
+              std::string rejectionReason;
+              if (!rawConnection) {
+                rejectionReason = "no_direct_raw_connection";
+              } else if (!tilingContract(first, *firstCanonical, producerAxis,
+                                         &rejectionReason)) {
+                rejectionReason = "producer_" + rejectionReason;
+              } else if (!tilingContract(second, *secondCanonical, consumerAxis,
+                                         &rejectionReason)) {
+                rejectionReason = "consumer_" + rejectionReason;
+              } else if (cotilingAxisCompatibility(
+                             first, *firstCanonical, producerAxis, second,
+                             *secondCanonical, consumerAxis, *rawConnection) ==
+                         CotilingAxisCompatibility::Incompatible) {
+                rejectionReason = "shared_storage_axis_mismatch";
+              }
+              if (!rejectionReason.empty()) {
+                ++cotilingRejections[rejectionReason];
+                continue;
+              }
+              ++acceptedCotiling;
+              int64_t producerExtent = firstCanonical->upper[producerAxis] -
+                                       firstCanonical->lower[producerAxis];
+              int64_t consumerExtent = secondCanonical->upper[consumerAxis] -
+                                       secondCanonical->lower[consumerAxis];
+              int64_t limit = std::min({static_cast<int64_t>(maxTileFactor),
+                                        producerExtent, consumerExtent});
+              for (int64_t factor = 2; factor <= limit; ++factor)
+                actions.push_back(cotilingAction(
+                    (*metadata)[firstIndex].name, (*metadata)[secondIndex].name,
+                    producerAxis, consumerAxis, factor));
+            }
         }
 
     auto addActionSummary = [&](StringRef kind, int64_t considered,
@@ -2902,8 +2889,8 @@ struct ExtractJointTaskGraphFactsPass
       auto task = join.getTileStates().front().getDefiningOp<TaskflowTaskOp>();
       unsigned readResult = 0;
       if (task) {
-        auto result = llvm::find(task.getDoneReads(),
-                                 join.getTileStates().front());
+        auto result =
+            llvm::find(task.getDoneReads(), join.getTileStates().front());
         if (result != task.getDoneReads().end())
           readResult = result - task.getDoneReads().begin();
       }
@@ -2913,9 +2900,9 @@ struct ExtractJointTaskGraphFactsPass
           {"replica_read_states",
            static_cast<int64_t>(join.getTileStates().size())},
           {"linked_output_completion_join", completionIndex},
-          {"users", static_cast<int64_t>(std::distance(
-                         join.getJoined().use_begin(),
-                         join.getJoined().use_end()))}});
+          {"users",
+           static_cast<int64_t>(std::distance(join.getJoined().use_begin(),
+                                              join.getJoined().use_end()))}});
     });
     json::Object root{
         {"schema", kFactsSchema},
@@ -2956,12 +2943,10 @@ struct ExtractJointTaskGraphFactsPass
 
 namespace mlir::amoeba::neura::joint_scheduling {
 
-ClosureStrictKClassification
-classifyClosureKLegality(TaskflowTaskOp task) {
+ClosureStrictKClassification classifyClosureKLegality(TaskflowTaskOp task) {
   KReductionProof proof = proveKReduction(task);
-  return {proof.potential, proof.extent.has_value(),
-          proof.extent.value_or(0), proof.provenIllegal,
-          proof.unprovenReason};
+  return {proof.potential, proof.extent.has_value(), proof.extent.value_or(0),
+          proof.provenIllegal, proof.unprovenReason};
 }
 
 } // namespace mlir::amoeba::neura::joint_scheduling

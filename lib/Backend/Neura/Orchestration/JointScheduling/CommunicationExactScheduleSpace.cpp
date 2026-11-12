@@ -43,11 +43,11 @@ static int64_t strictSuccessor(int64_t value) {
 // A candidate origin changes network endpoints. Reconstruct each branch's
 // reservations from its dispatch prefix; beginTrial/finishTrial(false) alone
 // cannot undo transfers already committed by an ancestor.
-bool replayPrefixAndGetReady(
-    const std::vector<ExactScheduleTask> &tasks,
-    const std::vector<ExactSchedulePlacement> &placed, unsigned index,
-    int row, int col, FixedScheduleCommunication &communication,
-    int64_t &candidateReady, std::string &error) {
+bool replayPrefixAndGetReady(const std::vector<ExactScheduleTask> &tasks,
+                             const std::vector<ExactSchedulePlacement> &placed,
+                             unsigned index, int row, int col,
+                             FixedScheduleCommunication &communication,
+                             int64_t &candidateReady, std::string &error) {
   std::vector<const ExactSchedulePlacement *> byTask(tasks.size(), nullptr);
   for (const auto &placement : placed)
     byTask[placement.task] = &placement;
@@ -90,14 +90,15 @@ bool replayPrefixAndGetReady(
                  dc < destination->col + destinationShape.cols; ++dc) {
               int64_t endpointReady = 0;
               if (!communication.getTransferReadyCycle(
-                      predecessor, current, sr, sc, dr, dc, source->end,
-                      false, endpointReady, error)) {
+                      predecessor, current, sr, sc, dr, dc, source->end, false,
+                      endpointReady, error)) {
                 communication.finishTrial(false);
                 return false;
               }
               if (endpointReady < source->end) {
                 communication.finishTrial(false);
-                error = "communication model returns a cycle before producer finish";
+                error = "communication model returns a cycle before producer "
+                        "finish";
                 return false;
               }
               if (endpointReady < bestReady) {
@@ -144,9 +145,9 @@ bool replayPrefixAndGetReady(
 // tie rule identical to replayPrefixAndGetReady().
 bool reserveCandidateIncomingTransfers(
     const std::vector<ExactScheduleTask> &tasks,
-    const std::vector<ExactSchedulePlacement> &placed, unsigned index,
-    int row, int col, FixedScheduleCommunication &communication,
-    int64_t &candidateReady, std::string &error) {
+    const std::vector<ExactSchedulePlacement> &placed, unsigned index, int row,
+    int col, FixedScheduleCommunication &communication, int64_t &candidateReady,
+    std::string &error) {
   std::vector<const ExactSchedulePlacement *> byTask(tasks.size(), nullptr);
   for (const auto &placement : placed)
     byTask[placement.task] = &placement;
@@ -183,9 +184,9 @@ bool reserveCandidateIncomingTransfers(
         for (int dr = row; dr < row + destinationShape.rows; ++dr)
           for (int dc = col; dc < col + destinationShape.cols; ++dc) {
             int64_t endpointReady = 0;
-            if (!communication.getTransferReadyCycle(
-                    predecessor, index, sr, sc, dr, dc, source->end, false,
-                    endpointReady, error)) {
+            if (!communication.getTransferReadyCycle(predecessor, index, sr, sc,
+                                                     dr, dc, source->end, false,
+                                                     endpointReady, error)) {
               communication.finishTrial(false);
               return false;
             }
@@ -208,10 +209,10 @@ bool reserveCandidateIncomingTransfers(
       error = "communication transfer has no rectangle endpoint";
       return false;
     }
-    if (!communication.getTransferReadyCycle(
-            predecessor, index, bestSourceRow, bestSourceCol,
-            bestDestinationRow, bestDestinationCol, source->end, true,
-            bestReady, error)) {
+    if (!communication.getTransferReadyCycle(predecessor, index, bestSourceRow,
+                                             bestSourceCol, bestDestinationRow,
+                                             bestDestinationCol, source->end,
+                                             true, bestReady, error)) {
       communication.finishTrial(false);
       return false;
     }
@@ -258,8 +259,7 @@ struct Search {
   std::map<std::string, int64_t> stateMemo;
   bool stateMemoUsable = false;
   mutable bool stateMemoCutoffViolation = false;
-  mutable int64_t lastObservedUpperBound =
-      std::numeric_limits<int64_t>::max();
+  mutable int64_t lastObservedUpperBound = std::numeric_limits<int64_t>::max();
 
   std::vector<std::pair<unsigned, unsigned>> incompatibleRectangles = {};
 
@@ -297,8 +297,7 @@ struct Search {
 
     bool operator<(const OptimisticEndPlacementKey &other) const {
       return std::tie(task, row, col, start, end) <
-             std::tie(other.task, other.row, other.col, other.start,
-                      other.end);
+             std::tie(other.task, other.row, other.col, other.start, other.end);
     }
   };
   using OptimisticEndsKey = std::vector<OptimisticEndPlacementKey>;
@@ -319,9 +318,11 @@ struct Search {
     return key;
   }
 
-  bool getCachedEndpointRectangleLowerBound(
-      unsigned producer, unsigned consumer, int sourceRow, int sourceCol,
-      int destinationRow, int destinationCol, int64_t &cycles) {
+  bool getCachedEndpointRectangleLowerBound(unsigned producer,
+                                            unsigned consumer, int sourceRow,
+                                            int sourceCol, int destinationRow,
+                                            int destinationCol,
+                                            int64_t &cycles) {
     cycles = 0;
     if (!communication.supportsStaticEndpointLowerBoundCache())
       return false;
@@ -330,17 +331,16 @@ struct Search {
     // Search lifetime already binds the architecture, edge payloads and model
     // instance; these fields make accidental reuse after shape mutation fail
     // as a distinct key rather than silently reusing a bound.
-    const EndpointRectangleCacheKey key{
-        producer,
-        consumer,
-        sourceRow,
-        sourceCol,
-        destinationRow,
-        destinationCol,
-        tasks[producer].rows,
-        tasks[producer].cols,
-        tasks[consumer].rows,
-        tasks[consumer].cols};
+    const EndpointRectangleCacheKey key{producer,
+                                        consumer,
+                                        sourceRow,
+                                        sourceCol,
+                                        destinationRow,
+                                        destinationCol,
+                                        tasks[producer].rows,
+                                        tasks[producer].cols,
+                                        tasks[consumer].rows,
+                                        tasks[consumer].cols};
     auto [it, inserted] = endpointRectangleLowerBounds.emplace(
         key, EndpointRectangleCacheEntry{});
     EndpointRectangleCacheEntry &entry = it->second;
@@ -392,9 +392,9 @@ struct Search {
   void configureRectanglePairs() {
     for (unsigned i = 0; i < tasks.size(); ++i)
       for (unsigned j = i + 1; j < tasks.size(); ++j)
-        if (!rectanglePairCanOverlapInTime(gridRows, gridCols,
-                                          tasks[i].rows, tasks[i].cols,
-                                          tasks[j].rows, tasks[j].cols))
+        if (!rectanglePairCanOverlapInTime(gridRows, gridCols, tasks[i].rows,
+                                           tasks[i].cols, tasks[j].rows,
+                                           tasks[j].cols))
           incompatibleRectangles.emplace_back(i, j);
   }
 
@@ -504,13 +504,17 @@ struct Search {
       int64_t value = 0;
       for (unsigned j = 0; j < tasks.size(); ++j)
         if (std::find(tasks[j].predecessors.begin(),
-                      tasks[j].predecessors.end(), i) != tasks[j].predecessors.end()) {
+                      tasks[j].predecessors.end(),
+                      i) != tasks[j].predecessors.end()) {
           int64_t suffix = tail(j);
-          suffix = suffix > std::numeric_limits<int64_t>::max() - edgeLowerBound[j][i]
-              ? std::numeric_limits<int64_t>::max() : suffix + edgeLowerBound[j][i];
-          value = std::max(value,
-              suffix > std::numeric_limits<int64_t>::max() - tasks[j].duration
-                  ? std::numeric_limits<int64_t>::max() : suffix + tasks[j].duration);
+          suffix = suffix > std::numeric_limits<int64_t>::max() -
+                                edgeLowerBound[j][i]
+                       ? std::numeric_limits<int64_t>::max()
+                       : suffix + edgeLowerBound[j][i];
+          value = std::max(value, suffix > std::numeric_limits<int64_t>::max() -
+                                               tasks[j].duration
+                                      ? std::numeric_limits<int64_t>::max()
+                                      : suffix + tasks[j].duration);
         }
       return successorTail[i] = value;
     };
@@ -527,7 +531,8 @@ struct Search {
   }
 
   int64_t upperBound() const {
-    int64_t bound = maxMakespan > 0 ? maxMakespan : std::numeric_limits<int64_t>::max();
+    int64_t bound =
+        maxMakespan > 0 ? maxMakespan : std::numeric_limits<int64_t>::max();
     if (!limits.rankingTopK)
       return bound;
     if (bestFive.size() >= limits.rankingTopK)
@@ -598,19 +603,18 @@ struct Search {
       int64_t bestEnd = std::numeric_limits<int64_t>::max();
       for (int row = 0; row < gridRows; ++row)
         for (int col = 0; col < gridCols; ++col) {
-          if (row + tasks[i].rows > gridRows ||
-              col + tasks[i].cols > gridCols)
+          if (row + tasks[i].rows > gridRows || col + tasks[i].cols > gridCols)
             continue;
 
           WideCycle release = 0;
           for (unsigned predecessor : tasks[i].predecessors) {
             const WideCycle predecessorEnd = earliestEnd(predecessor);
             int64_t delay = edgeLowerBound[i][predecessor];
-            auto source = std::find_if(
-                placed.begin(), placed.end(),
-                [&](const ExactSchedulePlacement &placement) {
-                  return placement.task == predecessor;
-                });
+            auto source =
+                std::find_if(placed.begin(), placed.end(),
+                             [&](const ExactSchedulePlacement &placement) {
+                               return placement.task == predecessor;
+                             });
             if (source != placed.end()) {
               int64_t endpointDelay = std::numeric_limits<int64_t>::max();
               bool endpointProof = true;
@@ -626,8 +630,7 @@ struct Search {
                        sourceCol < source->col + tasks[predecessor].cols;
                        ++sourceCol)
                     for (int destinationRow = row;
-                         destinationRow < row + tasks[i].rows;
-                         ++destinationRow)
+                         destinationRow < row + tasks[i].rows; ++destinationRow)
                       for (int destinationCol = col;
                            destinationCol < col + tasks[i].cols;
                            ++destinationCol) {
@@ -650,12 +653,13 @@ struct Search {
                   endpointDelay != std::numeric_limits<int64_t>::max())
                 delay = endpointDelay;
             }
-            release = std::max(
-                release, addCycles(predecessorEnd, static_cast<WideCycle>(delay)));
+            release =
+                std::max(release, addCycles(predecessorEnd,
+                                            static_cast<WideCycle>(delay)));
           }
           const int64_t dependencyReady = clampCycle(release);
-          const int64_t start = firstNonconflictingStart(
-              row, col, dependencyReady, tasks[i]);
+          const int64_t start =
+              firstNonconflictingStart(row, col, dependencyReady, tasks[i]);
           if (start == std::numeric_limits<int64_t>::max())
             continue;
           bestStart = std::min(bestStart, start);
@@ -699,8 +703,7 @@ struct Search {
   // meet the incumbent bound.  The event set includes all window boundaries
   // and duration offsets, so the check is conservative even for integer
   // starts; it never imposes a candidate or symmetry limit.
-  bool exceedsResourceWindowBound(
-      const std::vector<int64_t> &releases) {
+  bool exceedsResourceWindowBound(const std::vector<int64_t> &releases) {
     const int64_t bound = upperBound();
     const WideCycle wideBound = bound;
     std::vector<int64_t> deadlines(tasks.size(), 0);
@@ -720,16 +723,15 @@ struct Search {
       if (deadline < 0)
         return true;
       deadlines[i] = clampCycle(deadline);
-      const WideCycle completion =
-          addCycles(releases[i], tasks[i].duration);
+      const WideCycle completion = addCycles(releases[i], tasks[i].duration);
       if (completion > deadline)
         return true;
       events.push_back(releases[i]);
       events.push_back(deadlines[i]);
       events.push_back(clampCycle(completion));
       if (deadline >= tasks[i].duration)
-        events.push_back(clampCycle(
-            deadline - static_cast<WideCycle>(tasks[i].duration)));
+        events.push_back(
+            clampCycle(deadline - static_cast<WideCycle>(tasks[i].duration)));
     }
     std::sort(events.begin(), events.end());
     events.erase(std::unique(events.begin(), events.end()), events.end());
@@ -743,8 +745,9 @@ struct Search {
           continue;
         WideCycle demand = 0;
         for (const auto &p : placed) {
-          const WideCycle overlap = std::max<WideCycle>(
-              0, std::min<WideCycle>(p.end, b) - std::max<WideCycle>(p.start, a));
+          const WideCycle overlap =
+              std::max<WideCycle>(0, std::min<WideCycle>(p.end, b) -
+                                         std::max<WideCycle>(p.start, a));
           demand = addCycles(
               demand, overlap * static_cast<WideCycle>(tasks[p.task].rows) *
                           tasks[p.task].cols);
@@ -758,9 +761,9 @@ struct Search {
           const WideCycle after = std::max<WideCycle>(0, deadline - b);
           const WideCycle mandatory = std::max<WideCycle>(
               0, static_cast<WideCycle>(tasks[i].duration) - before - after);
-          demand = addCycles(
-              demand, mandatory * static_cast<WideCycle>(tasks[i].rows) *
-                          tasks[i].cols);
+          demand = addCycles(demand, mandatory *
+                                         static_cast<WideCycle>(tasks[i].rows) *
+                                         tasks[i].cols);
         }
         const WideCycle capacity = (b - a) * capacityPerTile;
         if (demand > capacity)
@@ -793,8 +796,8 @@ struct Search {
       const int64_t deadlineI = bound - successorTail[i];
       const int64_t deadlineJ = bound - successorTail[j];
       if (!rectanglePairHasSerialWindow(releases[i], tasks[i].duration,
-                                       deadlineI, releases[j], tasks[j].duration,
-                                       deadlineJ)) {
+                                        deadlineI, releases[j],
+                                        tasks[j].duration, deadlineJ)) {
         ++result.boundRejectedBranches;
         ++result.geometryTimeBoundRejectedBranches;
         return true;
@@ -810,7 +813,7 @@ struct Search {
   // Every start between start and the end of an intersecting reservation
   // overlaps that reservation. Jump over exactly those forbidden integers.
   int64_t firstNonconflictingStart(int row, int col, int64_t start,
-                                  const ExactScheduleTask &task) const {
+                                   const ExactScheduleTask &task) const {
     while (start <= std::numeric_limits<int64_t>::max() - task.duration) {
       int64_t next = start;
       for (const auto &p : placed) {
@@ -832,8 +835,10 @@ struct Search {
   bool seed() {
     if (!limits.seedIncumbents || !limits.rankingTopK)
       return true;
-    for (unsigned preference = 0; preference < std::min<unsigned>(
-             limits.seedPreferences, gridRows * gridCols); ++preference) {
+    for (unsigned preference = 0;
+         preference <
+         std::min<unsigned>(limits.seedPreferences, gridRows * gridCols);
+         ++preference) {
       placed.clear();
       std::fill(scheduled.begin(), scheduled.end(), false);
       while (placed.size() < tasks.size()) {
@@ -858,7 +863,7 @@ struct Search {
             continue;
           int64_t ready = 0;
           if (!replayPrefixAndGetReady(tasks, placed, index, row, col,
-                                      communication, ready, error)) {
+                                       communication, ready, error)) {
             result.reason = "communication-replay-failed";
             return false;
           }
@@ -903,8 +908,8 @@ struct Search {
     }
     if (limits.maxMilliseconds &&
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - began).count() >=
-            static_cast<int64_t>(limits.maxMilliseconds)) {
+            std::chrono::steady_clock::now() - began)
+                .count() >= static_cast<int64_t>(limits.maxMilliseconds)) {
       result.reason = "max-milliseconds";
       return true;
     }
@@ -987,7 +992,7 @@ struct Search {
     if (checkpointPath) {
       std::string checkpointError;
       if (!communication.captureReservationCheckpoint(parentCheckpoint,
-                                                       checkpointError))
+                                                      checkpointError))
         checkpointPath = false;
     }
     if (placed.size() == tasks.size()) {
@@ -995,8 +1000,8 @@ struct Search {
       order.reserve(placed.size());
       for (const auto &placement : placed)
         order.push_back(placement.task);
-      auto score = verifyAndScoreFixedSchedule(
-          gridRows, gridCols, tasks, placed, order, communication);
+      auto score = verifyAndScoreFixedSchedule(gridRows, gridCols, tasks,
+                                               placed, order, communication);
       // The independent verifier is authoritative and resets/reserves the
       // provider while checking the terminal. Restore this node's exact
       // prefix before any return so the caller's branch state is unchanged.
@@ -1016,8 +1021,8 @@ struct Search {
                 [](const auto &a, const auto &b) { return a.task < b.task; });
       std::ostringstream key;
       for (const auto &p : canonical)
-        key << p.task << ':' << p.row << ',' << p.col << '@'
-            << p.start << '-' << p.end << ';';
+        key << p.task << ':' << p.row << ',' << p.col << '@' << p.start << '-'
+            << p.end << ';';
       std::ostringstream pathKey;
       pathKey << key.str() << " order:";
       for (unsigned task : order)
@@ -1056,7 +1061,8 @@ struct Search {
         }
       if (!readyTask)
         continue;
-      if (dispatchPolicy == CommunicationDispatchPolicy::CanonicalSmallestReady) {
+      if (dispatchPolicy ==
+          CommunicationDispatchPolicy::CanonicalSmallestReady) {
         bool earlierReady = false;
         for (unsigned earlier = 0; earlier < index; ++earlier) {
           if (scheduled[earlier])
@@ -1092,13 +1098,13 @@ struct Search {
             }
           }
           int64_t ready = 0;
-          const bool prepared = checkpointPath
-                                    ? reserveCandidateIncomingTransfers(
-                                          tasks, placed, index, row, col,
-                                          communication, ready, error)
-                                    : replayPrefixAndGetReady(
-                                          tasks, placed, index, row, col,
-                                          communication, ready, error);
+          const bool prepared =
+              checkpointPath
+                  ? reserveCandidateIncomingTransfers(tasks, placed, index, row,
+                                                      col, communication, ready,
+                                                      error)
+                  : replayPrefixAndGetReady(tasks, placed, index, row, col,
+                                            communication, ready, error);
           if (!prepared) {
             result.reason = "communication-replay-failed";
             return false;
@@ -1129,8 +1135,9 @@ struct Search {
               }
               return true;
             }
-            placed.push_back({index, row, col, start, end,
-                start - firstNonconflictingStart(row, col, ready, task)});
+            placed.push_back(
+                {index, row, col, start, end,
+                 start - firstNonconflictingStart(row, col, ready, task)});
             scheduled[index] = true;
             int64_t childMinimum = std::numeric_limits<int64_t>::max();
             if (!visit(childMinimum)) {
@@ -1148,7 +1155,8 @@ struct Search {
           if (startPolicy == CommunicationStartPolicy::OrderDerived) {
             // Temporal choices are dispatch orders. Times are consequences
             // of dependency/network readiness and half-open cell occupancy.
-            const int64_t start = firstNonconflictingStart(row, col, ready, task);
+            const int64_t start =
+                firstNonconflictingStart(row, col, ready, task);
             const int64_t latest = latestStart(index);
             if (stateMemoCutoffViolation) {
               if (!restoreParent())
@@ -1161,7 +1169,8 @@ struct Search {
               ++result.boundRejectedBranches;
               continue;
             }
-            if (!visitStart(start)) return false;
+            if (!visitStart(start))
+              return false;
           } else if (startPolicy == CommunicationStartPolicy::AllInteger) {
             int64_t start = ready;
             while (start <= latestStart(index)) {
@@ -1176,7 +1185,8 @@ struct Search {
                 return false;
               }
               ++result.expandedNodes;
-              const int64_t freeStart = firstNonconflictingStart(row, col, start, task);
+              const int64_t freeStart =
+                  firstNonconflictingStart(row, col, start, task);
               if (freeStart > start) {
                 ++result.overlapRejectedBranches;
                 start = freeStart;
@@ -1194,7 +1204,8 @@ struct Search {
               if (other.end >= ready)
                 events.push_back(other.end);
             std::sort(events.begin(), events.end());
-            events.erase(std::unique(events.begin(), events.end()), events.end());
+            events.erase(std::unique(events.begin(), events.end()),
+                         events.end());
             for (int64_t start : events)
               if (!visitStart(start))
                 return false;
@@ -1208,8 +1219,8 @@ struct Search {
 bool validateInputs(int gridRows, int gridCols,
                     const std::vector<ExactScheduleTask> &tasks,
                     ExactScheduleLimits limits,
-                    CommunicationStartPolicy startPolicy,
-                    int64_t maxMakespan, std::string &error) {
+                    CommunicationStartPolicy startPolicy, int64_t maxMakespan,
+                    std::string &error) {
   if (gridRows != 4 || gridCols != 4 || tasks.empty() ||
       limits.maxExpandedNodes == 0 ||
       limits.maxMilliseconds >
@@ -1217,7 +1228,8 @@ bool validateInputs(int gridRows, int gridCols,
       maxMakespan < 0 ||
       (startPolicy == CommunicationStartPolicy::AllInteger &&
        maxMakespan == 0)) {
-    error = "communication scheduling requires nonempty 4x4 input and valid budget";
+    error =
+        "communication scheduling requires nonempty 4x4 input and valid budget";
     return false;
   }
   std::set<std::string> names;
@@ -1225,8 +1237,8 @@ bool validateInputs(int gridRows, int gridCols,
   std::vector<std::vector<unsigned>> users(tasks.size());
   for (unsigned i = 0; i < tasks.size(); ++i) {
     const auto &task = tasks[i];
-    if (task.name.empty() || !names.insert(task.name).second ||
-        task.rows < 1 || task.cols < 1 || task.rows > 4 || task.cols > 4 ||
+    if (task.name.empty() || !names.insert(task.name).second || task.rows < 1 ||
+        task.cols < 1 || task.rows > 4 || task.cols > 4 ||
         task.rows * task.cols > 4 || task.duration < 1) {
       error = "invalid fixed task shape, unique name or predicted duration";
       return false;
@@ -1270,9 +1282,8 @@ bool enumerateCommunicationScheduleSpace(
     const std::function<void(const std::vector<ExactSchedulePlacement> &,
                              const std::vector<unsigned> &,
                              const FixedScheduleScore &)> &emit,
-    ExactScheduleResult &result,
-    CommunicationScheduleCertificate &certificate, std::string &error,
-    CommunicationDispatchPolicy dispatchPolicy,
+    ExactScheduleResult &result, CommunicationScheduleCertificate &certificate,
+    std::string &error, CommunicationDispatchPolicy dispatchPolicy,
     const std::function<int64_t()> &externalUpperBound) {
   result = {};
   certificate = {};
@@ -1280,20 +1291,46 @@ bool enumerateCommunicationScheduleSpace(
   if (!validateInputs(gridRows, gridCols, tasks, limits, startPolicy,
                       maxMakespan, error))
     return false;
-  Search search{gridRows, gridCols, tasks, limits, startPolicy,
-                maxMakespan > 0 ? maxMakespan : std::numeric_limits<int64_t>::max(),
-                communication, emit, result, certificate, error, {}, {}, {},
-                {}, {}, std::chrono::steady_clock::now(),
-                CommunicationDispatchPolicy::AllReady, {}, {}, {}, {}, false,
-                false, std::numeric_limits<int64_t>::max(), {}, {}, {}};
+  Search search{gridRows,
+                gridCols,
+                tasks,
+                limits,
+                startPolicy,
+                maxMakespan > 0 ? maxMakespan
+                                : std::numeric_limits<int64_t>::max(),
+                communication,
+                emit,
+                result,
+                certificate,
+                error,
+                {},
+                {},
+                {},
+                {},
+                {},
+                std::chrono::steady_clock::now(),
+                CommunicationDispatchPolicy::AllReady,
+                {},
+                {},
+                {},
+                {},
+                false,
+                false,
+                std::numeric_limits<int64_t>::max(),
+                {},
+                {},
+                {}};
   search.scheduled.assign(tasks.size(), false);
   search.dispatchPolicy = dispatchPolicy;
   search.externalUpperBound = externalUpperBound;
   search.configureStateMemo();
-  search.edgeLowerBound.assign(tasks.size(), std::vector<int64_t>(tasks.size(), 0));
+  search.edgeLowerBound.assign(tasks.size(),
+                               std::vector<int64_t>(tasks.size(), 0));
   for (unsigned i = 0; i < tasks.size(); ++i)
     for (unsigned p : tasks[i].predecessors)
-      if (!communication.getTransferLowerBound(p, i, search.edgeLowerBound[i][p], error) || search.edgeLowerBound[i][p] < 0)
+      if (!communication.getTransferLowerBound(
+              p, i, search.edgeLowerBound[i][p], error) ||
+          search.edgeLowerBound[i][p] < 0)
         return false;
   search.computeSuccessorTails();
   search.configureRectanglePairs();
@@ -1304,15 +1341,14 @@ bool enumerateCommunicationScheduleSpace(
   if (startPolicy == CommunicationStartPolicy::OrderDerived &&
       communication.supportsReservationCheckpoint())
     communication.resetReservations();
-  result.complete = search.seed() &&
-      (startPolicy == CommunicationStartPolicy::SeedOnly ||
-       search.visit(rootMinimum));
+  result.complete =
+      search.seed() && (startPolicy == CommunicationStartPolicy::SeedOnly ||
+                        search.visit(rootMinimum));
   if (!result.complete && result.reason.empty())
     result.reason = "interrupted";
   certificate.distinctCandidates = result.acceptedPaths;
   if (result.complete && startPolicy == CommunicationStartPolicy::AllInteger &&
-      search.bestFive.size() == 5 &&
-      search.bestFive[4].first <= maxMakespan) {
+      search.bestFive.size() == 5 && search.bestFive[4].first <= maxMakespan) {
     certificate.topFiveCertifiedWithinFixedShapeGraph = true;
     certificate.fifthPredictedCycles = search.bestFive[4].first;
   }

@@ -7,7 +7,12 @@
 
 namespace mlir::amoeba::neura::joint_scheduling {
 
-enum class CommunicationStartPolicy { EventNormalized, AllInteger, SeedOnly, OrderDerived };
+enum class CommunicationStartPolicy {
+  EventNormalized,
+  AllInteger,
+  SeedOnly,
+  OrderDerived
+};
 enum class CommunicationDispatchPolicy { AllReady, CanonicalSmallestReady };
 
 struct CommunicationScheduleCertificate {
@@ -28,8 +33,8 @@ bool enumerateCommunicationScheduleSpace(
     const std::function<void(const std::vector<ExactSchedulePlacement> &,
                              const std::vector<unsigned> &,
                              const FixedScheduleScore &)> &emit,
-    ExactScheduleResult &result,
-    CommunicationScheduleCertificate &certificate, std::string &error,
+    ExactScheduleResult &result, CommunicationScheduleCertificate &certificate,
+    std::string &error,
     CommunicationDispatchPolicy dispatchPolicy =
         CommunicationDispatchPolicy::AllReady,
     const std::function<int64_t()> &externalUpperBound = {});

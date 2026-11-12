@@ -12,62 +12,561 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <set>
-using namespace mlir;using namespace orbit::taskflow;namespace j=llvm::json;
+using namespace mlir;
+using namespace orbit::taskflow;
+namespace j = llvm::json;
 namespace {
-bool fail(std::string &e,const std::string &s){e="joint AIR realization: "+s;return false;}
-bool named(Operation *o,StringRef name){return o->getName().getStringRef()==name;}
-Operation *unique(Operation *o,StringRef name){Operation *found=nullptr;bool many=false;o->walk([&](Operation *v){if(named(v,name)){many|=found!=nullptr;found=v;}});return many?nullptr:found;}
-Block *body(Operation *o){return o&&o->getNumRegions()==1&&llvm::hasSingleElement(o->getRegion(0))?&o->getRegion(0).front():nullptr;}
-Operation *make(OpBuilder &b,StringRef name,ValueRange operands={},bool region=false){OperationState s(b.getUnknownLoc(),name);s.addOperands(operands);if(region)s.addRegion();return b.create(s);}
-Operation *hierarchy(OpBuilder &b,StringRef name,const std::string &symbol,ValueRange sizes,ValueRange operands){SmallVector<Value> values(sizes);llvm::append_range(values,operands);auto *op=make(b,name,values,true);op->setAttr("sym_name",b.getStringAttr(symbol));op->setAttr("operandSegmentSizes",b.getDenseI32ArrayAttr({0,int32_t(sizes.size()),int32_t(operands.size())}));auto *block=new Block;op->getRegion(0).push_back(block);for(size_t i=0;i<2*sizes.size();++i)block->addArgument(b.getIndexType(),b.getUnknownLoc());for(auto v:operands)block->addArgument(v.getType(),b.getUnknownLoc());return op;}
-std::string print(ModuleOp module){std::string s;llvm::raw_string_ostream out(s);module.print(out,OpPrintingFlags().printGenericOpForm());return s;}
-bool rebase(Operation *herd,int64_t offset,std::string &e){auto *block=body(herd);bool good=true;herd->walk([&](Operation *o){if(!named(o,"air.dma_memcpy_nd"))return;auto sizes=o->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes");if(!sizes||sizes.size()!=9){good=false;return;}unsigned start=0;int external=0;for(size_t s=0;s<9;++s){if(s==1||s==5){if(sizes[s]!=1){good=false;return;}auto arg=dyn_cast<BlockArgument>(o->getOperand(start));if(arg&&arg.getOwner()==block&&arg.getArgNumber()>=4){++external;auto key=s==1?"static_dst_offsets":"static_src_offsets";auto old=o->getAttrOfType<DenseI64ArrayAttr>(key);if(!old||old.empty()||old[0]==ShapedType::kDynamic){good=false;return;}auto values=llvm::to_vector(old.asArrayRef());if(values[0]>INT64_MAX-offset){good=false;return;}values[0]+=offset;o->setAttr(key,OpBuilder(o).getDenseI64ArrayAttr(values));}}start+=sizes[s];}if(external!=1)good=false;});return good?true:fail(e,"unsupported host DMA rebase");}
-struct Child{OwningOpRef<ModuleOp> source,air;GenericAnalysis analysis;GenericMappingPlan plan;j::Value config=nullptr;std::vector<size_t> abi;int64_t offset=0,rows=0,column=0,row=0;size_t configuration=0,group=0;};
-bool project(ModuleOp original,const j::Value &config,const ProgramJointDomain &d,const ProgramJointSolution &s,const ProgramJointSelection &selection,Child &out,std::string &e){
- auto &v=d.variants[s.variant];auto &mode=d.groups[selection.group];auto &place=d.places[selection.place];auto &domain=v.graph.instances[mode.instances.front()].domain;out.offset=domain.front().lower;out.rows=domain.front().upper-out.offset;out.configuration=selection.configuration;out.group=selection.group;
- auto owner=programDomain(d.target,programResource(d.target,place.binding.resource)->domain);if(!owner||!owner->coordinates.count("column")||!owner->coordinates.count("row"))return fail(e,"chosen compute resource lacks explicit physical coordinates");auto localMemory=programMemory(d.target,place.binding.memory);auto hostMemory=programMemory(d.target,d.hostMemory);if(!localMemory||localMemory->domain!=owner->id||localMemory->kind!="local-sram"||!hostMemory||hostMemory->kind!="system-bo")return fail(e,"chosen physical group requires core-owned local SRAM and caller-visible BOs");out.column=owner->coordinates.at("column");out.row=owner->coordinates.at("row");if(out.column<0||out.column>3||out.row!=2)return fail(e,"current direct backend supports npu2 compute row 2, columns 0..3");
- ProgramPartitionPlan proof;OwningOpRef<ModuleOp> sliced;if(!planProgramPartition(v.graph.source,v.chunk,proof,e)||!materializeProgramPartition(original,proof,out.rows,sliced,e))return false;GenericAnalysis a;if(!analyzeGenericProgram(*sliced,a,e))return false;
- std::set<size_t> input,output,used;for(auto value:mode.inputs)input.insert(v.graph.regions[v.graph.versions[value].region].storage);for(auto value:mode.outputs)output.insert(v.graph.regions[v.graph.versions[value].region].storage);for(auto value:mode.values)used.insert(v.graph.regions[v.graph.versions[value].region].storage);
- out.abi.assign(input.begin(),input.end());for(auto st:output){if(input.count(st))return fail(e,"input/output alias outside executable subset");out.abi.push_back(st);}
- auto *ctx=original.getContext();out.source=ModuleOp::create(original.getLoc());OpBuilder b(ctx);SmallVector<Type> types;for(auto st:out.abi)types.push_back(a.storages[st].root.getType());auto function=func::FuncOp::create(original.getLoc(),a.function.getName().str()+"_group_"+std::to_string(selection.group),FunctionType::get(ctx,types,{}));function->setAttr("orbit.noalias",b.getUnitAttr());function->setAttr("llvm.emit_c_interface",b.getUnitAttr());out.source->push_back(function);auto *block=function.addEntryBlock();b.setInsertionPointToStart(block);IRMapping mapping;std::vector<Value> storage(a.storages.size());
- for(size_t i=0;i<out.abi.size();++i){auto st=out.abi[i];storage[st]=function.getArgument(i);function.setArgAttr(i,"orbit.role",b.getStringAttr(input.count(st)?"input":"output"));function.setArgAttr(i,"orbit.name",b.getStringAttr(a.storages[st].id));}
- for(auto st:used)if(!storage[st]){auto alloc=b.create<memref::AllocOp>(original.getLoc(),cast<MemRefType>(a.storages[st].root.getType()));alloc->setAttr("orbit.name",b.getStringAttr(a.storages[st].id));storage[st]=alloc;}
- for(auto st:used)mapping.map(a.storages[st].root,storage[st]);
- // Task results are storage states. Map external states to explicit boundary
- // arguments; cloning a selected producer then replaces its result mapping.
- for(auto &task:a.tasks){auto *yield=task.operation->getRegion(0).front().getTerminator();for(size_t i=0;i<task.operation->getNumResults();++i){auto arg=dyn_cast<BlockArgument>(yield->getOperand(i));if(!arg||arg.getArgNumber()>=task.argumentStorages.size())return fail(e,"unsupported source task result alias");auto st=task.argumentStorages[arg.getArgNumber()];if(storage[st])mapping.map(task.operation->getResult(i),storage[st]);}}
- std::vector<size_t> sourceTasks;for(auto instance:mode.instances)sourceTasks.push_back(v.graph.instances[instance].task);
- for(auto ti:sourceTasks){auto *task=a.tasks[ti].operation;for(auto operand:task->getOperands())if(!mapping.contains(operand)){auto *definition=operand.getDefiningOp();if(!definition||!named(definition,"arith.constant"))return fail(e,"unsupported scalar/source capture");b.clone(*definition,mapping);}b.clone(*task,mapping);}
- for(auto st:used)if(!input.count(st)&&!output.count(st))b.create<memref::DeallocOp>(original.getLoc(),storage[st]);b.create<func::ReturnOp>(original.getLoc());if(failed(verify(*out.source))||!analyzeGenericProgram(*out.source,out.analysis,e))return fail(e,"selected source group projection failed: "+e);
- ProgramMappingChoice choice;choice.residency="tiled-phase-local";choice.grouping="tile-major";choice.dataOrganization="retain-across-users";ProgramResidencyGroup group;for(size_t t=0;t<out.analysis.tasks.size();++t)group.tasks.push_back(t);
- for(size_t st=0;st<out.analysis.storages.size();++st){int readers=0,writers=0;for(auto &task:out.analysis.tasks){bool read=false,write=false;for(auto &access:task.accesses)if(access.storage==st){read|=access.read;write|=access.write;}readers+=read;writers+=write;}if((writers&&readers)||(!writers&&readers>1))group.retainedStorages.push_back(st);}
- if(group.tasks.size()>1){if(group.retainedStorages.empty())return fail(e,"multi-task group requires a backend-supported retained copy");choice.residencyGroups={group};}else {choice.grouping="task-shape-stages";choice.dataOrganization="phase-local";}
- auto localConfig=config;auto root=localConfig.getAsObject();if(!root)return fail(e,"configuration object required");if(!root->getObject("generic_air"))(*root)["generic_air"]=j::Object{};auto air=root->getObject("generic_air");auto memory=programMemory(d.target,place.binding.memory);if(memory->capacityBytes>24576)return fail(e,"local capacity exceeds supported physical NPU payload contract");(*air)["capacity_bytes"]=memory->capacityBytes;(*air)["tile_sizes"]=j::Array{out.rows,out.analysis.tasks.front().loops.size()>1?out.analysis.tasks.front().loops[1].upper:1,1};
- if(!setNativeAIRTileSizes(*out.source,out.rows,out.analysis.tasks.front().loops.size()>1?out.analysis.tasks.front().loops[1].upper:1,1,e)||!setNativeMappingChoice(*out.source,choice,e)||!analyzeGenericProgram(*out.source,out.analysis,e)||!planGenericMapping(out.analysis,localConfig,out.plan,e))return false;
- if(out.plan.executionGroups.size()!=1||out.plan.moduleWideChannelConversion)return fail(e,"chosen group does not have one direct AIR realization");
- std::multiset<std::pair<size_t,std::string>> expected,actual;for(auto value:mode.inputs)expected.emplace(v.graph.regions[v.graph.versions[value].region].storage,"host_to_l1");for(auto value:mode.outputs)expected.emplace(v.graph.regions[v.graph.versions[value].region].storage,"l1_to_host");for(auto &transfer:out.plan.transfers){auto &name=out.analysis.storages[transfer.storage].id;auto found=std::find_if(a.storages.begin(),a.storages.end(),[&](auto &st){return st.id==name;});if(found==a.storages.end())return fail(e,"lowering introduced unrelated storage");actual.emplace(found-a.storages.begin(),transfer.direction);}if(actual!=expected)return fail(e,"lowering transfer set differs from selected public copies");
- int64_t payload=0;if(!programJointGroupFits(d,selection.group,selection.place,payload,e)||out.plan.residentBytes!=payload)return fail(e,"lowering static buffers differ from selected public allocations");
- out.config=localConfig;return lowerGenericToAIR(out.analysis,out.plan,out.air,e);
+bool fail(std::string &e, const std::string &s) {
+  e = "joint AIR realization: " + s;
+  return false;
 }
+bool named(Operation *o, StringRef name) {
+  return o->getName().getStringRef() == name;
 }
-bool orbit::taskflow::configureProgramJointNPU(j::Value &config,int64_t cores,std::string &e){
- auto root=config.getAsObject();if(!root||cores<1||cores>4)return fail(e,"configuration object and 1..4 cores required");auto options=root->getObject("program_joint");if(options&&options->get("architecture"))return true;if(!options){(*root)["program_joint"]=j::Object{};options=root->getObject("program_joint");}
- GenericTargetCapabilities capabilities;GenericMemoryBinding binding;if(!getGenericTargetCapabilities(config,capabilities,e)||!configureGenericMemory(config,capabilities.capacityBytes,binding,e))return false;auto c=binding.architecture;auto core=*programResource(c,binding.computeResource);auto local=*programMemory(c,binding.localMemory);auto *ownerPointer=programDomain(c,core.domain);if(!ownerPointer)return fail(e,"automatic NPU expansion requires a physical core domain; provide program_joint.architecture explicitly");auto owner=*ownerPointer;c.resources.erase(std::remove_if(c.resources.begin(),c.resources.end(),[&](auto &r){return r.id==core.id||r.id==binding.dmaResource;}),c.resources.end());c.memories.erase(std::remove_if(c.memories.begin(),c.memories.end(),[&](auto &m){return m.id==local.id;}),c.memories.end());c.domains.erase(std::remove_if(c.domains.begin(),c.domains.end(),[&](auto &x){return x.id==owner.id;}),c.domains.end());c.links.clear();
- for(int64_t i=0;i<cores;++i){auto domain=owner;domain.id="npu.tile("+std::to_string(i)+",2)";domain.coordinates={{"column",i},{"row",2}};c.domains.push_back(domain);auto r=core;r.id="npu.core."+std::to_string(i);r.domain=domain.id;c.resources.push_back(r);auto m=local;m.id="npu.sram."+std::to_string(i);m.domain=domain.id;m.accessibleResources={r.id};c.memories.push_back(m);for(bool input:{true,false}){auto dma="npu.dma."+std::to_string(i)+(input?".input":".output");c.resources.push_back({dma,"transfer","npu",1,domain.id});auto l=*programLink(binding.architecture,input?binding.inputLink:binding.outputLink);l.id="npu.link."+std::to_string(i)+(input?".input":".output");l.source=input?binding.hostMemory:m.id;l.target=input?m.id:binding.hostMemory;l.resource=dma;l.domain=domain.id;c.links.push_back(l);}}
- if(!validateMemoryArchitecture(c,e))return false;(*options)["architecture"]=serializeMemoryArchitecture(c);(*options)["host_memory"]=binding.hostMemory;return true;
+Operation *unique(Operation *o, StringRef name) {
+  Operation *found = nullptr;
+  bool many = false;
+  o->walk([&](Operation *v) {
+    if (named(v, name)) {
+      many |= found != nullptr;
+      found = v;
+    }
+  });
+  return many ? nullptr : found;
 }
-bool orbit::taskflow::lowerProgramJointToAIR(ModuleOp original,const j::Value &config,const ProgramJointDomain &d,const ProgramJointSolution &s,const ProgramGraph &graph,OwningOpRef<ModuleOp> &output,j::Value &manifest,std::string &e){
- if(!checkProgramJointSolution(d,s,graph,e))return false;auto &v=d.variants[s.variant];std::vector<Child> children;std::set<size_t> hostStorages;for(auto &selection:s.groups){Child child;if(!project(original,config,d,s,selection,child,e))return false;for(auto st:child.abi)hostStorages.insert(st);children.push_back(std::move(child));}
- std::vector<size_t> abi(hostStorages.begin(),hostStorages.end());SmallVector<Type> types;for(auto st:abi)types.push_back(v.graph.source.storages[st].root.getType());auto *ctx=original.getContext();output=ModuleOp::create(original.getLoc());OpBuilder b(ctx);auto f=func::FuncOp::create(original.getLoc(),v.graph.source.function->getAttrOfType<StringAttr>("sym_name").getValue(),FunctionType::get(ctx,types,{}));output->push_back(f);auto *entry=f.addEntryBlock();b.setInsertionPointToStart(entry);auto one=b.create<arith::ConstantIndexOp>(original.getLoc(),1);j::Array records;
- for(size_t k=0;k<s.configurationStartNs.size();++k){b.setInsertionPointToEnd(entry);auto *launch=hierarchy(b,"air.launch","orbit_joint_"+std::to_string(k),{one,one},f.getArguments());auto *lb=body(launch);b.setInsertionPointToEnd(lb);auto *segment=hierarchy(b,"air.segment","orbit_joint_configuration_"+std::to_string(k),{},lb->getArguments().drop_front(4));auto *sb=body(segment);b.setInsertionPointToEnd(sb);std::set<std::pair<int64_t,int64_t>> coords;
-  for(auto &child:children)if(child.configuration==k){if(!coords.emplace(child.column,child.row).second)return fail(e,"physical placement aliases within configuration");auto *oldSegment=unique(*child.air,"air.segment"),*oldLaunch=unique(*child.air,"air.launch"),*oldHerd=unique(*child.air,"air.herd");if(!oldSegment||!oldLaunch||!oldHerd||oldHerd->getParentOp()!=oldSegment)return fail(e,"selected child has extra hierarchy");IRMapping mapping;auto cf=*child.air->getOps<func::FuncOp>().begin();
-   for(size_t i=0;i<child.abi.size();++i){auto st=child.abi[i];auto ai=std::find(abi.begin(),abi.end(),st)-abi.begin();auto value=sb->getArgument(ai);mapping.map(cf.getArgument(i),value);mapping.map(body(oldLaunch)->getArgument(4+i),value);mapping.map(body(oldSegment)->getArgument(i),value);}
-   for(auto &op:*body(oldSegment)){if(named(&op,"air.segment_terminator"))continue;bool good=true;op.walk([&](Operation *nested){for(auto value:nested->getOperands())if(!mapping.contains(value)){if(auto arg=dyn_cast<BlockArgument>(value)){if(arg.getOwner()->getParentOp()==&op||op.isProperAncestor(arg.getOwner()->getParentOp()))continue;good=false;}else if(auto *def=value.getDefiningOp()){if(def==&op||op.isProperAncestor(def)||oldSegment->isProperAncestor(def))continue;if(named(def,"arith.constant"))b.clone(*def,mapping);else good=false;}}});if(!good)return fail(e,"unproved external child capture");auto *copy=b.clone(op,mapping);if(named(copy,"air.herd")){auto *hb=body(copy);if(!hb||hb->getNumArguments()!=4+child.abi.size())return fail(e,"child herd ABI mismatch");for(size_t i=0;i<child.abi.size();++i)hb->getArgument(4+i).setType(v.graph.source.storages[child.abi[i]].root.getType());copy->setAttr("x_loc",b.getI32IntegerAttr(child.column));copy->setAttr("y_loc",b.getI32IntegerAttr(child.row));copy->setAttr("sym_name",b.getStringAttr("orbit_joint_group_"+std::to_string(child.group)));if(!rebase(copy,child.offset,e))return false;}}
-   j::Array bindings;for(auto st:child.abi)bindings.push_back(int64_t(st));records.push_back(j::Object{{"group",int64_t(child.group)},{"configuration",int64_t(k)},{"column",child.column},{"row",child.row},{"row_offset",child.offset},{"row_count",child.rows},{"abi_storage_indices",std::move(bindings)},{"source_mlir",print(*child.source)},{"child_config",child.config},{"child_plan",serializeGenericMapping(child.analysis,child.plan)}});
+Block *body(Operation *o) {
+  return o && o->getNumRegions() == 1 && llvm::hasSingleElement(o->getRegion(0))
+             ? &o->getRegion(0).front()
+             : nullptr;
+}
+Operation *make(OpBuilder &b, StringRef name, ValueRange operands = {},
+                bool region = false) {
+  OperationState s(b.getUnknownLoc(), name);
+  s.addOperands(operands);
+  if (region)
+    s.addRegion();
+  return b.create(s);
+}
+Operation *hierarchy(OpBuilder &b, StringRef name, const std::string &symbol,
+                     ValueRange sizes, ValueRange operands) {
+  SmallVector<Value> values(sizes);
+  llvm::append_range(values, operands);
+  auto *op = make(b, name, values, true);
+  op->setAttr("sym_name", b.getStringAttr(symbol));
+  op->setAttr("operandSegmentSizes",
+              b.getDenseI32ArrayAttr(
+                  {0, int32_t(sizes.size()), int32_t(operands.size())}));
+  auto *block = new Block;
+  op->getRegion(0).push_back(block);
+  for (size_t i = 0; i < 2 * sizes.size(); ++i)
+    block->addArgument(b.getIndexType(), b.getUnknownLoc());
+  for (auto v : operands)
+    block->addArgument(v.getType(), b.getUnknownLoc());
+  return op;
+}
+std::string print(ModuleOp module) {
+  std::string s;
+  llvm::raw_string_ostream out(s);
+  module.print(out, OpPrintingFlags().printGenericOpForm());
+  return s;
+}
+bool rebase(Operation *herd, int64_t offset, std::string &e) {
+  auto *block = body(herd);
+  bool good = true;
+  herd->walk([&](Operation *o) {
+    if (!named(o, "air.dma_memcpy_nd"))
+      return;
+    auto sizes = o->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes");
+    if (!sizes || sizes.size() != 9) {
+      good = false;
+      return;
+    }
+    unsigned start = 0;
+    int external = 0;
+    for (size_t s = 0; s < 9; ++s) {
+      if (s == 1 || s == 5) {
+        if (sizes[s] != 1) {
+          good = false;
+          return;
+        }
+        auto arg = dyn_cast<BlockArgument>(o->getOperand(start));
+        if (arg && arg.getOwner() == block && arg.getArgNumber() >= 4) {
+          ++external;
+          auto key = s == 1 ? "static_dst_offsets" : "static_src_offsets";
+          auto old = o->getAttrOfType<DenseI64ArrayAttr>(key);
+          if (!old || old.empty() || old[0] == ShapedType::kDynamic) {
+            good = false;
+            return;
+          }
+          auto values = llvm::to_vector(old.asArrayRef());
+          if (values[0] > INT64_MAX - offset) {
+            good = false;
+            return;
+          }
+          values[0] += offset;
+          o->setAttr(key, OpBuilder(o).getDenseI64ArrayAttr(values));
+        }
+      }
+      start += sizes[s];
+    }
+    if (external != 1)
+      good = false;
+  });
+  return good ? true : fail(e, "unsupported host DMA rebase");
+}
+struct Child {
+  OwningOpRef<ModuleOp> source, air;
+  GenericAnalysis analysis;
+  GenericMappingPlan plan;
+  j::Value config = nullptr;
+  std::vector<size_t> abi;
+  int64_t offset = 0, rows = 0, column = 0, row = 0;
+  size_t configuration = 0, group = 0;
+};
+bool project(ModuleOp original, const j::Value &config,
+             const ProgramJointDomain &d, const ProgramJointSolution &s,
+             const ProgramJointSelection &selection, Child &out,
+             std::string &e) {
+  auto &v = d.variants[s.variant];
+  auto &mode = d.groups[selection.group];
+  auto &place = d.places[selection.place];
+  auto &domain = v.graph.instances[mode.instances.front()].domain;
+  out.offset = domain.front().lower;
+  out.rows = domain.front().upper - out.offset;
+  out.configuration = selection.configuration;
+  out.group = selection.group;
+  auto owner = programDomain(
+      d.target, programResource(d.target, place.binding.resource)->domain);
+  if (!owner || !owner->coordinates.count("column") ||
+      !owner->coordinates.count("row"))
+    return fail(e,
+                "chosen compute resource lacks explicit physical coordinates");
+  auto localMemory = programMemory(d.target, place.binding.memory);
+  auto hostMemory = programMemory(d.target, d.hostMemory);
+  if (!localMemory || localMemory->domain != owner->id ||
+      localMemory->kind != "local-sram" || !hostMemory ||
+      hostMemory->kind != "system-bo")
+    return fail(e, "chosen physical group requires core-owned local SRAM and "
+                   "caller-visible BOs");
+  out.column = owner->coordinates.at("column");
+  out.row = owner->coordinates.at("row");
+  if (out.column < 0 || out.column > 3 || out.row != 2)
+    return fail(
+        e, "current direct backend supports npu2 compute row 2, columns 0..3");
+  ProgramPartitionPlan proof;
+  OwningOpRef<ModuleOp> sliced;
+  if (!planProgramPartition(v.graph.source, v.chunk, proof, e) ||
+      !materializeProgramPartition(original, proof, out.rows, sliced, e))
+    return false;
+  GenericAnalysis a;
+  if (!analyzeGenericProgram(*sliced, a, e))
+    return false;
+  std::set<size_t> input, output, used;
+  for (auto value : mode.inputs)
+    input.insert(v.graph.regions[v.graph.versions[value].region].storage);
+  for (auto value : mode.outputs)
+    output.insert(v.graph.regions[v.graph.versions[value].region].storage);
+  for (auto value : mode.values)
+    used.insert(v.graph.regions[v.graph.versions[value].region].storage);
+  out.abi.assign(input.begin(), input.end());
+  for (auto st : output) {
+    if (input.count(st))
+      return fail(e, "input/output alias outside executable subset");
+    out.abi.push_back(st);
   }
-  make(b,"air.segment_terminator");b.setInsertionPointToEnd(lb);make(b,"air.launch_terminator");
- }
- b.setInsertionPointToEnd(entry);b.create<func::ReturnOp>(original.getLoc());if(failed(verify(*output)))return fail(e,"merged AIR SSA/IR verification failed");
- output->getOperation()->setAttr("orbit.program_graph",b.getStringAttr(programGraphIdentity(graph)));output->getOperation()->setAttr("orbit.source_fingerprint",b.getStringAttr(v.graph.bodyFingerprint));output->getOperation()->setAttr("orbit.graph_schedule_realization",b.getStringAttr("selected static groups and coordinates; synchronous configuration barriers; DMA readiness, no timed dispatch guarantee"));j::Array buffers,outputs,abiIndices;for(auto st:abi){auto &storage=v.graph.source.storages[st];j::Array shape;for(auto x:storage.shape)shape.push_back(x);buffers.push_back(j::Object{{"name",storage.id},{"role",storage.role},{"dtype",storage.dtype},{"shape",std::move(shape)}});abiIndices.push_back(int64_t(st));if(storage.role=="output")outputs.push_back(storage.id);}
- manifest=j::Object{{"schema","orbit.program-joint.air.v23"},{"domain_id",d.identity},{"graph_id",programGraphIdentity(graph)},{"groups",std::move(records)},{"abi_storage_indices",std::move(abiIndices)},{"abi",j::Object{{"buffers",std::move(buffers)},{"outputs",std::move(outputs)}}},{"final_aie_checked",false},{"scope","static identity-grid pointwise; per-group copies; direct host/core DMA; host communication between serial configurations; no timed runtime dispatch or arbitrary cross-core residency"}};return true;
+  auto *ctx = original.getContext();
+  out.source = ModuleOp::create(original.getLoc());
+  OpBuilder b(ctx);
+  SmallVector<Type> types;
+  for (auto st : out.abi)
+    types.push_back(a.storages[st].root.getType());
+  auto function = func::FuncOp::create(original.getLoc(),
+                                       a.function.getName().str() + "_group_" +
+                                           std::to_string(selection.group),
+                                       FunctionType::get(ctx, types, {}));
+  function->setAttr("orbit.noalias", b.getUnitAttr());
+  function->setAttr("llvm.emit_c_interface", b.getUnitAttr());
+  out.source->push_back(function);
+  auto *block = function.addEntryBlock();
+  b.setInsertionPointToStart(block);
+  IRMapping mapping;
+  std::vector<Value> storage(a.storages.size());
+  for (size_t i = 0; i < out.abi.size(); ++i) {
+    auto st = out.abi[i];
+    storage[st] = function.getArgument(i);
+    function.setArgAttr(i, "orbit.role",
+                        b.getStringAttr(input.count(st) ? "input" : "output"));
+    function.setArgAttr(i, "orbit.name", b.getStringAttr(a.storages[st].id));
+  }
+  for (auto st : used)
+    if (!storage[st]) {
+      auto alloc = b.create<memref::AllocOp>(
+          original.getLoc(), cast<MemRefType>(a.storages[st].root.getType()));
+      alloc->setAttr("orbit.name", b.getStringAttr(a.storages[st].id));
+      storage[st] = alloc;
+    }
+  for (auto st : used)
+    mapping.map(a.storages[st].root, storage[st]);
+  // Task results are storage states. Map external states to explicit boundary
+  // arguments; cloning a selected producer then replaces its result mapping.
+  for (auto &task : a.tasks) {
+    auto *yield = task.operation->getRegion(0).front().getTerminator();
+    for (size_t i = 0; i < task.operation->getNumResults(); ++i) {
+      auto arg = dyn_cast<BlockArgument>(yield->getOperand(i));
+      if (!arg || arg.getArgNumber() >= task.argumentStorages.size())
+        return fail(e, "unsupported source task result alias");
+      auto st = task.argumentStorages[arg.getArgNumber()];
+      if (storage[st])
+        mapping.map(task.operation->getResult(i), storage[st]);
+    }
+  }
+  std::vector<size_t> sourceTasks;
+  for (auto instance : mode.instances)
+    sourceTasks.push_back(v.graph.instances[instance].task);
+  for (auto ti : sourceTasks) {
+    auto *task = a.tasks[ti].operation;
+    for (auto operand : task->getOperands())
+      if (!mapping.contains(operand)) {
+        auto *definition = operand.getDefiningOp();
+        if (!definition || !named(definition, "arith.constant"))
+          return fail(e, "unsupported scalar/source capture");
+        b.clone(*definition, mapping);
+      }
+    b.clone(*task, mapping);
+  }
+  for (auto st : used)
+    if (!input.count(st) && !output.count(st))
+      b.create<memref::DeallocOp>(original.getLoc(), storage[st]);
+  b.create<func::ReturnOp>(original.getLoc());
+  if (failed(verify(*out.source)) ||
+      !analyzeGenericProgram(*out.source, out.analysis, e))
+    return fail(e, "selected source group projection failed: " + e);
+  ProgramMappingChoice choice;
+  choice.residency = "tiled-phase-local";
+  choice.grouping = "tile-major";
+  choice.dataOrganization = "retain-across-users";
+  ProgramResidencyGroup group;
+  for (size_t t = 0; t < out.analysis.tasks.size(); ++t)
+    group.tasks.push_back(t);
+  for (size_t st = 0; st < out.analysis.storages.size(); ++st) {
+    int readers = 0, writers = 0;
+    for (auto &task : out.analysis.tasks) {
+      bool read = false, write = false;
+      for (auto &access : task.accesses)
+        if (access.storage == st) {
+          read |= access.read;
+          write |= access.write;
+        }
+      readers += read;
+      writers += write;
+    }
+    if ((writers && readers) || (!writers && readers > 1))
+      group.retainedStorages.push_back(st);
+  }
+  if (group.tasks.size() > 1) {
+    if (group.retainedStorages.empty())
+      return fail(
+          e, "multi-task group requires a backend-supported retained copy");
+    choice.residencyGroups = {group};
+  } else {
+    choice.grouping = "task-shape-stages";
+    choice.dataOrganization = "phase-local";
+  }
+  auto localConfig = config;
+  auto root = localConfig.getAsObject();
+  if (!root)
+    return fail(e, "configuration object required");
+  if (!root->getObject("generic_air"))
+    (*root)["generic_air"] = j::Object{};
+  auto air = root->getObject("generic_air");
+  auto memory = programMemory(d.target, place.binding.memory);
+  if (memory->capacityBytes > 24576)
+    return fail(
+        e, "local capacity exceeds supported physical NPU payload contract");
+  (*air)["capacity_bytes"] = memory->capacityBytes;
+  (*air)["tile_sizes"] =
+      j::Array{out.rows,
+               out.analysis.tasks.front().loops.size() > 1
+                   ? out.analysis.tasks.front().loops[1].upper
+                   : 1,
+               1};
+  if (!setNativeAIRTileSizes(*out.source, out.rows,
+                             out.analysis.tasks.front().loops.size() > 1
+                                 ? out.analysis.tasks.front().loops[1].upper
+                                 : 1,
+                             1, e) ||
+      !setNativeMappingChoice(*out.source, choice, e) ||
+      !analyzeGenericProgram(*out.source, out.analysis, e) ||
+      !planGenericMapping(out.analysis, localConfig, out.plan, e))
+    return false;
+  if (out.plan.executionGroups.size() != 1 ||
+      out.plan.moduleWideChannelConversion)
+    return fail(e, "chosen group does not have one direct AIR realization");
+  std::multiset<std::pair<size_t, std::string>> expected, actual;
+  for (auto value : mode.inputs)
+    expected.emplace(v.graph.regions[v.graph.versions[value].region].storage,
+                     "host_to_l1");
+  for (auto value : mode.outputs)
+    expected.emplace(v.graph.regions[v.graph.versions[value].region].storage,
+                     "l1_to_host");
+  for (auto &transfer : out.plan.transfers) {
+    auto &name = out.analysis.storages[transfer.storage].id;
+    auto found = std::find_if(a.storages.begin(), a.storages.end(),
+                              [&](auto &st) { return st.id == name; });
+    if (found == a.storages.end())
+      return fail(e, "lowering introduced unrelated storage");
+    actual.emplace(found - a.storages.begin(), transfer.direction);
+  }
+  if (actual != expected)
+    return fail(e, "lowering transfer set differs from selected public copies");
+  int64_t payload = 0;
+  if (!programJointGroupFits(d, selection.group, selection.place, payload, e) ||
+      out.plan.residentBytes != payload)
+    return fail(
+        e, "lowering static buffers differ from selected public allocations");
+  out.config = localConfig;
+  return lowerGenericToAIR(out.analysis, out.plan, out.air, e);
+}
+} // namespace
+bool orbit::taskflow::configureProgramJointNPU(j::Value &config, int64_t cores,
+                                               std::string &e) {
+  auto root = config.getAsObject();
+  if (!root || cores < 1 || cores > 4)
+    return fail(e, "configuration object and 1..4 cores required");
+  auto options = root->getObject("program_joint");
+  if (options && options->get("architecture"))
+    return true;
+  if (!options) {
+    (*root)["program_joint"] = j::Object{};
+    options = root->getObject("program_joint");
+  }
+  GenericTargetCapabilities capabilities;
+  GenericMemoryBinding binding;
+  if (!getGenericTargetCapabilities(config, capabilities, e) ||
+      !configureGenericMemory(config, capabilities.capacityBytes, binding, e))
+    return false;
+  auto c = binding.architecture;
+  auto core = *programResource(c, binding.computeResource);
+  auto local = *programMemory(c, binding.localMemory);
+  auto *ownerPointer = programDomain(c, core.domain);
+  if (!ownerPointer)
+    return fail(e, "automatic NPU expansion requires a physical core domain; "
+                   "provide program_joint.architecture explicitly");
+  auto owner = *ownerPointer;
+  c.resources.erase(std::remove_if(c.resources.begin(), c.resources.end(),
+                                   [&](auto &r) {
+                                     return r.id == core.id ||
+                                            r.id == binding.dmaResource;
+                                   }),
+                    c.resources.end());
+  c.memories.erase(std::remove_if(c.memories.begin(), c.memories.end(),
+                                  [&](auto &m) { return m.id == local.id; }),
+                   c.memories.end());
+  c.domains.erase(std::remove_if(c.domains.begin(), c.domains.end(),
+                                 [&](auto &x) { return x.id == owner.id; }),
+                  c.domains.end());
+  c.links.clear();
+  for (int64_t i = 0; i < cores; ++i) {
+    auto domain = owner;
+    domain.id = "npu.tile(" + std::to_string(i) + ",2)";
+    domain.coordinates = {{"column", i}, {"row", 2}};
+    c.domains.push_back(domain);
+    auto r = core;
+    r.id = "npu.core." + std::to_string(i);
+    r.domain = domain.id;
+    c.resources.push_back(r);
+    auto m = local;
+    m.id = "npu.sram." + std::to_string(i);
+    m.domain = domain.id;
+    m.accessibleResources = {r.id};
+    c.memories.push_back(m);
+    for (bool input : {true, false}) {
+      auto dma =
+          "npu.dma." + std::to_string(i) + (input ? ".input" : ".output");
+      c.resources.push_back({dma, "transfer", "npu", 1, domain.id});
+      auto l = *programLink(binding.architecture,
+                            input ? binding.inputLink : binding.outputLink);
+      l.id = "npu.link." + std::to_string(i) + (input ? ".input" : ".output");
+      l.source = input ? binding.hostMemory : m.id;
+      l.target = input ? m.id : binding.hostMemory;
+      l.resource = dma;
+      l.domain = domain.id;
+      c.links.push_back(l);
+    }
+  }
+  if (!validateMemoryArchitecture(c, e))
+    return false;
+  (*options)["architecture"] = serializeMemoryArchitecture(c);
+  (*options)["host_memory"] = binding.hostMemory;
+  return true;
+}
+bool orbit::taskflow::lowerProgramJointToAIR(
+    ModuleOp original, const j::Value &config, const ProgramJointDomain &d,
+    const ProgramJointSolution &s, const ProgramGraph &graph,
+    OwningOpRef<ModuleOp> &output, j::Value &manifest, std::string &e) {
+  if (!checkProgramJointSolution(d, s, graph, e))
+    return false;
+  auto &v = d.variants[s.variant];
+  std::vector<Child> children;
+  std::set<size_t> hostStorages;
+  for (auto &selection : s.groups) {
+    Child child;
+    if (!project(original, config, d, s, selection, child, e))
+      return false;
+    for (auto st : child.abi)
+      hostStorages.insert(st);
+    children.push_back(std::move(child));
+  }
+  std::vector<size_t> abi(hostStorages.begin(), hostStorages.end());
+  SmallVector<Type> types;
+  for (auto st : abi)
+    types.push_back(v.graph.source.storages[st].root.getType());
+  auto *ctx = original.getContext();
+  output = ModuleOp::create(original.getLoc());
+  OpBuilder b(ctx);
+  auto f = func::FuncOp::create(
+      original.getLoc(),
+      v.graph.source.function->getAttrOfType<StringAttr>("sym_name").getValue(),
+      FunctionType::get(ctx, types, {}));
+  output->push_back(f);
+  auto *entry = f.addEntryBlock();
+  b.setInsertionPointToStart(entry);
+  auto one = b.create<arith::ConstantIndexOp>(original.getLoc(), 1);
+  j::Array records;
+  for (size_t k = 0; k < s.configurationStartNs.size(); ++k) {
+    b.setInsertionPointToEnd(entry);
+    auto *launch =
+        hierarchy(b, "air.launch", "orbit_joint_" + std::to_string(k),
+                  {one, one}, f.getArguments());
+    auto *lb = body(launch);
+    b.setInsertionPointToEnd(lb);
+    auto *segment = hierarchy(b, "air.segment",
+                              "orbit_joint_configuration_" + std::to_string(k),
+                              {}, lb->getArguments().drop_front(4));
+    auto *sb = body(segment);
+    b.setInsertionPointToEnd(sb);
+    std::set<std::pair<int64_t, int64_t>> coords;
+    for (auto &child : children)
+      if (child.configuration == k) {
+        if (!coords.emplace(child.column, child.row).second)
+          return fail(e, "physical placement aliases within configuration");
+        auto *oldSegment = unique(*child.air, "air.segment"),
+             *oldLaunch = unique(*child.air, "air.launch"),
+             *oldHerd = unique(*child.air, "air.herd");
+        if (!oldSegment || !oldLaunch || !oldHerd ||
+            oldHerd->getParentOp() != oldSegment)
+          return fail(e, "selected child has extra hierarchy");
+        IRMapping mapping;
+        auto cf = *child.air->getOps<func::FuncOp>().begin();
+        for (size_t i = 0; i < child.abi.size(); ++i) {
+          auto st = child.abi[i];
+          auto ai = std::find(abi.begin(), abi.end(), st) - abi.begin();
+          auto value = sb->getArgument(ai);
+          mapping.map(cf.getArgument(i), value);
+          mapping.map(body(oldLaunch)->getArgument(4 + i), value);
+          mapping.map(body(oldSegment)->getArgument(i), value);
+        }
+        for (auto &op : *body(oldSegment)) {
+          if (named(&op, "air.segment_terminator"))
+            continue;
+          bool good = true;
+          op.walk([&](Operation *nested) {
+            for (auto value : nested->getOperands())
+              if (!mapping.contains(value)) {
+                if (auto arg = dyn_cast<BlockArgument>(value)) {
+                  if (arg.getOwner()->getParentOp() == &op ||
+                      op.isProperAncestor(arg.getOwner()->getParentOp()))
+                    continue;
+                  good = false;
+                } else if (auto *def = value.getDefiningOp()) {
+                  if (def == &op || op.isProperAncestor(def) ||
+                      oldSegment->isProperAncestor(def))
+                    continue;
+                  if (named(def, "arith.constant"))
+                    b.clone(*def, mapping);
+                  else
+                    good = false;
+                }
+              }
+          });
+          if (!good)
+            return fail(e, "unproved external child capture");
+          auto *copy = b.clone(op, mapping);
+          if (named(copy, "air.herd")) {
+            auto *hb = body(copy);
+            if (!hb || hb->getNumArguments() != 4 + child.abi.size())
+              return fail(e, "child herd ABI mismatch");
+            for (size_t i = 0; i < child.abi.size(); ++i)
+              hb->getArgument(4 + i).setType(
+                  v.graph.source.storages[child.abi[i]].root.getType());
+            copy->setAttr("x_loc", b.getI32IntegerAttr(child.column));
+            copy->setAttr("y_loc", b.getI32IntegerAttr(child.row));
+            copy->setAttr("sym_name",
+                          b.getStringAttr("orbit_joint_group_" +
+                                          std::to_string(child.group)));
+            if (!rebase(copy, child.offset, e))
+              return false;
+          }
+        }
+        j::Array bindings;
+        for (auto st : child.abi)
+          bindings.push_back(int64_t(st));
+        records.push_back(
+            j::Object{{"group", int64_t(child.group)},
+                      {"configuration", int64_t(k)},
+                      {"column", child.column},
+                      {"row", child.row},
+                      {"row_offset", child.offset},
+                      {"row_count", child.rows},
+                      {"abi_storage_indices", std::move(bindings)},
+                      {"source_mlir", print(*child.source)},
+                      {"child_config", child.config},
+                      {"child_plan",
+                       serializeGenericMapping(child.analysis, child.plan)}});
+      }
+    make(b, "air.segment_terminator");
+    b.setInsertionPointToEnd(lb);
+    make(b, "air.launch_terminator");
+  }
+  b.setInsertionPointToEnd(entry);
+  b.create<func::ReturnOp>(original.getLoc());
+  if (failed(verify(*output)))
+    return fail(e, "merged AIR SSA/IR verification failed");
+  output->getOperation()->setAttr("orbit.program_graph",
+                                  b.getStringAttr(programGraphIdentity(graph)));
+  output->getOperation()->setAttr("orbit.source_fingerprint",
+                                  b.getStringAttr(v.graph.bodyFingerprint));
+  output->getOperation()->setAttr(
+      "orbit.graph_schedule_realization",
+      b.getStringAttr(
+          "selected static groups and coordinates; synchronous configuration "
+          "barriers; DMA readiness, no timed dispatch guarantee"));
+  j::Array buffers, outputs, abiIndices;
+  for (auto st : abi) {
+    auto &storage = v.graph.source.storages[st];
+    j::Array shape;
+    for (auto x : storage.shape)
+      shape.push_back(x);
+    buffers.push_back(j::Object{{"name", storage.id},
+                                {"role", storage.role},
+                                {"dtype", storage.dtype},
+                                {"shape", std::move(shape)}});
+    abiIndices.push_back(int64_t(st));
+    if (storage.role == "output")
+      outputs.push_back(storage.id);
+  }
+  manifest = j::Object{
+      {"schema", "orbit.program-joint.air.v23"},
+      {"domain_id", d.identity},
+      {"graph_id", programGraphIdentity(graph)},
+      {"groups", std::move(records)},
+      {"abi_storage_indices", std::move(abiIndices)},
+      {"abi", j::Object{{"buffers", std::move(buffers)},
+                        {"outputs", std::move(outputs)}}},
+      {"final_aie_checked", false},
+      {"scope",
+       "static identity-grid pointwise; per-group copies; direct host/core "
+       "DMA; host communication between serial configurations; no timed "
+       "runtime dispatch or arbitrary cross-core residency"}};
+  return true;
 }

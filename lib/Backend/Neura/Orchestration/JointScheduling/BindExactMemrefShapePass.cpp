@@ -47,17 +47,14 @@ FailureOr<SmallVector<int64_t>> parseDimensions(StringRef specification) {
 }
 
 struct BindExactMemrefShapePass
-    : public PassWrapper<BindExactMemrefShapePass,
-                         OperationPass<ModuleOp>> {
+    : public PassWrapper<BindExactMemrefShapePass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BindExactMemrefShapePass)
 
   BindExactMemrefShapePass() = default;
   BindExactMemrefShapePass(const BindExactMemrefShapePass &other)
       : PassWrapper(other) {}
 
-  StringRef getArgument() const override {
-    return "bind-exact-memref-shape";
-  }
+  StringRef getArgument() const override { return "bind-exact-memref-shape"; }
   StringRef getDescription() const override {
     return "Bind an exact caller memref shape to one function argument";
   }
@@ -99,8 +96,8 @@ struct BindExactMemrefShapePass
 
     func::FuncOp function = module.lookupSymbol<func::FuncOp>(functionName);
     if (!function) {
-      module.emitError() << "bind-exact-memref-shape function '"
-                         << functionName << "' was not found";
+      module.emitError() << "bind-exact-memref-shape function '" << functionName
+                         << "' was not found";
       return signalPassFailure();
     }
 
@@ -132,10 +129,10 @@ struct BindExactMemrefShapePass
     for (auto [dimension, extent] : llvm::enumerate(shape)) {
       int64_t staticExtent = memrefType.getDimSize(dimension);
       if (!ShapedType::isDynamic(staticExtent) && staticExtent != extent) {
-        module.emitError()
-            << "bind-exact-memref-shape dimension " << dimension
-            << " disagrees with static memref extent " << staticExtent
-            << " (contract says " << extent << ")";
+        module.emitError() << "bind-exact-memref-shape dimension " << dimension
+                           << " disagrees with static memref extent "
+                           << staticExtent << " (contract says " << extent
+                           << ")";
         return signalPassFailure();
       }
     }

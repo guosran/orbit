@@ -38,9 +38,10 @@ namespace {
 // wider than the widest possible path.  Their sum is consequently an
 // admissible (possibly non-tight) lower bound for every route, including
 // routes selected after reservations are applied.
-static std::optional<uint64_t> minimumPathLatency(
-    const InterTaskNetworkSpec &network, TaskNetworkCoordinate source,
-    TaskNetworkCoordinate destination) {
+static std::optional<uint64_t>
+minimumPathLatency(const InterTaskNetworkSpec &network,
+                   TaskNetworkCoordinate source,
+                   TaskNetworkCoordinate destination) {
   const int rows = network.getRows();
   const int columns = network.getColumns();
   if (rows <= 0 || columns <= 0 || source.row < 0 || source.row >= rows ||
@@ -61,7 +62,8 @@ static std::optional<uint64_t> minimumPathLatency(
                                  std::numeric_limits<uint64_t>::max());
   using QueueEntry = std::pair<uint64_t, int>;
   std::priority_queue<QueueEntry, std::vector<QueueEntry>,
-                      std::greater<QueueEntry>> queue;
+                      std::greater<QueueEntry>>
+      queue;
   distance[sourceId] = 0;
   queue.push({0, sourceId});
   while (!queue.empty()) {
@@ -75,8 +77,8 @@ static std::optional<uint64_t> minimumPathLatency(
       if (link.source.row * columns + link.source.column != current)
         continue;
       const int next = nodeId(link.destination);
-      if (currentDistance > std::numeric_limits<uint64_t>::max() -
-                                 link.latency_cycles)
+      if (currentDistance >
+          std::numeric_limits<uint64_t>::max() - link.latency_cycles)
         continue;
       const uint64_t candidate = currentDistance + link.latency_cycles;
       if (candidate < distance[next]) {
@@ -88,9 +90,10 @@ static std::optional<uint64_t> minimumPathLatency(
   return std::nullopt;
 }
 
-static std::optional<uint64_t> maximumPathBandwidth(
-    const InterTaskNetworkSpec &network, TaskNetworkCoordinate source,
-    TaskNetworkCoordinate destination) {
+static std::optional<uint64_t>
+maximumPathBandwidth(const InterTaskNetworkSpec &network,
+                     TaskNetworkCoordinate source,
+                     TaskNetworkCoordinate destination) {
   const int rows = network.getRows();
   const int columns = network.getColumns();
   if (rows <= 0 || columns <= 0 || source.row < 0 || source.row >= rows ||
@@ -214,11 +217,10 @@ bool InterTaskNetworkCommunicationModel::getEndpointPathMetrics(
       destination_col >= columns)
     return false;
 
-  const uint64_t nodeCount64 = static_cast<uint64_t>(rows) *
-                               static_cast<uint64_t>(columns);
+  const uint64_t nodeCount64 =
+      static_cast<uint64_t>(rows) * static_cast<uint64_t>(columns);
   if (nodeCount64 == 0 ||
-      nodeCount64 > static_cast<uint64_t>(
-                        std::numeric_limits<size_t>::max()))
+      nodeCount64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
     return false;
   const size_t nodeCount = static_cast<size_t>(nodeCount64);
   if (nodeCount > std::numeric_limits<size_t>::max() / nodeCount)
@@ -227,7 +229,8 @@ bool InterTaskNetworkCommunicationModel::getEndpointPathMetrics(
   if (endpointPathCache_.size() != pairCount)
     endpointPathCache_.assign(pairCount, EndpointPathMetrics{});
 
-  const size_t sourceId = static_cast<size_t>(source_row * columns + source_col);
+  const size_t sourceId =
+      static_cast<size_t>(source_row * columns + source_col);
   const size_t destinationId =
       static_cast<size_t>(destination_row * columns + destination_col);
   EndpointPathMetrics &cached =
@@ -259,11 +262,11 @@ bool InterTaskNetworkCommunicationModel::getCachedEndpointLowerBound(
 
   const int rows = network_.getRows();
   const int columns = network_.getColumns();
-  const bool validEndpoint =
-      rows > 0 && columns > 0 && source_row >= 0 && source_row < rows &&
-      source_col >= 0 && source_col < columns && destination_row >= 0 &&
-      destination_row < rows && destination_col >= 0 &&
-      destination_col < columns;
+  const bool validEndpoint = rows > 0 && columns > 0 && source_row >= 0 &&
+                             source_row < rows && source_col >= 0 &&
+                             source_col < columns && destination_row >= 0 &&
+                             destination_row < rows && destination_col >= 0 &&
+                             destination_col < columns;
   const TaskPairPayloadCache *payload =
       getTaskPairPayloadCache(producer, consumer);
 
@@ -281,11 +284,11 @@ bool InterTaskNetworkCommunicationModel::getCachedEndpointLowerBound(
   EndpointBoundCacheEntry *cached = nullptr;
   if (producer && consumer && validEndpoint) {
     taskPair = &taskPairCache_[producer][consumer];
-    const uint64_t nodeCount64 = static_cast<uint64_t>(rows) *
-                                 static_cast<uint64_t>(columns);
+    const uint64_t nodeCount64 =
+        static_cast<uint64_t>(rows) * static_cast<uint64_t>(columns);
     if (nodeCount64 == 0 ||
-        nodeCount64 > static_cast<uint64_t>(
-                          std::numeric_limits<size_t>::max())) {
+        nodeCount64 >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
       error = "communication grid is too large for endpoint lower-bound cache";
       return false;
     }
@@ -416,7 +419,8 @@ bool InterTaskNetworkCommunicationModel::getTransferLowerBound(
       }
     }
   }
-  if (!best || *best > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+  if (!best ||
+      *best > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     error = "communication lower bound has no representable endpoint route";
     return false;
   }
@@ -538,8 +542,9 @@ bool InterTaskNetworkCommunicationModel::restoreReservationCheckpoint(
     error = "communication reservation checkpoint has no state";
     return false;
   }
-  const auto snapshot = std::static_pointer_cast<const ReservationCheckpointState>(
-      checkpoint.state);
+  const auto snapshot =
+      std::static_pointer_cast<const ReservationCheckpointState>(
+          checkpoint.state);
   if (!snapshot) {
     error = "communication reservation checkpoint has invalid state";
     return false;
@@ -744,13 +749,13 @@ bool InterTaskNetworkCommunicationModel::routeTransfer(
     // payload.  This upper bound covers every simple route and keeps the
     // overflow check independent of the path chosen by the DFS.
     if (relevantLatencyUpperBound >
-            std::numeric_limits<uint64_t>::max() - payload_bits)
+        std::numeric_limits<uint64_t>::max() - payload_bits)
       prefixPruningEnabled = false;
     else {
       routeDurationUpperBound = relevantLatencyUpperBound + payload_bits;
       if (routeDurationUpperBound >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) -
-                static_cast<uint64_t>(producer_finish))
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) -
+              static_cast<uint64_t>(producer_finish))
         prefixPruningEnabled = false;
     }
   }
@@ -787,13 +792,13 @@ bool InterTaskNetworkCommunicationModel::routeTransfer(
   std::vector<std::optional<uint64_t>> remainingLatency(node_count);
   std::vector<std::optional<uint64_t>> remainingBandwidth(node_count);
 
-  auto prefixLowerBoundExceedsBest = [&](int current,
-                                         uint64_t prefixLatency,
+  auto prefixLowerBoundExceedsBest = [&](int current, uint64_t prefixLatency,
                                          uint64_t prefixBottleneck) {
     if (!prefixPruningEnabled || best.links.empty())
       return false;
     if (!remainingMetricsComputed[current]) {
-      const TaskNetworkCoordinate coordinate{current / columns, current % columns};
+      const TaskNetworkCoordinate coordinate{current / columns,
+                                             current % columns};
       remainingLatency[current] =
           minimumPathLatency(network_, coordinate, destination);
       remainingBandwidth[current] =
@@ -819,8 +824,7 @@ bool InterTaskNetworkCommunicationModel::routeTransfer(
       return false;
     durationLowerBound += transmissionLowerBound;
     int64_t lowerBoundFinish = 0;
-    if (!checkedAddCycle(producer_finish, durationLowerBound,
-                         lowerBoundFinish))
+    if (!checkedAddCycle(producer_finish, durationLowerBound, lowerBoundFinish))
       return false;
     // The DFS order makes this subtree lexicographically later than the
     // incumbent.  Keep equal bounds so equal-finish paths still reach the
@@ -874,53 +878,57 @@ bool InterTaskNetworkCommunicationModel::routeTransfer(
          std::lexicographical_compare(path.begin(), path.end(),
                                       best.links.begin(), best.links.end())))
       best = {path, start, finish, latency, bottleneck, duration};
-    if (endpointLowerBoundFinishKnown && best.finish == endpointLowerBoundFinish)
+    if (endpointLowerBoundFinishKnown &&
+        best.finish == endpointLowerBoundFinish)
       exact_lower_bound_reached = true;
   };
 
   std::function<void(int, uint64_t, uint64_t, bool)> enumerate =
       [&](int current, uint64_t prefixLatency, uint64_t prefixBottleneck,
           bool prefixLatencyOverflow) {
-    if (search_budget_exceeded || exact_lower_bound_reached)
-      return;
-    if (++search_steps > kRouteSearchStepBudget) {
-      search_budget_exceeded = true;
-      return;
-    }
-    if (current == destination_id) {
-      evaluate();
-      return;
-    }
-    if (!prefixLatencyOverflow &&
-        prefixLowerBoundExceedsBest(current, prefixLatency, prefixBottleneck))
-      return;
-    for (auto indexed : llvm::enumerate(links)) {
-      if (exact_lower_bound_reached)
-        return;
-      const InterTaskNetworkLink &link = indexed.value();
-      const int link_source = link.source.row * columns + link.source.column;
-      const int next = link.destination.row * columns + link.destination.column;
-      if (link_source != current || visited[next])
-        continue;
-      uint64_t nextPrefixLatency = prefixLatency;
-      bool nextPrefixLatencyOverflow = prefixLatencyOverflow;
-      if (!nextPrefixLatencyOverflow) {
-        if (nextPrefixLatency >
-            std::numeric_limits<uint64_t>::max() - link.latency_cycles)
-          nextPrefixLatencyOverflow = true;
-        else
-          nextPrefixLatency += link.latency_cycles;
-      }
-      const uint64_t nextPrefixBottleneck =
-          std::min(prefixBottleneck, link.bandwidth_bits_per_cycle);
-      visited[next] = 1;
-      path.push_back(static_cast<uint32_t>(indexed.index()));
-      enumerate(next, nextPrefixLatency, nextPrefixBottleneck,
-                nextPrefixLatencyOverflow);
-      path.pop_back();
-      visited[next] = 0;
-    }
-  };
+        if (search_budget_exceeded || exact_lower_bound_reached)
+          return;
+        if (++search_steps > kRouteSearchStepBudget) {
+          search_budget_exceeded = true;
+          return;
+        }
+        if (current == destination_id) {
+          evaluate();
+          return;
+        }
+        if (!prefixLatencyOverflow &&
+            prefixLowerBoundExceedsBest(current, prefixLatency,
+                                        prefixBottleneck))
+          return;
+        for (auto indexed : llvm::enumerate(links)) {
+          if (exact_lower_bound_reached)
+            return;
+          const InterTaskNetworkLink &link = indexed.value();
+          const int link_source =
+              link.source.row * columns + link.source.column;
+          const int next =
+              link.destination.row * columns + link.destination.column;
+          if (link_source != current || visited[next])
+            continue;
+          uint64_t nextPrefixLatency = prefixLatency;
+          bool nextPrefixLatencyOverflow = prefixLatencyOverflow;
+          if (!nextPrefixLatencyOverflow) {
+            if (nextPrefixLatency >
+                std::numeric_limits<uint64_t>::max() - link.latency_cycles)
+              nextPrefixLatencyOverflow = true;
+            else
+              nextPrefixLatency += link.latency_cycles;
+          }
+          const uint64_t nextPrefixBottleneck =
+              std::min(prefixBottleneck, link.bandwidth_bits_per_cycle);
+          visited[next] = 1;
+          path.push_back(static_cast<uint32_t>(indexed.index()));
+          enumerate(next, nextPrefixLatency, nextPrefixBottleneck,
+                    nextPrefixLatencyOverflow);
+          path.pop_back();
+          visited[next] = 0;
+        }
+      };
   enumerate(source_id, 0, std::numeric_limits<uint64_t>::max(), false);
   if (search_budget_exceeded) {
     error = "communication route search exceeds its deterministic budget";
@@ -1006,10 +1014,11 @@ createInterTaskNetworkCommunicationModel(func::FuncOp function, int grid_rows,
   TaskEdgeGraphOptions edge_options;
   edge_options.require_payload = true;
   edge_options.read_control_predecessors = true;
-  const auto *publicGraph=activeProgramGraphCommunication();
-  FailureOr<TaskEdgeGraph> edge_graph = publicGraph
-      ? buildTaskEdgeGraphFromProgramGraph(function,*publicGraph,error)
-      : buildTaskEdgeGraph(function, edge_options, error);
+  const auto *publicGraph = activeProgramGraphCommunication();
+  FailureOr<TaskEdgeGraph> edge_graph =
+      publicGraph
+          ? buildTaskEdgeGraphFromProgramGraph(function, *publicGraph, error)
+          : buildTaskEdgeGraph(function, edge_options, error);
   if (failed(edge_graph))
     return failure();
 
@@ -1025,7 +1034,7 @@ createInterTaskNetworkCommunicationModel(func::FuncOp function, int grid_rows,
     return failure();
 
   return std::make_unique<InterTaskNetworkCommunicationModel>(
-      std::move(*edge_graph), std::move(**network), publicGraph!=nullptr);
+      std::move(*edge_graph), std::move(**network), publicGraph != nullptr);
 }
 
 } // namespace joint_scheduling

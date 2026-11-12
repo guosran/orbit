@@ -21,7 +21,9 @@
 #include <optional>
 #include <string>
 
-namespace orbit::taskflow { struct ProgramGraph; }
+namespace orbit::taskflow {
+struct ProgramGraph;
+}
 
 namespace mlir {
 namespace amoeba {
@@ -161,7 +163,7 @@ private:
                      std::string &error);
 
   friend FailureOr<TaskEdgeGraph> buildTaskEdgeGraphFromProgramGraph(
-      func::FuncOp,const ::orbit::taskflow::ProgramGraph &,std::string &);
+      func::FuncOp, const ::orbit::taskflow::ProgramGraph &, std::string &);
   llvm::SmallVector<taskflow::TaskflowTaskOp> tasks_;
   llvm::SmallVector<TaskEdge> edges_;
 };

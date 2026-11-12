@@ -11,8 +11,8 @@
 
 #include "AnalyticalTaskCandidateCommon.h"
 #include "Backend/Neura/NeuraBackendPasses.h"
-#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "Backend/Neura/Orchestration/JointScheduling/GraphFactsIO.h"
+#include "Backend/Neura/Orchestration/JointScheduling/TaskEdgeContract.h"
 #include "NeuraDialect/NeuraDialect.h"
 #include "TaskflowDialect/TaskflowDialect.h"
 
@@ -22,9 +22,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Parser/Parser.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -55,10 +55,8 @@ namespace {
 
 constexpr StringLiteral kSchema = "orbit-pruned-joint-graph-candidates-v1";
 constexpr StringLiteral kClosureSchema = "orbit-joint-graph-closure-v1";
-constexpr StringLiteral kProductionTemporalModel =
-    "production-scheduler";
-constexpr StringLiteral kProductionScheduleSpace =
-    "production-scheduler";
+constexpr StringLiteral kProductionTemporalModel = "production-scheduler";
+constexpr StringLiteral kProductionScheduleSpace = "production-scheduler";
 constexpr StringLiteral kProductionTemporalScope =
     "production-task-scheduler-only";
 constexpr StringLiteral kProductionStartPolicy =
@@ -194,8 +192,7 @@ static bool readJsonFile(StringRef path, json::Value &value,
             buffer.getError().message();
     return false;
   }
-  llvm::Expected<json::Value> parsed =
-      json::parse((*buffer)->getBuffer());
+  llvm::Expected<json::Value> parsed = json::parse((*buffer)->getBuffer());
   if (!parsed) {
     error = "cannot parse JSON file " + path.str() + ": " +
             llvm::toString(parsed.takeError());
@@ -206,7 +203,7 @@ static bool readJsonFile(StringRef path, json::Value &value,
 }
 
 static bool readFactsJsonFile(StringRef path, json::Value &value,
-                               std::string &error) {
+                              std::string &error) {
   std::string factsText;
   if (!graph_facts_io::readGraphFactsFile(path, factsText, error))
     return false;
@@ -347,19 +344,18 @@ static bool readClosure(StringRef path, ClosureInput &input) {
     }
     if (!row.hasStructuralKey) {
       if (input.error.empty())
-        input.error = "closure graph is missing structural_key: " +
-                      row.graphId;
+        input.error = "closure graph is missing structural_key: " + row.graphId;
     }
     input.graphs.push_back(std::move(row));
   }
-  input.upstreamComplete = input.sawHeader && input.sawFooter &&
-                           input.headerComplete && input.footerComplete &&
-                           (!input.graphScopeComplete ||
-                            *input.graphScopeComplete) &&
-                           input.upstreamUnknownActionCount == 0 &&
-                           input.upstreamIncompleteFactsCount == 0;
-  input.upstreamResourceBound = input.headerResourceBound ||
-                                input.footerResourceBound;
+  input.upstreamComplete =
+      input.sawHeader && input.sawFooter && input.headerComplete &&
+      input.footerComplete &&
+      (!input.graphScopeComplete || *input.graphScopeComplete) &&
+      input.upstreamUnknownActionCount == 0 &&
+      input.upstreamIncompleteFactsCount == 0;
+  input.upstreamResourceBound =
+      input.headerResourceBound || input.footerResourceBound;
   if (!input.sawHeader || !input.sawFooter) {
     input.valid = false;
     input.error = "closure is missing header or footer";
@@ -390,16 +386,15 @@ static bool runFactsExtraction(ModuleOp module, StringRef functionName,
   std::string diagnostic;
   LogicalResult result = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(
-                                            diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     result = manager.run(module);
   }
   if (failed(result)) {
@@ -544,36 +539,34 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
   if (!productionScheduler && !inputs.scheduleSpace.empty() &&
       inputs.scheduleSpace != "exact")
     return;
-  const StringRef boundScheduleSpace =
-      productionScheduler
-          ? StringRef(kProductionScheduleSpace)
-          : StringRef("exact");
-  const StringRef boundTemporalModel =
-      productionScheduler ? StringRef(kProductionTemporalModel)
-                           : StringRef("dispatch-order");
+  const StringRef boundScheduleSpace = productionScheduler
+                                           ? StringRef(kProductionScheduleSpace)
+                                           : StringRef("exact");
+  const StringRef boundTemporalModel = productionScheduler
+                                           ? StringRef(kProductionTemporalModel)
+                                           : StringRef("dispatch-order");
   const StringRef boundDispatchPolicy =
       productionScheduler
           ? (isProductionStageOne(*stage) ? StringRef("fixed")
-                                         : StringRef("critical-path"))
+                                          : StringRef("critical-path"))
           : StringRef("all-ready");
-  if (productionScheduler &&
-      inputs.scheduleSpace != kProductionScheduleSpace)
+  if (productionScheduler && inputs.scheduleSpace != kProductionScheduleSpace)
     return;
   if (!inputs.dispatchPolicy.empty() &&
       inputs.dispatchPolicy != boundDispatchPolicy)
     return;
-  result.boundScorePath = outputFile.str() + ".bound-" +
-                          std::to_string(ordinal) + ".jsonl";
+  result.boundScorePath =
+      outputFile.str() + ".bound-" + std::to_string(ordinal) + ".jsonl";
   auto pass = mlir::amoeba::neura::createScoreExactJointTaskCandidatesPass();
   std::string options =
       "candidates=" + quoteOption(*candidates) +
       " cost-file=" + quoteOption(*catalog) +
       " output=" + quoteOption(result.boundScorePath) +
       " top-k=5 max-expanded-nodes=9223372036854775807 max-milliseconds=0"
-      " max-makespan=0 dispatch-policy=" + boundDispatchPolicy.str() +
+      " max-makespan=0 dispatch-policy=" +
+      boundDispatchPolicy.str() +
       " schedule-space=" + boundScheduleSpace.str() +
-      " temporal-model=" + boundTemporalModel.str() +
-      " graph-bound-only=true" +
+      " temporal-model=" + boundTemporalModel.str() + " graph-bound-only=true" +
       std::string(" graph-variant-id=") + quoteOption(row.graphId) +
       " source-git-repository=" + quoteOption(*repository) +
       " source-git-commit=" + quoteOption(*commit) +
@@ -592,13 +585,14 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
   manager.addPass(std::move(pass));
   LogicalResult ran = failure();
   {
-    ScopedDiagnosticHandler capture(module.getContext(), [&](Diagnostic &entry) {
-      if (result.boundDiagnostic.empty()) {
-        llvm::raw_string_ostream stream(result.boundDiagnostic);
-        entry.print(stream);
-      }
-      return success();
-    });
+    ScopedDiagnosticHandler capture(
+        module.getContext(), [&](Diagnostic &entry) {
+          if (result.boundDiagnostic.empty()) {
+            llvm::raw_string_ostream stream(result.boundDiagnostic);
+            entry.print(stream);
+          }
+          return success();
+        });
     ran = manager.run(module);
   }
   if (failed(ran)) {
@@ -621,18 +615,19 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
       return;
     }
     const json::Object *object = value->getAsObject();
-    if (!object || object->getString("schema") !=
-                       std::optional<StringRef>("amoeba-exact-joint-task-scores-v1")) {
+    if (!object ||
+        object->getString("schema") !=
+            std::optional<StringRef>("amoeba-exact-joint-task-scores-v1")) {
       result.boundStatus = "bound-artifact-invalid";
       return;
     }
-    if (object->getString("record_type") ==
-        std::optional<StringRef>("header"))
+    if (object->getString("record_type") == std::optional<StringRef>("header"))
       header = *object;
     if (object->getString("record_type") == std::optional<StringRef>("footer"))
       footer = *object;
   }
-  if (!header || !footer || !footer->getBoolean("graph_bound_only").value_or(false)) {
+  if (!header || !footer ||
+      !footer->getBoolean("graph_bound_only").value_or(false)) {
     result.boundStatus = "bound-artifact-invalid";
     return;
   }
@@ -688,10 +683,12 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
   }
   result.graphLowerBound =
       footer->getInteger("global_cutoff_graph_lower_bound").value_or(0);
-  result.incumbentFifth = footer->getInteger("global_cutoff_cycles").value_or(0);
+  result.incumbentFifth =
+      footer->getInteger("global_cutoff_cycles").value_or(0);
   const bool zeroExpansion =
       footer->getInteger("expanded_shape_nodes") == std::optional<int64_t>(0) &&
-      footer->getInteger("expanded_schedule_nodes") == std::optional<int64_t>(0);
+      footer->getInteger("expanded_schedule_nodes") ==
+          std::optional<int64_t>(0);
   const bool numericProof = result.incumbentFifth > 0 &&
                             result.graphLowerBound > result.incumbentFifth;
   const bool shapeDomainProof =
@@ -705,7 +702,8 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
       footer->getInteger("global_cutoff_shape_domain_contradiction_task")
           .has_value();
   if (zeroExpansion &&
-      footer->getString("status") == std::optional<StringRef>("globally-pruned") &&
+      footer->getString("status") ==
+          std::optional<StringRef>("globally-pruned") &&
       footer->getBoolean("global_cutoff_proven").value_or(false) &&
       footer->getBoolean("global_cutoff_graph_pruned").value_or(false) &&
       !footer->getBoolean("incomplete").value_or(true) &&
@@ -720,7 +718,8 @@ static void applyCachedGraphBound(ModuleOp module, const GraphRow &row,
                            : "proven-global-incumbent-cycle-cutoff";
     result.eligibleForML = false;
   } else if (zeroExpansion &&
-             footer->getString("status") == std::optional<StringRef>("bound-only-retained")) {
+             footer->getString("status") ==
+                 std::optional<StringRef>("bound-only-retained")) {
     result.boundStatus = "retained-by-graph-bound";
   } else {
     result.boundStatus = "bound-proof-unavailable";
@@ -759,8 +758,8 @@ static Verification verifyGraph(ModuleOp owner, StringRef functionName,
     return result;
   }
 
-  OwningOpRef<ModuleOp> parsed = parseSourceFile<ModuleOp>(
-      row.mlirPath, ParserConfig(owner.getContext()));
+  OwningOpRef<ModuleOp> parsed =
+      parseSourceFile<ModuleOp>(row.mlirPath, ParserConfig(owner.getContext()));
   if (!parsed) {
     result.reason = "persisted_mlir_parse_failed";
     return result;
@@ -777,8 +776,8 @@ static Verification verifyGraph(ModuleOp owner, StringRef functionName,
     return result;
   }
 
-  std::string extractedPath = outputFile.str() + ".facts-" +
-                              std::to_string(ordinal) + ".json";
+  std::string extractedPath =
+      outputFile.str() + ".facts-" + std::to_string(ordinal) + ".json";
   if (!runFactsExtraction(*parsed, functionName, extractedPath, error)) {
     llvm::sys::fs::remove(extractedPath);
     result.reason = "facts_reextract_failed";
@@ -793,8 +792,8 @@ static Verification verifyGraph(ModuleOp owner, StringRef functionName,
     return result;
   }
   llvm::sys::fs::remove(extractedPath);
-  if (!compareFactsContract(persistedFacts, extractedFacts,
-                            row.structuralText, error)) {
+  if (!compareFactsContract(persistedFacts, extractedFacts, row.structuralText,
+                            error)) {
     result.reason = "facts_structural_contract_mismatch";
     result.diagnostic = error;
     return result;
@@ -888,33 +887,41 @@ public:
     return "prune-joint-graph-candidates";
   }
   StringRef getDescription() const override {
-    return "Validate persisted joint graph candidates after rewrite enumeration";
+    return "Validate persisted joint graph candidates after rewrite "
+           "enumeration";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, func::FuncDialect,
-                    memref::MemRefDialect, scf::SCFDialect,
-                    neura::NeuraDialect, TaskflowDialect>();
+    registry
+        .insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
+                scf::SCFDialect, neura::NeuraDialect, TaskflowDialect>();
   }
 
   Option<std::string> closureFile{*this, "closure", llvm::cl::init("")};
   Option<std::string> outputFile{*this, "output", llvm::cl::init("")};
   Option<std::string> functionName{*this, "function", llvm::cl::init("")};
-  Option<std::string> costManifestFile{*this, "cost-manifest", llvm::cl::init("")};
-  Option<std::string> globalIncumbentFile{*this, "global-incumbent", llvm::cl::init("")};
-  Option<std::string> globalStageManifestFile{*this, "global-stage-manifest", llvm::cl::init("")};
+  Option<std::string> costManifestFile{*this, "cost-manifest",
+                                       llvm::cl::init("")};
+  Option<std::string> globalIncumbentFile{*this, "global-incumbent",
+                                          llvm::cl::init("")};
+  Option<std::string> globalStageManifestFile{*this, "global-stage-manifest",
+                                              llvm::cl::init("")};
   // The default keeps the historical exact bound contract.  New production
   // manifests may carry these fields themselves; explicit options take
   // precedence so stage drivers can bind the command body directly.
-  Option<std::string> temporalModel{*this, "temporal-model", llvm::cl::init("")};
-  Option<std::string> scheduleSpace{*this, "schedule-space", llvm::cl::init("")};
-  Option<std::string> dispatchPolicy{*this, "dispatch-policy", llvm::cl::init("")};
+  Option<std::string> temporalModel{*this, "temporal-model",
+                                    llvm::cl::init("")};
+  Option<std::string> scheduleSpace{*this, "schedule-space",
+                                    llvm::cl::init("")};
+  Option<std::string> dispatchPolicy{*this, "dispatch-policy",
+                                     llvm::cl::init("")};
 
   void runOnOperation() override {
     ModuleOp owner = getOperation();
     if (closureFile.empty() || outputFile.empty() || functionName.empty()) {
-      owner.emitError("post-enumeration graph pruning requires closure, output, "
-                      "and function options");
+      owner.emitError(
+          "post-enumeration graph pruning requires closure, output, "
+          "and function options");
       return signalPassFailure();
     }
 
@@ -938,7 +945,8 @@ public:
           stageManifest.getAsObject()->getString("stage") !=
               std::optional<StringRef>(input.stage)) {
         owner.emitError() << "cached graph bounds require matching cost/stage "
-                            "manifests and a global incumbent: " << error;
+                             "manifests and a global incumbent: "
+                          << error;
         return signalPassFailure();
       }
       boundInputs.costManifest = costManifest.getAsObject();
@@ -947,15 +955,18 @@ public:
       boundInputs.stageManifestPath = globalStageManifestFile.getValue();
       if (!temporalModel.empty())
         boundInputs.temporalModel = temporalModel.getValue();
-      else if (auto value = stageManifest.getAsObject()->getString("temporal_model"))
+      else if (auto value =
+                   stageManifest.getAsObject()->getString("temporal_model"))
         boundInputs.temporalModel = value->str();
       if (!scheduleSpace.empty())
         boundInputs.scheduleSpace = scheduleSpace.getValue();
-      else if (auto value = stageManifest.getAsObject()->getString("schedule_space"))
+      else if (auto value =
+                   stageManifest.getAsObject()->getString("schedule_space"))
         boundInputs.scheduleSpace = value->str();
       if (!dispatchPolicy.empty())
         boundInputs.dispatchPolicy = dispatchPolicy.getValue();
-      else if (auto value = stageManifest.getAsObject()->getString("dispatch_policy"))
+      else if (auto value =
+                   stageManifest.getAsObject()->getString("dispatch_policy"))
         boundInputs.dispatchPolicy = value->str();
       if (boundInputs.temporalModel == kProductionTemporalModel &&
           boundInputs.scheduleSpace.empty())
@@ -1066,11 +1077,11 @@ public:
             header["temporal_search_scope"] = kProductionTemporalScope.str();
             header["start_policy"] = kProductionStartPolicy.str();
             header["scheduler_backend"] = kProductionSchedulerBackend.str();
-            header["dispatch_policy"] = boundInputs.dispatchPolicy.empty()
-                                              ? (isProductionStageOne(input.stage)
-                                                     ? "fixed"
-                                                     : "critical-path")
-                                              : boundInputs.dispatchPolicy;
+            header["dispatch_policy"] =
+                boundInputs.dispatchPolicy.empty()
+                    ? (isProductionStageOne(input.stage) ? "fixed"
+                                                         : "critical-path")
+                    : boundInputs.dispatchPolicy;
             header["global_shape_location_temporal_space"] = false;
             header["placement_coverage_limited"] = true;
             header["location_coverage_limited"] = true;
@@ -1089,9 +1100,9 @@ public:
                 input.upstreamIncompleteFactsCount;
           writeJsonLine(stream, std::move(header));
           for (const Report &report : reports)
-            writeJsonLine(stream, graphOutput(report.row, report.verification,
-                                              report.duplicate,
-                                              report.duplicateOf));
+            writeJsonLine(stream,
+                          graphOutput(report.row, report.verification,
+                                      report.duplicate, report.duplicateOf));
           json::Array retainedIds;
           for (const std::string &id : eligibleIds)
             retainedIds.push_back(id);
@@ -1114,7 +1125,8 @@ public:
               {"pruned_graph_count", prunedCount},
               {"bound_pruned_unique_graph_count", boundPrunedCount},
               {"bound_unavailable_unique_graph_count", boundUnavailableCount},
-              {"bound_pruning_complete", !boundsRequested || boundUnavailableCount == 0},
+              {"bound_pruning_complete",
+               !boundsRequested || boundUnavailableCount == 0},
               {"ml_inference_calls", 0},
               {"joint_search_nodes", 0},
               {"unknown_graph_count", unknownCount},
@@ -1129,11 +1141,11 @@ public:
             footer["temporal_search_scope"] = kProductionTemporalScope.str();
             footer["start_policy"] = kProductionStartPolicy.str();
             footer["scheduler_backend"] = kProductionSchedulerBackend.str();
-            footer["dispatch_policy"] = boundInputs.dispatchPolicy.empty()
-                                             ? (isProductionStageOne(input.stage)
-                                                    ? "fixed"
-                                                    : "critical-path")
-                                             : boundInputs.dispatchPolicy;
+            footer["dispatch_policy"] =
+                boundInputs.dispatchPolicy.empty()
+                    ? (isProductionStageOne(input.stage) ? "fixed"
+                                                         : "critical-path")
+                    : boundInputs.dispatchPolicy;
             footer["global_shape_location_temporal_space"] = false;
             footer["placement_coverage_limited"] = true;
             footer["location_coverage_limited"] = true;

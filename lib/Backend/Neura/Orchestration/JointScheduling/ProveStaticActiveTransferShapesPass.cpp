@@ -161,8 +161,8 @@ traceKernelInput(Value value, KernelOp kernel,
   if (!definition)
     return finish(std::nullopt);
   if (auto cast = dyn_cast<memref::CastOp>(definition))
-    return finish(traceKernelInput(cast.getSource(), kernel, visiting,
-                                   depth + 1));
+    return finish(
+        traceKernelInput(cast.getSource(), kernel, visiting, depth + 1));
   StringRef name = definition->getName().getStringRef();
   if (name == "neura.constant")
     return finish(detail::parseInputReference(definition->getAttr("value")));
@@ -671,8 +671,7 @@ private:
   // information only. The logical capacity authenticates each static extent;
   // layout, element type, address space, and rank must remain identical.
   bool isAuthenticatedIdentityMemRefView(Type sourceType, Type targetType,
-                                         Value storageRoot,
-                                         std::string &error,
+                                         Value storageRoot, std::string &error,
                                          bool requireCapacity = false) {
     auto source = dyn_cast<MemRefType>(sourceType);
     auto target = dyn_cast<MemRefType>(targetType);
@@ -728,12 +727,11 @@ private:
             traceKernelInput(cast.getSource(), kernel);
         if (!input || !task)
           return false;
-        Value storageRoot =
-            resolveKernelInputRoot(task, kernel, *input, error);
-        return storageRoot && isAuthenticatedIdentityMemRefView(
-                                  cast.getSource().getType(),
-                                  cast.getResult().getType(), storageRoot,
-                                  error, /*requireCapacity=*/true);
+        Value storageRoot = resolveKernelInputRoot(task, kernel, *input, error);
+        return storageRoot &&
+               isAuthenticatedIdentityMemRefView(
+                   cast.getSource().getType(), cast.getResult().getType(),
+                   storageRoot, error, /*requireCapacity=*/true);
       }
       std::optional<Value> sourceRoot = resolveRoot(cast.getSource(), error);
       return sourceRoot && isAuthenticatedIdentityMemRefView(

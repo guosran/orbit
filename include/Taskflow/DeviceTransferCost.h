@@ -38,7 +38,8 @@ struct DeviceTransferFacts {
   int64_t segmentCount = 0, tileElements = 0, elements = 0;
 };
 struct DeviceTransferCostDomain {
-  std::string runtimeIdentity, toolchainIdentity, pathIdentity, observerIdentity;
+  std::string runtimeIdentity, toolchainIdentity, pathIdentity,
+      observerIdentity;
   std::string conditionIdentity, architectureIdentity;
   std::string implementation = "identity-copy-f32";
   std::string completionBoundary = "submit-to-successful-wait-return";
@@ -66,19 +67,27 @@ struct DeviceTransferComposition {
   std::vector<size_t> separatelyPricedEvents;
   bool submitAlreadyPriced = false, completionAlreadyPriced = false;
 };
-bool collectDeviceTransferFacts(const GenericAnalysis &, const GenericMappingPlan &,
-    const DeviceTransferBackendBinding &, DeviceTransferFacts &, std::string &error);
-bool checkDeviceTransferFacts(const GenericAnalysis &, const GenericMappingPlan &,
-    const DeviceTransferFacts &, std::string &error);
+bool collectDeviceTransferFacts(const GenericAnalysis &,
+                                const GenericMappingPlan &,
+                                const DeviceTransferBackendBinding &,
+                                DeviceTransferFacts &, std::string &error);
+bool checkDeviceTransferFacts(const GenericAnalysis &,
+                              const GenericMappingPlan &,
+                              const DeviceTransferFacts &, std::string &error);
 bool parseDeviceTransferCostModel(llvm::StringRef jsonBytes,
-    DeviceTransferCostModel &, std::string &error);
+                                  DeviceTransferCostModel &,
+                                  std::string &error);
 // Rejects additive prices on any event already owned by this composite. The
 // caller lists separately priced graph events; an empty list means none.
 bool evaluateDeviceTransferCost(const DeviceTransferFacts &,
-    const DeviceTransferCostModel &, const DeviceTransferComposition &,
-    DeviceTransferCostEvaluation &, std::string &error);
-llvm::json::Value serializeDeviceTransferBackendBinding(const DeviceTransferBackendBinding &);
+                                const DeviceTransferCostModel &,
+                                const DeviceTransferComposition &,
+                                DeviceTransferCostEvaluation &,
+                                std::string &error);
+llvm::json::Value
+serializeDeviceTransferBackendBinding(const DeviceTransferBackendBinding &);
 llvm::json::Value serializeDeviceTransferFacts(const DeviceTransferFacts &);
-llvm::json::Value serializeDeviceTransferCost(const DeviceTransferCostEvaluation &);
+llvm::json::Value
+serializeDeviceTransferCost(const DeviceTransferCostEvaluation &);
 } // namespace orbit::taskflow
 #endif

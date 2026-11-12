@@ -71,42 +71,40 @@ inline bool productionAdapterFail(std::string &error, StringRef message) {
 inline void removeProductionCloneAttrs(func::FuncOp function) {
   // Exact schedule/replay metadata belongs to the ORBIT enumerator and must
   // never steer this production invocation.  Remove it only on the clone.
-  for (StringRef attr : {
-           StringRef("joint_scheduling_program_graph_id"),
-           StringRef("joint_scheduling_program_graph_transfer_events"),
-           StringRef("joint_scheduling_program_graph_order_edges"),
-           StringRef("joint_scheduling_exact_dispatch_order"),
-           StringRef("joint_scheduling_exact_replay_timing"),
-           StringRef("joint_scheduling_predicted_makespan"),
-           StringRef("joint_scheduling_actual_makespan"),
-           StringRef("joint_scheduling_replay_verified"),
-           StringRef("joint_scheduling_mapper_replay_completed"),
-           StringRef("joint_scheduling_production_dispatch_order"),
-           StringRef("joint_scheduling_production_schedule"),
-           StringRef("joint_scheduling_communication_trace"),
-           StringRef("joint_scheduling_dependency_trace"),
-           StringRef("joint_scheduling_fixed_point_max_iterations")})
+  for (StringRef attr :
+       {StringRef("joint_scheduling_program_graph_id"),
+        StringRef("joint_scheduling_program_graph_transfer_events"),
+        StringRef("joint_scheduling_program_graph_order_edges"),
+        StringRef("joint_scheduling_exact_dispatch_order"),
+        StringRef("joint_scheduling_exact_replay_timing"),
+        StringRef("joint_scheduling_predicted_makespan"),
+        StringRef("joint_scheduling_actual_makespan"),
+        StringRef("joint_scheduling_replay_verified"),
+        StringRef("joint_scheduling_mapper_replay_completed"),
+        StringRef("joint_scheduling_production_dispatch_order"),
+        StringRef("joint_scheduling_production_schedule"),
+        StringRef("joint_scheduling_communication_trace"),
+        StringRef("joint_scheduling_dependency_trace"),
+        StringRef("joint_scheduling_fixed_point_max_iterations")})
     function->removeAttr(attr);
 
   function.walk([](taskflow::TaskflowTaskOp task) {
-    for (StringRef attr : {
-             StringRef("amoeba.exact_schedule"),
-             StringRef("amoeba.exact_replay_mapped_timing"),
-             StringRef("profile_info"),
-             StringRef("task_orchestration_info"),
-             StringRef("amoeba.joint_shape_orientation_fixed"),
-             StringRef("amoeba.selected_cgra_count"),
-             StringRef("amoeba.selected_cgra_shape"),
-             StringRef("amoeba.mapper_replay_verified")})
+    for (StringRef attr :
+         {StringRef("amoeba.exact_schedule"),
+          StringRef("amoeba.exact_replay_mapped_timing"),
+          StringRef("profile_info"), StringRef("task_orchestration_info"),
+          StringRef("amoeba.joint_shape_orientation_fixed"),
+          StringRef("amoeba.selected_cgra_count"),
+          StringRef("amoeba.selected_cgra_shape"),
+          StringRef("amoeba.mapper_replay_verified")})
       task->removeAttr(attr);
   });
 }
 
 inline bool parseProductionRectangle(
     ArrayAttr cells, int64_t expectedRows, int64_t expectedCols,
-    std::set<std::pair<int64_t, int64_t>> &parsed,
-    int64_t &originRow, int64_t &originCol, std::string &error,
-    StringRef what) {
+    std::set<std::pair<int64_t, int64_t>> &parsed, int64_t &originRow,
+    int64_t &originCol, std::string &error, StringRef what) {
   auto malformed = [&](StringRef suffix) {
     std::string message = what.str();
     message += suffix.str();
@@ -125,10 +123,8 @@ inline bool parseProductionRectangle(
     return malformed(" does not contain the selected shape");
   for (Attribute attribute : cells) {
     auto position = dyn_cast<DictionaryAttr>(attribute);
-    auto row = position ? position.getAs<IntegerAttr>("row")
-                        : IntegerAttr();
-    auto col = position ? position.getAs<IntegerAttr>("col")
-                        : IntegerAttr();
+    auto row = position ? position.getAs<IntegerAttr>("row") : IntegerAttr();
+    auto col = position ? position.getAs<IntegerAttr>("col") : IntegerAttr();
     if (!row || !col || row.getInt() < 0 || col.getInt() < 0)
       return malformed(" contains a malformed coordinate");
     if (!parsed.insert({row.getInt(), col.getInt()}).second)
@@ -148,9 +144,8 @@ inline bool parseProductionRectangle(
   return true;
 }
 
-inline bool sameCoordinates(
-    const std::set<std::pair<int64_t, int64_t>> &lhs,
-    const std::set<std::pair<int64_t, int64_t>> &rhs) {
+inline bool sameCoordinates(const std::set<std::pair<int64_t, int64_t>> &lhs,
+                            const std::set<std::pair<int64_t, int64_t>> &rhs) {
   return lhs == rhs;
 }
 
@@ -169,43 +164,46 @@ inline bool scheduleWithAmoebaProductionPass(
   out = {};
   error.clear();
   if (!sourceModule || !sourceFunction)
-    return detail::productionAdapterFail(error,
-                                         "production scheduler requires a module and function");
+    return detail::productionAdapterFail(
+        error, "production scheduler requires a module and function");
   if (sourceFunction->getParentOfType<ModuleOp>() != sourceModule)
     return detail::productionAdapterFail(
         error, "production scheduler function is outside the supplied module");
   if (candidateId.empty())
-    return detail::productionAdapterFail(error,
-                                         "production scheduler candidate id is empty");
+    return detail::productionAdapterFail(
+        error, "production scheduler candidate id is empty");
   if (choices.empty() || choices.size() != predictedDurations.size())
     return detail::productionAdapterFail(
         error, "production scheduler shape and duration arrays disagree");
 
   SmallVector<taskflow::TaskflowTaskOp> sourceTasks;
-  sourceFunction.walk([&](taskflow::TaskflowTaskOp task) {
-    sourceTasks.push_back(task);
-  });
+  sourceFunction.walk(
+      [&](taskflow::TaskflowTaskOp task) { sourceTasks.push_back(task); });
   if (sourceTasks.size() != choices.size())
     return detail::productionAdapterFail(
-        error, "production scheduler candidate task count disagrees with function");
+        error,
+        "production scheduler candidate task count disagrees with function");
 
   std::map<std::string, size_t> choiceIndices;
   for (size_t index = 0; index < choices.size(); ++index) {
     const TaskShapeChoice &choice = choices[index];
-    if (choice.task.empty() || !choiceIndices.emplace(choice.task, index).second)
+    if (choice.task.empty() ||
+        !choiceIndices.emplace(choice.task, index).second)
       return detail::productionAdapterFail(
-          error, "production scheduler candidate has duplicate or empty task names");
+          error,
+          "production scheduler candidate has duplicate or empty task names");
     if (choice.shape.rows <= 0 || choice.shape.cols <= 0 ||
-        choice.shape.rows > std::numeric_limits<int64_t>::max() /
-                              choice.shape.cols)
+        choice.shape.rows >
+            std::numeric_limits<int64_t>::max() / choice.shape.cols)
       return detail::productionAdapterFail(
-          error, "production scheduler candidate has an invalid rectangle shape");
+          error,
+          "production scheduler candidate has an invalid rectangle shape");
     const int64_t cgraCount = choice.shape.rows * choice.shape.cols;
-    if (cgraCount <= 0 ||
-        cgraCount > std::numeric_limits<int32_t>::max() ||
+    if (cgraCount <= 0 || cgraCount > std::numeric_limits<int32_t>::max() ||
         predictedDurations[index] <= 0)
       return detail::productionAdapterFail(
-          error, "production scheduler candidate has an invalid count or duration");
+          error,
+          "production scheduler candidate has an invalid count or duration");
   }
   for (taskflow::TaskflowTaskOp task : sourceTasks)
     if (!choiceIndices.count(task.getTaskName().str()))
@@ -223,8 +221,8 @@ inline bool scheduleWithAmoebaProductionPass(
       clonedFunction = function;
   });
   if (!clonedFunction)
-    return detail::productionAdapterFail(error,
-                                         "production scheduler could not find cloned function");
+    return detail::productionAdapterFail(
+        error, "production scheduler could not find cloned function");
 
   detail::removeProductionCloneAttrs(clonedFunction);
   OpBuilder builder(clonedFunction.getContext());
@@ -239,12 +237,11 @@ inline bool scheduleWithAmoebaProductionPass(
     if (fixedPointIterations <= 0 ||
         fixedPointIterations > std::numeric_limits<int>::max())
       return detail::productionAdapterFail(
-          error,
-          "joint_scheduling_fixed_point_max_iterations is outside the supported range");
+          error, "joint_scheduling_fixed_point_max_iterations is outside the "
+                 "supported range");
   }
-  clonedFunction->setAttr(
-      "joint_scheduling_fixed_point_max_iterations",
-      builder.getI64IntegerAttr(fixedPointIterations));
+  clonedFunction->setAttr("joint_scheduling_fixed_point_max_iterations",
+                          builder.getI64IntegerAttr(fixedPointIterations));
   clonedFunction->setAttr("joint_scheduling_candidate_id",
                           builder.getStringAttr(candidateId));
   clonedFunction.walk([&](taskflow::TaskflowTaskOp task) {
@@ -253,9 +250,8 @@ inline bool scheduleWithAmoebaProductionPass(
       return;
     const size_t index = found->second;
     const TaskShapeChoice &choice = choices[index];
-    task->setAttr("cgra_count",
-                  builder.getI32IntegerAttr(static_cast<int32_t>(
-                      choice.shape.rows * choice.shape.cols)));
+    task->setAttr("cgra_count", builder.getI32IntegerAttr(static_cast<int32_t>(
+                                    choice.shape.rows * choice.shape.cols)));
     task->setAttr("cgra_shape",
                   builder.getStringAttr(choice.shape.toCgraShapeAttrValue()));
     task->setAttr("amoeba.joint_shape_orientation_fixed",
@@ -279,34 +275,41 @@ inline bool scheduleWithAmoebaProductionPass(
     return false;
   }
 
-  PassManager manager = PassManager::on<func::FuncOp>(clonedFunction.getContext());
+  PassManager manager =
+      PassManager::on<func::FuncOp>(clonedFunction.getContext());
   manager.enableVerifier(true);
   manager.addPass(std::move(pass));
   std::string diagnostic;
   LogicalResult runResult = failure();
   {
-    ScopedDiagnosticHandler capture(clonedFunction.getContext(),
-                                    [&](Diagnostic &entry) {
-                                      if (diagnostic.empty()) {
-                                        llvm::raw_string_ostream stream(diagnostic);
-                                        entry.print(stream);
-                                        stream.flush();
-                                      }
-                                      return success();
-                                    });
+    ScopedDiagnosticHandler capture(
+        clonedFunction.getContext(), [&](Diagnostic &entry) {
+          if (diagnostic.empty()) {
+            llvm::raw_string_ostream stream(diagnostic);
+            entry.print(stream);
+            stream.flush();
+          }
+          return success();
+        });
     runResult = manager.run(clonedFunction.getOperation());
   }
   if (failed(runResult)) {
-    error = diagnostic.empty() ? "production scheduler pass failed" : diagnostic;
+    error =
+        diagnostic.empty() ? "production scheduler pass failed" : diagnostic;
     return false;
   }
 
-  if(auto identity=clonedFunction->getAttrOfType<StringAttr>("joint_scheduling_program_graph_id")) {
-    out.programGraphId=identity.str();
-    if(auto values=clonedFunction->getAttrOfType<DenseI64ArrayAttr>("joint_scheduling_program_graph_transfer_events"))
-      out.programGraphTransfers.assign(values.asArrayRef().begin(),values.asArrayRef().end());
-    if(auto values=clonedFunction->getAttrOfType<DenseI64ArrayAttr>("joint_scheduling_program_graph_order_edges"))
-      out.programGraphOrders.assign(values.asArrayRef().begin(),values.asArrayRef().end());
+  if (auto identity = clonedFunction->getAttrOfType<StringAttr>(
+          "joint_scheduling_program_graph_id")) {
+    out.programGraphId = identity.str();
+    if (auto values = clonedFunction->getAttrOfType<DenseI64ArrayAttr>(
+            "joint_scheduling_program_graph_transfer_events"))
+      out.programGraphTransfers.assign(values.asArrayRef().begin(),
+                                       values.asArrayRef().end());
+    if (auto values = clonedFunction->getAttrOfType<DenseI64ArrayAttr>(
+            "joint_scheduling_program_graph_order_edges"))
+      out.programGraphOrders.assign(values.asArrayRef().begin(),
+                                    values.asArrayRef().end());
   }
   std::map<std::string, size_t> clonedTaskIndices;
   SmallVector<taskflow::TaskflowTaskOp> clonedTasks;
@@ -317,7 +320,8 @@ inline bool scheduleWithAmoebaProductionPass(
   if (clonedTasks.size() != choices.size() ||
       clonedTaskIndices.size() != clonedTasks.size())
     return detail::productionAdapterFail(
-        error, "production scheduler output task set is incomplete or ambiguous");
+        error,
+        "production scheduler output task set is incomplete or ambiguous");
 
   struct ParsedSchedule {
     ExactSchedulePlacement placement;
@@ -333,12 +337,11 @@ inline bool scheduleWithAmoebaProductionPass(
   for (Attribute attribute : scheduleAttr) {
     auto record = dyn_cast<DictionaryAttr>(attribute);
     auto name = record ? record.getAs<StringAttr>("task") : StringAttr();
-    auto start = record ? record.getAs<IntegerAttr>("start_cycle")
-                        : IntegerAttr();
-    auto end = record ? record.getAs<IntegerAttr>("end_cycle")
-                      : IntegerAttr();
-    auto cells = record ? record.getAs<ArrayAttr>("cgra_positions")
-                        : ArrayAttr();
+    auto start =
+        record ? record.getAs<IntegerAttr>("start_cycle") : IntegerAttr();
+    auto end = record ? record.getAs<IntegerAttr>("end_cycle") : IntegerAttr();
+    auto cells =
+        record ? record.getAs<ArrayAttr>("cgra_positions") : ArrayAttr();
     if (!name || !start || !end || !cells || start.getInt() < 0 ||
         end.getInt() <= start.getInt())
       return detail::productionAdapterFail(
@@ -346,7 +349,8 @@ inline bool scheduleWithAmoebaProductionPass(
     auto choice = choiceIndices.find(name.getValue().str());
     if (choice == choiceIndices.end() || parsed.count(name.getValue().str()))
       return detail::productionAdapterFail(
-          error, "production scheduler timing record references an unknown task");
+          error,
+          "production scheduler timing record references an unknown task");
     const TaskShapeChoice &shapeChoice = choices[choice->second];
     std::set<std::pair<int64_t, int64_t>> scheduleCells;
     int64_t row = 0, col = 0;
@@ -357,11 +361,15 @@ inline bool scheduleWithAmoebaProductionPass(
     const int64_t duration = predictedDurations[choice->second];
     if (end.getInt() - start.getInt() != duration)
       return detail::productionAdapterFail(
-          error, "production scheduler timing does not preserve predicted duration");
+          error,
+          "production scheduler timing does not preserve predicted duration");
     ParsedSchedule parsedRecord;
     parsedRecord.placement = {static_cast<unsigned>(choice->second),
-                              static_cast<int>(row), static_cast<int>(col),
-                              start.getInt(), end.getInt(), 0};
+                              static_cast<int>(row),
+                              static_cast<int>(col),
+                              start.getInt(),
+                              end.getInt(),
+                              0};
     parsedRecord.cells = std::move(scheduleCells);
     parsed.emplace(name.getValue().str(), std::move(parsedRecord));
   }
@@ -373,27 +381,30 @@ inline bool scheduleWithAmoebaProductionPass(
     const std::string name = task.getTaskName().str();
     auto parsedRecord = parsed.find(name);
     if (parsedRecord == parsed.end())
-      return detail::productionAdapterFail(error,
-                                           "production scheduler omitted a task record");
+      return detail::productionAdapterFail(
+          error, "production scheduler omitted a task record");
     auto info = task->getAttrOfType<DictionaryAttr>("task_orchestration_info");
-    auto infoCells = info ? info.getAs<ArrayAttr>("cgra_positions") : ArrayAttr();
+    auto infoCells =
+        info ? info.getAs<ArrayAttr>("cgra_positions") : ArrayAttr();
     auto profile = task->getAttrOfType<DictionaryAttr>("profile_info");
-    auto duration = profile ? profile.getAs<IntegerAttr>("duration")
-                            : IntegerAttr();
+    auto duration =
+        profile ? profile.getAs<IntegerAttr>("duration") : IntegerAttr();
     if (!info || !infoCells || !profile || !duration ||
         duration.getInt() != predictedDurations[choiceIndices[name]])
-      return detail::productionAdapterFail(
-          error, "production scheduler task metadata disagrees with selected duration");
+      return detail::productionAdapterFail(error,
+                                           "production scheduler task metadata "
+                                           "disagrees with selected duration");
     std::set<std::pair<int64_t, int64_t>> metadataCells;
     int64_t metadataRow = 0, metadataCol = 0;
     if (!detail::parseProductionRectangle(
             infoCells, choices[choiceIndices[name]].shape.rows,
-            choices[choiceIndices[name]].shape.cols, metadataCells,
-            metadataRow, metadataCol, error, "task_orchestration_info coordinates"))
+            choices[choiceIndices[name]].shape.cols, metadataCells, metadataRow,
+            metadataCol, error, "task_orchestration_info coordinates"))
       return false;
     if (!detail::sameCoordinates(metadataCells, parsedRecord->second.cells))
       return detail::productionAdapterFail(
-          error, "production scheduler timing and placement coordinates disagree");
+          error,
+          "production scheduler timing and placement coordinates disagree");
   }
 
   auto dispatchAttr = clonedFunction->getAttrOfType<ArrayAttr>(
@@ -406,8 +417,8 @@ inline bool scheduleWithAmoebaProductionPass(
   out.order.reserve(dispatchAttr.size());
   for (Attribute attribute : dispatchAttr) {
     auto name = dyn_cast<StringAttr>(attribute);
-    auto choice = name ? choiceIndices.find(name.getValue().str())
-                       : choiceIndices.end();
+    auto choice =
+        name ? choiceIndices.find(name.getValue().str()) : choiceIndices.end();
     if (!name || choice == choiceIndices.end() ||
         !seenDispatch.insert(static_cast<unsigned>(choice->second)).second)
       return detail::productionAdapterFail(
@@ -426,7 +437,8 @@ inline bool scheduleWithAmoebaProductionPass(
       "joint_scheduling_predicted_makespan");
   if (!makespan || makespan.getInt() <= 0 || makespan.getInt() != maximumEnd)
     return detail::productionAdapterFail(
-        error, "production scheduler makespan metadata is missing or inconsistent");
+        error,
+        "production scheduler makespan metadata is missing or inconsistent");
   out.makespan = makespan.getInt();
 
   auto communicationTrace = clonedFunction->getAttrOfType<ArrayAttr>(
@@ -439,8 +451,8 @@ inline bool scheduleWithAmoebaProductionPass(
   std::set<int64_t> committedEdgeIndices;
   for (Attribute attribute : communicationTrace) {
     auto transfer = dyn_cast<DictionaryAttr>(attribute);
-    auto edgeIndices = transfer ? transfer.getAs<ArrayAttr>("edge_indices")
-                                : ArrayAttr();
+    auto edgeIndices =
+        transfer ? transfer.getAs<ArrayAttr>("edge_indices") : ArrayAttr();
     if (!transfer || !edgeIndices)
       return detail::productionAdapterFail(
           error, "production scheduler communication trace is malformed");
@@ -448,12 +460,19 @@ inline bool scheduleWithAmoebaProductionPass(
       auto index = dyn_cast<IntegerAttr>(edge);
       if (!index || index.getInt() < 0)
         return detail::productionAdapterFail(
-            error, "production scheduler communication edge index is malformed");
+            error,
+            "production scheduler communication edge index is malformed");
       committedEdgeIndices.insert(index.getInt());
     }
   }
-  { llvm::raw_string_ostream os(out.communicationTraceMLIR);communicationTrace.print(os); }
-  { llvm::raw_string_ostream os(out.dependencyTraceMLIR);dependencyTrace.print(os); }
+  {
+    llvm::raw_string_ostream os(out.communicationTraceMLIR);
+    communicationTrace.print(os);
+  }
+  {
+    llvm::raw_string_ostream os(out.dependencyTraceMLIR);
+    dependencyTrace.print(os);
+  }
   out.replayedEdges = committedEdgeIndices.size();
   out.replayedEdgesKnown = true;
   return true;

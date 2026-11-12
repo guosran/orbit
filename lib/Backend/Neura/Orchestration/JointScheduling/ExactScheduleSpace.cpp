@@ -32,8 +32,8 @@ struct Search {
     }
     if (limits.maxMilliseconds &&
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - began).count() >=
-            static_cast<int64_t>(limits.maxMilliseconds)) {
+            std::chrono::steady_clock::now() - began)
+                .count() >= static_cast<int64_t>(limits.maxMilliseconds)) {
       result.reason = "max-milliseconds";
       return true;
     }
@@ -82,8 +82,8 @@ struct Search {
                 [](const auto &a, const auto &b) { return a.task < b.task; });
       std::ostringstream key;
       for (const auto &p : canonical)
-        key << p.task << ':' << p.row << ',' << p.col << '@'
-            << p.start << '-' << p.end << ';';
+        key << p.task << ':' << p.row << ',' << p.col << '@' << p.start << '-'
+            << p.end << ';';
       if (seen.insert(key.str()).second) {
         if (result.uniqueSchedules == std::numeric_limits<uint64_t>::max()) {
           result.reason = "count-overflow";
@@ -106,8 +106,8 @@ struct Search {
           allPredecessorsPlaced = false;
           break;
         }
-        const auto found = std::find_if(
-            placed.begin(), placed.end(), [&](const auto &entry) {
+        const auto found =
+            std::find_if(placed.begin(), placed.end(), [&](const auto &entry) {
               return entry.task == predecessor;
             });
         ready = std::max(ready, found->end);
@@ -163,9 +163,8 @@ bool enumerateExactScheduleSpace(
   }
   for (unsigned i = 0; i < tasks.size(); ++i) {
     const auto &task = tasks[i];
-    if (task.name.empty() || task.rows < 1 || task.cols < 1 ||
-        task.rows > 4 || task.cols > 4 ||
-        task.rows * task.cols > 4 || task.rows > gridRows ||
+    if (task.name.empty() || task.rows < 1 || task.cols < 1 || task.rows > 4 ||
+        task.cols > 4 || task.rows * task.cols > 4 || task.rows > gridRows ||
         task.cols > gridCols || task.duration < 1) {
       error = "invalid task name, fixed shape, duration or per-task CGRA limit";
       return false;
@@ -204,8 +203,9 @@ bool enumerateExactScheduleSpace(
     error = "task dependency graph has a cycle";
     return false;
   }
-  Search search{gridRows, gridCols, tasks, limits, emit, result, {}, {}, {},
-                std::chrono::steady_clock::now()};
+  Search search{
+      gridRows, gridCols, tasks, limits, emit,
+      result,   {},       {},    {},     std::chrono::steady_clock::now()};
   search.scheduled.assign(tasks.size(), false);
   result.complete = search.visit();
   if (!result.complete && result.reason.empty())

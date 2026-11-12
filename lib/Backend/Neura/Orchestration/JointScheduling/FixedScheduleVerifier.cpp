@@ -1,4 +1,5 @@
-//===- FixedScheduleVerifier.cpp - Fixed schedule resource/edge replay -----===//
+//===- FixedScheduleVerifier.cpp - Fixed schedule resource/edge replay
+//-----===//
 #include "FixedScheduleVerifier.h"
 
 #include <algorithm>

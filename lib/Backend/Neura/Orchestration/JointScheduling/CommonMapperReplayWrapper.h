@@ -20,9 +20,9 @@ namespace mlir::amoeba::neura::joint_scheduling {
 // caller chooses the symbol name; profile export uses
 // `__joint_task_mapper_replay__`.
 func::FuncOp buildCommonMapperReplayWrapper(taskflow::TaskflowTaskOp task,
-                                           ModuleOp owner,
-                                           llvm::StringRef symbolName,
-                                           std::string &error);
+                                            ModuleOp owner,
+                                            llvm::StringRef symbolName,
+                                            std::string &error);
 
 // Print the wrapper with the same flags used when MapJointSchedulingTasksPass
 // records pre_mapper_wrapper_bytes.

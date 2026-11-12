@@ -12,16 +12,16 @@
 #include "Backend/Neura/Orchestration/AnalyticalBasedTaskOrchestration/AnalyticalBasedTaskOrchestration.h"
 #include "Backend/Neura/Orchestration/JointScheduling/TaskCommunicationModel.h"
 
-#include "TaskflowDialect/TaskflowOps.h"
 #include "Taskflow/ComputeEstimate.h"
+#include "TaskflowDialect/TaskflowOps.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/APInt.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -55,9 +55,9 @@ struct FactoredRankedCandidate {
   llvm::json::Object scoreRecord;
 };
 
-static std::optional<std::string>
-getDecimal(const llvm::json::Object &object, StringRef key,
-           std::string &error) {
+static std::optional<std::string> getDecimal(const llvm::json::Object &object,
+                                             StringRef key,
+                                             std::string &error) {
   if (std::optional<int64_t> numeric = object.getInteger(key)) {
     if (*numeric < 0) {
       error = "factored space count must be nonnegative: " + key.str();
@@ -66,8 +66,7 @@ getDecimal(const llvm::json::Object &object, StringRef key,
     return std::to_string(*numeric);
   }
   std::optional<StringRef> text = object.getString(key);
-  if (!text || text->empty() ||
-      llvm::any_of(*text, [](char value) {
+  if (!text || text->empty() || llvm::any_of(*text, [](char value) {
         return value < '0' || value > '9';
       })) {
     error = "factored space count is not a decimal string: " + key.str();
@@ -95,7 +94,6 @@ static void putDecimal(llvm::json::Object &object, StringRef key,
     object[key] = decimal.str();
 }
 
-
 static bool isFactoredSpaceDescriptor(StringRef path) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -119,8 +117,7 @@ static bool isFactoredSpaceDescriptor(StringRef path) {
 
 static bool parseFactoredSpaceDescriptor(
     StringRef path, func::FuncOp func, ArrayRef<TaskMetadata> tasks,
-    StringRef expectedGraphId,
-    const ::mlir::neura::Architecture &architecture,
+    StringRef expectedGraphId, const ::mlir::neura::Architecture &architecture,
     FactoredSpaceDescriptor &descriptor, std::string &error) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
       llvm::MemoryBuffer::getFile(path);
@@ -184,14 +181,13 @@ static bool parseFactoredSpaceDescriptor(
   const llvm::json::Array *factors = header.getArray("factors");
   if (!schema || !representation || !exact || !function || !graphVariantId ||
       !searchScope || !shapePolicy || !capacityPolicy || !pruningPolicy ||
-      !maxChangedTasks ||
-      !maxCgras || !factors) {
+      !maxChangedTasks || !maxCgras || !factors) {
     error = "factored candidate header is missing required fields";
     return false;
   }
   if (*schema != kFactoredSpaceSchema || *representation != "factored" ||
-      !*exact || *function != func.getSymName() ||
-      expectedGraphId.empty() || *graphVariantId != expectedGraphId ||
+      !*exact || *function != func.getSymName() || expectedGraphId.empty() ||
+      *graphVariantId != expectedGraphId ||
       *searchScope != kFactoredSearchScope || *shapePolicy != kShapePolicy ||
       *capacityPolicy != kSpatialCapacityPolicy ||
       *pruningPolicy != kShapePruningPolicyNone || *maxChangedTasks != -1 ||
@@ -204,8 +200,8 @@ static bool parseFactoredSpaceDescriptor(
     error = "factored candidate factors do not match current task count";
     return false;
   }
-  if (*maxCgras > architecture.getMultiCgraRows() *
-                      architecture.getMultiCgraColumns()) {
+  if (*maxCgras >
+      architecture.getMultiCgraRows() * architecture.getMultiCgraColumns()) {
     error = "factored candidate max-cgras-per-task exceeds the architecture";
     return false;
   }
@@ -353,7 +349,8 @@ struct ScoreAnalyticalTaskCandidatesPass
       llvm::cl::init("")};
   Option<std::string> graphVariantSha256{
       *this, "graph-variant-sha256",
-      llvm::cl::desc("Legacy file fingerprint; rejected by the no-SHA contract."),
+      llvm::cl::desc(
+          "Legacy file fingerprint; rejected by the no-SHA contract."),
       llvm::cl::init("")};
   Option<std::string> sourceRepository{
       *this, "source-git-repository",
@@ -412,10 +409,9 @@ struct ScoreAnalyticalTaskCandidatesPass
     // Bind the catalogue to explicit source and architecture provenance.
     // Candidate ordering and exact count are independently validated by
     // readCandidateManifest below; no file-content hash is required.
-    StringRef architecturePath =
-        ::mlir::amoeba::getNeuraArchitectureSpecFile();
-    if (sourceRepository.getValue().empty() || sourceCommit.getValue().empty() ||
-        architecturePath.empty()) {
+    StringRef architecturePath = ::mlir::amoeba::getNeuraArchitectureSpecFile();
+    if (sourceRepository.getValue().empty() ||
+        sourceCommit.getValue().empty() || architecturePath.empty()) {
       func.emitError()
           << "source-git-repository, source-git-commit, and "
              "--architecture-spec are required for cost provenance";
@@ -526,8 +522,7 @@ struct ScoreAnalyticalTaskCandidatesPass
           scoreHeader["architecture_path"] = costs.architecturePath().str();
           scoreHeader["architecture_schema"] = costs.architectureSchema().str();
           scoreHeader["source_graph_id"] = costs.sourceGraphId().str();
-          scoreHeader["candidate_id_scheme"] =
-              costs.candidateIdScheme().str();
+          scoreHeader["candidate_id_scheme"] = costs.candidateIdScheme().str();
           if (factoredInput)
             putDecimal(scoreHeader, "candidate_count",
                        factoredDescriptor.candidateCount);
@@ -577,15 +572,13 @@ struct ScoreAnalyticalTaskCandidatesPass
                                     StringRef ordinal, double makespan) {
             factoredRanked.push_back(
                 {id.str(), ordinal.str(), makespan, std::move(score)});
-            llvm::sort(factoredRanked,
-                      [](const FactoredRankedCandidate &lhs,
-                         const FactoredRankedCandidate &rhs) {
-                        if (lhs.score != rhs.score)
-                          return lhs.score < rhs.score;
-                        return compareDecimal(lhs.ordinal, rhs.ordinal) < 0;
-                      });
-            if (factoredRanked.size() >
-                static_cast<size_t>(topK.getValue()))
+            llvm::sort(factoredRanked, [](const FactoredRankedCandidate &lhs,
+                                          const FactoredRankedCandidate &rhs) {
+              if (lhs.score != rhs.score)
+                return lhs.score < rhs.score;
+              return compareDecimal(lhs.ordinal, rhs.ordinal) < 0;
+            });
+            if (factoredRanked.size() > static_cast<size_t>(topK.getValue()))
               factoredRanked.pop_back();
           };
 
@@ -651,8 +644,10 @@ struct ScoreAnalyticalTaskCandidatesPass
                 estimate.implementation = "amoeba-analytical-mapped-task";
                 estimate.model = costs.nameSpace().str();
                 estimate.modelVersion = catalogueVersion;
-                estimate.provenance = "TaskShapeCostCache:" + costFile.getValue();
-                estimate.boundary = "production scheduler task occupancy: ceil(startup+II*(trip-1))";
+                estimate.provenance =
+                    "TaskShapeCostCache:" + costFile.getValue();
+                estimate.boundary = "production scheduler task occupancy: "
+                                    "ceil(startup+II*(trip-1))";
                 estimate.duration = scheduledCycles;
                 estimate.unit = "cycles";
                 estimate.resourceCount = choice.shape.cgraCount();
@@ -660,18 +655,23 @@ struct ScoreAnalyticalTaskCandidatesPass
                 estimate.resourceShape = {choice.shape.rows, choice.shape.cols};
                 estimate.resourceShapeUnit = "cgra_block";
                 estimate.implementationShape = {choice.shape.mapperRows,
-                                               choice.shape.mapperCols};
+                                                choice.shape.mapperCols};
                 estimate.implementationShapeUnit = "processing_element";
                 estimate.predictedII = cost->predictedII;
                 estimate.startupCycles = cost->startupCycles;
                 estimate.iterations = choice.tripCount;
-                estimate.includedCosts = {"DFG compute and load/store operations",
-                    "predictor mapped-resource/routing effects", "startup depth"};
+                estimate.includedCosts = {
+                    "DFG compute and load/store operations",
+                    "predictor mapped-resource/routing effects",
+                    "startup depth"};
                 estimate.excludedCosts = {"explicit inter-task data movement",
-                    "host preparation and submission", "scheduler queue waits"};
+                                          "host preparation and submission",
+                                          "scheduler queue waits"};
                 estimate.requiredDataSupply = {
-                    "load/store operands supplied under predictor training conditions",
-                    "external memory bandwidth and port availability require target validation"};
+                    "load/store operands supplied under predictor training "
+                    "conditions",
+                    "external memory bandwidth and port availability require "
+                    "target validation"};
                 // Existing catalogues do not certify a new residency scheme.
                 // A public evaluator must verify this before using the value.
                 estimate.supplyConditionsVerified = false;
@@ -722,8 +722,8 @@ struct ScoreAnalyticalTaskCandidatesPass
               }
               taskflow::AnalyticalBasedTaskOrchestration strategy(
                   static_cast<int>(manifestHeader.gridRows),
-                  static_cast<int>(manifestHeader.gridCols),
-                  mode, /*communication_aware=*/communicationAware,
+                  static_cast<int>(manifestHeader.gridCols), mode,
+                  /*communication_aware=*/communicationAware,
                   /*fixed_dispatch=*/dispatchPolicy.getValue() == "fixed");
               std::unique_ptr<InterTaskNetworkCommunicationModel>
                   communicationModel;
@@ -741,8 +741,8 @@ struct ScoreAnalyticalTaskCandidatesPass
               }
               taskflow::TaskScheduler scheduler(
                   static_cast<int>(manifestHeader.gridRows),
-                  static_cast<int>(manifestHeader.gridCols),
-                  mode, taskflow::ShapeSelectionPolicy::FixedOrientation,
+                  static_cast<int>(manifestHeader.gridCols), mode,
+                  taskflow::ShapeSelectionPolicy::FixedOrientation,
                   communicationModel.get());
               // A fixed-shape candidate can make the heuristic SRAM fixed
               // point oscillate even though its shape is individually legal.
@@ -753,10 +753,8 @@ struct ScoreAnalyticalTaskCandidatesPass
               bool schedulerAccepted = false;
               {
                 ScopedDiagnosticHandler schedulerDiagnostics(
-                    clonedFunction->getContext(),
-                    [&](Diagnostic &diagnostic) {
-                      if (diagnostic.getSeverity() ==
-                          DiagnosticSeverity::Error)
+                    clonedFunction->getContext(), [&](Diagnostic &diagnostic) {
+                      if (diagnostic.getSeverity() == DiagnosticSeverity::Error)
                         schedulerDiagnostic = diagnostic.str();
                     });
                 schedulerAccepted = scheduler.schedule(
@@ -764,8 +762,9 @@ struct ScoreAnalyticalTaskCandidatesPass
                     strategy.computeTaskPriority(*clonedFunction));
               }
               if (!schedulerAccepted) {
-                if (StringRef(schedulerDiagnostic).contains(
-                        "task placement and SRAM assignment did not converge")) {
+                if (StringRef(schedulerDiagnostic)
+                        .contains("task placement and SRAM assignment did not "
+                                  "converge")) {
                   score["valid"] = false;
                   score["reject_class"] = "heuristic_scheduler_failure";
                   score["reject_reason"] = "SCHEDULER_NO_CONVERGENCE";
@@ -777,10 +776,8 @@ struct ScoreAnalyticalTaskCandidatesPass
                   noteScored();
                   return true;
                 }
-                consumeError =
-                    schedulingMode.getValue() +
-                    " scheduler rejected candidate " +
-                    candidate.id;
+                consumeError = schedulingMode.getValue() +
+                               " scheduler rejected candidate " + candidate.id;
                 if (!schedulerDiagnostic.empty())
                   consumeError += ": " + schedulerDiagnostic;
                 return false;
@@ -993,8 +990,7 @@ struct ScoreAnalyticalTaskCandidatesPass
           if (factoredInput) {
             bool traversed = visitShapeCartesianProductExact(
                 factoredDescriptor.shapesByTask,
-                [&](const llvm::APInt &index,
-                    ArrayRef<size_t> shapeIndices) {
+                [&](const llvm::APInt &index, ArrayRef<size_t> shapeIndices) {
                   if (maxFactoredEvaluations.getValue() > 0 &&
                       factoredScoredCount.uge(llvm::APInt(
                           factoredCounterWidth,
@@ -1005,10 +1001,10 @@ struct ScoreAnalyticalTaskCandidatesPass
                     return false;
                   }
                   if (factoredTimeBudgetMs.getValue() > 0) {
-                    auto elapsed = std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - factoredStart)
-                                       .count();
+                    auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - factoredStart)
+                            .count();
                     if (elapsed >= factoredTimeBudgetMs.getValue()) {
                       factoredBudgetHit = true;
                       factoredBudgetReason = "factored-time-budget-ms";
@@ -1023,7 +1019,8 @@ struct ScoreAnalyticalTaskCandidatesPass
                     candidate.choices.push_back(
                         {(*taskMetadata)[taskIndex].name,
                          (*taskMetadata)[taskIndex].tripCount,
-                         factoredDescriptor.shapesByTask[taskIndex][shapeIndex]});
+                         factoredDescriptor
+                             .shapesByTask[taskIndex][shapeIndex]});
                   }
                   return consume(ordinal, candidate, error);
                 });
@@ -1041,24 +1038,25 @@ struct ScoreAnalyticalTaskCandidatesPass
             }
             if (factoredComplete &&
                 costs.coveredQueries() != costs.catalogQueries()) {
-              error = "cost catalogue does not exactly cover factored task-shape "
-                      "queries";
+              error =
+                  "cost catalogue does not exactly cover factored task-shape "
+                  "queries";
               return false;
             }
-            if (factoredComplete && factoredValidCount.ult(llvm::APInt(
-                    factoredCounterWidth,
-                    static_cast<uint64_t>(topK.getValue())))) {
+            if (factoredComplete &&
+                factoredValidCount.ult(
+                    llvm::APInt(factoredCounterWidth,
+                                static_cast<uint64_t>(topK.getValue())))) {
               error = "exact factored scorer found fewer valid candidates than "
                       "the requested top-k";
               return false;
             }
-            llvm::sort(factoredRanked,
-                      [](const FactoredRankedCandidate &lhs,
-                         const FactoredRankedCandidate &rhs) {
-                        if (lhs.score != rhs.score)
-                          return lhs.score < rhs.score;
-                        return compareDecimal(lhs.ordinal, rhs.ordinal) < 0;
-                      });
+            llvm::sort(factoredRanked, [](const FactoredRankedCandidate &lhs,
+                                          const FactoredRankedCandidate &rhs) {
+              if (lhs.score != rhs.score)
+                return lhs.score < rhs.score;
+              return compareDecimal(lhs.ordinal, rhs.ordinal) < 0;
+            });
             for (FactoredRankedCandidate &candidate : factoredRanked)
               writeJsonLine(os, std::move(candidate.scoreRecord));
             for (auto [index, candidate] : llvm::enumerate(factoredRanked)) {
@@ -1088,8 +1086,9 @@ struct ScoreAnalyticalTaskCandidatesPass
               return false;
             }
             if (costs.coveredQueries() != costs.catalogQueries()) {
-              error = "cost catalogue does not exactly cover candidate manifest "
-                      "task-shape queries";
+              error =
+                  "cost catalogue does not exactly cover candidate manifest "
+                  "task-shape queries";
               return false;
             }
 
@@ -1126,8 +1125,10 @@ struct ScoreAnalyticalTaskCandidatesPass
           if (factoredInput) {
             putDecimal(footer, "candidate_count",
                        factoredDescriptor.candidateCount);
-            std::string scoredDecimal = exactShapeIndexString(factoredScoredCount);
-            std::string validDecimal = exactShapeIndexString(factoredValidCount);
+            std::string scoredDecimal =
+                exactShapeIndexString(factoredScoredCount);
+            std::string validDecimal =
+                exactShapeIndexString(factoredValidCount);
             putDecimal(footer, "scored_count", scoredDecimal);
             putDecimal(footer, "valid_count", validDecimal);
             footer["representation"] = "factored";
@@ -1166,8 +1167,7 @@ struct ScoreAnalyticalTaskCandidatesPass
               footer["evaluation_status"] = "complete";
               footer["incomplete"] = false;
               footer["top_k_certified"] = true;
-              footer["ranking_certificate"] =
-                  "exhaustive-factored-cartesian";
+              footer["ranking_certificate"] = "exhaustive-factored-cartesian";
             } else if (factoredComplete) {
               footer["enumeration_status"] = "complete";
               footer["evaluation_status"] = "incomplete-heuristic";

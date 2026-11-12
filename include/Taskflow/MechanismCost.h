@@ -16,8 +16,8 @@ struct MechanismRuntimeContract {
   bool outputPoisoned = true;
   // Runtime cost labels bind to a declared serial host worker, never to a
   // fabricated physical DRAM port. Parameter resource labels stay unchanged.
-  std::map<std::string,std::string> resourceAliases = {
-      {"host.thread","CPU.compute"},{"host.memory","CPU.compute"}};
+  std::map<std::string, std::string> resourceAliases = {
+      {"host.thread", "CPU.compute"}, {"host.memory", "CPU.compute"}};
 };
 struct MechanismResourceBinding {
   std::string targetResource, semantics;
@@ -37,7 +37,7 @@ struct MechanismItem {
 struct MechanismFacts {
   std::string graphId, bodyFingerprint, identity;
   MechanismRuntimeContract runtime;
-  std::map<std::string,MechanismResourceBinding> runtimeResourceBindings;
+  std::map<std::string, MechanismResourceBinding> runtimeResourceBindings;
   std::vector<MechanismItem> items;
 };
 struct MechanismParameter {
@@ -57,8 +57,9 @@ struct MechanismCostEvaluation {
   std::optional<double> totalMs;
   std::vector<MechanismPricedItem> items;
 };
-bool collectMechanismFacts(const ProgramGraph &, const MechanismRuntimeContract &,
-                           MechanismFacts &, std::string &error);
+bool collectMechanismFacts(const ProgramGraph &,
+                           const MechanismRuntimeContract &, MechanismFacts &,
+                           std::string &error);
 bool parseMechanismParameters(const llvm::json::Value &,
                               std::vector<MechanismParameter> &,
                               std::string &error);

@@ -20,8 +20,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/Verifier.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 
@@ -32,11 +32,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
-#include <cstring>
 
 using namespace mlir;
 using namespace mlir::taskflow;
@@ -147,47 +147,48 @@ static Type payloadType(Type type) {
 }
 
 static Value createHostBool(OpBuilder &builder, Location loc, bool value) {
-  return builder.create<arith::ConstantOp>(
-      loc, builder.getI1Type(), builder.getBoolAttr(value));
+  return builder.create<arith::ConstantOp>(loc, builder.getI1Type(),
+                                           builder.getBoolAttr(value));
 }
 
 static Value createHostInteger(OpBuilder &builder, Location loc, Type type,
                                const APInt &value) {
-  return builder.create<arith::ConstantOp>(
-      loc, type, builder.getIntegerAttr(type, value));
+  return builder.create<arith::ConstantOp>(loc, type,
+                                           builder.getIntegerAttr(type, value));
 }
 
-static FailureOr<HostDataValue>
-lookupHostData(Value source, const HostDataMap &values, IRMapping &mapping,
-               Operation *owner) {
+static FailureOr<HostDataValue> lookupHostData(Value source,
+                                               const HostDataMap &values,
+                                               IRMapping &mapping,
+                                               Operation *owner) {
   if (auto found = values.find(source); found != values.end())
     return found->second;
   Value mapped = mapping.lookupOrNull(source);
   if (!mapped)
-    return reject(owner,
-                  "HOST_LOWERING_BODY_CONTRACT: dataflow value was not "
-                  "mapped into host IR");
+    return reject(owner, "HOST_LOWERING_BODY_CONTRACT: dataflow value was not "
+                         "mapped into host IR");
   return HostDataValue{mapped, nullptr};
 }
 
 static FailureOr<HostDataValue>
 resolveHostDataAttribute(Attribute attribute, Type expectedType,
                          ArrayRef<HostDataValue> inputs,
-                         ArrayRef<HostDataValue> iterArgs,
-                         Value truePredicate, OpBuilder &builder,
-                         Location loc, Operation *owner) {
+                         ArrayRef<HostDataValue> iterArgs, Value truePredicate,
+                         OpBuilder &builder, Location loc, Operation *owner) {
   if (!attribute)
-    return reject(owner, "HOST_LOWERING_BODY_CONTRACT: missing dataflow attribute");
+    return reject(owner,
+                  "HOST_LOWERING_BODY_CONTRACT: missing dataflow attribute");
   Type rawType = payloadType(expectedType);
   if (auto text = dyn_cast<StringAttr>(attribute)) {
     StringRef value = text.getValue();
-    auto resolveIndexed = [&](StringRef prefix,
-                              ArrayRef<HostDataValue> source)
-        -> FailureOr<HostDataValue> {
+    auto resolveIndexed =
+        [&](StringRef prefix,
+            ArrayRef<HostDataValue> source) -> FailureOr<HostDataValue> {
       if (!value.consume_front(prefix))
         return failure();
       unsigned index = 0;
-      if (value.empty() || value.getAsInteger(10, index) || index >= source.size())
+      if (value.empty() || value.getAsInteger(10, index) ||
+          index >= source.size())
         return failure();
       return source[index];
     };
@@ -198,19 +199,19 @@ resolveHostDataAttribute(Attribute attribute, Type expectedType,
       return *resolved;
     return reject(owner,
                   "HOST_LOWERING_BODY_CONTRACT: unsupported dataflow value "
-                  "reference " + value);
+                  "reference " +
+                      value);
   }
   if (auto integer = dyn_cast<IntegerAttr>(attribute)) {
     if (!rawType.isIndex() && !isa<IntegerType>(rawType))
-      return reject(owner,
-                    "HOST_LOWERING_UNSUPPORTED_SHAPE: integer dataflow "
-                    "constant has a non-integer payload type");
-    Value constant = createHostInteger(builder, loc, rawType, integer.getValue());
+      return reject(owner, "HOST_LOWERING_UNSUPPORTED_SHAPE: integer dataflow "
+                           "constant has a non-integer payload type");
+    Value constant =
+        createHostInteger(builder, loc, rawType, integer.getValue());
     return HostDataValue{constant, truePredicate};
   }
-  return reject(owner,
-                "HOST_LOWERING_UNSUPPORTED_OPERATION: dataflow constant "
-                "attribute is not an input reference or integer");
+  return reject(owner, "HOST_LOWERING_UNSUPPORTED_OPERATION: dataflow constant "
+                       "attribute is not an input reference or integer");
 }
 
 // Store/load destination attributes are references to a kernel input, but
@@ -218,16 +219,15 @@ resolveHostDataAttribute(Attribute attribute, Type expectedType,
 // operation itself.  Resolve those references without inventing a type.
 static FailureOr<HostDataValue>
 resolveHostDataReference(Attribute attribute, ArrayRef<HostDataValue> inputs,
-                         ArrayRef<HostDataValue> iterArgs,
-                         Operation *owner) {
+                         ArrayRef<HostDataValue> iterArgs, Operation *owner) {
   auto text = dyn_cast<StringAttr>(attribute);
   if (!text)
-    return reject(owner,
-                  "HOST_LOWERING_UNSUPPORTED_OPERATION: dataflow memory "
-                  "reference must be a string input reference");
+    return reject(owner, "HOST_LOWERING_UNSUPPORTED_OPERATION: dataflow memory "
+                         "reference must be a string input reference");
   StringRef value = text.getValue();
-  auto resolve = [&](StringRef prefix, ArrayRef<HostDataValue> source)
-      -> FailureOr<HostDataValue> {
+  auto resolve =
+      [&](StringRef prefix,
+          ArrayRef<HostDataValue> source) -> FailureOr<HostDataValue> {
     StringRef suffix = value;
     if (!suffix.consume_front(prefix))
       return failure();
@@ -243,22 +243,21 @@ resolveHostDataReference(Attribute attribute, ArrayRef<HostDataValue> inputs,
     return *result;
   return reject(owner,
                 "HOST_LOWERING_BODY_CONTRACT: unsupported dataflow memory "
-                "reference " + value);
+                "reference " +
+                    value);
 }
 
 static FailureOr<Value> createHostZero(OpBuilder &builder, Location loc,
                                        Type type, Operation *owner) {
   if (!type.isIndex() && !isa<IntegerType, FloatType>(type))
-    return reject(owner,
-                  "HOST_LOWERING_UNSUPPORTED_SHAPE: host dataflow loop "
-                  "state requires an integer or floating-point payload");
-  return builder.create<arith::ConstantOp>(loc, type,
-                                           builder.getZeroAttr(type))
+    return reject(owner, "HOST_LOWERING_UNSUPPORTED_SHAPE: host dataflow loop "
+                         "state requires an integer or floating-point payload");
+  return builder.create<arith::ConstantOp>(loc, type, builder.getZeroAttr(type))
       .getResult();
 }
 
-static Value andHostPredicates(OpBuilder &builder, Location loc,
-                               Value lhs, Value rhs) {
+static Value andHostPredicates(OpBuilder &builder, Location loc, Value lhs,
+                               Value rhs) {
   if (!lhs)
     return rhs;
   if (!rhs)
@@ -309,13 +308,12 @@ static Value unwrapHostDataMoves(Value value) {
 
 static bool isKnownHostDataflowOperation(Operation *operation) {
   return isa<neura::ConstantOp, neura::CounterOp, neura::ReserveOp,
-              neura::GrantOnceOp, neura::PhiStartOp, neura::PhiOp,
-              neura::GrantPredicateOp, neura::ExtractPredicateOp,
-              neura::NotOp, neura::ICmpOp, neura::SelOp, neura::AddOp,
-              neura::SubOp, neura::MulOp,
-              neura::DivOp, neura::CastOp, neura::LoadIndexedOp,
-              neura::StoreIndexedOp, neura::CtrlMovOp, neura::DataMovOp,
-              neura::ReturnValueOp, neura::YieldOp, arith::ConstantOp>(
+             neura::GrantOnceOp, neura::PhiStartOp, neura::PhiOp,
+             neura::GrantPredicateOp, neura::ExtractPredicateOp, neura::NotOp,
+             neura::ICmpOp, neura::SelOp, neura::AddOp, neura::SubOp,
+             neura::MulOp, neura::DivOp, neura::CastOp, neura::LoadIndexedOp,
+             neura::StoreIndexedOp, neura::CtrlMovOp, neura::DataMovOp,
+             neura::ReturnValueOp, neura::YieldOp, arith::ConstantOp>(
       operation);
 }
 
@@ -342,11 +340,10 @@ static LogicalResult validateNeuraKernel(neura::KernelOp kernel) {
     return reject(kernel,
                   "HOST_LOWERING_BODY_CONTRACT: neura.kernel must end in "
                   "neura.yield");
-  if (body.getNumArguments() != kernel.getInputs().size() +
-                                    kernel.getIterArgsInit().size())
-    return reject(kernel,
-                  "HOST_LOWERING_BODY_CONTRACT: neura.kernel block "
-                  "arguments do not match inputs and iter_args_init");
+  if (body.getNumArguments() !=
+      kernel.getInputs().size() + kernel.getIterArgsInit().size())
+    return reject(kernel, "HOST_LOWERING_BODY_CONTRACT: neura.kernel block "
+                          "arguments do not match inputs and iter_args_init");
   const bool predicated = isPredicatedKernel(kernel);
   if (yield.getIterArgsNext().size() != kernel.getIterArgsInit().size() ||
       yield.getResults().size() != kernel.getNumResults())
@@ -379,9 +376,8 @@ static LogicalResult validateNeuraKernel(neura::KernelOp kernel) {
                          ? kernel.getInputs()[index]
                          : kernel.getIterArgsInit()[index - inputCount];
     if ((!predicated && argument.getType() != expected.getType()) ||
-        (predicated &&
-         (!isPredicatedType(argument.getType()) ||
-          payloadType(argument.getType()) != expected.getType())))
+        (predicated && (!isPredicatedType(argument.getType()) ||
+                        payloadType(argument.getType()) != expected.getType())))
       return reject(kernel,
                     "HOST_LOWERING_BODY_CONTRACT: neura.kernel argument "
                     "type does not match its input");
@@ -393,9 +389,8 @@ static LogicalResult validateNeuraKernel(neura::KernelOp kernel) {
         if (!counter->getAttr("lower_bound_value") ||
             !counter->getAttr("upper_bound_value") ||
             !counter->getAttr("step_value"))
-          return reject(counter,
-                        "HOST_LOWERING_UNSUPPORTED_SHAPE: predicated "
-                        "neura.counter requires bound attributes");
+          return reject(counter, "HOST_LOWERING_UNSUPPORTED_SHAPE: predicated "
+                                 "neura.counter requires bound attributes");
         counters.push_back(counter);
         continue;
       }
@@ -408,18 +403,17 @@ static LogicalResult validateNeuraKernel(neura::KernelOp kernel) {
                           operation.getName().getStringRef());
     }
     if (counters.empty())
-      return reject(kernel,
-                    "HOST_LOWERING_UNSUPPORTED_SHAPE: predicated "
-                    "neura.kernel requires at least one counter");
+      return reject(kernel, "HOST_LOWERING_UNSUPPORTED_SHAPE: predicated "
+                            "neura.kernel requires at least one counter");
     return success();
   }
   for (auto [next, initial] :
        llvm::zip(yield.getIterArgsNext(), kernel.getIterArgsInit()))
     if (next.getType() != initial.getType())
-      return reject(yield,
-                    "HOST_LOWERING_BODY_CONTRACT: neura.kernel iter_arg "
-                    "yield type does not match its initial value");
-  for (auto [result, output] : llvm::zip(yield.getResults(), kernel.getResults()))
+      return reject(yield, "HOST_LOWERING_BODY_CONTRACT: neura.kernel iter_arg "
+                           "yield type does not match its initial value");
+  for (auto [result, output] :
+       llvm::zip(yield.getResults(), kernel.getResults()))
     if (result.getType() != output.getType())
       return reject(yield,
                     "HOST_LOWERING_BODY_CONTRACT: neura.kernel result type "
@@ -791,9 +785,10 @@ struct HostLoopState {
 // kernel lowering because the predicated form has no SSA operands on its
 // neura.yield; its dataflow values are explicitly materialized as host
 // payload/predicate pairs instead.
-static LogicalResult lowerPredicatedNeuraKernel(
-    neura::KernelOp kernel, IRMapping &mapping, OpBuilder &builder,
-    Operation *&completionSite) {
+static LogicalResult lowerPredicatedNeuraKernel(neura::KernelOp kernel,
+                                                IRMapping &mapping,
+                                                OpBuilder &builder,
+                                                Operation *&completionSite) {
   Block &sourceBody = kernel.getBody().front();
   SmallVector<neura::CounterOp> counters;
   SmallVector<neura::ReserveOp> reserves;
@@ -839,8 +834,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
         continue;
       for (unsigned dimension = 0; dimension < memref.getRank(); ++dimension)
         if (memref.isDynamicDim(dimension))
-          dynamicExtents[value.value][dimension] = builder.create<memref::DimOp>(
-              loc, value.value, dimension);
+          dynamicExtents[value.value][dimension] =
+              builder.create<memref::DimOp>(loc, value.value, dimension);
     }
   };
   cacheDynamicExtents(inputValues);
@@ -853,10 +848,11 @@ static LogicalResult lowerPredicatedNeuraKernel(
       if (!attr)
         return reject(counter,
                       "HOST_LOWERING_UNSUPPORTED_SHAPE: predicated counter "
-                      "is missing " + name + " attribute");
-      return resolveHostDataAttribute(attr, builder.getIndexType(),
-                                      inputValues, iterArgValues,
-                                      truePredicate, builder, loc, counter);
+                      "is missing " +
+                          name + " attribute");
+      return resolveHostDataAttribute(attr, builder.getIndexType(), inputValues,
+                                      iterArgValues, truePredicate, builder,
+                                      loc, counter);
     };
     FailureOr<HostDataValue> lower = resolveBound("lower_bound_value");
     FailureOr<HostDataValue> upper = resolveBound("upper_bound_value");
@@ -916,8 +912,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       value = unwrapHostDataMoves(value);
       if (!value || !zeroSeedVisiting.insert(value).second)
         return false;
-      auto clearVisiting = llvm::make_scope_exit(
-          [&] { zeroSeedVisiting.erase(value); });
+      auto clearVisiting =
+          llvm::make_scope_exit([&] { zeroSeedVisiting.erase(value); });
       if (auto constant = value.getDefiningOp<neura::ConstantOp>()) {
         auto integer = dyn_cast<IntegerAttr>(constant.getValueAttr());
         return integer && integer.getValue().isZero();
@@ -969,10 +965,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
         return false;
       auto indexCast =
           unwrapHostDataMoves(cmp.getLhs()).getDefiningOp<neura::CastOp>();
-      auto phi = indexCast
-                     ? unwrapHostDataMoves(indexCast.getInput())
-                           .getDefiningOp<neura::PhiOp>()
-                     : nullptr;
+      auto phi = indexCast ? unwrapHostDataMoves(indexCast.getInput())
+                                 .getDefiningOp<neura::PhiOp>()
+                           : nullptr;
       if (!indexCast || indexCast.getCastType() != "int_to_index" || !phi ||
           phi->getNumOperands() != 2 ||
           !unwrapHostDataMoves(phi->getOperand(0))
@@ -998,8 +993,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       }
       if (!routeVisiting.insert(value).second)
         return false;
-      auto clearVisiting = llvm::make_scope_exit(
-          [&] { routeVisiting.erase(value); });
+      auto clearVisiting =
+          llvm::make_scope_exit([&] { routeVisiting.erase(value); });
       if (auto grant = value.getDefiningOp<neura::GrantPredicateOp>()) {
         Value predicate = unwrapHostDataMoves(grant.getPredicate());
         RouteEvidence oldEvidence = evidence;
@@ -1094,11 +1089,13 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return false;
         bool complementaryPartition =
             firstPositive.empty() == secondPositive.empty() &&
-            llvm::all_of(firstPositive, [&](Value predicate) {
-              return llvm::any_of(secondPositive, [&](Value other) {
-                return hasComplement(predicate, other);
-              });
-            }) &&
+            llvm::all_of(firstPositive,
+                         [&](Value predicate) {
+                           return llvm::any_of(
+                               secondPositive, [&](Value other) {
+                                 return hasComplement(predicate, other);
+                               });
+                         }) &&
             llvm::all_of(secondPositive, [&](Value predicate) {
               return llvm::any_of(firstPositive, [&](Value other) {
                 return hasComplement(predicate, other);
@@ -1109,20 +1106,18 @@ static LogicalResult lowerPredicatedNeuraKernel(
         }
 
         evidence = baseEvidence;
-        evidence.predicates.append(
-            firstEvidence.predicates.begin() + baseEvidence.predicates.size(),
-            firstEvidence.predicates.end());
-        evidence.predicates.append(
-            secondEvidence.predicates.begin() + baseEvidence.predicates.size(),
-            secondEvidence.predicates.end());
-        evidence.cycleReserves.append(
-            firstEvidence.cycleReserves.begin() +
-                baseEvidence.cycleReserves.size(),
-            firstEvidence.cycleReserves.end());
-        evidence.cycleReserves.append(
-            secondEvidence.cycleReserves.begin() +
-                baseEvidence.cycleReserves.size(),
-            secondEvidence.cycleReserves.end());
+        evidence.predicates.append(firstEvidence.predicates.begin() +
+                                       baseEvidence.predicates.size(),
+                                   firstEvidence.predicates.end());
+        evidence.predicates.append(secondEvidence.predicates.begin() +
+                                       baseEvidence.predicates.size(),
+                                   secondEvidence.predicates.end());
+        evidence.cycleReserves.append(firstEvidence.cycleReserves.begin() +
+                                          baseEvidence.cycleReserves.size(),
+                                      firstEvidence.cycleReserves.end());
+        evidence.cycleReserves.append(secondEvidence.cycleReserves.begin() +
+                                          baseEvidence.cycleReserves.size(),
+                                      secondEvidence.cycleReserves.end());
         evidence.negativePredicates.append(
             firstEvidence.negativePredicates.begin() +
                 baseEvidence.negativePredicates.size(),
@@ -1131,17 +1126,15 @@ static LogicalResult lowerPredicatedNeuraKernel(
             secondEvidence.negativePredicates.begin() +
                 baseEvidence.negativePredicates.size(),
             secondEvidence.negativePredicates.end());
-        evidence.negativeGuardCount =
-            baseEvidence.negativeGuardCount +
-            (firstEvidence.negativeGuardCount -
-             baseEvidence.negativeGuardCount) +
-            (secondEvidence.negativeGuardCount -
-             baseEvidence.negativeGuardCount);
+        evidence.negativeGuardCount = baseEvidence.negativeGuardCount +
+                                      (firstEvidence.negativeGuardCount -
+                                       baseEvidence.negativeGuardCount) +
+                                      (secondEvidence.negativeGuardCount -
+                                       baseEvidence.negativeGuardCount);
         evidence.allActivePathsGuarded = firstGuarded && secondGuarded;
-        evidence.guardedReserveBranch =
-            baseEvidence.guardedReserveBranch ||
-            firstEvidence.guardedReserveBranch ||
-            secondEvidence.guardedReserveBranch;
+        evidence.guardedReserveBranch = baseEvidence.guardedReserveBranch ||
+                                        firstEvidence.guardedReserveBranch ||
+                                        secondEvidence.guardedReserveBranch;
         // The complementary branch pair discharges every positive guard
         // found below this merge.  Any positive guard added above the merge
         // remains in this vector and must be discharged by a later merge.
@@ -1161,10 +1154,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
         continue;
       auto indexCast =
           unwrapHostDataMoves(cmp.getLhs()).getDefiningOp<neura::CastOp>();
-      auto phi = indexCast
-                     ? unwrapHostDataMoves(indexCast.getInput())
-                           .getDefiningOp<neura::PhiOp>()
-                     : nullptr;
+      auto phi = indexCast ? unwrapHostDataMoves(indexCast.getInput())
+                                 .getDefiningOp<neura::PhiOp>()
+                           : nullptr;
       if (!indexCast || indexCast.getCastType() != "int_to_index" || !phi ||
           phi->getNumOperands() != 2)
         continue;
@@ -1191,13 +1183,11 @@ static LogicalResult lowerPredicatedNeuraKernel(
       neura::CtrlMovOp ctrl = matchingUpdates.front();
       auto cast =
           unwrapHostDataMoves(ctrl.getValue()).getDefiningOp<neura::CastOp>();
-      auto add = cast
-                     ? unwrapHostDataMoves(cast.getInput())
-                           .getDefiningOp<neura::AddOp>()
-                     : nullptr;
-      auto increment = add
-                           ? add->getAttrOfType<IntegerAttr>("rhs_value")
-                           : IntegerAttr();
+      auto add = cast ? unwrapHostDataMoves(cast.getInput())
+                            .getDefiningOp<neura::AddOp>()
+                      : nullptr;
+      auto increment =
+          add ? add->getAttrOfType<IntegerAttr>("rhs_value") : IntegerAttr();
       if (!cast || cast.getCastType() != "index_to_int" || !add ||
           add->getNumOperands() != 1 || add->getAttr("lhs_value") ||
           !increment || !payloadType(add.getResult().getType()).isIndex())
@@ -1244,8 +1234,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return false;
         if (!predicateRouteVisiting.insert(value).second)
           return false;
-        auto clearVisiting = llvm::make_scope_exit(
-            [&] { predicateRouteVisiting.erase(value); });
+        auto clearVisiting =
+            llvm::make_scope_exit([&] { predicateRouteVisiting.erase(value); });
         if (auto grant = value.getDefiningOp<neura::GrantPredicateOp>()) {
           if (unwrapHostDataMoves(grant.getPredicate()) == wanted)
             return true;
@@ -1294,8 +1284,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
                           "guard was not discharged by an exhaustive merge");
           Value childCompare = unwrapHostDataMoves(notOp.getInput());
           int childIndex = -1;
-          for (unsigned candidate = 0;
-               candidate < sequentialRecurrences.size(); ++candidate)
+          for (unsigned candidate = 0; candidate < sequentialRecurrences.size();
+               ++candidate)
             if (sequentialRecurrences[candidate].compareResult == childCompare)
               childIndex = static_cast<int>(candidate);
           if (childIndex < 0 || childIndex == static_cast<int>(index))
@@ -1315,17 +1305,15 @@ static LogicalResult lowerPredicatedNeuraKernel(
             }
             if (cycleUpdates.size() != 1) {
               return reject(
-                  kernel,
-                  "HOST_LOWERING_UNSUPPORTED_SHAPE: guarded parent "
-                  "coordinate reserve has an ambiguous control update");
+                  kernel, "HOST_LOWERING_UNSUPPORTED_SHAPE: guarded parent "
+                          "coordinate reserve has an ambiguous control update");
             }
             predicateRouteVisiting.clear();
             if (!carriesPredicate(cycleUpdates.front().getValue(),
                                   childCompare))
               return reject(
-                  kernel,
-                  "HOST_LOWERING_UNSUPPORTED_SHAPE: parent-coordinate "
-                  "handoff is not guarded by the child compare");
+                  kernel, "HOST_LOWERING_UNSUPPORTED_SHAPE: parent-coordinate "
+                          "handoff is not guarded by the child compare");
           }
           if (!llvm::is_contained(
                   sequentialRecurrences[childIndex].seedPredicates,
@@ -1338,8 +1326,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
             return reject(kernel,
                           "HOST_LOWERING_UNSUPPORTED_SHAPE: recurrence has "
                           "multiple child reset guards");
-          if (parent[childIndex] >= 0 && parent[childIndex] !=
-                                             static_cast<int>(index))
+          if (parent[childIndex] >= 0 &&
+              parent[childIndex] != static_cast<int>(index))
             return reject(kernel,
                           "HOST_LOWERING_UNSUPPORTED_SHAPE: recurrence child "
                           "has multiple parents");
@@ -1420,7 +1408,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
     auto phiStart = dyn_cast<neura::PhiStartOp>(&operation);
     if (!phiStart)
       continue;
-    auto grant = unwrapHostDataMoves(phiStart.getInitValue()).getDefiningOp<neura::GrantOnceOp>();
+    auto grant = unwrapHostDataMoves(phiStart.getInitValue())
+                     .getDefiningOp<neura::GrantOnceOp>();
     if (!grant)
       continue;
     auto text = grant->getAttrOfType<StringAttr>("constant_value");
@@ -1486,8 +1475,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       current = unwrapHostDataMoves(current);
       if (!current || !visiting.insert(current).second)
         return false;
-      auto clearVisiting = llvm::make_scope_exit(
-          [&] { visiting.erase(current); });
+      auto clearVisiting =
+          llvm::make_scope_exit([&] { visiting.erase(current); });
       if (auto grant = current.getDefiningOp<neura::GrantPredicateOp>()) {
         if (isKnownRecurrenceControl(grant.getPredicate()))
           return true;
@@ -1508,11 +1497,10 @@ static LogicalResult lowerPredicatedNeuraKernel(
       }
       if (auto cast = current.getDefiningOp<neura::CastOp>()) {
         StringRef castType = cast.getCastType();
-        bool indexIntCast = castType == "index_to_int" ||
-                            castType == "int_to_index";
-        if (!indexIntCast &&
-            payloadType(cast.getInput().getType()) !=
-                payloadType(cast.getResult().getType()))
+        bool indexIntCast =
+            castType == "index_to_int" || castType == "int_to_index";
+        if (!indexIntCast && payloadType(cast.getInput().getType()) !=
+                                 payloadType(cast.getResult().getType()))
           return false;
         return visit(cast.getInput());
       }
@@ -1546,13 +1534,12 @@ static LogicalResult lowerPredicatedNeuraKernel(
                  .getDefiningOp<neura::CounterOp>();
   };
   llvm::SmallPtrSet<Value, 16> initialRouteVisiting;
-  std::function<bool(Value)> hasInitialControlRoute =
-      [&](Value value) -> bool {
+  std::function<bool(Value)> hasInitialControlRoute = [&](Value value) -> bool {
     value = unwrapHostDataMoves(value);
     if (!value || !initialRouteVisiting.insert(value).second)
       return false;
-    auto clearVisiting = llvm::make_scope_exit(
-        [&] { initialRouteVisiting.erase(value); });
+    auto clearVisiting =
+        llvm::make_scope_exit([&] { initialRouteVisiting.erase(value); });
     if (auto grant = value.getDefiningOp<neura::GrantPredicateOp>()) {
       if (isInitialControlPredicate(grant.getPredicate()))
         return true;
@@ -1590,8 +1577,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
     value = unwrapHostDataMoves(value);
     if (!value || !initializerIndexVisiting.insert(value).second)
       return false;
-    auto clearVisiting = llvm::make_scope_exit(
-        [&] { initializerIndexVisiting.erase(value); });
+    auto clearVisiting =
+        llvm::make_scope_exit([&] { initializerIndexVisiting.erase(value); });
     if (auto counter = value.getDefiningOp<neura::CounterOp>())
       return llvm::is_contained(counters, counter);
     if (auto constant = value.getDefiningOp<neura::ConstantOp>())
@@ -1625,9 +1612,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
       return false;
     initializerIndexVisiting.clear();
     if (!llvm::all_of(store.getIndices(), [&](Value index) {
-      initializerIndexVisiting.clear();
-      return isCompilerOwnedInitializerIndex(index);
-    }))
+          initializerIndexVisiting.clear();
+          return isCompilerOwnedInitializerIndex(index);
+        }))
       return false;
 
     // The folded base must retain an explicit kernel-input reference.  A
@@ -1636,8 +1623,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
     Value base = unwrapHostDataMoves(store.getBase());
     auto baseConstant = base.getDefiningOp<neura::ConstantOp>();
     auto baseReference = baseConstant
-                             ? dyn_cast<StringAttr>(
-                                   baseConstant.getValueAttr())
+                             ? dyn_cast<StringAttr>(baseConstant.getValueAttr())
                              : StringAttr();
     if (!baseReference || !baseReference.getValue().starts_with("%input"))
       return false;
@@ -1654,8 +1640,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
     for (Operation &prior : sourceBody.without_terminator()) {
       if (&prior == store.getOperation())
         return true;
-      if (isa<neura::ConstantOp, neura::CounterOp, arith::ConstantOp>(
-              &prior))
+      if (isa<neura::ConstantOp, neura::CounterOp, arith::ConstantOp>(&prior))
         continue;
       if (auto cast = dyn_cast<neura::CastOp>(&prior)) {
         initializerIndexVisiting.clear();
@@ -1674,9 +1659,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       if (!store)
         continue;
       initialRouteVisiting.clear();
-      bool explicitCounterSeed =
-          !store->getAttr("lhs_value") &&
-          hasInitialControlRoute(store.getValue());
+      bool explicitCounterSeed = !store->getAttr("lhs_value") &&
+                                 hasInitialControlRoute(store.getValue());
       bool foldedZeroCandidate = isFoldedZeroInitializer(store);
       Value storeValue = unwrapHostDataMoves(store.getValue());
       bool grantOnceCandidate =
@@ -1686,10 +1670,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
       bool sourceOwnedSeed = hasSourceOwnedOnceProof(store);
       if (!sourceOwnedSeed) {
         if (explicitCounterSeed || foldedZeroCandidate || grantOnceCandidate)
-          return reject(
-              kernel,
-              "HOST_LOWERING_BODY_CONTRACT: seed candidate lacks "
-              "compiler-owned once-init provenance");
+          return reject(kernel,
+                        "HOST_LOWERING_BODY_CONTRACT: seed candidate lacks "
+                        "compiler-owned once-init provenance");
         continue;
       }
       bool foldedZeroSeed = foldedZeroCandidate;
@@ -1706,8 +1689,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
         provenSeedStores.insert(store.getOperation());
     }
   }
-  if (hasSequentialReduction && seedCandidateSeen &&
-      provenSeedStores.empty())
+  if (hasSequentialReduction && seedCandidateSeen && provenSeedStores.empty())
     return reject(kernel,
                   "HOST_LOWERING_BODY_CONTRACT: sequential reduction has "
                   "no compiler-owned once-init provenance");
@@ -1735,9 +1717,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
     SmallVector<Value> initialValues;
     if (!hasSequentialReduction && position + 1 == counters.size())
       initialValues = initialStateValues;
-    scf::ForOp loop = builder.create<scf::ForOp>(
-        loc, bounds.lower.value, bounds.upper.value, bounds.step.value,
-        initialValues);
+    scf::ForOp loop =
+        builder.create<scf::ForOp>(loc, bounds.lower.value, bounds.upper.value,
+                                   bounds.step.value, initialValues);
     loops.push_back(loop);
     builder.setInsertionPointToStart(loop.getBody());
     if (position + 1 == counters.size()) {
@@ -1761,15 +1743,15 @@ static LogicalResult lowerPredicatedNeuraKernel(
       reductionUpper = builder.create<arith::AddIOp>(
           loc, product, sequentialReductionUpper.value);
     }
-    reductionUpper = builder.create<arith::AddIOp>(
-        loc, reductionUpper, reductionStep);
+    reductionUpper =
+        builder.create<arith::AddIOp>(loc, reductionUpper, reductionStep);
     HostCounterBounds bounds{
         {builder.create<arith::ConstantIndexOp>(loc, 0), truePredicate},
         {reductionUpper, sequentialReductionUpper.predicate},
         {reductionStep, truePredicate}};
-    scf::ForOp loop = builder.create<scf::ForOp>(
-        loc, bounds.lower.value, bounds.upper.value, bounds.step.value,
-        initialStateValues);
+    scf::ForOp loop =
+        builder.create<scf::ForOp>(loc, bounds.lower.value, bounds.upper.value,
+                                   bounds.step.value, initialStateValues);
     loops.push_back(loop);
     innermostBounds = {bounds.lower, bounds.upper, bounds.step};
     builder.setInsertionPointToStart(loop.getBody());
@@ -1786,9 +1768,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
   SmallVector<HostDataValue> currentStates;
   auto regionArgs = innermost.getRegionIterArgs();
   if (regionArgs.size() != states.size() * 2)
-    return reject(kernel,
-                  "HOST_LOWERING_BODY_CONTRACT: predicated loop state "
-                  "argument count mismatch");
+    return reject(kernel, "HOST_LOWERING_BODY_CONTRACT: predicated loop state "
+                          "argument count mismatch");
   for (unsigned index = 0; index < states.size(); ++index)
     currentStates.push_back({regionArgs[index * 2], regionArgs[index * 2 + 1]});
 
@@ -1801,8 +1782,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       values[argument] = currentStates[iterArgSlots[index - inputCount]];
   }
   for (auto [index, counter] : llvm::enumerate(counters)) {
-    values[counter.getResult()] =
-        {loops[index].getInductionVar(), truePredicate};
+    values[counter.getResult()] = {loops[index].getInductionVar(),
+                                   truePredicate};
   }
   for (auto [reserve, slot] : stateSlots)
     values[reserve] = currentStates[slot];
@@ -1810,8 +1791,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
   auto valid = [&](HostDataValue value) -> Value {
     return value.predicate ? value.predicate : truePredicate;
   };
-  auto resolveOperand = [&](Value source, Operation *owner)
-      -> FailureOr<HostDataValue> {
+  auto resolveOperand = [&](Value source,
+                            Operation *owner) -> FailureOr<HostDataValue> {
     return lookupHostData(source, values, mapping, owner);
   };
   // Constant folding removes a source operand while retaining its original
@@ -1823,18 +1804,21 @@ static LogicalResult lowerPredicatedNeuraKernel(
     Attribute rhsAttribute = owner->getAttr("rhs_value");
     unsigned expectedOperands = !lhsAttribute + !rhsAttribute;
     if (owner->getNumOperands() != expectedOperands)
-      return reject(owner, "HOST_LOWERING_BODY_CONTRACT: folded binary source slots do not match operands");
+      return reject(owner, "HOST_LOWERING_BODY_CONTRACT: folded binary source "
+                           "slots do not match operands");
     unsigned operand = 0;
     Type type = expectedOperands ? payloadType(owner->getOperand(0).getType())
                                  : payloadType(owner->getResult(0).getType());
-    FailureOr<HostDataValue> lhs = lhsAttribute
-        ? resolveHostDataAttribute(lhsAttribute, type, inputValues, iterArgValues,
-                                   truePredicate, builder, loc, owner)
-        : resolveOperand(owner->getOperand(operand++), owner);
-    FailureOr<HostDataValue> rhs = rhsAttribute
-        ? resolveHostDataAttribute(rhsAttribute, type, inputValues, iterArgValues,
-                                   truePredicate, builder, loc, owner)
-        : resolveOperand(owner->getOperand(operand++), owner);
+    FailureOr<HostDataValue> lhs =
+        lhsAttribute ? resolveHostDataAttribute(lhsAttribute, type, inputValues,
+                                                iterArgValues, truePredicate,
+                                                builder, loc, owner)
+                     : resolveOperand(owner->getOperand(operand++), owner);
+    FailureOr<HostDataValue> rhs =
+        rhsAttribute ? resolveHostDataAttribute(rhsAttribute, type, inputValues,
+                                                iterArgValues, truePredicate,
+                                                builder, loc, owner)
+                     : resolveOperand(owner->getOperand(operand++), owner);
     if (failed(lhs) || failed(rhs))
       return failure();
     return std::make_pair(*lhs, *rhs);
@@ -1861,8 +1845,10 @@ static LogicalResult lowerPredicatedNeuraKernel(
     }
     if (auto move = dyn_cast<neura::DataMovOp>(&operation)) {
       if (move->getOperand(0).getType() != move->getResult(0).getType())
-        return reject(move, "HOST_LOWERING_BODY_CONTRACT: data_mov must preserve its payload and predicate type");
-      FailureOr<HostDataValue> source = resolveOperand(move->getOperand(0), move);
+        return reject(move, "HOST_LOWERING_BODY_CONTRACT: data_mov must "
+                            "preserve its payload and predicate type");
+      FailureOr<HostDataValue> source =
+          resolveOperand(move->getOperand(0), move);
       if (failed(source))
         return failure();
       // Register routing preserves both payload and predicate validity.
@@ -1888,9 +1874,9 @@ static LogicalResult lowerPredicatedNeuraKernel(
                       "HOST_LOWERING_BODY_CONTRACT: grant_once requires a "
                       "value operand or constant_value");
       }
-      values[grant.getResult()] =
-          {source.value, builder.create<arith::AndIOp>(loc, valid(source),
-                                                        firstIteration)};
+      values[grant.getResult()] = {
+          source.value,
+          builder.create<arith::AndIOp>(loc, valid(source), firstIteration)};
       continue;
     }
     if (auto phiStart = dyn_cast<neura::PhiStartOp>(&operation)) {
@@ -1904,7 +1890,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
       Value reservedValid = valid(*reserved);
       values[phiStart.getResult()] = {
           builder.create<arith::SelectOp>(loc, initValid, init->value,
-                                           reserved->value),
+                                          reserved->value),
           builder.create<arith::OrIOp>(loc, initValid, reservedValid)};
       continue;
     }
@@ -1921,25 +1907,24 @@ static LogicalResult lowerPredicatedNeuraKernel(
       Value secondValid = valid(*second);
       values[phi.getResult()] = {
           builder.create<arith::SelectOp>(loc, firstValid, first->value,
-                                           second->value),
+                                          second->value),
           builder.create<arith::OrIOp>(loc, firstValid, secondValid)};
       continue;
     }
     if (auto grant = dyn_cast<neura::GrantPredicateOp>(&operation)) {
-      FailureOr<HostDataValue> source =
-          resolveOperand(grant.getValue(), grant);
+      FailureOr<HostDataValue> source = resolveOperand(grant.getValue(), grant);
       FailureOr<HostDataValue> predicate =
           resolveOperand(grant.getPredicate(), grant);
       if (failed(source) || failed(predicate))
         return failure();
       Value predicateValue = predicate->value;
       if (!predicateValue.getType().isSignlessInteger(1))
-        return reject(grant,
-                      "HOST_LOWERING_UNSUPPORTED_SHAPE: grant_predicate "
-                      "requires an i1 payload");
+        return reject(grant, "HOST_LOWERING_UNSUPPORTED_SHAPE: grant_predicate "
+                             "requires an i1 payload");
       Value combined = builder.create<arith::AndIOp>(
           loc, valid(*source),
-          builder.create<arith::AndIOp>(loc, valid(*predicate), predicateValue));
+          builder.create<arith::AndIOp>(loc, valid(*predicate),
+                                        predicateValue));
       values[grant.getResult()] = {source->value, combined};
       continue;
     }
@@ -1955,8 +1940,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return reject(extract,
                         "HOST_LOWERING_BODY_CONTRACT: counter bounds were "
                         "not materialized before extract_predicate");
-        Value next = builder.create<arith::AddIOp>(
-            loc, source->value, found->second.step.value);
+        Value next = builder.create<arith::AddIOp>(loc, source->value,
+                                                   found->second.step.value);
         predicateValue = builder.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::sge, next, found->second.upper.value);
       }
@@ -1981,33 +1966,38 @@ static LogicalResult lowerPredicatedNeuraKernel(
       FailureOr<arith::CmpIPredicate> parsedPredicate =
           parseHostCmpPredicate(predicate);
       if (failed(parsedPredicate))
-        return reject(cmp,
-                      "HOST_LOWERING_UNSUPPORTED_OPERATION: unsupported "
-                      "integer comparison predicate " + predicate);
+        return reject(cmp, "HOST_LOWERING_UNSUPPORTED_OPERATION: unsupported "
+                           "integer comparison predicate " +
+                               predicate);
       auto operands = resolveBinary(cmp);
       if (failed(operands))
         return failure();
       auto [lhs, rhs] = *operands;
       if (lhs.value.getType() != rhs.value.getType())
-        return reject(cmp, "HOST_LOWERING_BODY_CONTRACT: comparison payload types differ");
-      Value result = builder.create<arith::CmpIOp>(
-          loc, *parsedPredicate, lhs.value, rhs.value);
+        return reject(
+            cmp,
+            "HOST_LOWERING_BODY_CONTRACT: comparison payload types differ");
+      Value result = builder.create<arith::CmpIOp>(loc, *parsedPredicate,
+                                                   lhs.value, rhs.value);
       values[cmp.getResult()] = {
           result, builder.create<arith::AndIOp>(loc, valid(lhs), valid(rhs))};
       continue;
     }
     if (auto select = dyn_cast<neura::SelOp>(&operation)) {
-      FailureOr<HostDataValue> condition = resolveOperand(select.getCond(), select);
-      FailureOr<HostDataValue> ifTrue = resolveOperand(select.getIfTrue(), select);
-      FailureOr<HostDataValue> ifFalse = resolveOperand(select.getIfFalse(), select);
+      FailureOr<HostDataValue> condition =
+          resolveOperand(select.getCond(), select);
+      FailureOr<HostDataValue> ifTrue =
+          resolveOperand(select.getIfTrue(), select);
+      FailureOr<HostDataValue> ifFalse =
+          resolveOperand(select.getIfFalse(), select);
       if (failed(condition) || failed(ifTrue) || failed(ifFalse))
         return failure();
       if (!condition->value.getType().isSignlessInteger(1) ||
           ifTrue->value.getType() != ifFalse->value.getType() ||
           ifTrue->value.getType() != payloadType(select.getResult().getType()))
-        return reject(select,
-                      "HOST_LOWERING_BODY_CONTRACT: sel requires an i1 condition "
-                      "and matching branch/result payload types");
+        return reject(
+            select, "HOST_LOWERING_BODY_CONTRACT: sel requires an i1 condition "
+                    "and matching branch/result payload types");
       Value selected = builder.create<arith::SelectOp>(
           loc, condition->value, ifTrue->value, ifFalse->value);
       Value selectedPredicate = builder.create<arith::SelectOp>(
@@ -2015,8 +2005,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       // Only the selected branch needs a valid packet. Requiring both would
       // suppress values produced by mutually exclusive dataflow branches.
       values[select.getResult()] = {
-          selected, builder.create<arith::AndIOp>(
-                        loc, valid(*condition), selectedPredicate)};
+          selected, builder.create<arith::AndIOp>(loc, valid(*condition),
+                                                  selectedPredicate)};
       continue;
     }
     if (auto add = dyn_cast<neura::AddOp>(&operation);
@@ -2028,23 +2018,25 @@ static LogicalResult lowerPredicatedNeuraKernel(
         return failure();
       auto [lhsData, rhsData] = *operands;
       if (lhsData.value.getType() != rhsData.value.getType() ||
-          lhsData.value.getType() != payloadType(operation.getResult(0).getType()) ||
+          lhsData.value.getType() !=
+              payloadType(operation.getResult(0).getType()) ||
           (!lhsData.value.getType().isIndex() &&
            !isa<IntegerType>(lhsData.value.getType())))
-        return reject(&operation,
-                      "HOST_LOWERING_BODY_CONTRACT: integer arithmetic requires "
-                      "matching operand/result payload types");
-      Value arithmeticPredicate = builder.create<arith::AndIOp>(
-          loc, valid(lhsData), valid(rhsData));
+        return reject(
+            &operation,
+            "HOST_LOWERING_BODY_CONTRACT: integer arithmetic requires "
+            "matching operand/result payload types");
+      Value arithmeticPredicate =
+          builder.create<arith::AndIOp>(loc, valid(lhsData), valid(rhsData));
       if (name == "neura.add")
-        resultValue = builder.create<arith::AddIOp>(loc, lhsData.value,
-                                                    rhsData.value);
+        resultValue =
+            builder.create<arith::AddIOp>(loc, lhsData.value, rhsData.value);
       else if (name == "neura.sub")
-        resultValue = builder.create<arith::SubIOp>(loc, lhsData.value,
-                                                    rhsData.value);
+        resultValue =
+            builder.create<arith::SubIOp>(loc, lhsData.value, rhsData.value);
       else if (name == "neura.mul")
-        resultValue = builder.create<arith::MulIOp>(loc, lhsData.value,
-                                                    rhsData.value);
+        resultValue =
+            builder.create<arith::MulIOp>(loc, lhsData.value, rhsData.value);
       else {
         if (!rhsData.value.getType().isIndex() &&
             !isa<IntegerType>(rhsData.value.getType()))
@@ -2057,8 +2049,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return failure();
         Value nonzero = builder.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::ne, rhsData.value, *zero);
-        arithmeticPredicate = builder.create<arith::AndIOp>(
-            loc, arithmeticPredicate, nonzero);
+        arithmeticPredicate =
+            builder.create<arith::AndIOp>(loc, arithmeticPredicate, nonzero);
 
         // arith.divsi is not speculative-safe for a zero divisor. Keep the
         // operation in the valid/nonzero branch and provide an invalid zero
@@ -2069,12 +2061,12 @@ static LogicalResult lowerPredicatedNeuraKernel(
         {
           OpBuilder::InsertionGuard divGuard(builder);
           builder.setInsertionPointToStart(&guarded.getThenRegion().front());
-          Value quotient = builder.create<arith::DivSIOp>(
-              loc, lhsData.value, rhsData.value);
+          Value quotient =
+              builder.create<arith::DivSIOp>(loc, lhsData.value, rhsData.value);
           builder.create<scf::YieldOp>(loc, quotient);
           builder.setInsertionPointToStart(&guarded.getElseRegion().front());
-          FailureOr<Value> invalid = createHostZero(
-              builder, loc, lhsData.value.getType(), &operation);
+          FailureOr<Value> invalid =
+              createHostZero(builder, loc, lhsData.value.getType(), &operation);
           if (failed(invalid))
             return failure();
           builder.create<scf::YieldOp>(loc, *invalid);
@@ -2092,8 +2084,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       Value result;
       StringRef castType = cast.getCastType();
       if (castType == "index_to_int" || castType == "int_to_index")
-        result = builder.create<arith::IndexCastOp>(loc, resultType,
-                                                    source->value);
+        result =
+            builder.create<arith::IndexCastOp>(loc, resultType, source->value);
       else if (castType == "extui") {
         auto sourceInteger = dyn_cast<IntegerType>(source->value.getType());
         auto resultInteger = dyn_cast<IntegerType>(resultType);
@@ -2103,19 +2095,17 @@ static LogicalResult lowerPredicatedNeuraKernel(
                         "HOST_LOWERING_BODY_CONTRACT: extui requires a wider "
                         "integer result");
         result = builder.create<arith::ExtUIOp>(loc, resultType, source->value);
-      }
-      else
-        return reject(cast,
-                      "HOST_LOWERING_UNSUPPORTED_OPERATION: unsupported "
-                      "dataflow cast type " + castType);
+      } else
+        return reject(cast, "HOST_LOWERING_UNSUPPORTED_OPERATION: unsupported "
+                            "dataflow cast type " +
+                                castType);
       values[cast.getResult()] = {result, valid(*source)};
       continue;
     }
     if (auto load = dyn_cast<neura::LoadIndexedOp>(&operation)) {
       HostDataValue base;
       if (Value baseOperand = load.getBase()) {
-        FailureOr<HostDataValue> resolved =
-            resolveOperand(baseOperand, load);
+        FailureOr<HostDataValue> resolved = resolveOperand(baseOperand, load);
         if (failed(resolved))
           return failure();
         base = *resolved;
@@ -2125,8 +2115,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return reject(load,
                         "HOST_LOWERING_BODY_CONTRACT: load_indexed has no "
                         "base or lhs_value reference");
-        FailureOr<HostDataValue> resolved = resolveHostDataReference(
-            attr, inputValues, iterArgValues, load);
+        FailureOr<HostDataValue> resolved =
+            resolveHostDataReference(attr, inputValues, iterArgValues, load);
         if (failed(resolved))
           return failure();
         base = *resolved;
@@ -2156,7 +2146,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
                         "HOST_LOWERING_UNSUPPORTED_SHAPE: load index is not "
                         "an index payload");
         indices.push_back(index->value);
-        predicate = builder.create<arith::AndIOp>(loc, predicate, valid(*index));
+        predicate =
+            builder.create<arith::AndIOp>(loc, predicate, valid(*index));
         Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
         Value lower = builder.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::sge, index->value, zero);
@@ -2169,9 +2160,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
                           "has no cached extent");
           auto extentIt = baseExtents->second.find(dimension);
           if (extentIt == baseExtents->second.end())
-            return reject(load,
-                          "HOST_LOWERING_BODY_CONTRACT: dynamic load "
-                          "dimension has no cached extent");
+            return reject(load, "HOST_LOWERING_BODY_CONTRACT: dynamic load "
+                                "dimension has no cached extent");
           extent = extentIt->second;
         } else
           extent = builder.create<arith::ConstantIndexOp>(
@@ -2191,8 +2181,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
       {
         OpBuilder::InsertionGuard loadGuard(builder);
         builder.setInsertionPointToStart(&guarded.getThenRegion().front());
-        Value loaded = builder.create<memref::LoadOp>(
-            loc, loadType, base.value, indices);
+        Value loaded =
+            builder.create<memref::LoadOp>(loc, loadType, base.value, indices);
         builder.create<scf::YieldOp>(loc, loaded);
         builder.setInsertionPointToStart(&guarded.getElseRegion().front());
         FailureOr<Value> zero = createHostZero(builder, loc, loadType, load);
@@ -2220,8 +2210,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
           return failure();
         base = *resolved;
       } else if (Value baseOperand = store.getBase()) {
-        FailureOr<HostDataValue> resolved =
-            resolveOperand(baseOperand, store);
+        FailureOr<HostDataValue> resolved = resolveOperand(baseOperand, store);
         if (failed(resolved))
           return failure();
         base = *resolved;
@@ -2244,12 +2233,11 @@ static LogicalResult lowerPredicatedNeuraKernel(
                       "HOST_LOWERING_BODY_CONTRACT: store value type does "
                       "not match its memref element type");
       SmallVector<Value> indices;
-      Value predicate = builder.create<arith::AndIOp>(loc, valid(*source),
-                                                      valid(base));
+      Value predicate =
+          builder.create<arith::AndIOp>(loc, valid(*source), valid(base));
       for (auto [dimension, sourceIndex] :
            llvm::enumerate(store.getIndices())) {
-        FailureOr<HostDataValue> index =
-            resolveOperand(sourceIndex, store);
+        FailureOr<HostDataValue> index = resolveOperand(sourceIndex, store);
         if (failed(index))
           return failure();
         if (!index->value.getType().isIndex())
@@ -2257,8 +2245,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
                         "HOST_LOWERING_UNSUPPORTED_SHAPE: store index is not "
                         "an index payload");
         indices.push_back(index->value);
-        predicate = builder.create<arith::AndIOp>(loc, predicate,
-                                                  valid(*index));
+        predicate =
+            builder.create<arith::AndIOp>(loc, predicate, valid(*index));
         Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
         Value lower = builder.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::sge, index->value, zero);
@@ -2271,9 +2259,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
                           "has no cached extent");
           auto extentIt = baseExtents->second.find(dimension);
           if (extentIt == baseExtents->second.end())
-            return reject(store,
-                          "HOST_LOWERING_BODY_CONTRACT: dynamic store "
-                          "dimension has no cached extent");
+            return reject(store, "HOST_LOWERING_BODY_CONTRACT: dynamic store "
+                                 "dimension has no cached extent");
           extent = extentIt->second;
         } else
           extent = builder.create<arith::ConstantIndexOp>(
@@ -2286,9 +2273,10 @@ static LogicalResult lowerPredicatedNeuraKernel(
       // Only an explicit counter==0 grant route is a seed boundary.  Stores
       // with the same destination but no such SSA/control proof remain live
       // on every valid packet.
-      if (hasSequentialReduction && provenSeedStores.contains(store.getOperation()))
-        predicate = builder.create<arith::AndIOp>(loc, predicate,
-                                                  firstIteration);
+      if (hasSequentialReduction &&
+          provenSeedStores.contains(store.getOperation()))
+        predicate =
+            builder.create<arith::AndIOp>(loc, predicate, firstIteration);
       scf::IfOp conditional = builder.create<scf::IfOp>(loc, predicate);
       OpBuilder::InsertionGuard storeGuard(builder);
       builder.setInsertionPointToStart(&conditional.getThenRegion().front());
@@ -2319,8 +2307,7 @@ static LogicalResult lowerPredicatedNeuraKernel(
         if (returnIndex >= outputSlots.size())
           return reject(returned,
                         "HOST_LOWERING_BODY_CONTRACT: too many return values");
-        FailureOr<HostDataValue> source =
-            resolveOperand(sourceValue, returned);
+        FailureOr<HostDataValue> source = resolveOperand(sourceValue, returned);
         if (failed(source))
           return failure();
         unsigned slot = outputSlots[returnIndex++];
@@ -2328,11 +2315,10 @@ static LogicalResult lowerPredicatedNeuraKernel(
         bool packetScoped = hasPacketScopedRoute(sourceValue);
         currentStates[slot] = {
             builder.create<arith::SelectOp>(loc, sourceValid, source->value,
-                                             currentStates[slot].value),
-            packetScoped
-                ? sourceValid
-                : builder.create<arith::OrIOp>(loc, sourceValid,
-                                               valid(currentStates[slot]))};
+                                            currentStates[slot].value),
+            packetScoped ? sourceValid
+                         : builder.create<arith::OrIOp>(
+                               loc, sourceValid, valid(currentStates[slot]))};
       }
       continue;
     }
@@ -2351,14 +2337,16 @@ static LogicalResult lowerPredicatedNeuraKernel(
   SmallVector<Value> nextStateValues;
   for (unsigned index = 0; index < states.size(); ++index) {
     HostDataValue next = currentStates[index];
-    if (auto update = pendingUpdates.find(index); update != pendingUpdates.end()) {
+    if (auto update = pendingUpdates.find(index);
+        update != pendingUpdates.end()) {
       Value updateValid = valid(update->second);
-      next = {builder.create<arith::SelectOp>(
-                  loc, updateValid, update->second.value, currentStates[index].value),
+      next = {builder.create<arith::SelectOp>(loc, updateValid,
+                                              update->second.value,
+                                              currentStates[index].value),
               packetScopedStateSlots.contains(index)
                   ? updateValid
-                  : builder.create<arith::OrIOp>(
-                        loc, updateValid, valid(currentStates[index]))};
+                  : builder.create<arith::OrIOp>(loc, updateValid,
+                                                 valid(currentStates[index]))};
     } else if (packetScopedStateSlots.contains(index)) {
       // A packet-scoped state with no update in this packet is invalid, while
       // retaining its payload for a later valid select.  Independent carried
@@ -2383,9 +2371,8 @@ static LogicalResult lowerPredicatedNeuraKernel(
   }
 
   if (innermost.getNumResults() != states.size() * 2)
-    return reject(kernel,
-                  "HOST_LOWERING_BODY_CONTRACT: predicated loop result "
-                  "count mismatch");
+    return reject(kernel, "HOST_LOWERING_BODY_CONTRACT: predicated loop result "
+                          "count mismatch");
   for (auto [result, slot] : llvm::zip(kernel.getResults(), outputSlots)) {
     mapping.map(result, innermost.getResult(slot * 2));
   }
@@ -2403,8 +2390,7 @@ static LogicalResult lowerNeuraKernel(neura::KernelOp kernel,
                                       IRMapping &mapping, OpBuilder &builder,
                                       Operation *&completionSite) {
   if (isPredicatedKernel(kernel))
-    return lowerPredicatedNeuraKernel(kernel, mapping, builder,
-                                      completionSite);
+    return lowerPredicatedNeuraKernel(kernel, mapping, builder, completionSite);
   Block &sourceBody = kernel.getBody().front();
   SmallVector<neura::CounterOp> counters;
   for (Operation &operation : sourceBody.without_terminator())
@@ -2435,8 +2421,10 @@ static LogicalResult lowerNeuraKernel(neura::KernelOp kernel,
 
   SmallVector<scf::ForOp> loops;
   for (auto [position, counter] : llvm::enumerate(counters)) {
-    FailureOr<Value> lower = mappedValue(mapping, counter.getLowerBound(), counter);
-    FailureOr<Value> upper = mappedValue(mapping, counter.getUpperBound(), counter);
+    FailureOr<Value> lower =
+        mappedValue(mapping, counter.getLowerBound(), counter);
+    FailureOr<Value> upper =
+        mappedValue(mapping, counter.getUpperBound(), counter);
     FailureOr<Value> step = mappedValue(mapping, counter.getStep(), counter);
     if (failed(lower) || failed(upper) || failed(step))
       return failure();
@@ -2448,8 +2436,8 @@ static LogicalResult lowerNeuraKernel(neura::KernelOp kernel,
           return failure();
         initialValues.push_back(*mapped);
       }
-    scf::ForOp loop = builder.create<scf::ForOp>(
-        kernel.getLoc(), *lower, *upper, *step, initialValues);
+    scf::ForOp loop = builder.create<scf::ForOp>(kernel.getLoc(), *lower,
+                                                 *upper, *step, initialValues);
     loops.push_back(loop);
     builder.setInsertionPointToStart(loop.getBody());
     mapping.map(counter.getCurrentIndex(), loop.getInductionVar());
@@ -2650,9 +2638,8 @@ static LogicalResult eliminateAliases(func::FuncOp function) {
   SmallVector<TaskflowReadCompletionJoinOp> readJoins;
   SmallVector<TaskflowChannelOp> channels;
   function.walk([&](TaskflowJoinOp join) { joins.push_back(join); });
-  function.walk([&](TaskflowReadCompletionJoinOp join) {
-    readJoins.push_back(join);
-  });
+  function.walk(
+      [&](TaskflowReadCompletionJoinOp join) { readJoins.push_back(join); });
   function.walk(
       [&](TaskflowChannelOp channel) { channels.push_back(channel); });
 
@@ -2666,9 +2653,8 @@ static LogicalResult eliminateAliases(func::FuncOp function) {
                     "did not verify");
   for (TaskflowReadCompletionJoinOp join : readJoins)
     if (failed(verify(join.getOperation())))
-      return reject(join,
-                    "HOST_LOWERING_UNVERIFIED_READ_JOIN: read completion "
-                    "proof did not verify");
+      return reject(join, "HOST_LOWERING_UNVERIFIED_READ_JOIN: read completion "
+                          "proof did not verify");
   for (TaskflowReadCompletionJoinOp join : readJoins) {
     join.getJoined().replaceAllUsesWith(join.getBaseState());
     join.erase();
@@ -2702,8 +2688,7 @@ static LogicalResult validateFunction(func::FuncOp function) {
   });
   function.walk([&](TaskflowReadCompletionJoinOp join) {
     if (failed(verify(join.getOperation()))) {
-      join.emitError() << kErrorPrefix
-                       << "HOST_LOWERING_UNVERIFIED_READ_JOIN: "
+      join.emitError() << kErrorPrefix << "HOST_LOWERING_UNVERIFIED_READ_JOIN: "
                        << "read completion proof did not verify";
       valid = false;
     }
@@ -2740,35 +2725,46 @@ static LogicalResult attachInput0NumericHarness(ModuleOp module,
                                                 func::FuncOp program,
                                                 StringRef workload) {
   int64_t tag = llvm::StringSwitch<int64_t>(workload)
-                    .Case("gcn", 1).Case("harris", 2).Case("radar", 3)
-                    .Case("lu", 4).Case("raytracing", 5).Default(0);
+                    .Case("gcn", 1)
+                    .Case("harris", 2)
+                    .Case("radar", 3)
+                    .Case("lu", 4)
+                    .Case("raytracing", 5)
+                    .Default(0);
   if (!tag || !program.getSymName().contains((workload + "_func").str()) ||
       program.getNumArguments() < 2 ||
       !program.getArgument(0).getType().isSignlessInteger(32) ||
       program.getNumResults() != 0 || module.lookupSymbol("main"))
-    return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: unsupported program signature");
+    return reject(
+        program, "HOST_NUMERIC_INPUT0_CONTRACT: unsupported program signature");
   auto bound = program->getAttrOfType<IntegerAttr>("amoeba.static_bound.arg.0");
   if (!bound || bound.getInt() <= 0 || bound.getInt() > INT32_MAX)
-    return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: missing positive input-0 scalar bound");
+    return reject(
+        program,
+        "HOST_NUMERIC_INPUT0_CONTRACT: missing positive input-0 scalar bound");
   for (unsigned index = 1; index < program.getNumArguments(); ++index) {
     auto type = dyn_cast<MemRefType>(program.getArgument(index).getType());
-    auto shape = program.getArgAttrOfType<DenseI64ArrayAttr>(index,
-                                                          "amoeba.logical_transfer_shape");
+    auto shape = program.getArgAttrOfType<DenseI64ArrayAttr>(
+        index, "amoeba.logical_transfer_shape");
     if (!type || !type.getElementType().isSignlessInteger(32) ||
-        !type.getLayout().isIdentity() || !shape || shape.size() != type.getRank())
-      return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: missing contiguous i32 buffer extent");
+        !type.getLayout().isIdentity() || !shape ||
+        shape.size() != type.getRank())
+      return reject(
+          program,
+          "HOST_NUMERIC_INPUT0_CONTRACT: missing contiguous i32 buffer extent");
     for (auto [dimension, size] : llvm::enumerate(shape.asArrayRef()))
-      if (size <= 0 || (!type.isDynamicDim(dimension) &&
-                       type.getDimSize(dimension) != size))
-        return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: buffer extent disagrees with its type");
+      if (size <= 0 ||
+          (!type.isDynamicDim(dimension) && type.getDimSize(dimension) != size))
+        return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: buffer extent "
+                               "disagrees with its type");
   }
   OpBuilder builder(module.getContext());
   Location loc = program.getLoc();
   Type i64 = builder.getI64Type();
   Type unranked = UnrankedMemRefType::get(builder.getI32Type(), 0);
   auto declare = [&](StringRef name, TypeRange inputs, TypeRange results) {
-    auto function = func::FuncOp::create(loc, name,
-                                        builder.getFunctionType(inputs, results));
+    auto function = func::FuncOp::create(
+        loc, name, builder.getFunctionType(inputs, results));
     function.setPrivate();
     function->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
     module.push_back(function);
@@ -2777,11 +2773,15 @@ static LogicalResult attachInput0NumericHarness(ModuleOp module,
   for (StringRef name : {"orbit_numeric_initialize", "orbit_numeric_snapshot",
                          "orbit_numeric_check"})
     if (module.lookupSymbol(name))
-      return reject(program, "HOST_NUMERIC_INPUT0_CONTRACT: conflicting reference symbol");
-  auto initialize = declare("orbit_numeric_initialize", {i64, i64, unranked}, {});
+      return reject(
+          program,
+          "HOST_NUMERIC_INPUT0_CONTRACT: conflicting reference symbol");
+  auto initialize =
+      declare("orbit_numeric_initialize", {i64, i64, unranked}, {});
   auto snapshot = declare("orbit_numeric_snapshot", {i64, i64}, {});
   auto check = declare("orbit_numeric_check", {i64}, {i64});
-  auto main = func::FuncOp::create(loc, "main", builder.getFunctionType({}, {i64}));
+  auto main =
+      func::FuncOp::create(loc, "main", builder.getFunctionType({}, {i64}));
   module.push_back(main);
   builder.setInsertionPointToStart(main.addEntryBlock());
   Value programTag = builder.create<arith::ConstantIntOp>(loc, tag, 64);
@@ -2789,26 +2789,28 @@ static LogicalResult attachInput0NumericHarness(ModuleOp module,
   SmallVector<Value> arguments{scalar}, allocations;
   for (unsigned index = 1; index < program.getNumArguments(); ++index) {
     auto type = cast<MemRefType>(program.getArgument(index).getType());
-    auto shape = program.getArgAttrOfType<DenseI64ArrayAttr>(index,
-                                                          "amoeba.logical_transfer_shape");
+    auto shape = program.getArgAttrOfType<DenseI64ArrayAttr>(
+        index, "amoeba.logical_transfer_shape");
     SmallVector<Value> dynamicSizes;
     for (unsigned dimension = 0; dimension < type.getRank(); ++dimension)
       if (type.isDynamicDim(dimension))
-        dynamicSizes.push_back(builder.create<arith::ConstantIndexOp>(
-            loc, shape[dimension]));
+        dynamicSizes.push_back(
+            builder.create<arith::ConstantIndexOp>(loc, shape[dimension]));
     Value buffer = builder.create<memref::AllocOp>(loc, type, dynamicSizes);
     allocations.push_back(buffer);
     arguments.push_back(buffer);
-    Value unrankedBuffer = builder.create<memref::CastOp>(loc, unranked, buffer);
+    Value unrankedBuffer =
+        builder.create<memref::CastOp>(loc, unranked, buffer);
     Value argumentIndex = builder.create<arith::ConstantIntOp>(loc, index, 64);
-    builder.create<func::CallOp>(loc, initialize,
-                                ValueRange{programTag, argumentIndex, unrankedBuffer});
+    builder.create<func::CallOp>(
+        loc, initialize, ValueRange{programTag, argumentIndex, unrankedBuffer});
   }
   Value scalar64 = builder.create<arith::ExtSIOp>(loc, i64, scalar);
   builder.create<func::CallOp>(loc, snapshot, ValueRange{programTag, scalar64});
   builder.create<func::CallOp>(loc, program, arguments);
-  Value mismatches = builder.create<func::CallOp>(loc, check,
-                                                ValueRange{programTag}).getResult(0);
+  Value mismatches =
+      builder.create<func::CallOp>(loc, check, ValueRange{programTag})
+          .getResult(0);
   for (Value buffer : allocations)
     builder.create<memref::DeallocOp>(loc, buffer);
   builder.create<func::ReturnOp>(loc, mismatches);
@@ -2850,18 +2852,21 @@ struct LowerJointTaskflowToHostSCFPass
 
   Option<std::string> hostHarness{
       *this, "host-harness",
-      llvm::cl::desc("Host MLIR numeric harness; import nonconflicting functions "
-                     "after lowering, retaining the current program body."),
+      llvm::cl::desc(
+          "Host MLIR numeric harness; import nonconflicting functions "
+          "after lowering, retaining the current program body."),
       llvm::cl::init("")};
   Option<std::string> numericProgram{
       *this, "input0-numeric-program",
-      llvm::cl::desc("Build a C++ reference numeric entry point for the selected input-0 program."),
+      llvm::cl::desc("Build a C++ reference numeric entry point for the "
+                     "selected input-0 program."),
       llvm::cl::init("")};
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
     if (!hostHarness.getValue().empty() && !numericProgram.getValue().empty()) {
-      module.emitError("HOST_NUMERIC_HARNESS_INVALID: select one harness source");
+      module.emitError(
+          "HOST_NUMERIC_HARNESS_INVALID: select one harness source");
       return signalPassFailure();
     }
     SmallVector<func::FuncOp> functions;
@@ -2889,29 +2894,33 @@ struct LowerJointTaskflowToHostSCFPass
     if (!numericProgram.getValue().empty()) {
       if (functions.size() != 1 ||
           failed(attachInput0NumericHarness(module, functions.front(),
-                                           numericProgram.getValue())))
+                                            numericProgram.getValue())))
         return signalPassFailure();
     }
     if (!hostHarness.getValue().empty()) {
       OwningOpRef<ModuleOp> harness = parseSourceFile<ModuleOp>(
           hostHarness.getValue(), module.getContext());
       if (!harness) {
-        module.emitError("HOST_NUMERIC_HARNESS_INVALID: cannot parse host harness");
+        module.emitError(
+            "HOST_NUMERIC_HARNESS_INVALID: cannot parse host harness");
         return signalPassFailure();
       }
       SmallVector<Operation *> imports;
       for (Operation &operation : harness->getBody()->getOperations()) {
         auto function = dyn_cast<func::FuncOp>(operation);
         if (!function) {
-          module.emitError("HOST_NUMERIC_HARNESS_INVALID: only function symbols are supported");
+          module.emitError("HOST_NUMERIC_HARNESS_INVALID: only function "
+                           "symbols are supported");
           return signalPassFailure();
         }
-        if (Operation *existing = SymbolTable::lookupSymbolIn(
-                module, function.getSymName())) {
+        if (Operation *existing =
+                SymbolTable::lookupSymbolIn(module, function.getSymName())) {
           auto program = dyn_cast<func::FuncOp>(existing);
-          if (!program || program.getFunctionType() != function.getFunctionType() ||
+          if (!program ||
+              program.getFunctionType() != function.getFunctionType() ||
               !llvm::is_contained(functions, program)) {
-            module.emitError("HOST_NUMERIC_HARNESS_INVALID: conflicting symbol or program signature");
+            module.emitError("HOST_NUMERIC_HARNESS_INVALID: conflicting symbol "
+                             "or program signature");
             return signalPassFailure();
           }
           // The fixture's old program body never replaces the selected graph.
