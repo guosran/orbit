@@ -1,0 +1,1236 @@
+{
+  "schema": "orbit.qwen-r19-final-results.v1",
+  "status": "completed-registered-local-frontier-and-final-board-comparison",
+  "artifact_root": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19",
+  "workload": {
+    "program": "original Triton-XDNA Qwen2.5-3B-Instruct Q4NX runtime",
+    "layers": 36,
+    "prefill_tokens": 5,
+    "generated_tokens": 128,
+    "full_decode_steps": 127,
+    "max_context": 2048,
+    "whole_source_operators": 138759,
+    "whole_source_values": 157615,
+    "prefill_source_operators": 581,
+    "prompt_ids": [
+      785,
+      6722,
+      315,
+      9625,
+      374
+    ],
+    "whole_source": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-operator-source-r17/source-p5-outputs128-v4.json",
+      "sha256": "31875ce02c2a1a3afce12db01dc12bdb0afa9019c5e4c402ef1904474d1b2b41",
+      "source_id": "a80070e7f879e074ce803d4e67dd4fa1f2f131505cad1b3abeb6687dd0a831fe"
+    },
+    "prefill_source": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r17/frozen/qwen-node-source-r17-v4-p5.json",
+      "sha256": "c325cc5c08e79c93042e43e1df21a30c24673da49ee27c8b4769e9656bab66c5",
+      "source_id": "bff71c12411eaf89e487d374c965cf7ee46d24c291c9342dc767ced5caddf20d"
+    }
+  },
+  "measurement_protocol": {
+    "fresh_processes": 3,
+    "warmups_per_process": 1,
+    "measured_requests_per_process": 3,
+    "total_measured_requests": 9,
+    "total_warmups": 3,
+    "outputs_per_request": 128,
+    "threads": 4,
+    "selected_prices_not_refit_from_heldout": true,
+    "same_owned_ready_runner": true,
+    "same_physical_dependency_replay_bridge": true,
+    "preparation_protocol": "owned-prefill-decode-release-readonly-prefault-v2",
+    "preparation_entrypoint": {
+      "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/run-r19-prepared-memory-v2.py",
+      "sha256": "52d263882256437d88eea3ce5cde0a28de344e3106e62a103013b0cebf3ef49c"
+    },
+    "verification_cache_policy": {
+      "schema": "orbit.readonly-verification-cache-policy.v1",
+      "large_file_threshold_bytes": 67108864,
+      "operation": "POSIX_FADV_DONTNEED",
+      "scope": "same read-only descriptor after complete actual SHA256 read",
+      "unsupported_or_failed_advice": "fail-closed-before-next-process",
+      "guarantees": "kernel advice issued successfully; physical eviction is not guaranteed",
+      "runtime_memory_guards_changed": false,
+      "timed_runtime_changed": false
+    },
+    "large_file_cache_eviction_guaranteed": false,
+    "original_guards_unchanged": true,
+    "rss_admission_limit_bytes": 21474836480,
+    "swap_admission_limit_bytes": 536870912,
+    "statistical_scope": "Three requests per fresh plan process; observed medians/ranges only, no confidence interval or statistical-significance claim",
+    "scope": "final three-plan comparison; calibration and previous incumbent replays are separate"
+  },
+  "board": {
+    "selected": {
+      "label": "selected",
+      "mode": "actual-orbit-selected",
+      "program_graph_id": "c5d291cb9a5b74162395951b50fe3fd9b315a453ed45eec52e22da2a36c2b5c7",
+      "replay_id": "1125a02cbe9b6466ae48b34f11c519632cf2a8d42a2a5d266ea3de1e3653d3b4",
+      "full_request_ms": {
+        "samples": [
+          6517.662312,
+          6643.32187,
+          6515.681753
+        ],
+        "median": 6517.662312,
+        "minimum": 6515.681753,
+        "maximum": 6643.32187
+      },
+      "ttft_ms": {
+        "samples": [
+          424.852256,
+          445.5592,
+          454.025195
+        ],
+        "median": 445.5592,
+        "minimum": 424.852256,
+        "maximum": 454.025195
+      },
+      "measured_requests": 3,
+      "warmups": 1,
+      "outputs": 128,
+      "prefill_tokens": 5,
+      "logical_prefix_placements": {
+        "cpu": 436,
+        "npu": 145
+      },
+      "completion_peak_rss_bytes": 13576130560,
+      "request_memory": [
+        {
+          "VmHWM_bytes": 13571231744,
+          "VmRSS_bytes": 13571231744,
+          "VmSwap_bytes": 0,
+          "available_bytes": 7928860672
+        },
+        {
+          "VmHWM_bytes": 13579239424,
+          "VmRSS_bytes": 13579239424,
+          "VmSwap_bytes": 0,
+          "available_bytes": 7876399104
+        },
+        {
+          "VmHWM_bytes": 13579919360,
+          "VmRSS_bytes": 13579919360,
+          "VmSwap_bytes": 0,
+          "available_bytes": 7805714432
+        }
+      ],
+      "request_end_swap_bytes": [
+        0,
+        0,
+        0
+      ],
+      "all_original_gates_pass": true,
+      "persistent_npu_owner_verified": true,
+      "source_exactcover_and_phase_union_all_pass": true,
+      "all_measured_token_streams_equal_within_cohort": true,
+      "numerical_pairs": [
+        {
+          "reference": "hf-bf16",
+          "file": "/home/shiran/project/aie-toy/results/qwen25-3b/hf-bf16-P5-capture.npz",
+          "sha256": "2a356bba43dd7b20611e5a87d772be98d8705ccdcc5b16dcf5da9814c36afed5",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": 5,
+            "test_chosen_at_div": 15344,
+            "ref_chosen_at_div": 9856,
+            "test_topk_at_div": [
+              15344,
+              17689,
+              9856,
+              5616,
+              279
+            ],
+            "ref_topk_at_div": [
+              9856,
+              17689,
+              15344,
+              279,
+              9448
+            ],
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": 3,
+            "ref_chosen_rank_in_test": 3,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": 5,
+          "same_context_logit_rows": 6,
+          "same_context_max_abs_error": 4.186279296875,
+          "full_logits_bitexact": null,
+          "post_divergence_error_metrics_computed": false
+        },
+        {
+          "reference": "prior-r18",
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/heldout-selected-v5-prepared/execution/capture.npz",
+          "sha256": "39944a60f43d8e2e0faed69740b0c262802b7cdb7d73763503c12a834509cde9",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": null,
+            "test_chosen_at_div": null,
+            "ref_chosen_at_div": null,
+            "test_topk_at_div": null,
+            "ref_topk_at_div": null,
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": null,
+            "ref_chosen_rank_in_test": null,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": null,
+          "same_context_logit_rows": 128,
+          "same_context_max_abs_error": 0.125,
+          "full_logits_bitexact": false,
+          "post_divergence_error_metrics_computed": false
+        }
+      ],
+      "cpu_compile_proofs": {
+        "count": 37,
+        "native_multi_operator_fusion_proven": 0,
+        "actual_generated_code_verified": true
+      },
+      "command_receipt": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/command-receipt.json",
+        "sha256": "2c414d80db37eaa05a641d83dd966eadb02a7e77d1a1c87ce5bb0e38dfa3265a",
+        "bytes": 2989609
+      },
+      "gate": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/gate.json",
+        "sha256": "4877ea30583c61f38c385ef692e3916f17f16b5de8fc6775af25eb2fe0c53283",
+        "bytes": 4322
+      },
+      "measurements": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/execution/measurements.jsonl",
+        "sha256": "014b791219a0f072aae1b460e6077cbcc00d35f71a542aec2945459d9fb1116d",
+        "bytes": 4090723
+      },
+      "completion": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/execution/completion.json",
+        "sha256": "dd379f71a4cc8a5b0083bfcfe56588d549c6c79bac823285ed65f5c21b70f77f",
+        "bytes": 94
+      },
+      "execution_result": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1.execution-result.json",
+        "sha256": "d4b17864ece1774da9ce620419b9b688d0bc77c71e684b91598d7eb5dbfcd488",
+        "bytes": 92910
+      },
+      "selected_runtime_proof": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/execution/selected-runtime-proof.json",
+        "sha256": "ca57298f95809d87bd6089b21563897e7b2c8c7511646b172ee29cba333bbd57",
+        "bytes": 102179
+      },
+      "preparation_protocol": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-selected-frontier-r3-r19-v1-prepared/execution/preparation-protocol.json",
+        "sha256": "af9dca4fd344a6c94a61d6d6336a1cbbeb34ac88bd93f1f738e7fcedcbb8e686",
+        "bytes": 1325
+      },
+      "invocation_count": 839,
+      "decode_variant_dir": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-full-dim-r18/decode-r0-cache1-coalesce1",
+      "decode_rope_prefetch": true
+    },
+    "original_supported_npu": {
+      "label": "original_supported_npu",
+      "mode": "manual-baseline",
+      "program_graph_id": "2c2800af3487a00cee282bf7d3382e1a8b88137af8f031e6d79f0d3e4fb01f26",
+      "replay_id": "0d2838f1dd7a4a9a81c3048b196cea5b8d09554e0a4f581db24fd50ad8cdb2f5",
+      "full_request_ms": {
+        "samples": [
+          7133.252869,
+          7219.606012,
+          7200.045999
+        ],
+        "median": 7200.045999,
+        "minimum": 7133.252869,
+        "maximum": 7219.606012
+      },
+      "ttft_ms": {
+        "samples": [
+          669.079705,
+          702.295884,
+          722.679654
+        ],
+        "median": 702.295884,
+        "minimum": 669.079705,
+        "maximum": 722.679654
+      },
+      "measured_requests": 3,
+      "warmups": 1,
+      "outputs": 128,
+      "prefill_tokens": 5,
+      "logical_prefix_placements": {
+        "cpu": 328,
+        "npu": 253
+      },
+      "completion_peak_rss_bytes": 13277253632,
+      "request_memory": [
+        {
+          "VmHWM_bytes": 13277253632,
+          "VmRSS_bytes": 13110497280,
+          "VmSwap_bytes": 0,
+          "available_bytes": 9465638912
+        },
+        {
+          "VmHWM_bytes": 13277253632,
+          "VmRSS_bytes": 13202186240,
+          "VmSwap_bytes": 0,
+          "available_bytes": 9432920064
+        },
+        {
+          "VmHWM_bytes": 13277253632,
+          "VmRSS_bytes": 13197180928,
+          "VmSwap_bytes": 0,
+          "available_bytes": 9382674432
+        }
+      ],
+      "request_end_swap_bytes": [
+        0,
+        0,
+        0
+      ],
+      "all_original_gates_pass": true,
+      "persistent_npu_owner_verified": true,
+      "source_exactcover_and_phase_union_all_pass": true,
+      "all_measured_token_streams_equal_within_cohort": true,
+      "numerical_pairs": [
+        {
+          "reference": "hf-bf16",
+          "file": "/home/shiran/project/aie-toy/results/qwen25-3b/hf-bf16-P5-capture.npz",
+          "sha256": "2a356bba43dd7b20611e5a87d772be98d8705ccdcc5b16dcf5da9814c36afed5",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": 2,
+            "test_chosen_at_div": 12095,
+            "ref_chosen_at_div": 576,
+            "test_topk_at_div": [
+              12095,
+              576,
+              15920,
+              1084,
+              758
+            ],
+            "ref_topk_at_div": [
+              576,
+              12095,
+              15920,
+              362,
+              3555
+            ],
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": 2,
+            "ref_chosen_rank_in_test": 2,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": 2,
+          "same_context_logit_rows": 3,
+          "same_context_max_abs_error": 3.138671875,
+          "full_logits_bitexact": null,
+          "post_divergence_error_metrics_computed": false
+        },
+        {
+          "reference": "prior-r18",
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/heldout-selected-v5-prepared/execution/capture.npz",
+          "sha256": "39944a60f43d8e2e0faed69740b0c262802b7cdb7d73763503c12a834509cde9",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": 2,
+            "test_chosen_at_div": 12095,
+            "ref_chosen_at_div": 576,
+            "test_topk_at_div": [
+              12095,
+              576,
+              15920,
+              1084,
+              758
+            ],
+            "ref_topk_at_div": [
+              576,
+              12095,
+              15920,
+              1084,
+              758
+            ],
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": 2,
+            "ref_chosen_rank_in_test": 2,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": 2,
+          "same_context_logit_rows": 3,
+          "same_context_max_abs_error": 0.3828125,
+          "full_logits_bitexact": false,
+          "post_divergence_error_metrics_computed": false
+        }
+      ],
+      "cpu_compile_proofs": {
+        "count": 0,
+        "native_multi_operator_fusion_proven": 0,
+        "actual_generated_code_verified": true
+      },
+      "command_receipt": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/command-receipt.json",
+        "sha256": "01d5d655b0a748daff98efb39771ad7c60c29dfe095daf74bb586199dd832fb4",
+        "bytes": 587895
+      },
+      "gate": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/gate.json",
+        "sha256": "4a5c5f43041659b27b6c916a3d9ae08172adc054ba7505c33912756c7a32d33b",
+        "bytes": 4440
+      },
+      "measurements": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/execution/measurements.jsonl",
+        "sha256": "07a65d0ebf7aa855012fa4f0460e2e4580a3a432030f6db7efa005e51bfd214b",
+        "bytes": 3072291
+      },
+      "completion": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/execution/completion.json",
+        "sha256": "f33bfebe03e6fdcfe9f8eb448c8b150e1cdebc7ea85282369fed810e0cb046c8",
+        "bytes": 94
+      },
+      "execution_result": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1.execution-result.json",
+        "sha256": "40340a1c3cd1a8992a1da58d2ae4bb495dd96116c98e4cd4e59d9e36779adeff",
+        "bytes": 32902
+      },
+      "selected_runtime_proof": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/execution/selected-runtime-proof.json",
+        "sha256": "b8acfeec53d932faaa963279bb7183a6e9e5988cff2fe7db73a7f4812da0eee0",
+        "bytes": 77495
+      },
+      "preparation_protocol": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-all-npu-r19-v1-prepared/execution/preparation-protocol.json",
+        "sha256": "99a83576f7417cfeddccc8af2934b752f5da20acaee81c99d12037e83a796e68",
+        "bytes": 1313
+      },
+      "invocation_count": 1091,
+      "decode_variant_dir": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-full-dim-r18/decode-r0-cache1-coalesce0",
+      "decode_rope_prefetch": false
+    },
+    "prior_manual": {
+      "label": "prior_manual",
+      "mode": "manual-baseline",
+      "program_graph_id": "024cf8b9b76eeb4bf288bfb157e1ed03ffa2f13d48da54ddd467e95395fce02c",
+      "replay_id": "5ab26a8bcc3220d8c4eb51a4ddecfd9f7be50fd66837b6b948eb6d801ed3964d",
+      "full_request_ms": {
+        "samples": [
+          6719.401464,
+          6847.747239,
+          6724.118686
+        ],
+        "median": 6724.118686,
+        "minimum": 6719.401464,
+        "maximum": 6847.747239
+      },
+      "ttft_ms": {
+        "samples": [
+          442.460081,
+          529.800359,
+          436.772936
+        ],
+        "median": 442.460081,
+        "minimum": 436.772936,
+        "maximum": 529.800359
+      },
+      "measured_requests": 3,
+      "warmups": 1,
+      "outputs": 128,
+      "prefill_tokens": 5,
+      "logical_prefix_placements": {
+        "cpu": 437,
+        "npu": 144
+      },
+      "completion_peak_rss_bytes": 13552504832,
+      "request_memory": [
+        {
+          "VmHWM_bytes": 13552504832,
+          "VmRSS_bytes": 13187739648,
+          "VmSwap_bytes": 0,
+          "available_bytes": 8297050112
+        },
+        {
+          "VmHWM_bytes": 13552504832,
+          "VmRSS_bytes": 13219389440,
+          "VmSwap_bytes": 0,
+          "available_bytes": 8255528960
+        },
+        {
+          "VmHWM_bytes": 13552504832,
+          "VmRSS_bytes": 13220564992,
+          "VmSwap_bytes": 0,
+          "available_bytes": 8201994240
+        }
+      ],
+      "request_end_swap_bytes": [
+        0,
+        0,
+        0
+      ],
+      "all_original_gates_pass": true,
+      "persistent_npu_owner_verified": true,
+      "source_exactcover_and_phase_union_all_pass": true,
+      "all_measured_token_streams_equal_within_cohort": true,
+      "numerical_pairs": [
+        {
+          "reference": "hf-bf16",
+          "file": "/home/shiran/project/aie-toy/results/qwen25-3b/hf-bf16-P5-capture.npz",
+          "sha256": "2a356bba43dd7b20611e5a87d772be98d8705ccdcc5b16dcf5da9814c36afed5",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": 5,
+            "test_chosen_at_div": 15344,
+            "ref_chosen_at_div": 9856,
+            "test_topk_at_div": [
+              15344,
+              17689,
+              9856,
+              5616,
+              279
+            ],
+            "ref_topk_at_div": [
+              9856,
+              17689,
+              15344,
+              279,
+              9448
+            ],
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": 3,
+            "ref_chosen_rank_in_test": 3,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": 5,
+          "same_context_logit_rows": 6,
+          "same_context_max_abs_error": 4.186279296875,
+          "full_logits_bitexact": null,
+          "post_divergence_error_metrics_computed": false
+        },
+        {
+          "reference": "prior-r18",
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/heldout-selected-v5-prepared/execution/capture.npz",
+          "sha256": "39944a60f43d8e2e0faed69740b0c262802b7cdb7d73763503c12a834509cde9",
+          "original_mutual_top5": {
+            "prompt_idx": 0,
+            "prompt_text": "",
+            "n_steps": 32,
+            "k": 5,
+            "divergence_step": null,
+            "test_chosen_at_div": null,
+            "ref_chosen_at_div": null,
+            "test_topk_at_div": null,
+            "ref_topk_at_div": null,
+            "status": "OK",
+            "fail_reason": null,
+            "test_chosen_rank_in_ref": null,
+            "ref_chosen_rank_in_test": null,
+            "test_chosen_text_at_div": null,
+            "ref_chosen_text_at_div": null,
+            "agreed_prefix_text": null
+          },
+          "first_token_divergence_zero_based": null,
+          "same_context_logit_rows": 128,
+          "same_context_max_abs_error": 0.0,
+          "full_logits_bitexact": true,
+          "post_divergence_error_metrics_computed": false
+        }
+      ],
+      "cpu_compile_proofs": {
+        "count": 0,
+        "native_multi_operator_fusion_proven": 0,
+        "actual_generated_code_verified": true
+      },
+      "command_receipt": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/command-receipt.json",
+        "sha256": "21bbc1d4b2fe662cc479d92a95e20dedd23b5ecf1f1991cfb5683b2fa14fc961",
+        "bytes": 587779
+      },
+      "gate": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/gate.json",
+        "sha256": "a8ff59f15b1cda7a46faaab398eb1b1aab31bf81cb8c1f278800263d9236a66b",
+        "bytes": 4279
+      },
+      "measurements": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/execution/measurements.jsonl",
+        "sha256": "75bb47b44c4b385db7a4a2bf22178ffe014460b9e699342c30c03e7279003afd",
+        "bytes": 3069712
+      },
+      "completion": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/execution/completion.json",
+        "sha256": "10511325b3b378f271724b6118f69351b6c623942b103f7746f0ad1cd950cafc",
+        "bytes": 94
+      },
+      "execution_result": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1.execution-result.json",
+        "sha256": "1e8b0e1a2fec7d921dc31eb131b862af4151c4453cbafb5979a2ee481d1057d1",
+        "bytes": 32853
+      },
+      "selected_runtime_proof": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/execution/selected-runtime-proof.json",
+        "sha256": "7cdb54f12a202d76de59459e71c342a83d0bb47569e372eabdc85187edbecdc5",
+        "bytes": 77495
+      },
+      "preparation_protocol": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/heldout-baseline-prior-r19-v1-prepared/execution/preparation-protocol.json",
+        "sha256": "b02cfe3d805c5804cbf67c4d4a359fe24d4631bce9867f136e8ec9489a7c64c5",
+        "bytes": 1307
+      },
+      "invocation_count": 1091,
+      "decode_variant_dir": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-full-dim-r18/decode-r0-cache1-coalesce1",
+      "decode_rope_prefetch": false
+    }
+  },
+  "comparisons": {
+    "original_supported_npu": {
+      "full_request_speedup_baseline_over_selected": 1.1046976130910662,
+      "full_request_latency_reduction_fraction": 0.0947749065901488,
+      "ttft_speedup_baseline_over_selected": 1.5762122833508994,
+      "ttft_latency_reduction_fraction": 0.3655676899852086
+    },
+    "prior_manual": {
+      "full_request_speedup_baseline_over_selected": 1.0316764453445038,
+      "full_request_latency_reduction_fraction": 0.03070385631798163,
+      "ttft_speedup_baseline_over_selected": 0.9930444282151508,
+      "ttft_latency_reduction_fraction": -0.007004290631135995
+    }
+  },
+  "quality_scope": {
+    "all_three_original_gates_pass": true,
+    "all_three_full128_output_count_and_shape": true,
+    "all_three_token_streams_identical": false,
+    "selected_vs_prior_reference_full128_tokens_agree": true,
+    "selected_vs_prior_reference_logits_bitexact": false,
+    "selected_vs_prior_reference_same_context_max_abs_error": 0.125,
+    "original_supported_npu_vs_prior_reference_first_divergence_zero_based": 2,
+    "hf_bf16_reference_tokens": 32,
+    "full128_hf_bf16_equivalence_established": false,
+    "post_divergence_error_metrics_computed": false
+  },
+  "selection": {
+    "configuration": {
+      "schema": "orbit.qwen-r19-selected-configuration-summary.v1",
+      "program_graph_id": "c5d291cb9a5b74162395951b50fe3fd9b315a453ed45eec52e22da2a36c2b5c7",
+      "replay_id": "1125a02cbe9b6466ae48b34f11c519632cf2a8d42a2a5d266ea3de1e3653d3b4",
+      "receipt_sha256": "2c414d80db37eaa05a641d83dd966eadb02a7e77d1a1c87ce5bb0e38dfa3265a",
+      "logical_placements": {
+        "cpu": 436,
+        "npu": 145
+      },
+      "cpu_covers": 143,
+      "cpu_cover_sizes": {
+        "2": 107,
+        "3": 1,
+        "5": 35
+      },
+      "cpu_policies": {
+        "eager-host-group/borrow-host/retain-host": 95,
+        "inductor-cpu/borrow-host/retain-host": 35,
+        "eager-host-group/borrow-host/copy-host": 9,
+        "inductor-cpu/stage-host-copy/retain-host": 2,
+        "eager-host-group/stage-host-copy/retain-host": 2
+      },
+      "native_whole_cover_multiop_fusion_proven": 0,
+      "ffn_routes": {
+        "35": {
+          "retention": "reload",
+          "split_order": "up-gate",
+          "ffn_artifact": {
+            "manifest": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/frozen-r18-v4/compiled-up-gate/manifest.json",
+            "sha256": "05e2abf170d10bad8efd5298c11dfa0d41c606ef36ef43e75c99d5fd76143595"
+          }
+        }
+      },
+      "gemm_variants": {},
+      "half_variants": {},
+      "decode_variant_dir": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-full-dim-r18/decode-r0-cache1-coalesce1",
+      "decode_rope_prefetch": true,
+      "prefix_invocations": 329,
+      "whole_invocations": 839,
+      "registered_files": 5603,
+      "aliases": 10,
+      "cache_advice_events": 119,
+      "diff_vs_r2": {
+        "selected_implementation_ids_equal": false,
+        "cpu_cover_policies_equal": false,
+        "placements_equal": true,
+        "ffn_routes_equal": true,
+        "gemms_equal": true,
+        "halves_equal": true,
+        "decode_equal": true,
+        "ready_priority_equal": false,
+        "physical_dependencies_equal": false
+      }
+    },
+    "catalogue": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r3-v2.json",
+      "requested_file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r3-v2.json",
+      "sha256": "e7c5c8d2bbbc749961bf2f757856ff17e97ee836de932e4da1c1ffc69f75c7c4"
+    },
+    "execution_registration_identity": "0872c94c2a89cf230a4c3a0585e4f812c8772ab6da8bee638afeff15a82dd77b",
+    "source_id": "a80070e7f879e074ce803d4e67dd4fa1f2f131505cad1b3abeb6687dd0a831fe",
+    "program_graph_id": "c5d291cb9a5b74162395951b50fe3fd9b315a453ed45eec52e22da2a36c2b5c7",
+    "result": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/result.json",
+      "requested_file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/result.json",
+      "sha256": "1bba03809ea69b17e5596798bfce3ed85ef870246eae7594c6b7522901d0f92e"
+    },
+    "selected_graph": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/selected-program-graph.json",
+      "requested_file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/selected-program-graph.json",
+      "sha256": "d87b1ffbce700b9858a93e16b4aa87b68b627f42bb8a01131a37598679e3a6f8"
+    },
+    "runtime_support": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r3-v1.runtime-support.json",
+      "sha256": "79901470786c52bf2396a26095fe25a2bbeef378afdb6fc64079dd94dd6504ee",
+      "identity": "571abff1831e0b67ecb0ec404ec7f02a5cca98a715fa40d509acb62c0eb0dfef"
+    },
+    "runtime_code_files": [
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/run-qwen-r19-ready.py",
+        "sha256": "db360197ef8a63765854fb0daabfedfd874067d2aaa1297b22ada7b72e091e95"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/qwen-r19-ready.py",
+        "sha256": "e73b5fd51d20da11ebf4838648ec594e36a0df2e207c1230a519db6f2b0cf5f8"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/qwen-r19-xrt.py",
+        "sha256": "b2fe4a7c86d54fc2c3ad58875d6a469e3c86ce00bdc7d6aae3ee253d8674cf2c"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/qwen-r19-source-ready.py",
+        "sha256": "2fe3bfef444b1ac10f97eacd0b1a867eb08d3101971bf8a2b52233a5e04b6bc8"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/qwen-r19-regions.py",
+        "sha256": "5995827e6446291835d944c0e974151ec5f63b0a4ac31a80a381c98b1327db11"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/qwen-r19-decode-ready.py",
+        "sha256": "00ce3c734c7dac87faaef73baa0e00a2580661b1ccc41a51e178c047597279b4"
+      },
+      {
+        "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/routed-r18-runtime.py",
+        "sha256": "de3b54e7a9e54fcb39c0d2b216c0906a49ca3199041177fc0cd36111ee9d0d45"
+      }
+    ],
+    "frozen_r18_runtime": {
+      "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/frozen-r18-v4",
+      "seal": {
+        "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-whole-graph-r18/frozen-r18-v4/freeze.json",
+        "sha256": "a0d92cd350c2dd15c9f3d7e2d4126e011b6a1f2d5ab7bcaa18cf2543fa843722"
+      }
+    }
+  },
+  "training": {
+    "actual_cohorts": 110,
+    "measured_complete_requests": 330,
+    "warmups": 110,
+    "implementations": 9100,
+    "cpu_regions": 5224,
+    "component_groups": 261,
+    "variable_groups": 218,
+    "fixed_groups": 43,
+    "total_component_choices": 553867,
+    "max_component_choices": 28243,
+    "missing_local_prices": 0,
+    "old_r18_prices_reused": false,
+    "complete_program_price_menu": false,
+    "fit_receipts": [
+      {
+        "round": 1,
+        "receipt": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/fit-frontier-r1-receipt.json",
+          "sha256": "6022ae936713cb3edad45f3ae2fdee31e9fc834b3001ed5018d042877209276c",
+          "bytes": 794961
+        },
+        "raw_catalogue": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r1-v1.json",
+          "sha256": "5b860e2334b85fd3a7c25a60efe733cf9d18fa03e33779779468f88ceeba0f16",
+          "bytes": 112705734
+        },
+        "runtime_support": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r1-v1.runtime-support.json",
+          "sha256": "5ba4b8e74befbd4da7f62c3e1dffa04016ae6d9112574558a14a02a797acac9b",
+          "bytes": 1751966
+        },
+        "training_cohorts": 62,
+        "implementations": 7730,
+        "new_pending_choices": 2854,
+        "component_choices": 121921,
+        "groups": 261,
+        "wall_time": "2:57.86",
+        "peak_rss_kib": 1543368,
+        "domain_profile": [
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 134,
+            "function": "build",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 0.049820169000000004,
+            "cumulative_seconds": 7.377968389
+          },
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 31,
+            "function": "exact_cover_groups",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 1.476084951,
+            "cumulative_seconds": 3.589380681
+          }
+        ],
+        "cprofile_total_seconds": null
+      },
+      {
+        "round": 2,
+        "receipt": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/fit-frontier-r2-receipt.json",
+          "sha256": "887807367717d570c9a840dca25cfc167eceac60dfa252e6fcd47e5ae0a91766",
+          "bytes": 2557654
+        },
+        "raw_catalogue": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r2-v1.json",
+          "sha256": "016496a0856e3c9be91800d124ada51b01b8c656fd0e5adf21c8852ec281203a",
+          "bytes": 281580192
+        },
+        "runtime_support": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r2-v1.runtime-support.json",
+          "sha256": "47a8068296caca7d3f6a25fc44e830af52d66fc722120b44b1a8d0c34dec1113",
+          "bytes": 2937980
+        },
+        "training_cohorts": 102,
+        "implementations": 9098,
+        "new_pending_choices": 1368,
+        "component_choices": 538009,
+        "groups": 261,
+        "wall_time": "4:01.98",
+        "peak_rss_kib": 2102784,
+        "domain_profile": [
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 134,
+            "function": "build",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 0.043779291000000005,
+            "cumulative_seconds": 11.854994947000002
+          },
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 31,
+            "function": "exact_cover_groups",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 3.3854756590000004,
+            "cumulative_seconds": 7.395409263
+          }
+        ],
+        "cprofile_total_seconds": 240.4541221109999
+      },
+      {
+        "round": 3,
+        "receipt": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/fit-frontier-r3-receipt.json",
+          "sha256": "86b03f8a3a836dd3efe44c6e7d144c0a11e3a6ef47a666f20aa446f45dc9b7c5",
+          "bytes": 1454302
+        },
+        "raw_catalogue": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r3-v1.json",
+          "sha256": "97e81eed12dd4d2e69fc07d8483c0f7a4b8dfa0eda37fc89b14ea5e84d6bf2b9",
+          "bytes": 288625188
+        },
+        "runtime_support": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/catalogue-r19-frontier-r3-v1.runtime-support.json",
+          "sha256": "79901470786c52bf2396a26095fe25a2bbeef378afdb6fc64079dd94dd6504ee",
+          "bytes": 3176402
+        },
+        "training_cohorts": 110,
+        "implementations": 9100,
+        "new_pending_choices": 2,
+        "component_choices": 553867,
+        "groups": 261,
+        "wall_time": "4:13.73",
+        "peak_rss_kib": 2126348,
+        "domain_profile": [
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 134,
+            "function": "build",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 0.045305688000000004,
+            "cumulative_seconds": 12.015007065
+          },
+          {
+            "file": "/home/shiran/project/orbit/experimental/qwen-runtime-search/build-r19-cover-domain.py",
+            "line": 31,
+            "function": "exact_cover_groups",
+            "primitive_calls": 1,
+            "total_calls": 1,
+            "self_seconds": 2.2379986250000004,
+            "cumulative_seconds": 6.46281347
+          }
+        ],
+        "cprofile_total_seconds": 252.212054112001
+      }
+    ],
+    "final_training_campaign": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/frontier-round3-prepared/campaign-admission.json",
+      "sha256": "a4b289fc3e40b0d6016d0bf922ccef3f26fda5e47074aad7b35136a32cc6e490"
+    },
+    "failed_or_rejected_attempts_preserved": true,
+    "failed_attempts_excluded_from_prices": true
+  },
+  "cost_model": {
+    "predicted_complete_request_ms": 6480.799959780972,
+    "observed_selected_median_ms": 6517.662312,
+    "signed_prediction_error_ms": -36.86235221902825,
+    "signed_prediction_error_fraction": -0.005655762826367837,
+    "physical_callback_calendar_ms": 6449.395499000001,
+    "controller_ms": 31.40446078097102,
+    "controller": {
+      "schema": "orbit.program-invocation-control-model.v1",
+      "identity": "ebc062f7fd7657081b0c220f125002714b45033f4a4e4051b648f8d8de9d895b",
+      "intercept_ms": 0.0,
+      "coefficients": {
+        "cpu_callbacks": 0.0945807123006475,
+        "npu_callbacks": 0.0965905475038593
+      },
+      "boundary": "outside-inclusive-invocation-wall",
+      "fit": {
+        "method": "nonnegative least squares; exhaustive active subsets of three coefficients",
+        "observations": 330,
+        "active_mask": 6,
+        "rmse_ms": 11.997048079945554,
+        "mean_absolute_error_ms": 7.8943827811644995,
+        "maximum_absolute_error_ms": 86.78138759841468,
+        "preparation_strata": [
+          {
+            "mode": "original-only",
+            "samples": 15,
+            "rmse_ms": 14.271780502390266
+          },
+          {
+            "mode": "owned-decode-release-readonly-prefault-v1",
+            "samples": 18,
+            "rmse_ms": 9.737925388419164
+          },
+          {
+            "mode": "owned-prefill-decode-release-readonly-prefault-v2",
+            "samples": 297,
+            "rmse_ms": 11.99529627964634
+          }
+        ],
+        "measured_boundary": "prefill inclusive implementation-span union complement + request clear/capture/control",
+        "exclusive_adjustment": "opaque compound internal idle gaps are already in their inclusive local span and removed from the controller target",
+        "excludes": "first-token argmax, KV handoff and all decoder host/service/wrapper phases already priced separately",
+        "scope": "candidate-dependent controller approximation; counts are causal dispatch proxies, not isolated per-launch charges; whole-request heldout must quantify error"
+      }
+    },
+    "exclusive_invocation_transport_launch_sync_owned_once": true,
+    "callback_overlap_uses_interval_union": true,
+    "controller_model_is_approximate": true
+  },
+  "search": {
+    "algorithm": "ORBIT joint coordinate warm-start initialization, uncapped beam, complete registered cover and legal priority neighborhoods",
+    "beam_width": 4,
+    "wall_timeout_seconds": null,
+    "evaluation_limit": null,
+    "round_limit": null,
+    "observed_wall_seconds": 2563.5251468908973,
+    "cli_wall_ms": 2559710.238027,
+    "exact_peak_rss_bytes": 18064039936,
+    "sampled_peak_swap_bytes": 14352384,
+    "sampled_swap_is_not_lifetime_high_water": true,
+    "inputs_unchanged": true,
+    "returncode": 0,
+    "total_cost_evaluations": 4982513,
+    "phase_evaluations": {
+      "coordinate-initialization": 553616,
+      "beam": 3875253,
+      "joint-cover-neighborhood": 553606
+    },
+    "coordinate_ms": 173184.686537,
+    "beam_ms": 2151842.926905,
+    "joint_ms": 161288.87465,
+    "registered_cover_choices": 553867,
+    "named_priorities": 5,
+    "all_local_choices_feasible_priced_witnessed": true,
+    "final_cover_neighbors_checked": 553606,
+    "final_priority_trials": 38,
+    "comparable_pairs_skipped": 800,
+    "final_trials_nonimproving": true,
+    "actual_captured_reference_checks": 100,
+    "max_fast_reference_error_ms": 4.547473508864641e-12,
+    "axis_witness_counts": {
+      "placement": {
+        "registered_distinct_values": 2,
+        "evaluated_distinct_values": 2,
+        "priced_feasible_distinct_values": 2
+      },
+      "dataflow": {
+        "registered_distinct_values": 11,
+        "evaluated_distinct_values": 11,
+        "priced_feasible_distinct_values": 11
+      },
+      "residence_policy": {
+        "registered_distinct_values": 10,
+        "evaluated_distinct_values": 10,
+        "priced_feasible_distinct_values": 10
+      },
+      "replicas": {
+        "registered_distinct_values": 3,
+        "evaluated_distinct_values": 3,
+        "priced_feasible_distinct_values": 3
+      },
+      "resource_shape": {
+        "registered_distinct_values": 3,
+        "evaluated_distinct_values": 3,
+        "priced_feasible_distinct_values": 3
+      },
+      "work_distribution": {
+        "registered_distinct_values": 2,
+        "evaluated_distinct_values": 2,
+        "priced_feasible_distinct_values": 2
+      },
+      "transport_ownership": {
+        "registered_distinct_values": 1,
+        "evaluated_distinct_values": 1,
+        "priced_feasible_distinct_values": 1
+      },
+      "visibility_policy": {
+        "registered_distinct_values": 1,
+        "evaluated_distinct_values": 1,
+        "priced_feasible_distinct_values": 1
+      },
+      "runtime_kind": {
+        "registered_distinct_values": 7,
+        "evaluated_distinct_values": 7,
+        "priced_feasible_distinct_values": 7
+      },
+      "source_partition": {
+        "registered_distinct_values": 945,
+        "evaluated_distinct_values": 945,
+        "priced_feasible_distinct_values": 945
+      },
+      "implementation_parameters": {
+        "registered_distinct_values": 10,
+        "evaluated_distinct_values": 10,
+        "priced_feasible_distinct_values": 10
+      },
+      "backend": {
+        "registered_distinct_values": 2,
+        "evaluated_distinct_values": 2,
+        "priced_feasible_distinct_values": 2
+      },
+      "input_policy": {
+        "registered_distinct_values": 2,
+        "evaluated_distinct_values": 2,
+        "priced_feasible_distinct_values": 2
+      },
+      "output_policy": {
+        "registered_distinct_values": 2,
+        "evaluated_distinct_values": 2,
+        "priced_feasible_distinct_values": 2
+      },
+      "named_ready_priority": {
+        "registered_distinct_values": 5,
+        "evaluated_distinct_values": 5,
+        "priced_feasible_distinct_values": 5
+      }
+    },
+    "binary_sha256": "60ffc0c4cf6732414c105ea5c9ec9bd8193fe48f00fffded797d7824ff382a84",
+    "final_audit": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/audit/final-audit-receipt.json",
+      "sha256": "6c2cfcf43bc5af9160b83bd4d0fbf46cd15075aa138ebd9725527dc04c365264",
+      "bytes": 6616
+    },
+    "memory_audit": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/audit/memory-audit.json",
+      "sha256": "12005844eaaa4d215580eea3ffed75f6e5a12cd4bd74ce844f4aa597b58b3192",
+      "bytes": 809
+    },
+    "observer_seal": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/observer/seal.json",
+      "sha256": "c11bab40b3918dd6c0e338ec46d5cd57fe5a9a9f5f463128ec0f14bccbf2ef5b",
+      "bytes": 22565
+    },
+    "historical_searches": [
+      {
+        "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0",
+        "status": "explicitly_interrupted_for_algorithm_initialization_revision",
+        "evaluations_approximate": 1910000,
+        "wall_seconds_documented": 1046.617,
+        "observer_memory": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0/observer/memory-summary.json",
+          "sha256": "48b75849b2b1106cbf71d38180a7c1802cecc655d135c418e329f366e713112b",
+          "bytes": 710
+        },
+        "observed_wall_seconds": 1046.6167689240538,
+        "returncode": -15,
+        "exact_peak_rss_bytes": 9980125184,
+        "sampled_peak_swap_bytes": 0,
+        "seal": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0/observer/seal.json",
+          "sha256": "4ac7db717147bc831cf3b0a9e5aeb52dd33549f3c67e43cc9531ccd17558b570",
+          "bytes": 14091
+        }
+      },
+      {
+        "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0-coordinate",
+        "status": "complete",
+        "cost_evaluations": 192045,
+        "observer_memory": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0-coordinate/observer/memory-summary.json",
+          "sha256": "b89fc3767491d4bb65e0e0c5b29f421aeaf3b79f4f1269b412679d96a21f7db9",
+          "bytes": 709
+        },
+        "observed_wall_seconds": 205.36616924405098,
+        "returncode": 0,
+        "exact_peak_rss_bytes": 11046260736,
+        "sampled_peak_swap_bytes": 0,
+        "seal": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-round0-coordinate/observer/seal.json",
+          "sha256": "83a70ef92c2f620517036407148780415a0a9136c44d5d3552facebfd6310a86",
+          "bytes": 15427
+        }
+      },
+      {
+        "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r1",
+        "status": "complete",
+        "cost_evaluations": 1094999,
+        "observer_memory": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r1/observer/memory-summary.json",
+          "sha256": "c50caa6c6029762ebfc67b0b5a881dc89da11f152787d4ee59f09697166cb81a",
+          "bytes": 708
+        },
+        "observed_wall_seconds": 937.6946443840861,
+        "returncode": 0,
+        "exact_peak_rss_bytes": 12848545792,
+        "sampled_peak_swap_bytes": 0,
+        "seal": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r1/observer/seal.json",
+          "sha256": "3a4fad09b140babf30498263ebe0a32dfb78c1eddce4c711bf9787ced862ebf7",
+          "bytes": 21471
+        }
+      },
+      {
+        "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r2",
+        "status": "complete",
+        "cost_evaluations": 4839791,
+        "observer_memory": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r2/observer/memory-summary.json",
+          "sha256": "42c63e2f261280ec728a0663aadcbc238712d93aaf574cf3b1e50da6263e8bef",
+          "bytes": 711
+        },
+        "observed_wall_seconds": 2566.998216968961,
+        "returncode": 0,
+        "exact_peak_rss_bytes": 17922715648,
+        "sampled_peak_swap_bytes": 0,
+        "seal": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r2/observer/seal.json",
+          "sha256": "f6bc9d0cd6ecf061b16966f9bdd007666a6b1d4f17ada99d7b885b62222831c4",
+          "bytes": 21880
+        }
+      },
+      {
+        "directory": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3",
+        "status": "complete",
+        "cost_evaluations": 4982513,
+        "observer_memory": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/observer/memory-summary.json",
+          "sha256": "b0823d5d7927a5a78b962178df6a53d17f9bf62b1bde63d3e5d509c499ebf0b0",
+          "bytes": 719
+        },
+        "observed_wall_seconds": 2563.5251468908973,
+        "returncode": 0,
+        "exact_peak_rss_bytes": 18064039936,
+        "sampled_peak_swap_bytes": 14352384,
+        "seal": {
+          "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/observer/seal.json",
+          "sha256": "c11bab40b3918dd6c0e338ec46d5cd57fe5a9a9f5f463128ec0f14bccbf2ef5b",
+          "bytes": 22565
+        }
+      }
+    ]
+  },
+  "frontier": {
+    "status": "closed-in-current-supported-backend-local-neighborhood",
+    "enumeration": {
+      "cpu_incumbent_covers": 146,
+      "adjacent_pairs": 72,
+      "legal_merge_fission_moves": 285,
+      "unpriced_choices": 0,
+      "whole_program_disjoint_cohorts": 0,
+      "rejected": {
+        "merge_nonconvex_or_effectful": 71,
+        "fission_illegal_child": 351
+      },
+      "size_cap": null,
+      "time_cap": null,
+      "evaluation_cap": null,
+      "scope": "all legal adjacent pairwise CPU-cover merges and all legal two-way fissions of this incumbent; repeat after measurement and joint search"
+    },
+    "new_unpriced_candidates": 0,
+    "pending_trials": 0,
+    "pending_cohorts": 0,
+    "scope": "all legal registered adjacent CPU-cover pair merges and legal two-way fissions of this actual incumbent have no newly unpriced implementations; combined with separately audited cover/priority cost closure; not global search exhaustion",
+    "proof": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/search-frontier-r3/audit/frontier-closure-binding.json",
+      "sha256": "db625f3709fbd5a362340b58c065883260305baec2cdb6b8c36aa6cf5cf39d3a",
+      "bytes": 1994
+    },
+    "frontier": {
+      "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/frontier-round3.json",
+      "sha256": "21406d3df2f025aa112c3ba28a12f3cf93d6f97e746323abf5da071267c91ba1"
+    },
+    "global_optimality_proved": false,
+    "cartesian_product_exhausted": false
+  },
+  "limitations": [
+    "Original supported-NPU baseline retains mandatory CPU prefill embedding, RoPE, attention and prefill LM-head plus host work; attention and LM-head inside fused decode execute on NPU. It is not an all-operators-on-NPU baseline.",
+    "Three measured requests per plan, one fresh process per plan; no confidence claim.",
+    "Final full-request gain over the prior manual plan is modest; TTFT does not improve.",
+    "All plans pass the original quality gate, but the original supported-NPU baseline diverges in generated tokens at step 2 and is not full128 bitwise-equivalent to the selected plan.",
+    "HF BF16 reference covers 32 outputs only; errors after autoregressive divergence are not treated as local kernel errors.",
+    "Controller fit is approximate; heldout data did not change the winner or training prices.",
+    "Closure covers admitted source-convex CPU regions, registered implementations, adjacent pairwise CPU merges/two-way fissions and legal ready-priority neighbors of this incumbent, not all programs or the full Cartesian mapping space.",
+    "Decode search selects four validated whole36-layer contexts (coalescing x pure host RoPE prefetch), not arbitrary internal decoder transformations.",
+    "Invocation-inclusive costs do not establish separately priced arbitrary DMA overlap or unrestricted SRAM residence.",
+    "Search peak sampled swap is nonzero (14352384 bytes); it must not be reported as zero."
+  ],
+  "independent_final_comparison_audit": {
+    "file": "/home/shiran/project/orbit-artifact/results/taskflow/qwen-ready-r19/final-independent-audit/heldout-audit.json",
+    "sha256": "6d5c03775396d0601e8b48fac37de7db02e5e6dbe50f43e1e6c79d9f81b3f450"
+  }
+}

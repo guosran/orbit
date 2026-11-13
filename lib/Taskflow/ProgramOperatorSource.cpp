@@ -449,13 +449,17 @@ bool checkSelection(const ProgramOperatorSource &source,
         (impl.wallMs && (!std::isfinite(*impl.wallMs) || *impl.wallMs < 0)))
       return fail(error,
                   "invalid executable implementation/cost ownership contract");
+    for (const auto &feature : impl.controllerFeatures)
+      if (feature.first.empty() || feature.second < 0)
+        return fail(error, "negative or unnamed controller feature");
     auto members = sorted(impl.operators);
     if (members.size() != impl.operators.size() ||
         members.back() >= source.operators.size())
       return fail(error, "invalid/duplicate implementation source coverage");
     // The first executable realization accepts contiguous source regions only.
     // A named fused implementation, not adjacency, grants this coverage.
-    if (members.back() - members.front() + 1 != members.size())
+    if (selection.executionPolicy != "source-dependency-ready" &&
+        members.back() - members.front() + 1 != members.size())
       return fail(error,
                   "noncontiguous implementation coverage is unsupported");
     for (size_t op : members) {
@@ -463,7 +467,8 @@ bool checkSelection(const ProgramOperatorSource &source,
         return fail(error, "overlapping implementation coverage");
       owners[op] = r;
     }
-    if (r && selection.regions[r - 1].operators.back() >= members.front())
+    if (selection.executionPolicy != "source-dependency-ready" && r &&
+        selection.regions[r - 1].operators.back() >= members.front())
       return fail(error,
                   "implementation regions violate source execution order");
   }
@@ -525,6 +530,109 @@ lifecycleKinds(const ProgramOperatorImplementation &impl) {
   return {"submit", "complete"};
 }
 } // namespace
+bool orbit::taskflow::programOperatorSourceDependencies(
+    const ProgramOperatorSource &source,
+    std::vector<std::vector<size_t>> &result, std::string &error) {
+  if (!checkProgramOperatorSource(source, error))
+    return false;
+  std::vector<std::set<size_t>> predecessors(source.operators.size());
+  std::vector<int64_t> producers(source.values.size(), -1);
+  std::map<size_t, size_t> lastWriter;
+  std::map<size_t, std::set<size_t>> readers;
+  auto depend = [&](size_t consumer, size_t producer) {
+    if (consumer != producer)
+      predecessors[consumer].insert(producer);
+  };
+  // A whole physical root is conservatively conflicting. Disjoint slice
+  // concurrency needs a separate proved byte-range alias contract. Readonly
+  // view definitions do not mutate their backing allocation.
+  for (size_t o = 0; o < source.operators.size(); ++o) {
+    const auto &op = source.operators[o];
+    size_t owner = o;
+    for (size_t p : op.dependencies)
+      depend(owner, p);
+    std::set<size_t> reads, writes;
+    for (size_t value : op.inputs) {
+      if (producers[value] >= 0)
+        depend(owner, size_t(producers[value]));
+      reads.insert(physicalRoot(source, value));
+    }
+    for (size_t value : op.outputs) {
+      producers[value] = int64_t(owner);
+      if (!source.values[value].view)
+        writes.insert(physicalRoot(source, value));
+    }
+    for (size_t root : reads) {
+      auto previous = lastWriter.find(root);
+      if (previous != lastWriter.end())
+        depend(owner, previous->second);
+      readers[root].insert(owner);
+    }
+    for (size_t root : writes) {
+      auto previous = lastWriter.find(root);
+      if (previous != lastWriter.end())
+        depend(owner, previous->second);
+      for (size_t reader : readers[root])
+        depend(owner, reader);
+      readers[root].clear();
+      lastWriter[root] = owner;
+    }
+  }
+  result.clear();
+  for (const auto &p : predecessors)
+    result.emplace_back(p.begin(), p.end());
+  return true;
+}
+bool orbit::taskflow::programOperatorInvocationDependencies(
+    const ProgramOperatorSource &source,
+    const ProgramOperatorSelection &selection,
+    std::vector<std::vector<size_t>> &result, std::string &error) {
+  std::vector<size_t> owners;
+  if (!checkSelection(source, selection, owners, error))
+    return false;
+  result.assign(selection.regions.size(), {});
+  if (selection.executionPolicy == "synchronous-source-order") {
+    if (!selection.sourceOrderingIdentity.empty() ||
+        !selection.asyncRuntimeProofIdentity.empty())
+      return fail(error, "synchronous selection has spurious async evidence");
+    for (size_t r = 1; r < result.size(); ++r)
+      result[r] = {r - 1};
+    return true;
+  }
+  if (selection.executionPolicy != "source-dependency-ready" ||
+      selection.sourceOrderingIdentity != source.sourceId ||
+      selection.asyncRuntimeProofIdentity.empty())
+    return fail(error, "ready execution lacks source-bound runtime proof");
+  std::vector<std::vector<size_t>> semanticDependencies;
+  if (!programOperatorSourceDependencies(source, semanticDependencies, error))
+    return false;
+  std::vector<std::set<size_t>> predecessors(result.size());
+  for (size_t o = 0; o < source.operators.size(); ++o)
+    for (size_t p : semanticDependencies[o])
+      if (owners[o] != owners[p])
+        predecessors[owners[o]].insert(owners[p]);
+  for (size_t r = 0; r < result.size(); ++r) {
+    result[r].assign(predecessors[r].begin(), predecessors[r].end());
+  }
+  // Quotient cycles detect nonconvex fusion (A -> outside -> A). Source
+  // ordinals alone cannot establish convexity of a noncontiguous cover.
+  std::vector<size_t> indegree(result.size());
+  std::vector<std::vector<size_t>> users(result.size());
+  std::vector<size_t> ready;
+  for (size_t r = 0; r < result.size(); ++r) {
+    indegree[r] = result[r].size();
+    for (size_t p : result[r])
+      users[p].push_back(r);
+    if (!indegree[r])
+      ready.push_back(r);
+  }
+  for (size_t i = 0; i < ready.size(); ++i)
+    for (size_t user : users[ready[i]])
+      if (!--indegree[user])
+        ready.push_back(user);
+  return ready.size() == result.size() ||
+         fail(error, "cyclic source-cover quotient; nonconvex fusion");
+}
 bool orbit::taskflow::materializeProgramOperatorGraph(
     std::shared_ptr<const ProgramOperatorSource> source,
     const ProgramOperatorSelection &selection, const StaticConfig &target,
@@ -537,6 +645,17 @@ bool orbit::taskflow::materializeProgramOperatorGraph(
     return false;
   const auto &s = *source;
   size_t count = selection.regions.size();
+  std::vector<std::vector<size_t>> invocationDependencies;
+  if (!programOperatorInvocationDependencies(s, selection,
+                                             invocationDependencies, error))
+    return false;
+  for (size_t r = 0; r < count; ++r)
+    for (size_t p : invocationDependencies[r])
+      if (p >= r)
+        return fail(
+            error,
+            "physical invocation phases require a canonical topological cover");
+  std::vector<size_t> lifecycleEnds(count);
   std::vector<int64_t> producer(s.values.size(), -1);
   for (size_t o = 0; o < s.operators.size(); ++o)
     for (size_t v : s.operators[o].outputs)
@@ -650,8 +769,7 @@ bool orbit::taskflow::materializeProgramOperatorGraph(
     event.phase = r;
     event.resource = impl.resource;
     event.memory = impl.memory;
-    if (r)
-      event.dependencies = {r - 1}; // conservative real serial runtime order
+    event.dependencies = invocationDependencies[r];
     for (size_t v : impl.inputs) {
       size_t copy = copyForValue.at(v);
       auto &location = graph.copies[copy];
@@ -696,26 +814,33 @@ bool orbit::taskflow::materializeProgramOperatorGraph(
     region.outputCopies = graph.events.back().writes;
     if (impl.device == "npu")
       region.deviceStages = {r};
-    if (r)
-      region.predecessorRegions = {r - 1};
+    region.predecessorRegions = invocationDependencies[r];
     graph.executionRegions.push_back(std::move(region));
+    bool firstActivity = true;
     for (const auto &kind : lifecycleKinds(impl)) {
       MappingRegionEvent activity;
       activity.kind = kind;
       activity.region = r;
       activity.resource = impl.resource;
-      if (!graph.regionEvents.empty())
+      if (firstActivity) {
+        for (size_t p : invocationDependencies[r])
+          activity.dependencies.push_back(lifecycleEnds[p]);
+      } else
         activity.dependencies = {graph.regionEvents.size() - 1};
+      firstActivity = false;
       if (kind == "visible-to-device")
         activity.copies = graph.executionRegions.back().inputCopies;
       if (kind == "visible-to-host")
         activity.copies = graph.executionRegions.back().outputCopies;
       graph.regionEvents.push_back(std::move(activity));
     }
+    lifecycleEnds[r] = graph.regionEvents.size() - 1;
   }
   for (auto &copy : graph.copies) {
     if (!copy.users.empty())
-      copy.lastUsers = {copy.users.back()};
+      copy.lastUsers = selection.executionPolicy == "source-dependency-ready"
+                           ? copy.users
+                           : std::vector<size_t>{copy.users.back()};
     auto &allocation = graph.allocations[copy.allocation];
     allocation.endPhase = std::max(allocation.endPhase, copy.releasedAfter);
   }
@@ -856,6 +981,11 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
       return fail(error,
                   "source operator missing/wrong implementation instance");
   }
+  std::vector<std::vector<size_t>> invocationDependencies;
+  if (!programOperatorInvocationDependencies(s, selection,
+                                             invocationDependencies, error))
+    return false;
+  std::vector<size_t> lifecycleEnds(selection.regions.size());
   size_t edgeCursor = 0, lifecycleCursor = 0;
   std::vector<std::vector<size_t>> users(g.copies.size()),
       consumerEdges(g.copies.size());
@@ -896,8 +1026,7 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
           portMemory(impl, v, false))
         return fail(error, "wrong output physical memory");
     }
-    std::vector<size_t> predecessor =
-        r ? std::vector<size_t>{r - 1} : std::vector<size_t>{};
+    const auto &predecessor = invocationDependencies[r];
     if (event.kind != "implementation" || event.phase != r ||
         event.task != impl.operators.front() ||
         event.resource != impl.resource || event.memory != impl.memory ||
@@ -923,13 +1052,18 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
         region.deviceStages != (impl.device == "npu" ? std::vector<size_t>{r}
                                                      : std::vector<size_t>{}))
       return fail(error, "region coverage/lifecycle fabricated");
+    bool firstActivity = true;
     for (const auto &kind : lifecycleKinds(impl)) {
       if (lifecycleCursor >= g.regionEvents.size())
         return fail(error, "missing invocation lifecycle event");
       const auto &activity = g.regionEvents[lifecycleCursor];
-      auto dependencies = lifecycleCursor
-                              ? std::vector<size_t>{lifecycleCursor - 1}
-                              : std::vector<size_t>{};
+      std::vector<size_t> dependencies;
+      if (firstActivity) {
+        for (size_t p : invocationDependencies[r])
+          dependencies.push_back(lifecycleEnds[p]);
+      } else
+        dependencies = {lifecycleCursor - 1};
+      firstActivity = false;
       auto copies =
           kind == "visible-to-device"
               ? inputs
@@ -941,6 +1075,7 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
                     "fake host sync/readback or missing invocation ordering");
       ++lifecycleCursor;
     }
+    lifecycleEnds[r] = lifecycleCursor - 1;
   }
   if (edgeCursor != g.dataEdges.size() ||
       lifecycleCursor != g.regionEvents.size() || !g.orderEdges.empty())
@@ -948,7 +1083,9 @@ bool orbit::taskflow::checkProgramOperatorGraph(const ProgramGraph &g,
   for (size_t c = 0; c < g.copies.size(); ++c) {
     std::vector<size_t> last;
     if (!users[c].empty())
-      last = {users[c].back()};
+      last = selection.executionPolicy == "source-dependency-ready"
+                 ? users[c]
+                 : std::vector<size_t>{users[c].back()};
     if (g.copies[c].users != users[c] ||
         g.copies[c].consumerEdges != consumerEdges[c] ||
         g.copies[c].lastUsers != last)
@@ -972,11 +1109,13 @@ j::Value orbit::taskflow::serializeProgramOperatorSelection(
         array.push_back(int64_t(v));
       return array;
     };
-    j::Object inputs, outputs;
+    j::Object inputs, outputs, controllerFeatures;
     for (const auto &p : impl.inputLocations)
       inputs[std::to_string(p.first)] = p.second;
     for (const auto &p : impl.outputLocations)
       outputs[std::to_string(p.first)] = p.second;
+    for (const auto &feature : impl.controllerFeatures)
+      controllerFeatures[feature.first] = feature.second;
     regions.push_back(j::Object{
         {"id", impl.id},
         {"source_id", impl.sourceId},
@@ -992,13 +1131,18 @@ j::Value orbit::taskflow::serializeProgramOperatorSelection(
         {"executable", impl.executable},
         {"launch_count", impl.launchCount},
         {"cost_boundary", impl.costBoundary},
+        {"controller_features", std::move(controllerFeatures)},
         {"transport_ownership", impl.transportOwnership},
         {"visibility_policy", impl.visibilityPolicy},
         {"input_locations", std::move(inputs)},
         {"output_locations", std::move(outputs)}});
   }
-  return j::Object{{"schema", "orbit.program-operator-selection.v1"},
-                   {"regions", std::move(regions)}};
+  return j::Object{
+      {"schema", "orbit.program-operator-selection.v1"},
+      {"execution_policy", selection.executionPolicy},
+      {"source_ordering_identity", selection.sourceOrderingIdentity},
+      {"async_runtime_proof_identity", selection.asyncRuntimeProofIdentity},
+      {"regions", std::move(regions)}};
 }
 
 j::Value
@@ -1028,7 +1172,11 @@ orbit::taskflow::summarizeProgramOperatorGraph(const ProgramGraph &graph) {
       {"source_operators", int64_t(graph.operatorSource->operators.size())},
       {"physical_invocations", int64_t(graph.events.size())},
       {"actual_npu_launches", launches},
-      {"estimated_ms", complete ? j::Value(wall) : j::Value(nullptr)},
+      {"inclusive_invocation_work_ms",
+       complete ? j::Value(wall) : j::Value(nullptr)},
+      {"estimated_ms", graph.operatorMapping && graph.estimatedMakespanMs
+                           ? j::Value(*graph.estimatedMakespanMs)
+                           : (complete ? j::Value(wall) : j::Value(nullptr))},
       {"unknown_implementations", std::move(unknown)},
       {"boundary",
        "inclusive-region-wall; internal operator durations not inferred"},
@@ -1089,6 +1237,16 @@ bool orbit::taskflow::parseProgramOperatorImplementations(
         !ids("inputs", "input_values", valueIds, impl.inputs) ||
         !ids("outputs", "output_values", valueIds, impl.outputs))
       return fail(error, "invalid implementation source/ABI references");
+    if (o->get("controller_features") && !o->getObject("controller_features"))
+      return fail(error,
+                  "controller_features must be an explicit integer table");
+    if (auto *features = o->getObject("controller_features"))
+      for (const auto &feature : *features) {
+        auto amount = feature.second.getAsInteger();
+        if (llvm::StringRef(feature.first).empty() || !amount || *amount < 0)
+          return fail(error, "unknown/negative controller callback count");
+        impl.controllerFeatures.emplace(feature.first.str(), *amount);
+      }
     auto executable = o->getBoolean("executable");
     auto launches = o->getInteger("launch_count");
     if (!executable || !launches)
@@ -1141,7 +1299,7 @@ bool orbit::taskflow::certifyProgramOperatorChoices(
     const ProgramOperatorSource &source,
     const std::vector<ProgramOperatorImplementation> &implementations,
     const std::vector<ProgramOperatorChoiceGroup> &groups, j::Value &receipt,
-    std::string &error) {
+    std::string &error, bool dependencyReady) {
   std::vector<int64_t> producer(source.values.size(), -1);
   std::vector<std::vector<size_t>> readers(source.values.size());
   for (size_t o = 0; o < source.operators.size(); ++o) {
@@ -1157,8 +1315,9 @@ bool orbit::taskflow::certifyProgramOperatorChoices(
         impl.memory.empty() || impl.operators.empty() ||
         sorted(impl.operators) != impl.operators ||
         impl.operators.back() >= source.operators.size() ||
-        impl.operators.back() - impl.operators.front() + 1 !=
-            impl.operators.size() ||
+        (!dependencyReady &&
+         impl.operators.back() - impl.operators.front() + 1 !=
+             impl.operators.size()) ||
         (impl.device != "cpu" && impl.device != "npu") ||
         impl.costBoundary != "inclusive-region-wall" ||
         impl.transportOwnership != "implementation-inclusive" ||
@@ -1167,6 +1326,9 @@ bool orbit::taskflow::certifyProgramOperatorChoices(
         (impl.device == "cpu" ? impl.launchCount != 0 : impl.launchCount < 1) ||
         (impl.wallMs && (!std::isfinite(*impl.wallMs) || *impl.wallMs < 0)))
       return fail(error, "invalid local executable implementation certificate");
+    for (const auto &feature : impl.controllerFeatures)
+      if (feature.first.empty() || feature.second < 0)
+        return fail(error, "invalid local controller feature certificate");
     auto contains = [&](int64_t o) {
       return o >= 0 && std::binary_search(impl.operators.begin(),
                                           impl.operators.end(), size_t(o));
@@ -1288,9 +1450,14 @@ bool orbit::taskflow::certifyProgramOperatorChoices(
       {"source_id", source.sourceId},
       {"source_operators", int64_t(source.operators.size())},
       {"groups", std::move(groupEvidence)},
+      {"dependency_ready", dependencyReady},
       {"candidate_legality",
-       "product of exact local source covers with invariant cross-group ABI; "
-       "source order/state/version semantics checked before certification"},
+       dependencyReady
+           ? "local exact source covers and invariant ABI; each assignment "
+             "still requires dependency-quotient and resource-calendar checks"
+           : "product of exact local source covers with invariant cross-group "
+             "ABI; source order/state/version semantics checked before "
+             "certification"},
       {"cost_ownership", "actual implementation invocation/transport fees; no "
                          "adjacency-based fusion"},
       {"physical_capacity_scope",

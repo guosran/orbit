@@ -1,7 +1,9 @@
 #include "Taskflow/ProgramOperatorMapping.h"
+#include "Taskflow/JSONUtils.h"
 #include "Taskflow/ProgramTargetBinding.h"
 #include <algorithm>
 #include <cmath>
+#include <queue>
 #include <set>
 using namespace orbit::taskflow;
 namespace j = llvm::json;
@@ -162,28 +164,49 @@ bool add(int64_t &a, int64_t b) {
   a += b;
   return true;
 }
+bool fitsReservation(const Calendar &calendar, const std::string &key,
+                     double begin, double end, int64_t amount,
+                     int64_t capacity) {
+  if (amount < 0 || amount > capacity)
+    return false;
+  if (begin == end || amount == 0)
+    return true;
+  auto entry = calendar.find(key);
+  if (entry == calendar.end() || entry->second.empty() ||
+      begin >= entry->second.rbegin()->first)
+    return true; // No previously scheduled interval remains live.
+  __int128 live = 0;
+  for (const auto &point : entry->second) {
+    if (point.first >= end)
+      break;
+    live += point.second;
+    if (point.first <= begin) {
+      auto next = entry->second.upper_bound(point.first);
+      if (next != entry->second.end() && next->first <= begin)
+        continue;
+    }
+    if (live + amount > capacity)
+      return false;
+  }
+  return true;
+}
 bool reserve(Calendar &calendar, const std::string &key, double begin,
              double end, int64_t amount, int64_t capacity, std::string &error) {
-  if (amount < 0 || amount > capacity)
-    return fail(error, "reservation exceeds capacity: " + key);
-  if (begin == end)
+  if (!fitsReservation(calendar, key, begin, end, amount, capacity))
+    return fail(error, "overlapping reservations exceed capacity: " + key);
+  if (begin == end || !amount)
     return true;
   for (auto change :
        {std::make_pair(begin, amount), std::make_pair(end, -amount)}) {
     __int128 delta = __int128(calendar[key][change.first]) + change.second;
     if (delta < INT64_MIN || delta > INT64_MAX)
       return fail(error, "calendar delta overflow: " + key);
-    calendar[key][change.first] = int64_t(delta);
+    if (!delta)
+      calendar[key].erase(change.first);
+    else
+      calendar[key][change.first] = int64_t(delta);
   }
-  int64_t live = 0;
-  for (auto change : calendar[key]) {
-    // Summed deltas may overflow if malformed callers reserve INT64_MAX twice.
-    __int128 next = __int128(live) + change.second;
-    if (next < 0 || next > capacity)
-      return fail(error, "overlapping reservations exceed capacity: " + key);
-    live = int64_t(next);
-  }
-  return live == 0 || fail(error, "unclosed reservation: " + key);
+  return true;
 }
 struct ScheduleView {
   const ProgramOperatorSelection *operatorSelection;
@@ -218,6 +241,26 @@ bool build(const ScheduleView &g, const ProgramOperatorMapping &mapping,
       return fail(error, "ready priority is not a permutation");
     rank[event] = i;
   }
+  ProgramOperatorSelection policy;
+  for (const auto &impl : g.operatorSelection->regions) {
+    ProgramOperatorImplementation identity;
+    identity.id = impl.id;
+    identity.sourceId = impl.sourceId;
+    policy.regions.push_back(std::move(identity));
+  }
+  if (!configureProgramOperatorExecutionPolicy(policy, mapping, error) ||
+      policy.executionPolicy != g.operatorSelection->executionPolicy ||
+      policy.sourceOrderingIdentity !=
+          g.operatorSelection->sourceOrderingIdentity ||
+      policy.asyncRuntimeProofIdentity !=
+          g.operatorSelection->asyncRuntimeProofIdentity)
+    return fail(error, "graph and registered execution policy disagree");
+  double outsideControlMs;
+  std::map<std::string, int64_t> outsideFeatures;
+  if (!estimateProgramOperatorInvocationControl(
+          *g.operatorSelection, mapping.controlModel, outsideControlMs,
+          outsideFeatures, error))
+    return false;
   StaticConfig target;
   target.resources = g.resources;
   target.domains = g.domains;
@@ -335,64 +378,93 @@ bool build(const ScheduleView &g, const ProgramOperatorMapping &mapping,
     return true;
   }
   Calendar resourceCalendar, memoryCalendar;
-  std::vector<bool> done(g.events.size());
+  std::vector<size_t> remaining(g.events.size());
+  std::vector<std::vector<size_t>> users(g.events.size());
+  std::priority_queue<std::pair<size_t, size_t>,
+                      std::vector<std::pair<size_t, size_t>>,
+                      std::greater<std::pair<size_t, size_t>>>
+      ready;
+  for (size_t i = 0; i < g.events.size(); ++i) {
+    remaining[i] = g.events[i].dependencies.size();
+    for (size_t p : g.events[i].dependencies) {
+      if (p >= g.events.size() || p == i)
+        return fail(error, "invalid invocation dependency");
+      users[p].push_back(i);
+    }
+    if (!remaining[i])
+      ready.emplace(rank[i], i);
+  }
   double makespan = 0;
   for (size_t issued = 0; issued < g.events.size(); ++issued) {
-    size_t chosen = SIZE_MAX;
-    for (size_t i = 0; i < g.events.size(); ++i) {
-      if (done[i])
-        continue;
-      bool ready = true;
-      for (size_t p : g.events[i].dependencies) {
-        if (p >= g.events.size())
-          return fail(error, "dependency out of bounds");
-        ready &= done[p];
-      }
-      if (ready && (chosen == SIZE_MAX || rank[i] < rank[chosen]))
-        chosen = i;
-    }
-    if (chosen == SIZE_MAX)
+    if (ready.empty())
       return fail(error, "cyclic implementation schedule");
+    size_t chosen = ready.top().second;
+    ready.pop();
     double earliest = 0;
     for (size_t p : g.events[chosen].dependencies)
       earliest = std::max(earliest, *schedule.events[p].endMs);
     // Every contention transition is a calendar endpoint, so scanning these
     // points finds the earliest feasible nonpreemptive reservation exactly.
     std::set<double> starts{earliest};
-    for (const auto *calendar : {&resourceCalendar, &memoryCalendar})
-      for (const auto &r : *calendar)
-        for (const auto &point : r.second)
-          if (point.first >= earliest)
-            starts.insert(point.first);
+    // Only resources used by this invocation can delay it. A strict serial
+    // suffix starts after the current makespan and needs no endpoint scan.
+    if (earliest < makespan) {
+      auto endpoints = [&](const Calendar &calendar, const auto &requirements) {
+        for (const auto &requirement : requirements) {
+          auto entry = calendar.find(requirement.first);
+          if (entry != calendar.end())
+            for (auto p = entry->second.lower_bound(earliest);
+                 p != entry->second.end(); ++p)
+              starts.insert(p->first);
+        }
+      };
+      endpoints(resourceCalendar, demands[chosen]);
+      endpoints(memoryCalendar, mapping.variants[chosen].temporaryBytes);
+    }
     bool placed = false;
     for (double begin : starts) {
       double end = begin + schedule.eventDurationsMs[chosen];
       if (!std::isfinite(end))
         return fail(error, "schedule time overflow");
-      auto resources = resourceCalendar, memory = memoryCalendar;
       std::string rejected;
       bool fits = true;
       for (const auto &d : demands[chosen]) {
         auto *r = programResource(target, d.first);
-        fits &= r && reserve(resources, d.first, begin, end, d.second,
-                             r->capacity, rejected);
+        fits &= r && fitsReservation(resourceCalendar, d.first, begin, end,
+                                     d.second, r->capacity);
       }
       for (const auto &t : mapping.variants[chosen].temporaryBytes) {
         auto *m = programMemory(target, t.first);
         int64_t available = m->capacityKnown
                                 ? m->capacityBytes - persistent[m->id]
                                 : INT64_MAX - persistent[m->id];
-        fits &=
-            reserve(memory, t.first, begin, end, t.second, available, rejected);
+        fits &= fitsReservation(memoryCalendar, t.first, begin, end, t.second,
+                                available);
       }
       if (!fits)
         continue;
-      resourceCalendar = std::move(resources);
-      memoryCalendar = std::move(memory);
+      // Probe first, commit once: rejected placements never mutate a calendar
+      // and evaluating a candidate does not copy all prior reservations.
+      for (const auto &d : demands[chosen])
+        if (!reserve(resourceCalendar, d.first, begin, end, d.second,
+                     programResource(target, d.first)->capacity, rejected))
+          return fail(error, rejected);
+      for (const auto &t : mapping.variants[chosen].temporaryBytes) {
+        const auto *m = programMemory(target, t.first);
+        int64_t available = m->capacityKnown
+                                ? m->capacityBytes - persistent[m->id]
+                                : INT64_MAX - persistent[m->id];
+        if (!reserve(memoryCalendar, t.first, begin, end, t.second, available,
+                     rejected))
+          return fail(error, rejected);
+      }
       schedule.events[chosen] = {chosen, g.events[chosen].dependencies, begin,
                                  end};
       makespan = std::max(makespan, end);
-      placed = done[chosen] = true;
+      placed = true;
+      for (size_t user : users[chosen])
+        if (!--remaining[user])
+          ready.emplace(rank[user], user);
       break;
     }
     if (!placed)
@@ -402,6 +474,108 @@ bool build(const ScheduleView &g, const ProgramOperatorMapping &mapping,
   return true;
 }
 } // namespace
+bool orbit::taskflow::estimateProgramOperatorInvocationControl(
+    const ProgramOperatorSelection &selection,
+    const std::optional<ProgramOperatorInvocationControlModel> &model,
+    double &controlMs, std::map<std::string, int64_t> &features,
+    std::string &error) {
+  controlMs = 0;
+  features.clear();
+  if (!model)
+    return true;
+  if (model->identity.empty() || model->sourceId.empty() ||
+      model->boundary != "outside-inclusive-invocation-wall" ||
+      !std::isfinite(model->interceptMs) || model->interceptMs < 0 ||
+      model->coefficients.size() != 2 ||
+      !model->coefficients.count("cpu_callbacks") ||
+      !model->coefficients.count("npu_callbacks"))
+    return fail(error, "invalid outside-invocation controller model contract");
+  for (const auto &coefficient : model->coefficients) {
+    if (!std::isfinite(coefficient.second) || coefficient.second < 0)
+      return fail(error, "unknown/nonfinite/negative controller coefficient");
+    features[coefficient.first] = 0;
+  }
+  for (const auto &impl : selection.regions) {
+    if (impl.sourceId != model->sourceId ||
+        impl.controllerFeatures.size() != model->coefficients.size())
+      return fail(error, "controller model source or explicit callback "
+                         "features are unavailable");
+    for (const auto &feature : impl.controllerFeatures) {
+      auto count = features.find(feature.first);
+      if (count == features.end() || feature.second < 0 ||
+          feature.second > INT64_MAX - count->second)
+        return fail(error,
+                    "unknown/negative/overflowing controller callback feature");
+      count->second += feature.second;
+    }
+  }
+  controlMs = model->interceptMs;
+  for (const auto &feature : features)
+    controlMs += model->coefficients.at(feature.first) * double(feature.second);
+  if (!std::isfinite(controlMs))
+    return fail(error, "controller prediction overflows finite wall time");
+  return true;
+}
+namespace {
+j::Value serializeControlModel(
+    const std::optional<ProgramOperatorInvocationControlModel> &model) {
+  if (!model)
+    return nullptr;
+  j::Object coefficients;
+  for (const auto &c : model->coefficients)
+    coefficients[c.first] = c.second;
+  return j::Object{{"schema", "orbit.program-invocation-control-model.v1"},
+                   {"identity", model->identity},
+                   {"source_id", model->sourceId},
+                   {"boundary", model->boundary},
+                   {"intercept_ms", model->interceptMs},
+                   {"coefficients", std::move(coefficients)}};
+}
+} // namespace
+bool orbit::taskflow::parseProgramOperatorInvocationControlModel(
+    const ProgramOperatorSource &source, const j::Value &catalogue,
+    std::optional<ProgramOperatorInvocationControlModel> &model,
+    std::string &error) {
+  model.reset();
+  const auto *root = catalogue.getAsObject();
+  const auto *value = root ? root->get("invocation_control_model") : nullptr;
+  if (!value)
+    return true;
+  const auto *object = value->getAsObject();
+  if (!object ||
+      object->getString("schema") !=
+          "orbit.program-invocation-control-model.v1" ||
+      object->getString("source_id") != source.sourceId ||
+      !object->getObject("fit"))
+    return fail(error, "invalid source-bound calibrated controller model");
+  auto identity = object->getString("identity"),
+       boundary = object->getString("boundary");
+  auto intercept = object->getNumber("intercept_ms");
+  const auto *coefficients = object->getObject("coefficients");
+  if (!identity || identity->empty() || !boundary || !intercept ||
+      !coefficients)
+    return fail(error,
+                "controller identity/boundary/coefficients are unavailable");
+  ProgramOperatorInvocationControlModel parsed;
+  parsed.identity = identity->str();
+  parsed.sourceId = source.sourceId;
+  parsed.boundary = boundary->str();
+  parsed.interceptMs = *intercept;
+  for (const auto &entry : *coefficients) {
+    auto coefficient = entry.second.getAsNumber();
+    if (!coefficient)
+      return fail(error,
+                  "controller coefficients must be explicit finite numbers");
+    parsed.coefficients.emplace(entry.first.str(), *coefficient);
+  }
+  double ignored;
+  std::map<std::string, int64_t> features;
+  if (!estimateProgramOperatorInvocationControl({}, parsed, ignored, features,
+                                                error))
+    return false;
+  model = std::move(parsed);
+  return true;
+}
 bool orbit::taskflow::scheduleProgramOperatorGraph(
     ProgramGraph &graph, const ProgramOperatorMapping &mapping,
     std::string &error) {
@@ -418,6 +592,12 @@ bool orbit::taskflow::scheduleProgramOperatorGraph(
                                 mapping.variants[i], error))
       return false;
   if (!applyPacking(graph, mapping, error))
+    return false;
+  double controlMs;
+  std::map<std::string, int64_t> controlFeatures;
+  if (!estimateProgramOperatorInvocationControl(*graph.operatorSelection,
+                                                mapping.controlModel, controlMs,
+                                                controlFeatures, error))
     return false;
   MappingGraphSchedule schedule;
   if (!build(ScheduleView(graph), mapping, schedule, error))
@@ -438,6 +618,12 @@ bool orbit::taskflow::checkProgramOperatorMapping(const ProgramGraph &graph,
                                 graph.operatorSelection->regions[i],
                                 graph.operatorMapping->variants[i], error))
       return false;
+  double controlMs;
+  std::map<std::string, int64_t> controlFeatures;
+  if (!estimateProgramOperatorInvocationControl(
+          *graph.operatorSelection, graph.operatorMapping->controlModel,
+          controlMs, controlFeatures, error))
+    return false;
   MappingGraphSchedule expected;
   if (!build(ScheduleView(graph), *graph.operatorMapping, expected, error))
     return false;
@@ -516,6 +702,9 @@ j::Value orbit::taskflow::serializeProgramOperatorMapping(
                   {"artifact_identity", v.artifactIdentity},
                   {"entrypoint", v.entrypoint},
                   {"runtime_context_identity", v.runtimeContextIdentity},
+                  {"execution_policy", v.executionPolicy},
+                  {"source_ordering_identity", v.sourceOrderingIdentity},
+                  {"async_runtime_proof_identity", v.asyncRuntimeProofIdentity},
                   {"dataflow", v.dataflow},
                   {"residence_policy", v.residencePolicy},
                   {"implementation_parameters", std::move(parameters)},
@@ -532,8 +721,129 @@ j::Value orbit::taskflow::serializeProgramOperatorMapping(
   return j::Object{{"schema", "orbit.program-operator-mapping.v1"},
                    {"host_memory", m.hostMemory},
                    {"registration_identity", m.registrationIdentity},
+                   {"control_model", serializeControlModel(m.controlModel)},
                    {"variants", std::move(variants)},
                    {"ready_priority", std::move(priority)}};
+}
+bool orbit::taskflow::configureProgramOperatorExecutionPolicy(
+    ProgramOperatorSelection &selection, const ProgramOperatorMapping &mapping,
+    std::string &error) {
+  if (selection.regions.size() != mapping.variants.size() ||
+      selection.regions.empty())
+    return fail(error, "execution policy needs every registered invocation");
+  const auto &first = mapping.variants.front();
+  for (size_t i = 0; i < mapping.variants.size(); ++i) {
+    const auto &v = mapping.variants[i];
+    if (v.executionPolicy != first.executionPolicy ||
+        v.sourceOrderingIdentity != first.sourceOrderingIdentity ||
+        v.asyncRuntimeProofIdentity != first.asyncRuntimeProofIdentity ||
+        v.implementationId != selection.regions[i].id)
+      return fail(error, "mixed or mismatched runtime execution policies");
+    if (v.executionPolicy == "source-dependency-ready") {
+      if (v.sourceOrderingIdentity != selection.regions[i].sourceId ||
+          v.asyncRuntimeProofIdentity.empty())
+        return fail(error, "async runtime lacks source-bound support proof");
+    } else if (v.executionPolicy != "synchronous-source-order" ||
+               !v.sourceOrderingIdentity.empty() ||
+               !v.asyncRuntimeProofIdentity.empty())
+      return fail(error, "invalid runtime execution policy");
+  }
+  selection.executionPolicy = first.executionPolicy;
+  selection.sourceOrderingIdentity = first.sourceOrderingIdentity;
+  selection.asyncRuntimeProofIdentity = first.asyncRuntimeProofIdentity;
+  return true;
+}
+bool orbit::taskflow::canonicalizeProgramOperatorCandidate(
+    const ProgramOperatorSource &source,
+    ProgramOperatorMappingCandidate &candidate, std::string &error) {
+  if (!configureProgramOperatorExecutionPolicy(candidate.selection,
+                                               candidate.mapping, error))
+    return false;
+  if (candidate.selection.executionPolicy == "synchronous-source-order")
+    return true;
+  std::vector<std::vector<size_t>> dependencies;
+  if (!programOperatorInvocationDependencies(source, candidate.selection,
+                                             dependencies, error))
+    return false;
+  const auto n = dependencies.size();
+  if (candidate.mapping.readyPriority.size() != n)
+    return fail(error,
+                "canonicalization needs a complete priority permutation");
+  std::vector<size_t> indegree(n), order, inverse(n), rank(n, SIZE_MAX);
+  std::vector<std::vector<size_t>> users(n);
+  std::set<size_t> ready;
+  for (size_t i = 0; i < n; ++i) {
+    auto p = candidate.mapping.readyPriority[i];
+    if (p >= n || rank[p] != SIZE_MAX)
+      return fail(error, "canonicalization priority is not a permutation");
+    rank[p] = i;
+    indegree[i] = dependencies[i].size();
+    for (size_t p : dependencies[i])
+      users[p].push_back(i);
+    if (!indegree[i])
+      ready.insert(i);
+  }
+  while (!ready.empty()) {
+    size_t i = *ready.begin();
+    ready.erase(ready.begin());
+    inverse[i] = order.size();
+    order.push_back(i);
+    for (size_t u : users[i])
+      if (!--indegree[u])
+        ready.insert(u);
+  }
+  if (order.size() != n)
+    return fail(error, "cyclic source implementation quotient");
+  auto selection = candidate.selection;
+  auto variants = candidate.mapping.variants;
+  for (size_t i = 0; i < n; ++i) {
+    candidate.selection.regions[i] = selection.regions[order[i]];
+    candidate.mapping.variants[i] = variants[order[i]];
+    candidate.mapping.readyPriority[rank[i]] = inverse[i];
+  }
+  return true;
+}
+bool orbit::taskflow::setProgramOperatorReadyPriority(
+    const ProgramOperatorSelection &selection, ProgramOperatorMapping &mapping,
+    llvm::StringRef policy, std::string &error) {
+  if (policy != "source-order" && policy != "reverse-source-order" &&
+      policy != "cpu-first" && policy != "npu-first" &&
+      policy != "longest-first")
+    return fail(error, "unknown registered ready-priority policy");
+  mapping.readyPriority.resize(selection.regions.size());
+  for (size_t i = 0; i < selection.regions.size(); ++i)
+    mapping.readyPriority[i] = i;
+  if (policy == "reverse-source-order")
+    std::reverse(mapping.readyPriority.begin(), mapping.readyPriority.end());
+  else if (policy != "source-order")
+    std::stable_sort(mapping.readyPriority.begin(), mapping.readyPriority.end(),
+                     [&](size_t a, size_t b) {
+                       const auto &x = selection.regions[a],
+                                  &y = selection.regions[b];
+                       if (policy == "longest-first")
+                         return x.wallMs.value_or(0) > y.wallMs.value_or(0);
+                       const auto device =
+                           policy == "cpu-first" ? "cpu" : "npu";
+                       return (x.device == device) > (y.device == device);
+                     });
+  return true;
+}
+std::vector<ProgramOperatorMappingAction>
+orbit::taskflow::programOperatorReadyPriorityNeighbors(
+    const ProgramOperatorMappingCandidate &candidate) {
+  std::vector<ProgramOperatorMappingAction> result;
+  if (candidate.selection.executionPolicy != "source-dependency-ready")
+    return result;
+  // Adjacent transpositions generate every finite priority permutation. A
+  // priority is only a tie breaker among semantically ready invocations.
+  for (size_t i = 1; i < candidate.mapping.readyPriority.size(); ++i) {
+    ProgramOperatorMappingAction action;
+    action.kind = ProgramOperatorMappingActionKind::ReadyPriority;
+    action.readyPriority = candidate.mapping.readyPriority;
+    std::swap(action.readyPriority[i - 1], action.readyPriority[i]);
+    result.push_back(std::move(action));
+  }
+  return result;
 }
 bool orbit::taskflow::applyProgramOperatorMappingAction(
     const ProgramOperatorMappingCandidate &parent,
@@ -593,6 +903,105 @@ bool orbit::taskflow::applyProgramOperatorMappingAction(
     child.mapping.readyPriority[i] = i;
   return true;
 }
+bool orbit::taskflow::applyProgramOperatorRegisteredMappingAction(
+    const ProgramOperatorMappingCandidate &parent,
+    const ProgramOperatorMappingAction &action,
+    const std::vector<ProgramOperatorImplementation> &implementations,
+    const std::map<std::string, ProgramOperatorExecutionVariant> &variants,
+    ProgramOperatorMappingCandidate &child, std::string &error) {
+  if (action.kind != ProgramOperatorMappingActionKind::IndependentReplica &&
+      action.kind !=
+          ProgramOperatorMappingActionKind::IndependentResourceShape &&
+      action.kind != ProgramOperatorMappingActionKind::IndependentResidence)
+    return fail(
+        error,
+        "registered coordinate resolver supports replica/shape/residence only; "
+        "transfer routes require an executable copy ABI");
+  if (!action.regionCount ||
+      action.firstRegion >= parent.selection.regions.size() ||
+      action.regionCount >
+          parent.selection.regions.size() - action.firstRegion ||
+      action.replacements.empty() ||
+      parent.mapping.variants.size() != parent.selection.regions.size())
+    return fail(error, "invalid registered coordinate replacement range");
+  ProgramOperatorMappingAction resolved = action;
+  resolved.kind = ProgramOperatorMappingActionKind::ReplaceExecutableCover;
+  resolved.replacements.clear();
+  resolved.replacementVariants.clear();
+  auto coordinate = [&](const ProgramOperatorExecutionVariant &v) {
+    ProgramOperatorMapping single;
+    single.variants = {v};
+    auto value = serializeProgramOperatorMapping(single);
+    const auto &serialized =
+        *value.getAsObject()->getArray("variants")->front().getAsObject();
+    j::Object result;
+    if (action.kind == ProgramOperatorMappingActionKind::IndependentReplica) {
+      result["replicas"] = v.replicas;
+      result["work_distribution"] = v.workDistribution;
+      result["work_partitions"] =
+          copyJSONWithoutFields(*serialized.get("work_partitions"));
+    } else if (action.kind ==
+               ProgramOperatorMappingActionKind::IndependentResourceShape) {
+      result["resource_shape"] =
+          copyJSONWithoutFields(*serialized.get("resource_shape"));
+      result["resource_demands"] =
+          copyJSONWithoutFields(*serialized.get("resource_demands"));
+    } else {
+      result["residence_policy"] = v.residencePolicy;
+      result["resident_allocations"] =
+          copyJSONWithoutFields(*serialized.get("resident_allocations"));
+      result["packed_inputs"] =
+          copyJSONWithoutFields(*serialized.get("packed_inputs"));
+    }
+    return staticFingerprint(j::Value(std::move(result)));
+  };
+  std::map<size_t, std::pair<std::string, std::string>> oldCoordinates;
+  auto binding = [](const ProgramOperatorExecutionVariant &v) {
+    return staticFingerprint(j::Object{{"artifact", v.artifactIdentity},
+                                       {"entrypoint", v.entrypoint},
+                                       {"context", v.runtimeContextIdentity},
+                                       {"residence", v.residencePolicy}});
+  };
+  for (size_t i = action.firstRegion;
+       i < action.firstRegion + action.regionCount; ++i)
+    for (size_t op : parent.selection.regions[i].operators)
+      oldCoordinates[op] = {coordinate(parent.mapping.variants[i]),
+                            binding(parent.mapping.variants[i])};
+  bool changed = false;
+  for (const auto &request : action.replacements) {
+    auto found =
+        std::find_if(implementations.begin(), implementations.end(),
+                     [&](const auto &i) { return i.id == request.id; });
+    auto variant = variants.find(request.id);
+    if (found == implementations.end() || variant == variants.end() ||
+        !found->executable || variant->second.implementationId != found->id ||
+        variant->second.artifactIdentity != found->artifactIdentity ||
+        variant->second.entrypoint != found->entrypoint)
+      return fail(error,
+                  "coordinate action has no registered executable artifact");
+    // The request names an immutable registration. Its supplied field edits
+    // are ignored, so neither a caller flag nor a stale partial ABI is trusted.
+    resolved.replacements.push_back(*found);
+    resolved.replacementVariants.push_back(variant->second);
+    const auto key = coordinate(variant->second);
+    for (size_t op : found->operators) {
+      auto old = oldCoordinates.find(op);
+      if (old == oldCoordinates.end())
+        return fail(error, "coordinate action changes logical source coverage");
+      changed |= old->second.first != key &&
+                 old->second.second != binding(variant->second);
+    }
+  }
+  if (!changed)
+    return fail(
+        error,
+        "requested coordinate has no actual registered implementation change");
+  if (!applyProgramOperatorMappingAction(parent, resolved, child, error) ||
+      !configureProgramOperatorExecutionPolicy(child.selection, child.mapping,
+                                               error))
+    return false;
+  return true;
+}
 ProgramSearchEvaluation
 orbit::taskflow::evaluateProgramOperatorMappingCandidate(
     std::shared_ptr<const ProgramOperatorSource> source,
@@ -601,9 +1010,12 @@ orbit::taskflow::evaluateProgramOperatorMappingCandidate(
     ProgramGraph &materialized) {
   ProgramSearchEvaluation result;
   std::string error;
-  if (!materializeProgramOperatorGraph(source, candidate.selection, target,
+  auto checked = candidate;
+  if (!source ||
+      !canonicalizeProgramOperatorCandidate(*source, checked, error) ||
+      !materializeProgramOperatorGraph(source, checked.selection, target,
                                        hostMemory, materialized, error) ||
-      !scheduleProgramOperatorGraph(materialized, candidate.mapping, error)) {
+      !scheduleProgramOperatorGraph(materialized, checked.mapping, error)) {
     result.message = error;
     // A missing implementation duration is unavailable evidence, rather than
     // mathematical infeasibility. No zero-duration replacement is introduced.
@@ -612,7 +1024,17 @@ orbit::taskflow::evaluateProgramOperatorMappingCandidate(
     return result;
   }
   result.feasible = true;
-  result.costMs = materialized.estimatedMakespanMs;
+  double controlMs;
+  std::map<std::string, int64_t> controlFeatures;
+  if (!estimateProgramOperatorInvocationControl(
+          *materialized.operatorSelection, candidate.mapping.controlModel,
+          controlMs, controlFeatures, error)) {
+    result.feasible = false;
+    result.feasibilityKnown = false;
+    result.message = error;
+    return result;
+  }
+  result.costMs = materialized.estimatedMakespanMs.value_or(0) + controlMs;
   j::Array unproved;
   std::set<std::string> usedMemories;
   for (const auto &a : materialized.allocations)
@@ -634,11 +1056,15 @@ orbit::taskflow::evaluateProgramOperatorMappingCandidate(
     }
   result.message = "checked source/cover/ABI/copy/resource-calendar mapping; "
                    "backend arithmetic and registration proof remain external";
-  result.result =
-      j::Object{{"schedule_policy", materialized.schedule.policy},
-                {"mapping", serializeProgramOperatorMapping(candidate.mapping)},
-                {"unproved_target_constraints", std::move(unproved)},
-                {"independent_additive_cover_model", false}};
+  result.result = j::Object{
+      {"schedule_policy", materialized.schedule.policy},
+      {"physical_callback_makespan_ms",
+       materialized.estimatedMakespanMs.value_or(0)},
+      {"invocation_control_ms", controlMs},
+      {"controller_is_approximate", candidate.mapping.controlModel.has_value()},
+      {"mapping", serializeProgramOperatorMapping(candidate.mapping)},
+      {"unproved_target_constraints", std::move(unproved)},
+      {"independent_additive_cover_model", false}};
   return result;
 }
 bool orbit::taskflow::parseProgramOperatorMappingRegistrations(
@@ -698,6 +1124,26 @@ bool orbit::taskflow::parseProgramOperatorMappingRegistrations(
     variant.residencePolicy = residence->str();
     variant.replicas = *replicas;
     variant.workDistribution = work->str();
+    for (const auto *field : {"execution_policy", "source_ordering_identity",
+                              "async_runtime_proof_identity"})
+      if (v->get(field) && !v->getString(field))
+        return fail(error, "execution policy/proof fields must be strings");
+    if (auto policy = v->getString("execution_policy"))
+      variant.executionPolicy = policy->str();
+    if (auto identity = v->getString("source_ordering_identity"))
+      variant.sourceOrderingIdentity = identity->str();
+    if (auto proof = v->getString("async_runtime_proof_identity"))
+      variant.asyncRuntimeProofIdentity = proof->str();
+    if (variant.executionPolicy == "source-dependency-ready") {
+      if (variant.sourceOrderingIdentity != source.sourceId ||
+          variant.asyncRuntimeProofIdentity.empty())
+        return fail(
+            error,
+            "ready policy requires source identity and actual runtime proof");
+    } else if (variant.executionPolicy != "synchronous-source-order" ||
+               !variant.sourceOrderingIdentity.empty() ||
+               !variant.asyncRuntimeProofIdentity.empty())
+      return fail(error, "unknown or inconsistent execution policy");
     if (!integerMap(*v, "resource_demands", variant.resourceDemands, true) ||
         !integerMap(*v, "temporary_bytes", variant.temporaryBytes, false) ||
         !integerMap(*v, "implementation_parameters",
@@ -852,11 +1298,22 @@ struct AllocationReservation {
   int64_t bytes = 0;
   std::optional<size_t> sourceRoot;
 };
+struct ChoiceDependencyFrontier {
+  size_t group = 0;
+  // Each choice contracts the same immutable source predecessors to its
+  // actual implementation owners. No timing or whole-plan price is cached.
+  std::vector<std::vector<size_t>> ownersByChoice;
+};
+struct DenseInvocationSummary {
+  double wallMs = 0;
+  std::vector<std::pair<size_t, int64_t>> demands, temporary;
+};
 struct SerialChoiceSummary {
   double wallMs = 0;
   bool valid = true, feasibilityKnown = true;
   std::string error;
   std::vector<AllocationReservation> allocations;
+  std::map<std::string, int64_t> controllerFeatures;
   std::vector<int64_t> temporaryMax;
   std::vector<std::string> unproved;
 };
@@ -864,16 +1321,27 @@ struct SerialChoiceSummary {
 namespace orbit::taskflow {
 struct ProgramOperatorMappingDomain {
   std::string identity, registrationIdentity;
+  std::optional<ProgramOperatorInvocationControlModel> controlModel;
   StaticConfig target;
   std::vector<ProgramOperatorImplementation> implementations;
   std::vector<ProgramOperatorExecutionVariant> variants;
   std::vector<ProgramOperatorChoiceGroup> groups;
   std::vector<std::vector<MappingAllocation>> boundaryAllocations;
+  std::vector<std::vector<size_t>> implementationPredecessors;
+  bool sourceDependencyReady = false;
+  std::vector<size_t> sourceGroups;
+  std::vector<std::vector<std::map<size_t, size_t>>> choiceSourceOwners;
   std::vector<std::vector<SerialChoiceSummary>> serialChoices;
+  std::map<std::string, size_t> resourceIndices;
+  std::vector<DenseInvocationSummary> denseInvocations;
+  std::vector<std::vector<ChoiceDependencyFrontier>> dependencyFrontiers;
   std::vector<std::string> allocationIdentities;
   std::map<std::string, size_t> memoryIndices;
 };
 } // namespace orbit::taskflow
+static ProgramSearchEvaluation evaluateSerialStorageProjection(
+    const ProgramOperatorMappingDomain &, const std::vector<size_t> &,
+    std::vector<int64_t> *persistentTotals = nullptr);
 bool orbit::taskflow::prepareProgramOperatorMappingDomain(
     const ProgramOperatorSource &source,
     const std::vector<ProgramOperatorImplementation> &implementations,
@@ -882,21 +1350,44 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
     llvm::StringRef registrationIdentity, const StaticConfig &target,
     llvm::StringRef hostMemory,
     std::shared_ptr<const ProgramOperatorMappingDomain> &result,
-    std::string &error) {
+    std::string &error,
+    const ProgramOperatorInvocationControlModel *controlModel) {
+  bool readyDomain =
+      std::any_of(variants.begin(), variants.end(), [](const auto &entry) {
+        return entry.second.executionPolicy == "source-dependency-ready";
+      });
   j::Value certificate = nullptr;
   if (registrationIdentity.empty() || !programMemory(target, hostMemory) ||
       !validateMemoryArchitecture(target, error) ||
       !certifyProgramOperatorChoices(source, implementations, groups,
-                                     certificate, error))
+                                     certificate, error, readyDomain))
     return fail(error, "cannot certify mapping domain: " + error);
   auto domain = std::make_shared<ProgramOperatorMappingDomain>();
   domain->registrationIdentity = registrationIdentity.str();
+  if (controlModel)
+    domain->controlModel = *controlModel;
   domain->target.domains = target.domains;
   domain->target.resources = target.resources;
   domain->target.memories = target.memories;
   domain->target.links = target.links;
   domain->implementations = implementations;
   domain->groups = groups;
+  domain->sourceGroups.assign(source.operators.size(), SIZE_MAX);
+  if (readyDomain) {
+    for (size_t g = 0; g < groups.size(); ++g) {
+      std::vector<std::map<size_t, size_t>> choices;
+      for (const auto &choice : groups[g].choices) {
+        std::map<size_t, size_t> owners;
+        for (size_t i : choice)
+          for (size_t op : implementations[i].operators) {
+            owners.emplace(op, i);
+            domain->sourceGroups[op] = g;
+          }
+        choices.push_back(std::move(owners));
+      }
+      domain->choiceSourceOwners.push_back(std::move(choices));
+    }
+  }
   std::vector<size_t> roots(source.values.size());
   std::vector<int64_t> bytes(source.values.size());
   for (size_t v = 0; v < source.values.size(); ++v) {
@@ -924,8 +1415,18 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
     }
     bytes[v] = size;
   }
+  std::vector<std::vector<size_t>> semanticDependencies;
+  bool sourceDependencyReady =
+      std::any_of(variants.begin(), variants.end(), [](const auto &entry) {
+        return entry.second.executionPolicy == "source-dependency-ready";
+      });
+  if (sourceDependencyReady &&
+      !programOperatorSourceDependencies(source, semanticDependencies, error))
+    return false;
+  domain->sourceDependencyReady = sourceDependencyReady;
   ProgramOperatorMapping registration;
   registration.registrationIdentity = registrationIdentity.str();
+  registration.controlModel = domain->controlModel;
   for (const auto &impl : implementations) {
     auto variant = variants.find(impl.id);
     const auto *resource = programResource(target, impl.resource);
@@ -935,6 +1436,20 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
                   "missing registered variant or incompatible target resource");
     if (!validateWorkPartitions(source, impl, variant->second, error))
       return false;
+    if ((variant->second.executionPolicy == "source-dependency-ready") !=
+        sourceDependencyReady)
+      return fail(error,
+                  "domain mixes synchronous and ready execution protocols");
+    std::set<size_t> externalPredecessors;
+    if (sourceDependencyReady) {
+      std::set<size_t> members(impl.operators.begin(), impl.operators.end());
+      for (size_t op : impl.operators)
+        for (size_t p : semanticDependencies[op])
+          if (!members.count(p))
+            externalPredecessors.insert(p);
+    }
+    domain->implementationPredecessors.emplace_back(
+        externalPredecessors.begin(), externalPredecessors.end());
     domain->variants.push_back(variant->second);
     registration.variants.push_back(variant->second);
     std::map<size_t, MappingAllocation> boundaries;
@@ -996,6 +1511,31 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
     }
     domain->boundaryAllocations.push_back(std::move(allocations));
   }
+  if (readyDomain) {
+    domain->dependencyFrontiers.resize(implementations.size());
+    for (size_t i = 0; i < implementations.size(); ++i) {
+      std::map<size_t, std::vector<size_t>> groupedPredecessors;
+      for (size_t op : domain->implementationPredecessors[i])
+        groupedPredecessors[domain->sourceGroups[op]].push_back(op);
+      for (const auto &entry : groupedPredecessors) {
+        ChoiceDependencyFrontier frontier;
+        frontier.group = entry.first;
+        for (const auto &owners : domain->choiceSourceOwners[entry.first]) {
+          std::set<size_t> uniqueOwners;
+          for (size_t op : entry.second) {
+            auto owner = owners.find(op);
+            if (owner == owners.end())
+              return fail(error,
+                          "cached choice frontier omits source predecessor");
+            uniqueOwners.insert(owner->second);
+          }
+          frontier.ownersByChoice.emplace_back(uniqueOwners.begin(),
+                                               uniqueOwners.end());
+        }
+        domain->dependencyFrontiers[i].push_back(std::move(frontier));
+      }
+    }
+  }
   ProgramOperatorSelection implementationCosts;
   implementationCosts.regions = implementations;
   j::Array groupBindings;
@@ -1026,6 +1566,25 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
   // Cache those invariant proofs, not complete-plan prices or feasibility.
   for (size_t m = 0; m < domain->target.memories.size(); ++m)
     domain->memoryIndices.emplace(domain->target.memories[m].id, m);
+  ProgramOperatorSelection registrationSelection;
+  registrationSelection.regions = implementations;
+  if (domain->controlModel) {
+    ProgramOperatorSelection one;
+    for (const auto &impl : implementations) {
+      one.regions = {impl};
+      double controlValidation;
+      std::map<std::string, int64_t> features;
+      if (!estimateProgramOperatorInvocationControl(
+              one, domain->controlModel, controlValidation, features, error))
+        return false;
+    }
+  }
+  if (!configureProgramOperatorExecutionPolicy(registrationSelection,
+                                               registration, error))
+    return false;
+  for (size_t r = 0; r < domain->target.resources.size(); ++r)
+    domain->resourceIndices.emplace(domain->target.resources[r].id, r);
+  domain->denseInvocations.resize(implementations.size());
   std::vector<std::string> invocationErrors(implementations.size());
   std::vector<bool> invocationKnown(implementations.size(), true);
   for (size_t i = 0; i < implementations.size(); ++i) {
@@ -1066,6 +1625,16 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
       if (r.first.empty() || r.second.second <= 0 ||
           !domain->memoryIndices.count(r.second.first))
         invalid = "invalid resident allocation";
+    auto &dense = domain->denseInvocations[i];
+    dense.wallMs = impl.wallMs.value_or(0);
+    for (const auto &d : expanded)
+      if (d.second && domain->resourceIndices.count(d.first))
+        dense.demands.emplace_back(domain->resourceIndices.at(d.first),
+                                   d.second);
+    for (const auto &t : v.temporaryBytes)
+      if (t.second && domain->memoryIndices.count(t.first))
+        dense.temporary.emplace_back(domain->memoryIndices.at(t.first),
+                                     t.second);
     invocationErrors[i] = std::move(invalid);
   }
   std::map<std::string, size_t> allocationIndices;
@@ -1114,6 +1683,13 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
           summary.wallMs += *implementations[index].wallMs;
         for (const auto &a : domain->boundaryAllocations[index])
           reserveIdentity(a.key, a.memory, a.bytes, a.storage);
+        if (domain->controlModel)
+          for (const auto &feature : implementations[index].controllerFeatures)
+            if (!add(summary.controllerFeatures[feature.first],
+                     feature.second)) {
+              summary.valid = false;
+              summary.error = "controller feature sum overflow";
+            }
         const auto &v = domain->variants[index];
         for (const auto &r : v.residentAllocations)
           reserveIdentity(r.first, r.second.first, r.second.second,
@@ -1140,10 +1716,10 @@ bool orbit::taskflow::prepareProgramOperatorMappingDomain(
   result = std::move(domain);
   return true;
 }
-ProgramSearchEvaluation
-orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
+static ProgramSearchEvaluation evaluateMappingDomainCalendar(
     const ProgramOperatorMappingDomain &domain,
-    const std::vector<size_t> &groupChoices) {
+    const std::vector<size_t> &groupChoices, llvm::StringRef priorityPolicy,
+    const std::vector<size_t> *implementationPriorityKeys) {
   ProgramSearchEvaluation result;
   auto reject = [&](const std::string &message) {
     result.message = "certified mapping projection: " + message;
@@ -1165,6 +1741,7 @@ orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
   ProgramOperatorSelection selection;
   ProgramOperatorMapping mapping;
   mapping.registrationIdentity = domain.registrationIdentity;
+  mapping.controlModel = domain.controlModel;
   std::vector<MappingEvent> events;
   std::map<std::string, MappingAllocation> roots;
   for (size_t index : selected) {
@@ -1174,10 +1751,13 @@ orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
     // It is never serialized or admitted as an executable ProgramGraph.
     ProgramOperatorImplementation impl;
     impl.id = registered.id;
+    impl.sourceId = registered.sourceId;
     impl.artifactIdentity = registered.artifactIdentity;
     impl.entrypoint = registered.entrypoint;
     impl.resource = registered.resource;
+    impl.device = registered.device;
     impl.wallMs = registered.wallMs;
+    impl.controllerFeatures = registered.controllerFeatures;
     selection.regions.push_back(std::move(impl));
     mapping.readyPriority.push_back(events.size());
     mapping.variants.push_back(domain.variants[index]);
@@ -1196,6 +1776,44 @@ orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
         return reject("alias storage requires an unimplemented transfer");
     }
   }
+  std::string policyError;
+  if (!setProgramOperatorReadyPriority(selection, mapping, priorityPolicy,
+                                       policyError) ||
+      !configureProgramOperatorExecutionPolicy(selection, mapping, policyError))
+    return reject(policyError);
+  if (implementationPriorityKeys) {
+    if (implementationPriorityKeys->size() != domain.implementations.size())
+      return reject("implementation priority key count mismatch");
+    std::stable_sort(mapping.readyPriority.begin(), mapping.readyPriority.end(),
+                     [&](size_t a, size_t b) {
+                       return (*implementationPriorityKeys)[selected[a]] <
+                              (*implementationPriorityKeys)[selected[b]];
+                     });
+  }
+  if (domain.sourceDependencyReady) {
+    // Immutable source DAG is contracted once per registered cover. Per
+    // assignment, resolve only the cross-cover frontier, never rewalk source.
+    std::vector<size_t> eventForImplementation(domain.implementations.size(),
+                                               SIZE_MAX);
+    for (size_t r = 0; r < selected.size(); ++r)
+      eventForImplementation[selected[r]] = r;
+    for (size_t r = 0; r < selected.size(); ++r) {
+      std::set<size_t> predecessors;
+      for (size_t op : domain.implementationPredecessors[selected[r]]) {
+        size_t group = domain.sourceGroups[op];
+        auto owner =
+            domain.choiceSourceOwners[group][groupChoices[group]].find(op);
+        if (owner ==
+            domain.choiceSourceOwners[group][groupChoices[group]].end())
+          return reject("source predecessor has no selected cover");
+        size_t event = eventForImplementation[owner->second];
+        if (event == SIZE_MAX)
+          return reject("source predecessor implementation was not selected");
+        predecessors.insert(event);
+      }
+      events[r].dependencies.assign(predecessors.begin(), predecessors.end());
+    }
+  }
   std::vector<MappingAllocation> allocations;
   for (auto &root : roots)
     allocations.push_back(std::move(root.second));
@@ -1209,7 +1827,12 @@ orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
     return result;
   }
   result.feasible = true;
-  result.costMs = schedule.estimatedMakespanMs;
+  double controlMs;
+  std::map<std::string, int64_t> controllerFeatures;
+  if (!estimateProgramOperatorInvocationControl(
+          selection, domain.controlModel, controlMs, controllerFeatures, error))
+    return reject(error);
+  result.costMs = schedule.estimatedMakespanMs.value_or(0) + controlMs;
   j::Array unproved;
   std::set<std::string> usedMemories;
   for (const auto &a : allocations)
@@ -1229,13 +1852,21 @@ orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
       result.feasibilityKnown = false;
       unproved.push_back("physical capacity unavailable: " + memory.id);
     }
-  result.result = j::Object{
-      {"mapping_domain", domain.identity},
-      {"resource_calendar_checked", true},
-      {"source_abi_certified", true},
-      {"full_physical_materialization_required", true},
-      {"unproved_target_constraints", std::move(unproved)},
-      {"runtime_dependencies", "actual synchronous invocation order"}};
+  result.result =
+      j::Object{{"mapping_domain", domain.identity},
+                {"physical_callback_makespan_ms",
+                 schedule.estimatedMakespanMs.value_or(0)},
+                {"invocation_control_ms", controlMs},
+                {"controller_is_approximate", domain.controlModel.has_value()},
+                {"resource_calendar_checked", true},
+                {"source_abi_certified", true},
+                {"full_physical_materialization_required", true},
+                {"unproved_target_constraints", std::move(unproved)},
+                {"runtime_dependencies",
+                 domain.sourceDependencyReady
+                     ? "source data/control and conservative physical hazards; "
+                       "registered async backend"
+                     : "actual synchronous invocation order"}};
   result.message =
       "certified invocation projection plus joint resource/resident/scratch "
       "calendar; final physical graph still required";
@@ -1367,7 +1998,10 @@ bool applyPacking(ProgramGraph &graph, const ProgramOperatorMapping &mapping,
     }
   for (auto &copy : copies)
     if (!copy.users.empty())
-      copy.lastUsers = {copy.users.back()};
+      copy.lastUsers =
+          graph.operatorSelection->executionPolicy == "source-dependency-ready"
+              ? copy.users
+              : std::vector<size_t>{copy.users.back()};
   for (auto &region : graph.executionRegions) {
     region.inputCopies = expand(region.inputCopies);
     region.outputCopies = expand(region.outputCopies);
@@ -1424,9 +2058,304 @@ bool orbit::taskflow::checkProgramOperatorPackedGraph(const ProgramGraph &graph,
                        "fragment/copy/lifetime/schedule witness");
   return true;
 }
+// The dense evaluator consumes only immutable certified invocation facts.
+// It does not retain whole-plan prices. Joint physical identities are still
+// rebuilt for each assignment, then an exact resource/memory calendar is run.
+static ProgramSearchEvaluation
+evaluateDenseReadyCalendar(const ProgramOperatorMappingDomain &domain,
+                           const std::vector<size_t> &choices,
+                           llvm::StringRef priorityPolicy,
+                           const std::vector<size_t> *priorityKeys) {
+  std::vector<int64_t> persistent;
+  auto result = evaluateSerialStorageProjection(domain, choices, &persistent);
+  if (!result.feasible)
+    return result;
+  auto reject = [&](const std::string &reason) {
+    result.feasible = false;
+    result.costMs.reset();
+    result.message = "certified dense ready calendar: " + reason;
+    return std::move(result);
+  };
+  if (priorityKeys && priorityKeys->size() != domain.implementations.size())
+    return reject("implementation priority key count mismatch");
+  if (priorityPolicy != "source-order" &&
+      priorityPolicy != "reverse-source-order" &&
+      priorityPolicy != "cpu-first" && priorityPolicy != "npu-first" &&
+      priorityPolicy != "longest-first")
+    return reject("unknown ready-priority policy");
+  std::vector<size_t> selected;
+  for (size_t g = 0; g < choices.size(); ++g) {
+    const auto &members = domain.groups[g].choices[choices[g]];
+    selected.insert(selected.end(), members.begin(), members.end());
+  }
+  std::sort(selected.begin(), selected.end(), [&](size_t a, size_t b) {
+    return domain.implementations[a].operators.front() <
+           domain.implementations[b].operators.front();
+  });
+  size_t n = selected.size();
+  std::vector<size_t> eventForImplementation(domain.implementations.size(),
+                                             SIZE_MAX);
+  for (size_t i = 0; i < n; ++i)
+    eventForImplementation[selected[i]] = i;
+  std::vector<std::vector<size_t>> dependencies(n);
+  for (size_t i = 0; i < n; ++i) {
+    auto &predecessors = dependencies[i];
+    for (const auto &frontier : domain.dependencyFrontiers[selected[i]])
+      for (size_t implementation :
+           frontier.ownersByChoice[choices[frontier.group]]) {
+        size_t event = eventForImplementation[implementation];
+        if (event == SIZE_MAX)
+          return reject("cached predecessor has no selected implementation");
+        predecessors.push_back(event);
+      }
+    std::sort(predecessors.begin(), predecessors.end());
+    predecessors.erase(std::unique(predecessors.begin(), predecessors.end()),
+                       predecessors.end());
+  }
+  std::vector<size_t> priority(n), rank(n);
+  for (size_t i = 0; i < n; ++i)
+    priority[i] = i;
+  if (priorityPolicy == "reverse-source-order")
+    std::reverse(priority.begin(), priority.end());
+  else if (priorityPolicy != "source-order")
+    std::stable_sort(priority.begin(), priority.end(), [&](size_t a, size_t b) {
+      const auto &x = domain.implementations[selected[a]],
+                 &y = domain.implementations[selected[b]];
+      if (priorityPolicy == "longest-first")
+        return *x.wallMs > *y.wallMs;
+      const char *device = priorityPolicy == "cpu-first" ? "cpu" : "npu";
+      return (x.device == device) > (y.device == device);
+    });
+  if (priorityKeys)
+    std::stable_sort(priority.begin(), priority.end(), [&](size_t a, size_t b) {
+      return (*priorityKeys)[selected[a]] < (*priorityKeys)[selected[b]];
+    });
+  for (size_t i = 0; i < n; ++i)
+    rank[priority[i]] = i;
+
+  // A strict source-ordered suffix can be summed only after every prefix
+  // invocation must have completed. Its REAL invocation identities remain in
+  // selection/final materialization; this is an evaluator reduction only.
+  size_t prefix = n;
+  while (prefix > 1 &&
+         std::binary_search(dependencies[prefix - 1].begin(),
+                            dependencies[prefix - 1].end(), prefix - 2))
+    --prefix;
+  bool tailCertified = prefix + 1 < n;
+  for (size_t i = 0; i < n && tailCertified; ++i)
+    for (size_t p : dependencies[i])
+      if ((i < prefix && p >= prefix) || (i >= prefix && p >= i))
+        tailCertified = false;
+  std::vector<bool> ancestors(n);
+  std::vector<size_t> pending;
+  if (tailCertified)
+    pending = dependencies[prefix];
+  while (!pending.empty()) {
+    size_t p = pending.back();
+    pending.pop_back();
+    if (ancestors[p])
+      continue;
+    ancestors[p] = true;
+    pending.insert(pending.end(), dependencies[p].begin(),
+                   dependencies[p].end());
+  }
+  for (size_t p = 0; p < prefix && tailCertified; ++p)
+    tailCertified &= ancestors[p];
+  if (!tailCertified)
+    prefix = n;
+  double tailMs = 0;
+  for (size_t i = prefix; i < n; ++i)
+    tailMs += domain.denseInvocations[selected[i]].wallMs;
+
+  const size_t memories = domain.target.memories.size();
+  const size_t resources = domain.target.resources.size();
+  // Each invocation chooses one resource it fully occupies. At most one
+  // invocation assigned to that lane can execute at once. Sum of per-lane
+  // maxima is therefore an upper bound on ANY resource-legal scratch overlap.
+  // Failure to prove this bound falls back to the exact memory calendar.
+  std::vector<std::vector<int64_t>> laneMax(resources,
+                                            std::vector<int64_t>(memories));
+  bool memoryIndependent = true;
+  for (size_t index : selected) {
+    const auto &invocation = domain.denseInvocations[index];
+    size_t lane = SIZE_MAX;
+    for (const auto &d : invocation.demands)
+      if (d.second == domain.target.resources[d.first].capacity) {
+        lane = d.first;
+        break;
+      }
+    if (lane == SIZE_MAX) {
+      memoryIndependent = false;
+      break;
+    }
+    for (const auto &t : invocation.temporary)
+      laneMax[lane][t.first] = std::max(laneMax[lane][t.first], t.second);
+  }
+  if (memoryIndependent)
+    for (size_t m = 0; m < memories; ++m) {
+      __int128 peak = persistent[m];
+      for (size_t lane = 0; lane < resources; ++lane)
+        peak += laneMax[lane][m];
+      const auto &memory = domain.target.memories[m];
+      if (peak > INT64_MAX ||
+          (peak && (!memory.capacityKnown || peak > memory.capacityBytes)))
+        memoryIndependent = false;
+    }
+
+  using Timeline = std::map<double, int64_t>;
+  std::vector<Timeline> resourceCalendar(resources), memoryCalendar(memories);
+  auto fits = [](const Timeline &timeline, double begin, double end,
+                 int64_t amount, int64_t capacity) {
+    if (amount > capacity || amount < 0)
+      return false;
+    if (!amount || begin == end || timeline.empty() ||
+        begin >= timeline.rbegin()->first)
+      return true;
+    __int128 live = 0;
+    for (auto point = timeline.begin();
+         point != timeline.end() && point->first < end; ++point) {
+      live += point->second;
+      auto next = std::next(point);
+      if (point->first <= begin && next != timeline.end() &&
+          next->first <= begin)
+        continue;
+      if (live + amount > capacity)
+        return false;
+    }
+    return true;
+  };
+  auto commit = [](Timeline &timeline, double begin, double end,
+                   int64_t amount) {
+    if (!amount || begin == end)
+      return;
+    for (auto point :
+         {std::make_pair(begin, amount), std::make_pair(end, -amount)}) {
+      // Local bounds and the successful overlap probe ensure this difference
+      // of two capacity-bounded live sets fits signed int64.
+      auto &delta = timeline[point.first];
+      delta = int64_t(__int128(delta) + point.second);
+      if (!delta)
+        timeline.erase(point.first);
+    }
+  };
+  std::vector<size_t> remaining(prefix);
+  std::vector<std::vector<size_t>> users(prefix);
+  std::priority_queue<std::pair<size_t, size_t>,
+                      std::vector<std::pair<size_t, size_t>>,
+                      std::greater<std::pair<size_t, size_t>>>
+      ready;
+  for (size_t i = 0; i < prefix; ++i) {
+    remaining[i] = dependencies[i].size();
+    for (size_t p : dependencies[i]) {
+      if (p >= prefix || p == i)
+        return reject("invalid prefix dependency");
+      users[p].push_back(i);
+    }
+    if (!remaining[i])
+      ready.emplace(rank[i], i);
+  }
+  std::vector<double> ends(prefix);
+  double makespan = 0;
+  for (size_t issued = 0; issued < prefix; ++issued) {
+    if (ready.empty())
+      return reject("cyclic source-cover quotient");
+    size_t i = ready.top().second;
+    ready.pop();
+    const auto &invocation = domain.denseInvocations[selected[i]];
+    double earliest = 0;
+    for (size_t p : dependencies[i])
+      earliest = std::max(earliest, ends[p]);
+    std::set<double> starts{earliest};
+    if (earliest < makespan) {
+      for (const auto &d : invocation.demands)
+        for (auto p = resourceCalendar[d.first].lower_bound(earliest);
+             p != resourceCalendar[d.first].end(); ++p)
+          starts.insert(p->first);
+      if (!memoryIndependent)
+        for (const auto &t : invocation.temporary)
+          for (auto p = memoryCalendar[t.first].lower_bound(earliest);
+               p != memoryCalendar[t.first].end(); ++p)
+            starts.insert(p->first);
+    }
+    bool placed = false;
+    for (double begin : starts) {
+      double end = begin + invocation.wallMs;
+      if (!std::isfinite(end))
+        return reject("schedule time overflow");
+      bool legal = true;
+      for (const auto &d : invocation.demands)
+        legal &= fits(resourceCalendar[d.first], begin, end, d.second,
+                      domain.target.resources[d.first].capacity);
+      if (!memoryIndependent)
+        for (const auto &t : invocation.temporary) {
+          const auto &m = domain.target.memories[t.first];
+          int64_t available = (m.capacityKnown ? m.capacityBytes : INT64_MAX) -
+                              persistent[t.first];
+          legal &=
+              fits(memoryCalendar[t.first], begin, end, t.second, available);
+        }
+      if (!legal)
+        continue;
+      for (const auto &d : invocation.demands)
+        commit(resourceCalendar[d.first], begin, end, d.second);
+      if (!memoryIndependent)
+        for (const auto &t : invocation.temporary)
+          commit(memoryCalendar[t.first], begin, end, t.second);
+      ends[i] = end;
+      makespan = std::max(makespan, end);
+      for (size_t u : users[i])
+        if (!--remaining[u])
+          ready.emplace(rank[u], u);
+      placed = true;
+      break;
+    }
+    if (!placed)
+      return reject("no resource/memory-feasible invocation placement");
+  }
+  double controlMs = result.result.getAsObject()
+                         ->getNumber("invocation_control_ms")
+                         .value_or(0);
+  result.costMs = makespan + tailMs + controlMs;
+  result.message = "immutable source frontier plus exact dense resource/memory "
+                   "calendar; final graph required";
+  auto &receipt = *result.result.getAsObject();
+  receipt["physical_callback_makespan_ms"] = makespan + tailMs;
+  receipt["runtime_dependencies"] =
+      "source data/control/physical hazards; registered async backend";
+  receipt["evaluation"] = "exact dense ready resource calendar; joint "
+                          "allocation identities recomputed";
+  receipt["serial_tail_invocations"] = int64_t(n - prefix);
+  receipt["serial_tail_ms"] = tailMs;
+  receipt["serial_tail_prefix_barrier_proved"] = tailCertified;
+  receipt["scratch_noncontention_certificate"] = memoryIndependent;
+  receipt["no_invocations_fused_by_evaluator"] = true;
+  return result;
+}
+ProgramSearchEvaluation
+orbit::taskflow::evaluateProgramOperatorMappingDomainReference(
+    const ProgramOperatorMappingDomain &domain,
+    const std::vector<size_t> &choices, llvm::StringRef priority,
+    const std::vector<size_t> *keys) {
+  return evaluateMappingDomainCalendar(domain, choices, priority, keys);
+}
 ProgramSearchEvaluation orbit::taskflow::evaluateProgramOperatorMappingDomain(
     const ProgramOperatorMappingDomain &domain,
-    const std::vector<size_t> &groupChoices) {
+    const std::vector<size_t> &choices, llvm::StringRef priority,
+    const std::vector<size_t> *keys) {
+  if (domain.sourceDependencyReady)
+    return evaluateDenseReadyCalendar(domain, choices, priority, keys);
+  if (priority != "source-order" || keys) {
+    ProgramSearchEvaluation rejected;
+    rejected.message =
+        "synchronous domain has no registered ready-priority search";
+    return rejected;
+  }
+  return evaluateSerialStorageProjection(domain, choices);
+}
+static ProgramSearchEvaluation
+evaluateSerialStorageProjection(const ProgramOperatorMappingDomain &domain,
+                                const std::vector<size_t> &groupChoices,
+                                std::vector<int64_t> *persistentTotals) {
   ProgramSearchEvaluation result;
   if (groupChoices.size() != domain.serialChoices.size()) {
     result.message = "certified serial calendar: group choice count mismatch";
@@ -1443,7 +2372,9 @@ ProgramSearchEvaluation orbit::taskflow::evaluateProgramOperatorMappingDomain(
   std::vector<size_t> identityRoot(domain.allocationIdentities.size(),
                                    SIZE_MAX);
   j::Array unproved;
-  double wall = 0;
+  double wall = 0,
+         controlMs = domain.controlModel ? domain.controlModel->interceptMs : 0;
+  std::map<std::string, int64_t> controllerFeatures;
   auto reject = [&](const std::string &message) {
     result.message = "certified serial calendar: " + message;
     return result;
@@ -1457,6 +2388,9 @@ ProgramSearchEvaluation orbit::taskflow::evaluateProgramOperatorMappingDomain(
       return reject(choice.error);
     }
     wall += choice.wallMs;
+    for (const auto &feature : choice.controllerFeatures)
+      if (!add(controllerFeatures[feature.first], feature.second))
+        return reject("controller feature accounting overflow");
     for (const auto &a : choice.allocations) {
       if (identityMemory[a.identity] == SIZE_MAX) {
         identityMemory[a.identity] = a.memory;
@@ -1479,7 +2413,12 @@ ProgramSearchEvaluation orbit::taskflow::evaluateProgramOperatorMappingDomain(
       unproved.push_back(reason);
     }
   }
-  if (!std::isfinite(wall))
+  if (domain.controlModel)
+    for (const auto &feature : controllerFeatures)
+      controlMs += domain.controlModel->coefficients.at(feature.first) *
+                   double(feature.second);
+  if (!std::isfinite(wall) || !std::isfinite(controlMs) ||
+      !std::isfinite(wall + controlMs))
     return reject("schedule time overflow");
   for (size_t m = 0; m < memories; ++m) {
     int64_t peak = persistent[m];
@@ -1494,12 +2433,26 @@ ProgramSearchEvaluation orbit::taskflow::evaluateProgramOperatorMappingDomain(
       unproved.push_back("physical capacity unavailable: " + memory.id);
     }
   }
+  if (persistentTotals)
+    *persistentTotals = persistent;
   result.feasible = true;
-  result.costMs = wall;
+  result.costMs = wall + controlMs;
   result.message = "immutable source/ABI/local-resource proofs plus exact "
                    "synchronous calendar and joint physical allocation unions";
   result.result = j::Object{
       {"mapping_domain", domain.identity},
+      {"physical_callback_makespan_ms", wall},
+      {"invocation_control_ms", controlMs},
+      {"controller_is_approximate", domain.controlModel.has_value()},
+      {"controller_model_identity",
+       domain.controlModel ? domain.controlModel->identity : "disabled"},
+      {"controller_features",
+       [&]() {
+         j::Object values;
+         for (const auto &f : controllerFeatures)
+           values[f.first] = f.second;
+         return values;
+       }()},
       {"resource_calendar_checked", true},
       {"source_abi_certified", true},
       {"full_physical_materialization_required", true},

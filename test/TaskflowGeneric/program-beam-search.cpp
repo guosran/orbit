@@ -369,6 +369,291 @@ int main() {
   if (!require(failedSink,
                "trace write failure cannot claim a completed search"))
     return 1;
+  // Unequal domains cross byte boundaries and include zero-bit singleton
+  // dimensions. Independently enumerate all states to catch packed-key aliasing
+  // that would silently discard legitimate search assignments.
+  for (const std::vector<size_t> cardinalities :
+       {std::vector<size_t>{1, 3, 17, 1, 5, 2},
+        std::vector<size_t>{1, 257, 1, 2}}) {
+    ProgramSearchSpace unequal;
+    std::set<std::vector<int64_t>> expected{{}}, actual;
+    size_t bits = 0;
+    for (size_t count : cardinalities) {
+      ProgramSearchDimension dimension;
+      dimension.id = "unequal-" + std::to_string(unequal.dimensions.size());
+      for (size_t i = 0; i < count; ++i) {
+        ProgramSearchChoice choice;
+        choice.id = std::to_string(i);
+        dimension.choices.push_back(std::move(choice));
+      }
+      unequal.dimensions.push_back(std::move(dimension));
+      std::set<std::vector<int64_t>> next;
+      for (auto prefix : expected)
+        for (size_t i = 0; i < count; ++i) {
+          auto assignment = prefix;
+          assignment.push_back(i);
+          next.insert(std::move(assignment));
+        }
+      expected = std::move(next);
+      for (size_t maximum = count - 1; maximum; maximum >>= 1)
+        ++bits;
+    }
+    auto packed = searchProgramSpaceBeam(
+        unequal,
+        [&](const std::vector<int64_t> &assignment) {
+          actual.insert(assignment);
+          ProgramSearchEvaluation evaluation;
+          evaluation.feasible = true;
+          evaluation.costMs = 1.;
+          return evaluation;
+        },
+        unlimited, expected.size(), -1);
+    if (!require(actual == expected &&
+                     packed.report.getInteger("evaluations") ==
+                         int64_t(expected.size()) &&
+                     packed.report.getInteger("assignment_key_bytes") ==
+                         int64_t((bits + 7) / 8),
+                 "lossless packed deduplication visits every unequal-domain "
+                 "state, including wide and fixed dimensions"))
+      return 1;
+  }
+  {
+    // This joint matrix cannot be represented as independent per-choice fees.
+    // One coordinate pass reaches (0,1)=8; only later revisiting dimension0
+    // reaches (1,1)=0. Initialization must not become a stopping criterion.
+    auto jointSpace = binarySpace(2);
+    auto jointCost = [](const std::vector<int64_t> &assignment) {
+      const double costs[2][2] = {{10., 8.}, {11., 0.}};
+      ProgramSearchEvaluation evaluation;
+      evaluation.feasible = true;
+      evaluation.costMs = costs[assignment[0]][assignment[1]];
+      return evaluation;
+    };
+    std::vector<std::vector<int64_t>> initialized;
+    auto coordinate = initializeProgramCoordinates(
+        jointSpace, jointCost, {},
+        [&](const auto &a, const auto &) { initialized.push_back(a); });
+    if (!require(
+            coordinate.valid && coordinate.hasPricedSeed &&
+                coordinate.assignment == std::vector<int64_t>({0, 1}) &&
+                coordinate.evaluation.costMs == 8. &&
+                coordinate.startCostMs == 10. && coordinate.evaluations == 3 &&
+                coordinate.improvedCoordinates == 1 &&
+                initialized ==
+                    std::vector<std::vector<int64_t>>({{0, 0}, {1, 0}, {0, 1}}),
+            "one coordinate pass checks joint choices from a fixed "
+            "per-dimension incumbent"))
+      return 1;
+    ProgramBeamInitialStates initializedSeed;
+    initializedSeed.assignments.push_back(coordinate.assignment);
+    auto closed = searchProgramSpaceBeam(jointSpace, jointCost, unlimited, 1,
+                                         -1, 0, {}, {}, initializedSeed);
+    if (!require(
+            closed.hasBest && closed.bestEvaluation.costMs == 0. &&
+                closed.bestAssignment == std::vector<int64_t>({1, 1}) &&
+                closed.report.getInteger("evaluations").value_or(0) >= 4,
+            "full neighborhood remains active after coordinate initialization"))
+      return 1;
+    auto guarded = initializeProgramCoordinates(jointSpace, [&](const auto &a) {
+      auto evaluation = jointCost(a);
+      if (a != std::vector<int64_t>({0, 0})) {
+        evaluation.feasibilityKnown = false;
+        evaluation.costMs = 0.;
+      }
+      return evaluation;
+    });
+    if (!require(guarded.hasPricedSeed && guarded.evaluation.costMs == 10. &&
+                     guarded.improvedCoordinates == 0,
+                 "unknown-feasibility trial is never an artificial zero-cost "
+                 "improvement"))
+      return 1;
+  }
+  {
+    ProgramBeamInitialStates seeds;
+    seeds.assignments = {{1, 1, 1}, {1, 1, 1}, {0, 0, 0}};
+    std::vector<std::vector<int64_t>> warmCalls;
+    auto warmEvaluator = [&](const std::vector<int64_t> &assignment) {
+      warmCalls.push_back(assignment);
+      ProgramSearchEvaluation evaluation;
+      evaluation.feasible = true;
+      evaluation.costMs =
+          assignment == std::vector<int64_t>({1, 1, 1}) ? 1. : 5.;
+      return evaluation;
+    };
+    auto warm = searchProgramSpaceBeam(binarySpace(3), warmEvaluator, unlimited,
+                                       1, -1, 0, {}, {}, seeds);
+    if (!require(warm.hasBest && warm.bestEvaluation.costMs == 1. &&
+                     warm.report.getInteger("initial_states_reevaluated") ==
+                         1 &&
+                     warm.report.getInteger("initial_state_duplicates") == 2 &&
+                     std::count(warmCalls.begin(), warmCalls.end(),
+                                std::vector<int64_t>({1, 1, 1})) == 1,
+                 "warm proposals use fresh callbacks, deduplicate and enter "
+                 "initial beam"))
+      return 1;
+    for (size_t d = 0; d < 3; ++d)
+      for (int64_t choice = 0; choice < 2; ++choice)
+        if (!require(std::any_of(warmCalls.begin(), warmCalls.end(),
+                                 [&](const auto &a) { return a[d] == choice; }),
+                     "warm initialization leaves every local choice exposed"))
+          return 1;
+    auto reversedPrice = [&](const std::vector<int64_t> &assignment) {
+      ProgramSearchEvaluation evaluation;
+      evaluation.feasible = true;
+      evaluation.costMs =
+          assignment == std::vector<int64_t>({1, 1, 1}) ? 100. : 2.;
+      return evaluation;
+    };
+    auto repriced = searchProgramSpaceBeam(binarySpace(3), reversedPrice,
+                                           unlimited, 1, 0, 0, {}, {}, seeds);
+    if (!require(
+            repriced.hasBest && repriced.bestEvaluation.costMs == 2. &&
+                repriced.bestAssignment == std::vector<int64_t>({0, 0, 0}),
+            "historical winner loses when fresh evaluator reverses its price"))
+      return 1;
+    for (const auto &bad :
+         std::vector<std::vector<int64_t>>{{1}, {2, 0, 0}, {-1, 0, 0}}) {
+      ProgramBeamInitialStates invalid;
+      invalid.assignments.push_back(bad);
+      int invalidCalls = 0;
+      auto rejectedSeed = searchProgramSpaceBeam(
+          binarySpace(3),
+          [&](const auto &a) {
+            ++invalidCalls;
+            return reversedPrice(a);
+          },
+          unlimited, 1, -1, 0, {}, {}, invalid);
+      if (!require(rejectedSeed.status ==
+                           ConstraintSearchStatus::InvalidInput &&
+                       invalidCalls == 0,
+                   "invalid seed is rejected before any baseline/evaluator "
+                   "callback"))
+        return 1;
+    }
+    auto constrained = binarySpace(2);
+    ProgramSearchConstraint onlyBaseline;
+    onlyBaseline.dimensions = {0, 1};
+    onlyBaseline.allowedTuples = {{0, 0}};
+    constrained.constraints.push_back(onlyBaseline);
+    ProgramBeamInitialStates incompatible;
+    incompatible.assignments = {{1, 1}};
+    int incompatibleCalls = 0;
+    auto incompatibleResult = searchProgramSpaceBeam(
+        constrained,
+        [&](const auto &a) {
+          ++incompatibleCalls;
+          return reversedPrice(a);
+        },
+        unlimited, 1, -1, 0, {}, {}, incompatible);
+    if (!require(
+            incompatibleResult.status == ConstraintSearchStatus::InvalidInput &&
+                incompatibleCalls == 0,
+            "compatibility-invalid warm state is rejected before callbacks"))
+      return 1;
+    std::vector<std::vector<int64_t>> oldOrder, emptyOrder;
+    auto ordered = [&](auto &order) {
+      return [&order](const std::vector<int64_t> &assignment) {
+        order.push_back(assignment);
+        ProgramSearchEvaluation evaluation;
+        evaluation.feasible = true;
+        evaluation.costMs = 1.;
+        return evaluation;
+      };
+    };
+    auto oldResult = searchProgramSpaceBeam(binarySpace(2), ordered(oldOrder),
+                                            unlimited, 2, -1);
+    auto emptyResult = searchProgramSpaceBeam(
+        binarySpace(2), ordered(emptyOrder), unlimited, 2, -1, 0, {}, {}, {});
+    if (!require(oldOrder == emptyOrder &&
+                     oldResult.bestAssignment == emptyResult.bestAssignment &&
+                     oldResult.status == emptyResult.status,
+                 "default empty warm proposals preserve old evaluation order "
+                 "and result"))
+      return 1;
+  }
+  {
+    std::vector<ProgramSearchSpace> malformed;
+    auto invalid = binarySpace(2);
+    invalid.dimensions[0].id.clear();
+    malformed.push_back(invalid);
+    invalid = binarySpace(2);
+    invalid.dimensions[1].id = invalid.dimensions[0].id;
+    malformed.push_back(invalid);
+    invalid = binarySpace(2);
+    invalid.dimensions[0].choices[0].id.clear();
+    malformed.push_back(invalid);
+    invalid = binarySpace(2);
+    invalid.dimensions[0].choices[1].id = invalid.dimensions[0].choices[0].id;
+    malformed.push_back(invalid);
+    invalid = binarySpace(2);
+    ProgramSearchConstraint duplicateScope;
+    duplicateScope.dimensions = {0, 0};
+    duplicateScope.allowedTuples = {{0, 0}};
+    invalid.constraints.push_back(duplicateScope);
+    malformed.push_back(invalid);
+    for (const auto &domain : malformed) {
+      int callbacks = 0;
+      auto callback = [&](const auto &) {
+        ++callbacks;
+        ProgramSearchEvaluation evaluation;
+        evaluation.feasible = true;
+        evaluation.costMs = 1.;
+        return evaluation;
+      };
+      auto coordinate = initializeProgramCoordinates(domain, callback);
+      auto beam = searchProgramSpaceBeam(domain, callback, unlimited, 1, -1);
+      if (!require(!coordinate.valid && !coordinate.attempted &&
+                       !coordinate.completed &&
+                       beam.status == ConstraintSearchStatus::InvalidInput &&
+                       callbacks == 0,
+                   "both public entries reject malformed domain "
+                   "identities/scopes before callbacks"))
+        return 1;
+    }
+    auto tinyWall = unlimited;
+    tinyWall.wallSeconds = std::numeric_limits<double>::min();
+    int deadlineCallbacks = 0;
+    auto interrupted = searchProgramSpaceBeam(
+        binarySpace(2),
+        [&](const auto &) {
+          ++deadlineCallbacks;
+          return ProgramSearchEvaluation{};
+        },
+        tinyWall, 1, -1);
+    if (!require(interrupted.status == ConstraintSearchStatus::Unknown &&
+                     deadlineCallbacks == 0 &&
+                     interrupted.report.getBoolean("budget_exhausted") == true,
+                 "positive exhausted validation wall budget is Unknown before "
+                 "callbacks"))
+      return 1;
+    auto unknown =
+        initializeProgramCoordinates(binarySpace(1), [](const auto &) {
+          ProgramSearchEvaluation evaluation;
+          evaluation.feasible = true;
+          return evaluation;
+        });
+    if (!require(unknown.valid && unknown.attempted && !unknown.completed &&
+                     !unknown.hasPricedSeed && unknown.evaluations == 1 &&
+                     !unknown.startCostMs && !unknown.evaluation.costMs,
+                 "unknown start reports attempted but incomplete "
+                 "initialization without zero cost"))
+      return 1;
+    auto quota = unlimited;
+    quota.maxVariables = 1;
+    int quotaCallbacks = 0;
+    auto limited = searchProgramSpaceBeam(
+        binarySpace(2),
+        [&](const auto &) {
+          ++quotaCallbacks;
+          return ProgramSearchEvaluation{};
+        },
+        quota, 1, -1);
+    if (!require(
+            limited.status == ConstraintSearchStatus::ModelLimit &&
+                quotaCallbacks == 0,
+            "shared structural validation retains beam model quota rejection"))
+      return 1;
+  }
   unlimited.wallSeconds = std::numeric_limits<double>::quiet_NaN();
   auto invalidUnlimited =
       searchProgramSpaceBeam(binarySpace(1), evaluator, unlimited, 1, -1);

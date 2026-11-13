@@ -525,6 +525,557 @@ int main() {
                "joint identity size conflict cannot be hidden by local summary "
                "proofs"))
     return 1;
+  // These are source/ABI scheduling fixtures. They do not claim any backend
+  // supports asynchronous execution until its independent registration gate.
+  auto readyDocument = copyJSONWithoutFields(*parsed);
+  auto &readyValues = *readyDocument.getAsObject()->getArray("values");
+  readyValues[2].getAsObject()->erase("allocation_view");
+  readyValues[3].getAsObject()->erase("allocation_view");
+  std::shared_ptr<ProgramOperatorSource> readySource;
+  if (!require(parseProgramOperatorSource(readyDocument, readySource, error),
+               "independent storage fixture has explicit source semantics"))
+    return 1;
+  auto readySelection = selection;
+  auto readyMapping = mapping;
+  for (auto &v : readyMapping.variants) {
+    v.executionPolicy = "source-dependency-ready";
+    v.sourceOrderingIdentity = readySource->sourceId;
+    v.asyncRuntimeProofIdentity = "fixture-only-async-contract";
+  }
+  readySelection.regions[0].wallMs = 10;
+  readySelection.regions[1].wallMs = 2;
+  readySelection.regions[2].wallMs = 1;
+  auto readyTarget = target;
+  readyTarget.memories[0].capacityKnown = true;
+  readyTarget.memories[0].capacityBytes = 4096;
+  ProgramOperatorMappingCandidate readyCandidate{readySelection, readyMapping};
+  ProgramGraph readyGraph;
+  auto readyResult = evaluateProgramOperatorMappingCandidate(
+      readySource, readyCandidate, readyTarget, "abi", readyGraph);
+  if (!require(readyResult.feasible && readyResult.feasibilityKnown &&
+                   readyResult.costMs && *readyResult.costMs == 11 &&
+                   readyGraph.events[1].dependencies.empty() &&
+                   readyGraph.events[2].dependencies ==
+                       std::vector<size_t>({0, 1}) &&
+                   readyGraph.regionEvents[2].dependencies.empty(),
+               "independent CPU/NPU calls overlap only under explicit ready "
+               "contract"))
+    return 1;
+  broken = readyGraph;
+  broken.events[2].dependencies.clear();
+  if (!require(!checkProgramGraph(broken, error),
+               "source data dependencies cannot be deleted to create overlap"))
+    return 1;
+  auto missingProof = readyCandidate;
+  missingProof.mapping.variants[1].asyncRuntimeProofIdentity.clear();
+  if (!require(!evaluateProgramOperatorMappingCandidate(
+                    readySource, missingProof, readyTarget, "abi", broken)
+                    .feasible,
+               "mixed or absent async support proof is rejected"))
+    return 1;
+  auto staleProof = readyCandidate;
+  staleProof.mapping.variants[0].sourceOrderingIdentity = "another-source";
+  if (!require(!evaluateProgramOperatorMappingCandidate(
+                    readySource, staleProof, readyTarget, "abi", broken)
+                    .feasible,
+               "async registration cannot authorize a different source"))
+    return 1;
+  auto hazardResult = evaluateProgramOperatorMappingCandidate(
+      source, readyCandidate, readyTarget, "abi", broken);
+  if (!require(
+          hazardResult.feasible && hazardResult.costMs &&
+              *hazardResult.costMs == 13,
+          "writes to shared physical workspace remain conservatively ordered"))
+    return 1;
+  auto controlledDocument = copyJSONWithoutFields(readyDocument);
+  (*controlledDocument.getAsObject()->getArray("operators"))[1].getAsObject()->
+  operator[]("dependencies") = j::Array{"write-a"};
+  std::shared_ptr<ProgramOperatorSource> controlledSource;
+  if (!require(parseProgramOperatorSource(controlledDocument, controlledSource,
+                                          error),
+               "source control fixture parses"))
+    return 1;
+  auto controlled = evaluateProgramOperatorMappingCandidate(
+      controlledSource, readyCandidate, readyTarget, "abi", broken);
+  if (!require(controlled.feasible && controlled.costMs &&
+                   *controlled.costMs == 13,
+               "original source control edge survives ready lowering"))
+    return 1;
+  auto scratchCandidate = readyCandidate;
+  scratchCandidate.mapping.variants[0].temporaryBytes = {{"abi", 16}};
+  scratchCandidate.mapping.variants[1].temporaryBytes = {{"abi", 16}};
+  auto scratchTarget = readyTarget;
+  scratchTarget.memories[0].capacityBytes = 80; // 64 persistent + one scratch.
+  auto scratchResult = evaluateProgramOperatorMappingCandidate(
+      readySource, scratchCandidate, scratchTarget, "abi", broken);
+  if (!require(scratchResult.feasible && scratchResult.costMs &&
+                   *scratchResult.costMs == 13,
+               "simultaneous temporary storage is capacity constrained"))
+    return 1;
+  // A(2ms CPU) is independent; B(1ms CPU) feeds C(10ms NPU).
+  // Ready priority changes the critical path without changing a source edge.
+  auto priorityDocument = copyJSONWithoutFields(readyDocument);
+  (*priorityDocument.getAsObject()->getArray("values"))[2].getAsObject()->
+  operator[]("role") = "output";
+  (*priorityDocument.getAsObject()->getArray("operators"))[2].getAsObject()->
+  operator[]("inputs") = j::Array{"b"};
+  std::shared_ptr<ProgramOperatorSource> prioritySource;
+  if (!require(
+          parseProgramOperatorSource(priorityDocument, prioritySource, error),
+          "branch critical-path fixture parses"))
+    return 1;
+  auto priorityCandidate = readyCandidate;
+  for (size_t i = 0; i < 3; ++i) {
+    auto &impl = priorityCandidate.selection.regions[i];
+    auto &variant = priorityCandidate.mapping.variants[i];
+    impl.device = i == 2 ? "npu" : "cpu";
+    impl.resource = impl.device;
+    impl.launchCount = i == 2 ? 1 : 0;
+    impl.wallMs = i == 0 ? 2 : i == 1 ? 1 : 10;
+    impl.inputs = prioritySource->operators[i].inputs;
+    variant.resourceDemands = {{impl.resource, 1}};
+  }
+  auto firstPriority = evaluateProgramOperatorMappingCandidate(
+      prioritySource, priorityCandidate, readyTarget, "abi", broken);
+  priorityCandidate.selection.executionPolicy = "source-dependency-ready";
+  auto priorityNeighbors =
+      programOperatorReadyPriorityNeighbors(priorityCandidate);
+  if (!require(priorityNeighbors.size() == 2 &&
+                   applyProgramOperatorMappingAction(
+                       priorityCandidate, priorityNeighbors[0], child, error),
+               "ready neighborhood contains adjacent priority transpositions"))
+    return 1;
+  auto changedPriority = evaluateProgramOperatorMappingCandidate(
+      prioritySource, child, readyTarget, "abi", readyGraph);
+  if (!require(firstPriority.costMs && *firstPriority.costMs == 13 &&
+                   changedPriority.feasible && changedPriority.costMs &&
+                   *changedPriority.costMs == 11,
+               "actual ready order changes resource calendar makespan"))
+    return 1;
+  std::vector<ProgramOperatorChoiceGroup> priorityGroups;
+  std::map<std::string, ProgramOperatorExecutionVariant> priorityVariants;
+  for (size_t i = 0; i < 3; ++i) {
+    priorityGroups.push_back({"priority" + std::to_string(i), {"only"}, {{i}}});
+    priorityVariants.emplace(priorityCandidate.selection.regions[i].id,
+                             priorityCandidate.mapping.variants[i]);
+  }
+  std::shared_ptr<const ProgramOperatorMappingDomain> priorityDomain;
+  if (!require(prepareProgramOperatorMappingDomain(
+                   *prioritySource, priorityCandidate.selection.regions,
+                   priorityGroups, priorityVariants, "fixture-ready-domain",
+                   readyTarget, "abi", priorityDomain, error),
+               "immutable source frontier certifies ready domain"))
+    return 1;
+  auto projection = evaluateProgramOperatorMappingDomain(
+      *priorityDomain, {0, 0, 0}, "reverse-source-order");
+  if (!require(projection.feasible && projection.costMs &&
+                   *projection.costMs == 11,
+               "cached dependency projection uses exact nonserial calendar"))
+    return 1;
+  // Noncontiguous {A,C} is legal only when no outside path re-enters it.
+  auto convexCandidate = priorityCandidate;
+  auto merged = convexCandidate.selection.regions[0];
+  merged.id = "fixture-noncontiguous-cover";
+  merged.operators = {0, 2};
+  merged.inputs = {0, 3};
+  merged.outputs = {2, 4};
+  merged.wallMs = 12;
+  auto mergedVariant = convexCandidate.mapping.variants[0];
+  mergedVariant.implementationId = merged.id;
+  convexCandidate.selection.regions = {merged,
+                                       priorityCandidate.selection.regions[1]};
+  convexCandidate.mapping.variants = {mergedVariant,
+                                      priorityCandidate.mapping.variants[1]};
+  convexCandidate.mapping.readyPriority = {0, 1};
+  auto convexResult = evaluateProgramOperatorMappingCandidate(
+      prioritySource, convexCandidate, readyTarget, "abi", readyGraph);
+  if (!require(convexResult.feasible &&
+                   readyGraph.operatorSelection->regions[0].operators ==
+                       std::vector<size_t>{1},
+               "DAG-convex noncontiguous cover is canonically reordered"))
+    return 1;
+  auto convexImplementations = priorityCandidate.selection.regions;
+  convexImplementations.push_back(merged);
+  auto convexVariants = priorityVariants;
+  convexVariants.emplace(merged.id, mergedVariant);
+  std::vector<ProgramOperatorChoiceGroup> convexGroups{
+      {"noncontiguous-component", {"unfused", "fused"}, {{0, 2}, {3}}},
+      {"outside-producer", {"only"}, {{1}}}};
+  std::shared_ptr<const ProgramOperatorMappingDomain> convexDomain;
+  if (!require(prepareProgramOperatorMappingDomain(
+                   *prioritySource, convexImplementations, convexGroups,
+                   convexVariants, "fixture-convex-domain", readyTarget, "abi",
+                   convexDomain, error),
+               "noncontiguous component choices certify invariant exact ABI"))
+    return 1;
+  auto convexProjection =
+      evaluateProgramOperatorMappingDomain(*convexDomain, {1, 0});
+  auto convexReference =
+      evaluateProgramOperatorMappingDomainReference(*convexDomain, {1, 0});
+  auto unfusedProjection = evaluateProgramOperatorMappingDomain(
+      *convexDomain, {0, 0}, "reverse-source-order");
+  if (!require(convexProjection.feasible &&
+                   convexProjection.costMs == convexResult.costMs &&
+                   convexProjection.costMs == convexReference.costMs &&
+                   unfusedProjection.costMs && *unfusedProjection.costMs == 11,
+               "choice-contracted source frontier preserves fused/unfused "
+               "noncontiguous semantics"))
+    return 1;
+  auto cycleDocument = copyJSONWithoutFields(priorityDocument);
+  (*cycleDocument.getAsObject()->getArray("operators"))[1].getAsObject()->
+  operator[]("dependencies") = j::Array{"write-a"};
+  std::shared_ptr<ProgramOperatorSource> cycleSource;
+  if (!require(parseProgramOperatorSource(cycleDocument, cycleSource, error),
+               "nonconvex cycle fixture parses before contraction"))
+    return 1;
+  auto cycleResult = evaluateProgramOperatorMappingCandidate(
+      cycleSource, convexCandidate, readyTarget, "abi", broken);
+  if (!require(!cycleResult.feasible &&
+                   cycleResult.message.find("cyclic source-cover quotient") !=
+                       std::string::npos,
+               "fusion contracting an outside dependency cycle is rejected"))
+    return 1;
+  std::shared_ptr<const ProgramOperatorMappingDomain> nonconvexDomain;
+  if (!require(prepareProgramOperatorMappingDomain(
+                   *cycleSource, convexImplementations, convexGroups,
+                   convexVariants, "fixture-nonconvex-domain", readyTarget,
+                   "abi", nonconvexDomain, error),
+               "local ABI certificate does not falsely claim global quotient "
+               "legality"))
+    return 1;
+  auto nonconvexProjection =
+      evaluateProgramOperatorMappingDomain(*nonconvexDomain, {1, 0});
+  auto nonconvexReference =
+      evaluateProgramOperatorMappingDomainReference(*nonconvexDomain, {1, 0});
+  if (!require(!nonconvexProjection.feasible && !nonconvexReference.feasible &&
+                   nonconvexProjection.feasibilityKnown &&
+                   nonconvexReference.feasibilityKnown,
+               "both calendars reject a quotient cycle introduced by an "
+               "otherwise exact cover"))
+    return 1;
+  auto coordinateImpl = selection.regions[0];
+  coordinateImpl.id = "registered-shape-artifact";
+  coordinateImpl.artifactIdentity = "fixture-shape-binary";
+  auto coordinateVariant = mapping.variants[0];
+  coordinateVariant.implementationId = coordinateImpl.id;
+  coordinateVariant.artifactIdentity = coordinateImpl.artifactIdentity;
+  coordinateVariant.resourceShape = {1, 1};
+  std::vector<ProgramOperatorImplementation> coordinateImplementations{
+      coordinateImpl};
+  std::map<std::string, ProgramOperatorExecutionVariant> coordinateVariants{
+      {coordinateImpl.id, coordinateVariant}};
+  ProgramOperatorMappingAction coordinateAction;
+  coordinateAction.kind =
+      ProgramOperatorMappingActionKind::IndependentResourceShape;
+  coordinateAction.firstRegion = 0;
+  coordinateAction.regionCount = 1;
+  coordinateAction.replacements = {coordinateImpl};
+  coordinateAction.replacements[0].artifactIdentity = "caller-invented-binary";
+  if (!require(applyProgramOperatorRegisteredMappingAction(
+                   candidate, coordinateAction, coordinateImplementations,
+                   coordinateVariants, child, error) &&
+                   child.selection.regions[0].artifactIdentity ==
+                       "fixture-shape-binary",
+               "resource action resolves the actual atomic registration, "
+               "ignoring caller field edits"))
+    return 1;
+  coordinateAction.replacements[0].id = "unregistered-id";
+  if (!require(!applyProgramOperatorRegisteredMappingAction(
+                   candidate, coordinateAction, coordinateImplementations,
+                   coordinateVariants, child, error),
+               "coordinate action cannot invent an unregistered executable"))
+    return 1;
+  coordinateAction.replacements = {coordinateImpl};
+  coordinateAction.kind = ProgramOperatorMappingActionKind::IndependentReplica;
+  coordinateVariants[coordinateImpl.id].replicas = 2;
+  coordinateVariants[coordinateImpl.id].workDistribution =
+      "registered-disjoint-work";
+  coordinateVariants[coordinateImpl.id].workPartitions = {{2, 0, {0}, {2}},
+                                                          {2, 1, {2}, {2}}};
+  if (!require(applyProgramOperatorRegisteredMappingAction(
+                   candidate, coordinateAction, coordinateImplementations,
+                   coordinateVariants, child, error) &&
+                   child.mapping.variants[0].replicas == 2,
+               "replica action binds an actual registered work-partition "
+               "implementation"))
+    return 1;
+  coordinateAction.kind =
+      ProgramOperatorMappingActionKind::IndependentResidence;
+  coordinateVariants[coordinateImpl.id] = coordinateVariant;
+  coordinateVariants[coordinateImpl.id].residencePolicy = "fixture-retain";
+  coordinateVariants[coordinateImpl.id].residentAllocations = {
+      {"fixture-weight", {"abi", 16}}};
+  if (!require(
+          applyProgramOperatorRegisteredMappingAction(
+              candidate, coordinateAction, coordinateImplementations,
+              coordinateVariants, child, error),
+          "residence action uses a complete registered physical reservation"))
+    return 1;
+  coordinateVariants[coordinateImpl.id] = mapping.variants[0];
+  coordinateVariants[coordinateImpl.id].implementationId = coordinateImpl.id;
+  coordinateVariants[coordinateImpl.id].artifactIdentity =
+      coordinateImpl.artifactIdentity;
+  if (!require(!applyProgramOperatorRegisteredMappingAction(
+                   candidate, coordinateAction, coordinateImplementations,
+                   coordinateVariants, child, error),
+               "renamed artifact alone does not constitute a residence change"))
+    return 1;
+  coordinateAction.kind = ProgramOperatorMappingActionKind::TransferRoute;
+  if (!require(!applyProgramOperatorRegisteredMappingAction(
+                   candidate, coordinateAction, coordinateImplementations,
+                   coordinateVariants, child, error),
+               "transfer route still requires an actually lowered copy ABI"))
+    return 1;
+  // Independent discrete-time oracle: durations and reservations are integral,
+  // so exhaustive tick placement agrees with endpoint placement without
+  // sharing the production calendar or its resource-probe implementation.
+  uint32_t randomState = 971;
+  auto nextRandom = [&]() {
+    randomState = randomState * 1664525u + 1013904223u;
+    return randomState;
+  };
+  for (size_t trial = 0; trial < 24; ++trial) {
+    j::Array fixtureValues, fixtureOperators;
+    fixtureValues.push_back(j::Object{{"id", "x"},
+                                      {"dtype", "f32"},
+                                      {"shape", j::Array{4}},
+                                      {"role", "input"},
+                                      {"layout", "row_major"}});
+    std::vector<std::vector<size_t>> expectedDependencies(6);
+    for (size_t i = 0; i < 6; ++i) {
+      auto name = "v" + std::to_string(i);
+      fixtureValues.push_back(j::Object{{"id", name},
+                                        {"dtype", "f32"},
+                                        {"shape", j::Array{4}},
+                                        {"role", "output"},
+                                        {"layout", "row_major"}});
+      j::Array inputs{"x"}, control;
+      for (size_t p = 0; p < i; ++p) {
+        if ((trial == 0 && p + 1 == i) || nextRandom() % 4 == 0) {
+          inputs.push_back("v" + std::to_string(p));
+          expectedDependencies[i].push_back(p);
+        } else if (nextRandom() % 5 == 0) {
+          control.push_back("op" + std::to_string(p));
+          expectedDependencies[i].push_back(p);
+        }
+      }
+      fixtureOperators.push_back(j::Object{{"id", "op" + std::to_string(i)},
+                                           {"kind", "fixture"},
+                                           {"binding", "fixture"},
+                                           {"source_ordinal", int64_t(i)},
+                                           {"inputs", std::move(inputs)},
+                                           {"outputs", j::Array{name}},
+                                           {"dependencies", std::move(control)},
+                                           {"attributes", j::Object{}}});
+    }
+    auto oracleDocument = copyJSONWithoutFields(*parsed);
+    (*oracleDocument.getAsObject())["values"] = std::move(fixtureValues);
+    (*oracleDocument.getAsObject())["operators"] = std::move(fixtureOperators);
+    std::shared_ptr<ProgramOperatorSource> oracleSource;
+    if (!require(
+            parseProgramOperatorSource(oracleDocument, oracleSource, error),
+            "random discrete calendar source parses"))
+      return 1;
+    ProgramOperatorMappingCandidate oracleCandidate;
+    oracleCandidate.mapping.registrationIdentity = "fixture-discrete-oracle";
+    auto oracleTarget = readyTarget;
+    oracleTarget.resources[1].capacity = 2;
+    const int64_t scratchCapacity = 3 + nextRandom() % 5;
+    oracleTarget.memories[0].capacityBytes = 7 * 16 + scratchCapacity;
+    std::vector<int64_t> duration(6), scratch(6), resource(6);
+    for (size_t i = 0; i < 6; ++i) {
+      auto impl = selection.regions[0];
+      impl.id = "oracle" + std::to_string(i);
+      impl.operators = {i};
+      impl.inputs = oracleSource->operators[i].inputs;
+      impl.outputs = oracleSource->operators[i].outputs;
+      resource[i] = nextRandom() % 2;
+      impl.device = impl.resource = resource[i] ? "npu" : "cpu";
+      impl.launchCount = resource[i];
+      duration[i] = 1 + nextRandom() % 5;
+      impl.wallMs = double(duration[i]);
+      auto variant = readyMapping.variants[0];
+      variant.implementationId = impl.id;
+      variant.resourceDemands = {{impl.resource, 1}};
+      scratch[i] = nextRandom() % (scratchCapacity + 1);
+      variant.temporaryBytes = {{"abi", scratch[i]}};
+      oracleCandidate.selection.regions.push_back(impl);
+      oracleCandidate.mapping.variants.push_back(variant);
+      oracleCandidate.mapping.readyPriority.push_back(i);
+    }
+    for (size_t i = 5; i; --i)
+      std::swap(oracleCandidate.mapping.readyPriority[i],
+                oracleCandidate.mapping.readyPriority[nextRandom() % (i + 1)]);
+    std::vector<int64_t> starts(6, -1), ends(6, -1);
+    int64_t expectedMakespan = 0;
+    for (size_t issued = 0; issued < 6; ++issued) {
+      size_t chosen = SIZE_MAX;
+      for (size_t i : oracleCandidate.mapping.readyPriority) {
+        if (ends[i] >= 0)
+          continue;
+        bool ready = true;
+        for (size_t p : expectedDependencies[i])
+          ready &= ends[p] >= 0;
+        if (ready) {
+          chosen = i;
+          break;
+        }
+      }
+      int64_t earliest = 0;
+      for (size_t p : expectedDependencies[chosen])
+        earliest = std::max(earliest, ends[p]);
+      for (int64_t begin = earliest;; ++begin) {
+        bool fits = true;
+        for (int64_t tick = begin; tick < begin + duration[chosen]; ++tick) {
+          int64_t memoryLive = scratch[chosen], resourceLive = 1;
+          for (size_t i = 0; i < 6; ++i)
+            if (starts[i] <= tick && tick < ends[i]) {
+              memoryLive += scratch[i];
+              resourceLive += resource[i] == resource[chosen];
+            }
+          fits &= memoryLive <= scratchCapacity &&
+                  resourceLive <= (resource[chosen] ? 2 : 1);
+        }
+        if (!fits)
+          continue;
+        starts[chosen] = begin;
+        ends[chosen] = begin + duration[chosen];
+        expectedMakespan = std::max(expectedMakespan, ends[chosen]);
+        break;
+      }
+    }
+    auto oracleResult = evaluateProgramOperatorMappingCandidate(
+        oracleSource, oracleCandidate, oracleTarget, "abi", readyGraph);
+    if (!require(oracleResult.feasible && oracleResult.feasibilityKnown &&
+                     oracleResult.costMs &&
+                     *oracleResult.costMs == expectedMakespan,
+                 "endpoint resource/memory calendar agrees with independent "
+                 "discrete oracle"))
+      return 1;
+    std::vector<ProgramOperatorChoiceGroup> oracleGroups;
+    std::map<std::string, ProgramOperatorExecutionVariant> oracleVariants;
+    for (size_t i = 0; i < 6; ++i) {
+      oracleGroups.push_back(
+          {"oracle-group" + std::to_string(i), {"only"}, {{i}}});
+      oracleVariants.emplace(oracleCandidate.selection.regions[i].id,
+                             oracleCandidate.mapping.variants[i]);
+    }
+    std::shared_ptr<const ProgramOperatorMappingDomain> oracleDomain;
+    if (!require(prepareProgramOperatorMappingDomain(
+                     *oracleSource, oracleCandidate.selection.regions,
+                     oracleGroups, oracleVariants, "oracle-domain",
+                     oracleTarget, "abi", oracleDomain, error),
+                 "random dense calendar domain prepares"))
+      return 1;
+    std::vector<size_t> oracleKeys(6);
+    for (size_t i = 0; i < 6; ++i)
+      oracleKeys[oracleCandidate.mapping.readyPriority[i]] = i;
+    auto denseResult = evaluateProgramOperatorMappingDomain(
+        *oracleDomain, {0, 0, 0, 0, 0, 0}, "source-order", &oracleKeys);
+    auto fullReference = evaluateProgramOperatorMappingDomainReference(
+        *oracleDomain, {0, 0, 0, 0, 0, 0}, "source-order", &oracleKeys);
+    if (!require(denseResult.feasible && denseResult.feasibilityKnown &&
+                     denseResult.costMs &&
+                     *denseResult.costMs == expectedMakespan &&
+                     fullReference.costMs == denseResult.costMs,
+                 "dense calendar/scratch certificate/serial suffix match full "
+                 "calendar and discrete oracle"))
+      return 1;
+    if (trial == 0 && !require(denseResult.result.getAsObject()
+                                       ->getInteger("serial_tail_invocations")
+                                       .value_or(0) > 0,
+                               "strict source-dependent suffix actually "
+                               "exercises exact evaluator reduction"))
+      return 1;
+  }
+  ProgramOperatorInvocationControlModel controllerModel;
+  controllerModel.identity = "fixture-controller-model";
+  controllerModel.sourceId = prioritySource->sourceId;
+  controllerModel.coefficients = {{"cpu_callbacks", 0}, {"npu_callbacks", 20}};
+  auto controllerImplementations = convexImplementations;
+  for (auto &impl : controllerImplementations)
+    impl.controllerFeatures = {{"cpu_callbacks", impl.device == "cpu" ? 1 : 0},
+                               {"npu_callbacks", impl.device == "npu" ? 1 : 0}};
+  std::shared_ptr<const ProgramOperatorMappingDomain> controllerDomain;
+  if (!require(prepareProgramOperatorMappingDomain(
+                   *prioritySource, controllerImplementations, convexGroups,
+                   convexVariants, "fixture-controller-domain", readyTarget,
+                   "abi", controllerDomain, error, &controllerModel),
+               "candidate-dependent controller features prepare with local "
+               "prices unchanged"))
+    return 1;
+  auto controllerFused =
+      evaluateProgramOperatorMappingDomain(*controllerDomain, {1, 0});
+  auto controllerUnfused = evaluateProgramOperatorMappingDomain(
+      *controllerDomain, {0, 0}, "reverse-source-order");
+  auto controllerReference = evaluateProgramOperatorMappingDomainReference(
+      *controllerDomain, {0, 0}, "reverse-source-order");
+  if (!require(controllerFused.costMs && *controllerFused.costMs == 13 &&
+                   controllerUnfused.costMs &&
+                   *controllerUnfused.costMs == 31 &&
+                   controllerReference.costMs == controllerUnfused.costMs &&
+                   controllerUnfused.result.getAsObject()->getNumber(
+                       "physical_callback_makespan_ms") == 11 &&
+                   controllerUnfused.result.getAsObject()->getNumber(
+                       "invocation_control_ms") == 20,
+               "outside callback controller cost changes fused/unfused "
+               "preference and stays separately auditable"))
+    return 1;
+  auto missingControllerFeatures = controllerImplementations;
+  missingControllerFeatures[0].controllerFeatures.erase("npu_callbacks");
+  std::shared_ptr<const ProgramOperatorMappingDomain> badControllerDomain;
+  if (!require(!prepareProgramOperatorMappingDomain(
+                   *prioritySource, missingControllerFeatures, convexGroups,
+                   convexVariants, "fixture-missing-feature", readyTarget,
+                   "abi", badControllerDomain, error, &controllerModel),
+               "missing explicit zero controller feature is unknown, never "
+               "inferred free"))
+    return 1;
+  auto controllerCatalogue = j::Value(j::Object{
+      {"invocation_control_model",
+       j::Object{
+           {"schema", "orbit.program-invocation-control-model.v1"},
+           {"identity", "fixture-controller-model"},
+           {"source_id", prioritySource->sourceId},
+           {"boundary", "outside-inclusive-invocation-wall"},
+           {"intercept_ms", 0.5},
+           {"coefficients",
+            j::Object{{"cpu_callbacks", 0.1}, {"npu_callbacks", 0.2}}},
+           {"fit",
+            j::Object{
+                {"scope", "synthetic fixture; not a device calibration"}}}}}});
+  std::optional<ProgramOperatorInvocationControlModel> parsedController;
+  if (!require(
+          parseProgramOperatorInvocationControlModel(
+              *prioritySource, controllerCatalogue, parsedController, error) &&
+              parsedController,
+          "explicit calibrated controller model parses"))
+    return 1;
+  auto unknownController = copyJSONWithoutFields(controllerCatalogue);
+  (*unknownController.getAsObject()
+        ->getObject("invocation_control_model")
+        ->getObject("coefficients"))["cpu_callbacks"] = nullptr;
+  if (!require(!parseProgramOperatorInvocationControlModel(
+                   *prioritySource, unknownController, parsedController, error),
+               "unknown controller coefficient cannot become zero"))
+    return 1;
+  auto negativeController = copyJSONWithoutFields(controllerCatalogue);
+  (*negativeController.getAsObject()->getObject(
+      "invocation_control_model"))["intercept_ms"] = -1;
+  if (!require(
+          !parseProgramOperatorInvocationControlModel(
+              *prioritySource, negativeController, parsedController, error),
+          "negative controller intercept is rejected"))
+    return 1;
+  controllerModel.coefficients["cpu_callbacks"] =
+      std::numeric_limits<double>::quiet_NaN();
+  double controllerWall;
+  std::map<std::string, int64_t> controllerCounts;
+  if (!require(
+          !estimateProgramOperatorInvocationControl(
+              {}, controllerModel, controllerWall, controllerCounts, error),
+          "nonfinite typed controller model is rejected"))
+    return 1;
   llvm::outs() << "{\"status\":\"passed\",\"checks\":" << checks << "}\n";
   return 0;
 }

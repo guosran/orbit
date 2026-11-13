@@ -17,6 +17,29 @@ struct ProgramBeamTraceOptions {
   bool retainInMemory = true;
   std::function<void(const llvm::json::Value &)> sink;
 };
+// Caller-supplied assignments are proposals in this domain, never cached costs.
+// Empty preserves the historical baseline initialization and evaluation order.
+struct ProgramBeamInitialStates {
+  std::vector<std::vector<int64_t>> assignments;
+};
+struct ProgramCoordinateInitialization {
+  bool valid = true, hasPricedSeed = false;
+  // Without a priced feasible start, initialization is attempted but no pass
+  // completes.
+  bool attempted = false, completed = false;
+  std::string message;
+  std::vector<int64_t> assignment;
+  ProgramSearchEvaluation evaluation;
+  int64_t evaluations = 0, improvedCoordinates = 0;
+  std::optional<double> startCostMs;
+};
+// One ordered coordinate pass supplies a proposal, never a stopping rule. Each
+// trial changes only the current coordinate of the accepted joint incumbent.
+ProgramCoordinateInitialization initializeProgramCoordinates(
+    const ProgramSearchSpace &, const ProgramSearchEvaluator &,
+    const std::vector<std::vector<int64_t>> &starts = {},
+    const std::function<void(const std::vector<int64_t> &,
+                             const ProgramSearchEvaluation &)> &observed = {});
 // Explicit adapter over the public finite domain and evaluator. Reuses
 // selectSearchBeam, but is not the legacy driver's default action generator.
 // Beam accepts +infinity wallSeconds, maxEvaluations=0 and maxRounds=-1
@@ -29,6 +52,7 @@ searchProgramSpaceBeam(const ProgramSearchSpace &,
                        const ProgramSearchOptions &, int64_t beamWidth,
                        int64_t maxRounds, int64_t diversitySlots = 0,
                        const ProgramBeamExplorationOptions &exploration = {},
-                       const ProgramBeamTraceOptions &traceOptions = {});
+                       const ProgramBeamTraceOptions &traceOptions = {},
+                       const ProgramBeamInitialStates &initialStates = {});
 } // namespace orbit::taskflow
 #endif

@@ -61,6 +61,8 @@ struct ProgramOperatorImplementation {
   // Inclusive implementation wall owns invocation and transport. This contract
   // cannot be passed off as transfer-exclusive MappingComputeEstimate data.
   std::string costBoundary = "inclusive-region-wall";
+  // Actual scheduler callback counts, not logical source operator counts.
+  std::map<std::string, int64_t> controllerFeatures;
 };
 struct ProgramOperatorChoiceGroup {
   std::string id;
@@ -69,6 +71,10 @@ struct ProgramOperatorChoiceGroup {
       choices; // local implementation catalogue indices
 };
 struct ProgramOperatorSelection {
+  // Default preserves the actual synchronous backend order. Ready execution
+  // requires a source-bound backend registration, never an inferred relaxation.
+  std::string executionPolicy = "synchronous-source-order";
+  std::string sourceOrderingIdentity, asyncRuntimeProofIdentity;
   std::vector<ProgramOperatorImplementation> regions;
 };
 bool parseProgramOperatorSource(const llvm::json::Value &,
@@ -83,7 +89,16 @@ bool certifyProgramOperatorChoices(
     const ProgramOperatorSource &,
     const std::vector<ProgramOperatorImplementation> &,
     const std::vector<ProgramOperatorChoiceGroup> &, llvm::json::Value &receipt,
-    std::string &error);
+    std::string &error, bool dependencyReady = false);
+// Projects data/control dependencies and conservative physical alias hazards.
+// It never removes source control edges, even for an asynchronous backend.
+bool programOperatorSourceDependencies(const ProgramOperatorSource &,
+                                       std::vector<std::vector<size_t>> &,
+                                       std::string &error);
+bool programOperatorInvocationDependencies(const ProgramOperatorSource &,
+                                           const ProgramOperatorSelection &,
+                                           std::vector<std::vector<size_t>> &,
+                                           std::string &error);
 bool checkProgramOperatorSource(const ProgramOperatorSource &, std::string &);
 llvm::json::Value serializeProgramOperatorSource(const ProgramOperatorSource &);
 // These graphs use the existing regions/versions/copies/events/regions as their

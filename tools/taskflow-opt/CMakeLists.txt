@@ -202,6 +202,15 @@ add_executable(taskflow-program-operator-search EXCLUDE_FROM_ALL
   ../../experimental/qwen-runtime-search/program-operator-search.cpp)
 target_link_libraries(taskflow-program-operator-search PRIVATE MLIRTaskflowStructured LLVMSupport)
 target_compile_options(taskflow-program-operator-search PRIVATE -fexceptions)
+# The experimental external-runtime CLI has its own contract fixture. Keep it
+# separate from the public search API checks so that aggregate stays focused.
+add_custom_target(check-taskflow-program-operator-ready
+  COMMAND ${Python3_EXECUTABLE}
+    ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_operator_ready_cli.py
+    $<TARGET_FILE:taskflow-program-operator-search>
+  DEPENDS taskflow-program-operator-search
+    ${PROJECT_SOURCE_DIR}/test/TaskflowGeneric/program_operator_ready_cli.py
+  VERBATIM)
 add_executable(taskflow-program-operator-source-test EXCLUDE_FROM_ALL
   ../../test/TaskflowGeneric/program-operator-source.cpp)
 target_link_libraries(taskflow-program-operator-source-test PRIVATE MLIRTaskflowStructured LLVMSupport)

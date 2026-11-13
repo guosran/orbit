@@ -32,6 +32,8 @@ struct ProgramOperatorExecutionVariant {
   // Common mapping carries them in candidate identity; it does not infer
   // compatible device contexts from identical operator names.
   std::string runtimeContextIdentity, dataflow, residencePolicy;
+  std::string executionPolicy = "synchronous-source-order";
+  std::string sourceOrderingIdentity, asyncRuntimeProofIdentity;
   std::map<std::string, int64_t> implementationParameters;
   std::map<std::string, int64_t> resourceDemands;
   std::vector<int64_t> resourceShape;
@@ -44,8 +46,23 @@ struct ProgramOperatorExecutionVariant {
   // Prepared immutable allocations are shared by identity, not per call.
   std::map<std::string, std::pair<std::string, int64_t>> residentAllocations;
 };
+struct ProgramOperatorInvocationControlModel {
+  std::string identity, sourceId;
+  std::string boundary = "outside-inclusive-invocation-wall";
+  double interceptMs = 0;
+  std::map<std::string, double> coefficients;
+};
+bool parseProgramOperatorInvocationControlModel(
+    const ProgramOperatorSource &, const llvm::json::Value &,
+    std::optional<ProgramOperatorInvocationControlModel> &, std::string &error);
+bool estimateProgramOperatorInvocationControl(
+    const ProgramOperatorSelection &,
+    const std::optional<ProgramOperatorInvocationControlModel> &,
+    double &controlMs, std::map<std::string, int64_t> &features,
+    std::string &error);
 struct ProgramOperatorMapping {
   std::string registrationIdentity, hostMemory;
+  std::optional<ProgramOperatorInvocationControlModel> controlModel;
   std::vector<ProgramOperatorExecutionVariant> variants; // event indexed
   std::vector<size_t> readyPriority; // permutation; never overrides dependence
 };
@@ -72,10 +89,35 @@ struct ProgramOperatorMappingAction {
 // Structural replacement preserves the exact source-operator coverage. Only
 // registered executable implementations grant fusion, fission or resource
 // changes. The result still requires full physical materialization/checking.
+// All invocations must agree on a registered execution protocol. The proof
+// identity is evidence to be verified by backend replay, not an arithmetic
+// proof.
+bool configureProgramOperatorExecutionPolicy(ProgramOperatorSelection &,
+                                             const ProgramOperatorMapping &,
+                                             std::string &);
+bool canonicalizeProgramOperatorCandidate(const ProgramOperatorSource &,
+                                          ProgramOperatorMappingCandidate &,
+                                          std::string &error);
+bool setProgramOperatorReadyPriority(const ProgramOperatorSelection &,
+                                     ProgramOperatorMapping &,
+                                     llvm::StringRef policy,
+                                     std::string &error);
+std::vector<ProgramOperatorMappingAction>
+programOperatorReadyPriorityNeighbors(const ProgramOperatorMappingCandidate &);
 bool applyProgramOperatorMappingAction(const ProgramOperatorMappingCandidate &,
                                        const ProgramOperatorMappingAction &,
                                        ProgramOperatorMappingCandidate &,
                                        std::string &error);
+// Coordinate actions resolve atomically through actual backend registrations.
+// Hardware-coupled fields may change together; editing a replica/shape flag
+// without a different registered artifact is never a lowering implementation.
+bool applyProgramOperatorRegisteredMappingAction(
+    const ProgramOperatorMappingCandidate &,
+    const ProgramOperatorMappingAction &,
+    const std::vector<ProgramOperatorImplementation> &registeredImplementations,
+    const std::map<std::string, ProgramOperatorExecutionVariant>
+        &registeredVariants,
+    ProgramOperatorMappingCandidate &, std::string &error);
 ProgramSearchEvaluation evaluateProgramOperatorMappingCandidate(
     std::shared_ptr<const ProgramOperatorSource>,
     const ProgramOperatorMappingCandidate &, const StaticConfig &,
@@ -98,16 +140,21 @@ bool prepareProgramOperatorMappingDomain(
     const std::map<std::string, ProgramOperatorExecutionVariant> &,
     llvm::StringRef registrationIdentity, const StaticConfig &,
     llvm::StringRef hostMemory,
-    std::shared_ptr<const ProgramOperatorMappingDomain> &, std::string &error);
-ProgramSearchEvaluation
-evaluateProgramOperatorMappingDomain(const ProgramOperatorMappingDomain &,
-                                     const std::vector<size_t> &groupChoices);
+    std::shared_ptr<const ProgramOperatorMappingDomain> &, std::string &error,
+    const ProgramOperatorInvocationControlModel *controlModel = nullptr);
+ProgramSearchEvaluation evaluateProgramOperatorMappingDomain(
+    const ProgramOperatorMappingDomain &,
+    const std::vector<size_t> &groupChoices,
+    llvm::StringRef priorityPolicy = "source-order",
+    const std::vector<size_t> *implementationPriorityKeys = nullptr);
 // Deliberately retained slow invocation-by-invocation evaluator for
 // differential tests and auditing captured assignments after evaluator
 // optimizations.
 ProgramSearchEvaluation evaluateProgramOperatorMappingDomainReference(
     const ProgramOperatorMappingDomain &,
-    const std::vector<size_t> &groupChoices);
+    const std::vector<size_t> &groupChoices,
+    llvm::StringRef priorityPolicy = "source-order",
+    const std::vector<size_t> *implementationPriorityKeys = nullptr);
 // Adds timing only after checking the source-bound physical graph. Scheduling
 // uses its real data/control/implementation dependencies and target capacities.
 // Unsupported transfers and unknown inclusive timings remain explicit errors.
